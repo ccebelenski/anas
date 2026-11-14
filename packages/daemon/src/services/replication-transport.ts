@@ -71,8 +71,16 @@ export type RemotePoolList
 
 /** The answer to "does this peer/remote have that pool": yes, no, or why it could not say. */
 export type PoolExistence
-  = | { ok: true, exists: boolean }
-    | { ok: false, error: string }
+  = | {
+    ok: true
+    exists: boolean
+    /**
+     * cr3.followup: the pool is absent because ZFS is not available on the
+     * node at all (the plain statement, `zfsUnavailableReason`). Local only.
+     */
+    zfsUnavailable?: string
+  }
+  | { ok: false, error: string }
 
 /** PVE cluster membership: this node's name + every node in the cluster. */
 export interface PveMembers {

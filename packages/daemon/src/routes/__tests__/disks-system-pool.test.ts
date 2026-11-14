@@ -10,6 +10,7 @@ import { LSBLK_ARGS } from '../../parsers/lsblk.js'
 import { createServer } from '../../server.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
 import { collectDisks } from '../disks.js'
+import { serveMdAbsent } from './md-absent.js'
 
 /**
  * disks.r1 — the boot disk of a ZFS-root node reads `system`.
@@ -58,7 +59,9 @@ function makeExecutor(findmnt?: 'capture' | 'exit1' | 'throws' | 'none'): MockEx
   else if (findmnt === 'throws')
     mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], throws: new Error('findmnt could not start') })
   // 'none' (and the default): the mock's command-not-found answer → unreadable.
-  return mock
+  // A ZFS-root node has no md stack (cr3.followup: an unanswered mdstat is a
+  // failed AHR read, which would make the data disks `unknown`).
+  return serveMdAbsent(mock)
 }
 
 async function collect(findmnt: 'capture' | 'exit1' | 'throws' | 'none'): Promise<Map<string, Disk>> {

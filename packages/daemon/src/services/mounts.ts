@@ -1452,6 +1452,18 @@ function mountProbeRuntimeDir(): string {
   return process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR ?? MOUNT_PROBE_RUNTIME_DIR
 }
 
+/** cr3.followup 9(b): how long one start-up sweep `umount` may take (TERM), and its KILL grace. */
+const SWEEP_UMOUNT_S = 10
+/** `timeout -k`'s exit when its KILL had to end the command. */
+const TIMEOUT_KILLED_EXIT = 137
+/** The executor's own deadline over the bounded umount (10 s + 1 s KILL + slack). */
+const SWEEP_UMOUNT_DEADLINE_MS = 15_000
+
+/** `timeout -k 1 10 umount -- <dir>`: one plain unmount (never lazy, never forced), bounded. */
+export function sweepUmountArgs(dir: string): string[] {
+  return ['-k', '1', String(SWEEP_UMOUNT_S), UMOUNT, '--', dir]
+}
+
 /**
  * cr3.mounts review 2 (6): the START-UP sweep of what a daemon that died
  * mid-probe left under the runtime directory — a probe MOUNT POINT
@@ -1462,7 +1474,8 @@ function mountProbeRuntimeDir(): string {
  * touched. It runs once at start, when this process has no probe in flight.
  *
  *  - a probe mount point the mount table shows mounted is unmounted with a
- *    plain `umount -- <dir>` (never lazy, never forced); a failure is
+ *    plain `umount -- <dir>` (never lazy, never forced), bounded by
+ *    `timeout -k 1 10` (cr3.followup 9(b)); a failure or a timeout is
  *    reported and the directory left;
  *  - every probe directory is then removed with `rmdir(2)` only — never
  *    recursively: a directory still mounted (or not empty) refuses, and is
@@ -1498,33 +1511,47 @@ export async function sweepStaleMountProbes(
   const nodes = table ? parseFindmnt(table) : []
   for (const name of names) {
     const dir = join(base, name)
-    // cr3.mounts review 3 (8): lstat first — only a REAL directory (never a
-    // symlink) made before this process started counts as a leftover. The
-    // time test is a belt only: on a MOUNTED probe directory lstat reads the
-    // share root's times, not the directory's (review 4, N4). What protects a
-    // probe of THIS process is that the caller AWAITS this sweep before the
-    // socket listens, so no probe can be in flight while it runs.
-    const st = await lstat(dir).catch(() => null)
-    if (st === null || !st.isDirectory())
-      continue
-    const made = st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs
-    if (made >= startedAtMs)
-      continue
-    if (name.startsWith(MOUNT_PROBE_MOUNT_PREFIX)) {
-      const stacked = nodes.filter(n => n.target === dir).length
-      let unmountFailed = false
-      for (let i = 0; i < stacked && !unmountFailed; i++) {
-        const u = await executor.exec(UMOUNT, ['--', dir])
-          .catch((err: unknown) => ({ stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: -1 }))
-        if (u.exitCode !== 0) {
-          unmountFailed = true
-          failures.push(`the leftover probe mount at '${dir}' could not be unmounted (${cleanMountStderr(u.stderr) || `umount exited ${u.exitCode}`}) — unmount it by hand (umount ${dir}), then remove the empty directory`)
-        }
+    const isMountProbe = name.startsWith(MOUNT_PROBE_MOUNT_PREFIX)
+    // cr3.followup 9(b): the sweep is awaited before the socket listens, so
+    // nothing in it may wait on a dead server. A probe directory the mount
+    // table shows mounted is unmounted FIRST, each `umount` bounded
+    // (`timeout -k 1 10`, and the call's own short deadline) — and nothing
+    // in-process touches it while it may still be a mount: an lstat of a
+    // mountpoint reads the share's root, which on a dead hard NFS mount never
+    // answers. A mount that does not go within the bound is reported and left.
+    const stacked = isMountProbe ? nodes.filter(n => n.target === dir).length : 0
+    let unmountFailed = false
+    for (let i = 0; i < stacked && !unmountFailed; i++) {
+      const u = await executor.exec(TIMEOUT, sweepUmountArgs(dir), { timeoutMs: SWEEP_UMOUNT_DEADLINE_MS })
+        .catch((err: unknown) => ({ stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: -1 }))
+      if (u.exitCode !== 0) {
+        unmountFailed = true
+        const why = u.exitCode === TIMEOUT_FIRED_EXIT || u.exitCode === TIMEOUT_KILLED_EXIT
+          ? `umount did not finish within ${SWEEP_UMOUNT_S} s`
+          : (cleanMountStderr(u.stderr) || `umount exited ${u.exitCode}`)
+        failures.push(`the leftover probe mount at '${dir}' could not be unmounted (${why}) — unmount it by hand (umount ${dir}), then remove the empty directory`)
       }
-      if (unmountFailed)
+    }
+    if (unmountFailed)
+      continue
+    // cr3.mounts review 3 (8): only a REAL directory (never a symlink) made
+    // before this process started counts as a leftover. The time test is a
+    // belt only: what protects a probe of THIS process is that the caller
+    // AWAITS this sweep before the socket listens. cr3.followup 9(b): the
+    // lstat runs only on a directory known NOT to be a mount (the table was
+    // read and the mounts on it are gone); with an unreadable table a probe
+    // mount directory is not lstat-ed at all — the rmdir below never follows
+    // a symlink and refuses a mountpoint or a non-empty directory, so it is
+    // safe on its own.
+    if (!isMountProbe || table !== null) {
+      const st = await lstat(dir).catch(() => null)
+      if (st === null || !st.isDirectory())
+        continue
+      const made = st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs
+      if (made >= startedAtMs)
         continue
     }
-    else {
+    if (!isMountProbe) {
       // Only the one regular `probe.cred` of a probe credentials directory is
       // ever unlinked; anything else there is reported and left.
       const inside = await readdir(dir).catch(() => null)

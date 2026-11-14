@@ -3,6 +3,7 @@ import type { ExecResult } from '../../executor/types.js'
 import type { createServer } from '../../server.js'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { LSBLK_ARGS } from '../../parsers/lsblk.js'
+import { serveMdAbsent } from './md-absent.js'
 
 /**
  * Shared seam for composer tests (cr.12): make the named disk ids resolve in
@@ -36,6 +37,11 @@ export function serveBlankInventoryDisksOn(
   mock: MockExecutor,
   ids: string[],
 ): void {
+  // cr3.followup: the AHR topology is part of a readable inventory too (a
+  // failed md read makes membership unknown). A server that `clearFixtures()`
+  // and never served `/proc/mdstat` gets a node without md, as it gets the
+  // dev lsblk; a test that registered its own answer keeps it.
+  serveMdAbsent(mock)
   const orig = mock.exec.bind(mock)
   mock.exec = async (command: string, args: string[]): Promise<ExecResult> => {
     if (command === '/usr/bin/lsblk' && args.join(' ') === LSBLK_ARGS.join(' ')) {

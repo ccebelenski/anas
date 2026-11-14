@@ -31,7 +31,7 @@ import { backupRoutes } from './routes/backup.js'
 import { cloudRoutes } from './routes/cloud.js'
 import { dashboardRoutes } from './routes/dashboard.js'
 import { datasetRoutes } from './routes/datasets.js'
-import { diskRoutes } from './routes/disks.js'
+import { DiskInventoryUnreadableError, diskRoutes, inventoryUnreadableRefusal } from './routes/disks.js'
 import { fsRoutes } from './routes/fs.js'
 import { healthRoutes } from './routes/health.js'
 import { iscsiMutationRoutes } from './routes/iscsi-mutate.js'
@@ -85,9 +85,12 @@ const MOCK_PARTITION_RE = /(?:-part\d+|\/[sv]d[a-z]+\d+|n\d+p\d+)$/
 /**
  * The "a list could not be read" errors the datasets routes throw
  * (`DatasetListUnreadableError`, `SnapshotListUnreadableError`, cr3.datasets),
- * recognised by name so the server does not import the route.
+ * a `zfs` that could not be started (`ZfsCommandUnavailableError`,
+ * routes/pools.ts, cr3.followup) and a disk list that could not be read
+ * (`DiskListUnreadableError`, routes/disks.ts, cr3.followup), recognised by name so the server does not
+ * import the route.
  */
-const UNREADABLE_LIST_ERRORS: ReadonlySet<string> = new Set(['DatasetListUnreadableError', 'SnapshotListUnreadableError'])
+const UNREADABLE_LIST_ERRORS: ReadonlySet<string> = new Set(['DatasetListUnreadableError', 'SnapshotListUnreadableError', 'ZfsCommandUnavailableError', 'DiskListUnreadableError'])
 
 function isUnreadableListError(error: unknown): error is Error {
   return error instanceof Error && UNREADABLE_LIST_ERRORS.has(error.name)
@@ -228,6 +231,14 @@ export function createServer(opts?: ServerOptions) {
       return reply.code(503).send({
         error: { code: 'UNAVAILABLE', message: error.message },
       })
+    }
+    // cr3.followup 9(c): a composability check whose inventory could not be
+    // read (routes/disks.ts `collectComposableInventory`) is the ZFS doors'
+    // 409 `unreadable` with its sentence, as disks.ts documents — never a
+    // bare 500.
+    if (error instanceof DiskInventoryUnreadableError) {
+      const refusal = inventoryUnreadableRefusal(error.reason)
+      return reply.code(refusal.status).send({ error: { code: refusal.code, reason: refusal.reason, message: refusal.message } })
     }
     // cr3 (handed by cr3.datasets): a dataset or snapshot list that could not
     // be READ is the same fact as an unreadable topology: 503 UNAVAILABLE with

@@ -139,9 +139,39 @@
     // a foreign md operation, a read failed). Such a block is NOT EXAMINED:
     // nothing is known about it, so it never carries restore advice.
     var RUN_STOPPED = 'run-stopped';
+    // cr3.followup: the self-heal lane's newer codes (shared selfheal.ts,
+    // spelled once here for the same reason as the two above).
+    // `write-unconfirmed`: the write through md was issued and could not be
+    // confirmed, so the bytes may have landed: the one not-examined code of
+    // which "nothing was written" is not known to be true.
+    var WRITE_UNCONFIRMED = 'write-unconfirmed';
+    // `no-checksum`: btrfs stores no checksum for the block now (a stale
+    // finding, or a file that keeps none). Scrub again; never a restore.
+    var NO_CHECKSUM = 'no-checksum';
+    // `array-rebuilds-rot`: an unrepairable block every copy in the array
+    // gives back as the same failing bytes. Restore, and the daemon says why.
+    var ARRAY_REBUILDS_ROT = 'array-rebuilds-rot';
+    // `scrub-unproven`: Rewrite parity / Reconcile mirror refused because the
+    // checksum pass they stand on delivered no verdict.
+    var SCRUB_UNPROVEN = 'scrub-unproven';
     // The not-examined reason codes said in words; others read as their code.
     var NOT_EXAMINED_WORDS = {
-        'run-stopped': 'the run stopped before reaching them'
+        'run-stopped': 'the run stopped before reaching them',
+        'no-checksum': 'btrfs stores no checksum for them now: scrub again'
+    };
+    // Every not-examined code (shared SELFHEAL_NOT_EXAMINED_REASONS): a block
+    // carrying one reached no verdict on its bytes, so it never earns restore
+    // advice, whatever bucket it arrived in.
+    var NOT_EXAMINED_CODES = {
+        'inline-extent': true,
+        'hole': true,
+        'owner-scan-truncated': true,
+        'band-unreadable': true,
+        'unresolvable': true,
+        'inode-changed': true,
+        'run-stopped': true,
+        'write-unconfirmed': true,
+        'no-checksum': true
     };
 
     // Shared schedules helpers (fs-tag chip, pills, poll loop) — ONE copy in
@@ -253,7 +283,7 @@
 
     // ---- Row shape + renderers ---------------------------------------------
 
-    function scrubRow(state, findingsByPool, parityByPool) {
+    function scrubRow(state, findingsByPool, parityByPool, poolStates) {
         state = state || {};
         var target = state.target || {};
         var kind = target.kind || 'zfs';
@@ -302,6 +332,14 @@
             // a later completed scrub displaces this exactly as it displaces
             // findings, and vice versa.
             lastFailed: (kind === 'ahr' && findingsByPool) ? failedFor(findingsByPool, target.pool) : null,
+            // cr3.followup: the newest completed scrub's checksum pass
+            // delivered NO verdict (`btrfsUnproven`, the daemon's reason), or
+            // null. Its `btrfsErrors: null` is then not "clean".
+            btrfsUnproven: (kind === 'ahr' && findingsByPool) ? unprovenFor(findingsByPool, target.pool) : null,
+            // cr3.followup: the AHR pool's state as GET /ahr read it, or null
+            // when that read failed or did not list the pool. The writing
+            // verbs are gated on it (the daemon refuses on `unknown`).
+            poolState: kind === 'ahr' ? poolStateFor(poolStates, target.pool) : null,
             // A stable per-row key (kind+pool) so selection survives a poll.
             rowKey: kind + ':' + (target.pool || '')
         };
@@ -349,8 +387,21 @@
         return (job.result && job.result.scrubbed) || (job.detail && job.detail.pool) || null;
     }
 
+    // cr3.followup: a completed scrub whose checksum pass delivered NO
+    // verdict (`btrfsUnproven`) proved nothing about the files, so it never
+    // displaces or hides an earlier scrub's findings. Its entry keeps the
+    // newest-wins time and its own result (`newest`: phase 1's measured
+    // facts, the unproven reason), and carries the findings of the newest
+    // EARLIER completed scrub that did deliver a verdict (`result`), walking
+    // back past other unproven passes. A failed job stops the walk (scrub.r2:
+    // a failure displaces findings on its own terms).
+    function isUnprovenJob(job) {
+        return job.status === 'completed' && !!job.result && typeof job.result.btrfsUnproven === 'string';
+    }
+
     function latestScrubByPool(res) {
         var byPool = {};
+        var perPool = {};
         var list = (res && res.data) || [];
         for (var i = 0; i < list.length; i++) {
             var job = list[i] || {};
@@ -361,14 +412,52 @@
             if (!pool) {
                 continue;
             }
+            (perPool[pool] = perPool[pool] || []).push(job);
             var prior = byPool[pool];
             if (!prior || jobTime(job) >= prior.at) {
                 byPool[pool] = job.status === 'failed'
                     ? { at: jobTime(job), failed: failedEntryOf(job) }
-                    : { at: jobTime(job), result: job.result };
+                    : { at: jobTime(job), result: job.result, job: job };
+            }
+        }
+        for (var name in byPool) {
+            if (!Object.prototype.hasOwnProperty.call(byPool, name)) {
+                continue;
+            }
+            var entry = byPool[name];
+            // A newest unproven pass that named files itself keeps them.
+            if (!entry.job || !isUnprovenJob(entry.job)
+                || (entry.result && entry.result.findings && entry.result.findings.length)) {
+                delete entry.job;
+                continue;
+            }
+            var newestJob = entry.job;
+            delete entry.job;
+            entry.newest = newestJob.result;
+            var older = perPool[name].filter(function (j) { return j !== newestJob && jobTime(j) <= jobTime(newestJob); });
+            older.sort(function (a, b) { return jobTime(b) - jobTime(a); });
+            for (var k = 0; k < older.length; k++) {
+                if (isUnprovenJob(older[k])) {
+                    continue;
+                }
+                if (older[k].status === 'completed' && older[k].result && older[k].result.findings
+                    && older[k].result.findings.length) {
+                    // The earlier verdict's findings stand; the window and
+                    // Repair read them from `result`.
+                    entry.result = older[k].result;
+                    entry.heldFrom = jobTime(older[k]);
+                }
+                break;
             }
         }
         return byPool;
+    }
+
+    // The result whose PHASE-1 facts (skipped bands, corrected metadata) and
+    // unproven reason describe the newest scrub: its own, even when the
+    // findings shown are an earlier scrub's.
+    function newestResultOf(entry) {
+        return entry ? (entry.newest || entry.result) : null;
     }
 
     /** The failed entry of a failed scrub job: when it ended, and what it said. */
@@ -452,8 +541,8 @@
     // The newest scrub's skipped bands (D8) — a band md never checked must not
     // ride home as coverage.
     function skippedFor(byPool, pool) {
-        var entry = byPool[pool];
-        var list = entry && entry.result && entry.result.bandsSkipped;
+        var newest = newestResultOf(byPool[pool]);
+        var list = newest && newest.bandsSkipped;
         return (list && list.length) ? list : null;
     }
 
@@ -462,9 +551,57 @@
     // the summary reports nothing, the kernel's `read error corrected` line is
     // the only evidence, and the row must not read as a clean bill.
     function correctedFor(byPool, pool) {
-        var entry = byPool[pool];
-        var mc = entry && entry.result && entry.result.metadataCorrected;
+        var newest = newestResultOf(byPool[pool]);
+        var mc = newest && newest.metadataCorrected;
         return (mc && Number(mc.count) > 0) ? mc : null;
+    }
+
+    // cr3.followup: the newest completed scrub's checksum pass had no verdict
+    // (`btrfsUnproven`, the daemon's reason) — or null. A row carrying it must
+    // never read as a clean scrub, and the two verbs that stand on a clean
+    // checksum pass (Rewrite parity, Reconcile mirror) are refused on it.
+    function unprovenFor(byPool, pool) {
+        var newest = newestResultOf(byPool[pool]);
+        var why = newest && newest.btrfsUnproven;
+        return (typeof why === 'string') ? why : null;
+    }
+
+    // cr3.followup: GET /ahr's pools as { name: state }, or null when the
+    // read failed (a pool state that could not be read is unknown, never
+    // assumed fine).
+    function poolStatesOf(res) {
+        if (!res || !res.data || typeof res.data.length !== 'number') {
+            return null;
+        }
+        var out = {};
+        for (var i = 0; i < res.data.length; i++) {
+            var p = res.data[i] || {};
+            if (p.name) {
+                out[p.name] = p.state || 'unknown';
+            }
+        }
+        return out;
+    }
+
+    function poolStateFor(states, pool) {
+        return (states && Object.prototype.hasOwnProperty.call(states, pool)) ? states[pool] : null;
+    }
+
+    // Why a writing verb (Repair, Rewrite parity, Reconcile mirror) is off
+    // because of the pool's state, or '' (cr3.followup). The daemon refuses
+    // all three on an `unknown` pool (the mount table could not be read, so
+    // whether btrfs forced the filesystem read-only is not known); a state
+    // this screen could not read at all is unknown too. Every other state is
+    // the daemon's to judge at submit.
+    function poolStateBlocked(state) {
+        if (state === null || state === undefined) {
+            return t('the AHR pool state could not be read, so whether a write is safe is not known');
+        }
+        if (state === 'unknown') {
+            return t('pool state') + ': ' + t('unknown') + '. '
+                + t('whether the filesystem is read-only is not known, so nothing is written to it');
+        }
+        return '';
     }
 
     // Pool: the shared fs-tag chip ("zfs"/"ahr") + the full pool name — reads
@@ -574,7 +711,7 @@
     // refused and the tip says so; the failed branch passes null (a failed
     // job carries no result, so no findings ride it) and gets the
     // data-intact text its own completed pass established.
-    function paritySpanHtml(parity, findings) {
+    function paritySpanHtml(parity, findings, unproven) {
         var bands = [];
         // A mismatch on a RAID1 band is legs disagreeing with each
         // other, not parity disagreeing with data, and it has no
@@ -595,7 +732,14 @@
         // corrupt files also on the pool the verb is refused (md
         // repair would bless that rot), and the window says so on a
         // disabled button rather than hiding the door.
-        var parityTip = findings
+        // cr3.followup: a checksum pass with no verdict proved nothing about
+        // the data, so the tip never says "the checksum scrub found no corrupt
+        // files" on it; both verbs are refused until a scrub delivers one.
+        var parityTip = unproven
+            ? t('md counted mismatches on these bands, and the checksum pass of the same scrub delivered no '
+                + 'verdict, so whether the data is intact is not known. Scrub the pool again before rewriting '
+                + 'parity or reconciling a mirror')
+            : findings
             ? t('md counted parity mismatches on these bands. The file list names what the checksum '
                 + 'scrub attributed. A mismatch it cannot attribute is PARITY-ONLY rot: the parity (or Q) '
                 + 'member disagrees while every file\'s checksum passes. Repair the named files first. '
@@ -689,21 +833,38 @@
         var parity = rec.get('parity');
         var skipped = rec.get('skipped');
         var corrected = rec.get('metadataCorrected');
-        if (findings || parity || skipped || corrected) {
+        var unproven = rec.get('btrfsUnproven');
+        if (findings || parity || skipped || corrected || unproven) {
             var spans = [];
+            // cr3.followup: the checksum pass delivered no verdict. Said first
+            // and in amber: whatever else the scrub reported, its phase 2 is
+            // unproven, and "no findings" here is not a clean pool.
+            if (unproven) {
+                spans.push('<span class="anas-scrub-unproven" style="color:var(--anas-warn,#b06a12);" title="'
+                    + enc(t('the btrfs checksum pass of that scrub delivered no verdict, so no file is proven intact')
+                        + ': ' + unproven + '. ' + t('Scrub the pool again')) + '">'
+                    + '<i class="fa fa-question-circle" aria-hidden="true" style="margin-right:5px;"></i>'
+                    + enc(t('checksum pass: no verdict')) + '</span>');
+            }
             if (findings) {
                 var files = (findings.result.findings || []).length;
+                // cr3.followup: findings an EARLIER scrub named, kept because
+                // the newest one's checksum pass delivered no verdict.
+                var findingsTip = findings.heldFrom
+                    ? t('an earlier AHR scrub found checksum errors, and the newest one\'s checksum pass delivered '
+                        + 'no verdict, so nothing has cleared them. Click to see the files and their bad blocks.')
+                    : t('the last AHR scrub that completed since the daemon started found checksum errors. Click '
+                        + 'to see the files and their bad blocks. ANAS keeps no scrub history of its own, '
+                        + 'and md records no completion time or result for a check.');
                 spans.push('<span class="anas-scrub-findings-link" style="color:var(--anas-warn,#b06a12);'
                     + 'cursor:pointer;text-decoration:underline;" title="'
-                    + enc(t('the last AHR scrub that completed since the daemon started found checksum errors. Click '
-                        + 'to see the files and their bad blocks. ANAS keeps no scrub history of its own, '
-                        + 'and md records no completion time or result for a check.')) + '">'
+                    + enc(findingsTip) + '">'
                     + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:5px;"></i>'
                     + enc(files + ' ' + (files === 1 ? t('file with checksum errors') : t('files with checksum errors')))
                     + '</span>');
             }
             if (parity) {
-                spans.push(paritySpanHtml(parity, findings));
+                spans.push(paritySpanHtml(parity, findings, unproven));
             }
             if (skipped) {
                 var why = [];
@@ -829,7 +990,14 @@
             function (r) { return r; },
             function () { return null; }
         );
-        Promise.all([ANAS.api.get(node, '/scrub'), completedRead, failedRead]).then(function (both) {
+        // cr3.followup: the AHR pools' states, for the writing verbs' gate. A
+        // read that failed is null here and every AHR row's state unknown:
+        // the verbs say so on a dark button rather than offer a write.
+        var ahrRead = ANAS.api.get(node, '/ahr').then(
+            function (r) { return r; },
+            function () { return null; }
+        );
+        Promise.all([ANAS.api.get(node, '/scrub'), completedRead, failedRead, ahrRead]).then(function (both) {
             var res = both[0];
             // Drop a response older than the newest request: its rows, its
             // mask and — below all else — its idea of what was selected.
@@ -866,10 +1034,11 @@
             } catch (eJ) {
                 ANAS.warn('scrub findings read failed: ' + ANAS.errText(eJ));
             }
+            var poolStates = poolStatesOf(both[3]);
             var list = (res && res.data) || [];
             var rows = [];
             for (var i = 0; i < list.length; i++) {
-                rows.push(scrubRow(list[i], findingsByPool, parityByPool));
+                rows.push(scrubRow(list[i], findingsByPool, parityByPool, poolStates));
             }
             try {
                 scrubGrid.getStore().loadData(rows);
@@ -1012,6 +1181,9 @@
             } else if (!repairable.length) {
                 why = t('findings cannot be repaired from here') + ': '
                     + blockedFindingReasons((entry.result || {}).findings).join(', ');
+            } else {
+                // cr3.followup: the pool's state, as the daemon would refuse it.
+                why = poolStateBlocked(rec.get('poolState'));
             }
             repairBtn.setDisabled(!rec || !!why);
             btnSetTip(repairBtn, why);
@@ -1353,10 +1525,13 @@
             return;
         }
         var picked = repairSelection(grid);
-        btn.setDisabled(!picked.length);
-        btnSetTip(btn, picked.length
+        // cr3.followup: the pool's state gates the write here too (the window
+        // can be opened from the row's findings link as well as the toolbar).
+        var stateWhy = poolStateBlocked(win.anasPoolState);
+        btn.setDisabled(!picked.length || !!stateWhy);
+        btnSetTip(btn, stateWhy || (picked.length
             ? ''
-            : t('tick the files to repair. A finding with no live file under the mountpoint cannot be'));
+            : t('tick the files to repair. A finding with no live file under the mountpoint cannot be')));
     }
 
     // The job's answer, in the window the request was made from: the three
@@ -1409,17 +1584,24 @@
             var csumFiles = [];
             var restoreFiles = 0;
             var sawRunStopped = false;
+            // cr3.followup: the daemon's own sentence for each block the array
+            // rebuilds as the same failing bytes: it says why the restore.
+            var rotReasons = [];
             for (var f = 0; f < files.length; f++) {
                 var bad = [];
                 var fb = files[f].blocks || [];
                 for (var b = 0; b < fb.length; b++) {
                     // Restore advice rides only a block that was EXAMINED and
-                    // proven lost: a `run-stopped` code means it never was,
+                    // proven lost: a not-examined code (`run-stopped`, and
+                    // since cr3.followup every other one) means it never was,
                     // whatever bucket it arrived in.
-                    if (fb[b].outcome === 'unrepairable' && fb[b].reasonCode === RUN_STOPPED) {
+                    if (fb[b].outcome === 'unrepairable' && NOT_EXAMINED_CODES[fb[b].reasonCode] === true) {
                         sawRunStopped = true;
                     } else if (fb[b].outcome === 'unrepairable') {
                         bad.push(fb[b]);
+                        if (fb[b].reasonCode === ARRAY_REBUILDS_ROT && fb[b].reason) {
+                            rotReasons.push(String(fb[b].reason));
+                        }
                     }
                 }
                 if (!bad.length) {
@@ -1444,6 +1626,9 @@
                 lines.push(enc(t('Unrepairable: nothing below the checksum tree can be proven right for '
                     + 'those blocks. Restore this file from backup.')));
             }
+            for (var rr = 0; rr < rotReasons.length; rr++) {
+                lines.push(enc(rotReasons[rr]));
+            }
             if (csumFiles.length) {
                 lines.push(enc(t('The checksum could not be read reliably for')
                     + ' ' + csumFiles.join(', ') + '. '
@@ -1461,10 +1646,20 @@
         // of none of them, so they never borrow that sentence.
         if (Number(res.notExamined || 0) > 0) {
             var whys = {};
+            // cr3.followup: a `write-unconfirmed` block is NOT one of which
+            // "nothing was written" is known: the write was issued and could
+            // not be confirmed. It gets its own sentence and leaves the count
+            // the "nothing was written" sentence speaks for.
+            var unconfirmedWrites = 0;
             for (var n = 0; n < files.length; n++) {
                 var nb = files[n].blocks || [];
                 for (var k = 0; k < nb.length; k++) {
-                    if (nb[k].outcome === 'not-examined') {
+                    if (nb[k].outcome !== 'not-examined') {
+                        continue;
+                    }
+                    if (nb[k].reasonCode === WRITE_UNCONFIRMED) {
+                        unconfirmedWrites += 1;
+                    } else {
                         whys[nb[k].reasonCode || 'unresolvable'] = true;
                     }
                 }
@@ -1475,14 +1670,39 @@
                     why.push(NOT_EXAMINED_WORDS[code] ? t(NOT_EXAMINED_WORDS[code]) : code);
                 }
             }
-            lines.push(enc(Number(res.notExamined || 0) + ' ' + t('block(s) could not be EXAMINED')
-                + (why.length ? ' (' + why.join(', ') + ')' : '') + '. '
-                + t('Nothing was written, and nothing is known about those bytes. This is neither a clean '
-                    + 'bill of health nor a reason to restore. Re-scrub once the reason no longer applies.')));
+            var unexamined = Number(res.notExamined || 0) - unconfirmedWrites;
+            if (unexamined > 0) {
+                lines.push(enc(unexamined + ' ' + t('block(s) could not be EXAMINED')
+                    + (why.length ? ' (' + why.join(', ') + ')' : '') + '. '
+                    + t('Nothing was written, and nothing is known about those bytes. This is neither a clean '
+                        + 'bill of health nor a reason to restore. Re-scrub once the reason no longer applies.')));
+            }
+            if (unconfirmedWrites > 0) {
+                lines.push(enc(unconfirmedWrites + ' ' + t('block(s) were written through md and the write could '
+                    + 'not be confirmed: the bytes, checked against the stored checksum, may or may not have landed. '
+                    + 'The next scrub decides: a block it still names is repaired again. This is not a reason to restore.')));
+            }
         }
         if (Number(res.aboveMd || 0) > 0) {
             lines.push(enc(t('Above md: parity already agreed with the bad data. This implicates '
                 + 'something other than the disks (memory, controller, software). Nothing was written.')));
+        }
+        // cr3.followup: blocks written with bytes proven against their stored
+        // checksum whose confirmation after the write (post-check, cold read)
+        // did not run. Repaired, not confirmed: a re-scrub confirms them.
+        var unconfirmed = [];
+        for (var u = 0; u < files.length; u++) {
+            var ub = files[u].blocks || [];
+            for (var w = 0; w < ub.length; w++) {
+                if (ub[w].outcome === 'repaired' && ub[w].postcheckSkipped) {
+                    unconfirmed.push(files[u].path + ' ' + t('block') + ' ' + ub[w].block + ': '
+                        + String(ub[w].postcheckSkipped));
+                }
+            }
+        }
+        if (unconfirmed.length) {
+            lines.push(enc(unconfirmed.length + ' ' + t('block(s) repaired; re-scrub to confirm. The confirmation after '
+                + 'the write did not run') + ': ' + unconfirmed.join('; ')));
         }
         // Seventh pass, F2 — blocks that were repaired and PROVEN while md still
         // counts mismatching stripes on their band. The file is right; the
@@ -1510,12 +1730,18 @@
         var detail = [];
         for (var i = 0; i < blocks.length; i++) {
             var kind = blocks[i].outcome;
+            // cr3.followup: written and proven, but the confirmation after the
+            // write did not run — not the same as a confirmed repair.
+            if (kind === 'repaired' && blocks[i].postcheckSkipped) {
+                kind = t('repaired; re-scrub to confirm');
+            }
             if (!byKind[kind]) {
                 byKind[kind] = 0;
                 order.push(kind);
             }
             byKind[kind] += 1;
-            detail.push(t('block') + ' ' + blocks[i].block + ': ' + kind + '. ' + (blocks[i].reason || ''));
+            detail.push(t('block') + ' ' + blocks[i].block + ': ' + kind + '. ' + (blocks[i].reason || '')
+                + (blocks[i].postcheckSkipped ? ' ' + String(blocks[i].postcheckSkipped) : ''));
         }
         var parts = [];
         for (var j = 0; j < order.length; j++) {
@@ -1534,7 +1760,7 @@
             return;
         }
         var files = repairSelection(grid);
-        if (!files.length) {
+        if (!files.length || poolStateBlocked(win.anasPoolState)) {
             return;
         }
         var blocks = 0;
@@ -1598,9 +1824,9 @@
         }
         try {
             if (hit === 'parity' && parity) {
-                showParityMismatches(node, rec.get('pool'), parity, !!entry);
+                showParityMismatches(node, rec.get('pool'), parity, !!entry, rec.get('btrfsUnproven'), rec.get('poolState'));
             } else if (hit === 'findings' && entry) {
-                showScrubFindings(node, rec.get('pool'), entry.result);
+                showScrubFindings(node, rec.get('pool'), entry.result, false, rec.get('poolState'));
             }
         } catch (eW) {
             ANAS.warn('scrub findings failed: ' + ANAS.errText(eW));
@@ -1659,10 +1885,26 @@
         + 'the leg that matches the checksum btrfs stored for it. Rows with no checksum — free space, a '
         + 'NOCOW file, a preallocated range — are counted and left exactly as they are.';
 
+    // cr3.followup: both band verbs stand on a checksum pass that found
+    // nothing; one that delivered no verdict proves nothing, and the daemon
+    // refuses it (`scrub-unproven`) with this reason. The pool's state gates
+    // them as it gates Repair.
+    function unprovenOrStateBlocked(win) {
+        if (win.anasUnproven) {
+            return t('the last scrub\'s checksum pass delivered no verdict') + ': ' + win.anasUnproven + '. '
+                + t('Scrub the pool again');
+        }
+        return poolStateBlocked(win.anasPoolState);
+    }
+
     function parityRewriteBlocked(win, hasFindings) {
         if (hasFindings) {
             return t('the same scrub named corrupt files. Repair those from parity first. Rewriting parity now '
                 + 'would recompute it from the corrupt data and make the rot permanent');
+        }
+        var held = unprovenOrStateBlocked(win);
+        if (held) {
+            return held;
         }
         var grid = win.down('#parityGrid');
         var sel = grid && typeof grid.getSelection === 'function' ? grid.getSelection() : [];
@@ -1690,6 +1932,10 @@
             return t('the same scrub named corrupt files. Repair those from parity first. Both arms of the '
                 + 'reconcile treat the checksum tree as the authority, and a file that already fails its '
                 + 'checksum is not one a leg can be arbitrated against');
+        }
+        var held = unprovenOrStateBlocked(win);
+        if (held) {
+            return held;
         }
         var grid = win.down('#parityGrid');
         var sel = grid && typeof grid.getSelection === 'function' ? grid.getSelection() : [];
@@ -1756,6 +2002,11 @@
         } else if (res.outcome === 'still-mismatched') {
             lines.push(enc(t('md repaired the band and the check afterwards STILL counted mismatches. The parity '
                 + 'is not proven good. Do not treat this band as healthy. The PVE notification has the detail.')));
+        } else if (res.outcome === 'refused' && res.reasonCode === SCRUB_UNPROVEN) {
+            // cr3.followup: the checksum pass this verb stands on had no
+            // verdict; the daemon's sentence below says which and why.
+            lines.push(enc(t('Refused: the checksum scrub this verb stands on delivered no verdict, so nothing proves '
+                + 'the data intact. Nothing was written. Scrub the pool again.')));
         }
         if (res.reason) {
             lines.push(enc(String(res.reason)));
@@ -1797,8 +2048,11 @@
                 + 'read and compared') + '. ' + Number(res.rowsDiffering || 0) + ' ' + t('differing row(s)') + ', '
                 + ((res.rowsWritten && (Number(res.rowsWritten.leg0 || 0) + Number(res.rowsWritten.leg1 || 0))) || 0)
                 + ' ' + t('written back through md')
-            : t('Arm A (scrub until clean)') + ': ' + passes + ' ' + t('btrfs scrub pass(es); md served the rotten leg '
-                + 'and btrfs healed the band through it')));
+            // cr3.followup: "healed" only on a run that ended reconciled; a
+            // refused or residual arm-A run healed nothing anyone proved.
+            : t('Arm A (scrub until clean)') + ': ' + passes + ' ' + (res.outcome === 'reconciled'
+                ? t('btrfs scrub pass(es); md served the rotten leg and btrfs healed the band through it')
+                : t('btrfs scrub pass(es)'))));
         var skipped = [];
         if (Number(res.uncheckedRows || 0) > 0) {
             skipped.push(Number(res.uncheckedRows) + ' ' + t('row(s) with no stored checksum (left as they are)'));
@@ -1817,8 +2071,26 @@
         if (Number(res.undecidedRows || 0) > 0) {
             lines.push(enc(Number(res.undecidedRows) + ' ' + t('row(s) not decided: no verdict about their data, nothing written')));
         }
+        // cr3.followup: a run that did not end reconciled names the rows it
+        // DID write (the first 64; `rowsWritten` says how many in all).
+        var writtenAt = res.writtenAt || [];
+        if (res.outcome !== 'reconciled' && writtenAt.length) {
+            var wroteTotal = res.rowsWritten
+                ? Number(res.rowsWritten.leg0 || 0) + Number(res.rowsWritten.leg1 || 0)
+                : writtenAt.length;
+            var moreRows = wroteTotal - writtenAt.length;
+            var at = [];
+            for (var wa = 0; wa < writtenAt.length; wa++) {
+                at.push(String(Number(writtenAt[wa])));
+            }
+            lines.push(enc(t('Rows written back through md, at md byte(s)') + ' ' + at.join(', ')
+                + (moreRows > 0 ? ' ' + t('and') + ' ' + moreRows + ' ' + t('more') : '')));
+        }
         if (res.outcome === 'reconciled') {
             lines.push(enc(t('The legs agree again, and the verifying check counted 0.')));
+        } else if (res.outcome === 'refused' && res.reasonCode === SCRUB_UNPROVEN) {
+            lines.push(enc(t('Refused: a scrub pass of this run delivered no checksum verdict, so the run stopped '
+                + 'there. Scrub the pool again.')));
         } else if (res.outcome === 'residual') {
             lines.push(enc(t('The band is NOT clean. Do not treat it as healthy, and do not run md repair on it — on a '
                 + 'mirror that copies the first in-sync leg over the other without looking at which one is right. '
@@ -1908,7 +2180,7 @@
     // The window behind the parity indicator: the bands md counted mismatches
     // on, and the verb. `hasFindings` is the pool's same-scrub corrupt-file
     // verdict — it does not hide the window, it disables the verb and says why.
-    function showParityMismatches(node, pool, parity, hasFindings) {
+    function showParityMismatches(node, pool, parity, hasFindings, unproven, poolState) {
         var rows = [];
         for (var i = 0; i < parity.length; i++) {
             var pm = parity[i] || {};
@@ -2036,6 +2308,10 @@
                 }
             ]
         });
+        // cr3.followup: what the two verbs are refused on besides the
+        // selection: a checksum pass with no verdict, and the pool's state.
+        win.anasUnproven = unproven || null;
+        win.anasPoolState = poolState;
         win.show();
         updateParityButton(win, hasFindings);
         return true;
@@ -2045,7 +2321,7 @@
     // the repairable rows already ticked: the toolbar established what can be
     // repaired, the operator only confirms. The row indicator and the post-Run
     // auto-open leave the rows unticked, as ever.
-    function showScrubFindings(node, pool, result, preselect) {
+    function showScrubFindings(node, pool, result, preselect, poolState) {
         var findings = (result && result.findings) || [];
         if (!findings.length) {
             return false;
@@ -2092,6 +2368,10 @@
             ? '<br>' + enc(t('md counted parity mismatches on') + ' ' + parityBands.join(', ')
                 + '. ' + t('A mismatch the checksum scrub cannot attribute is parity-only rot. The PVE notification explains it'))
             : '';
+        // cr3.followup: a checksum pass with no verdict, said in the window too.
+        if (result && typeof result.btrfsUnproven === 'string') {
+            parityLine += '<br>' + enc(t('checksum pass: no verdict') + ': ' + result.btrfsUnproven);
+        }
 
         var win = Ext.create('Ext.window.Window', {
             cls: 'anas-win-scrub-findings',
@@ -2163,6 +2443,8 @@
                 }
             ]
         });
+        // cr3.followup: the pool state the row read, for the Repair gate.
+        win.anasPoolState = poolState;
         win.show();
         if (preselect) {
             try {
@@ -2236,7 +2518,7 @@
                     return;
                 }
                 try {
-                    showScrubFindings(node, pool, job.result);
+                    showScrubFindings(node, pool, job.result, false, rec.get('poolState'));
                 } catch (e) {
                     ANAS.warn('scrub findings failed: ' + ANAS.errText(e));
                 }
@@ -2259,7 +2541,9 @@
                 { name: 'parity', type: 'auto' },
                 { name: 'skipped', type: 'auto' },
                 { name: 'metadataCorrected', type: 'auto' },
-                { name: 'lastFailed', type: 'auto' }],
+                { name: 'lastFailed', type: 'auto' },
+                { name: 'btrfsUnproven', type: 'auto' },
+                { name: 'poolState', type: 'auto' }],
             data: [],
             sorters: [{ property: 'kind', direction: 'ASC' }, { property: 'pool', direction: 'ASC' }]
         });
@@ -2380,7 +2664,7 @@
                                     return;
                                 }
                                 try {
-                                    showScrubFindings(node, rec.get('pool'), entry.result, true);
+                                    showScrubFindings(node, rec.get('pool'), entry.result, true, rec.get('poolState'));
                                 } catch (e) {
                                     ANAS.warn('scrub findings failed: ' + ANAS.errText(e));
                                 }
@@ -2428,6 +2712,13 @@
     ANAS.scrubs.updateButtons = updateScrubButtons;
     ANAS.scrubs.showRepairResult = showRepairResult;
     ANAS.scrubs.showMirrorResult = showMirrorResult;
+    // cr3.followup: for cr3-followup.harness.mjs.
+    ANAS.scrubs.showParityResult = showParityResult;
+    ANAS.scrubs.updateRepairButton = updateRepairButton;
+    ANAS.scrubs.updateParityButton = updateParityButton;
+    ANAS.scrubs.fileOutcome = fileOutcome;
+    ANAS.scrubs.notExaminedCodes = NOT_EXAMINED_CODES;
+    ANAS.scrubs.latestScrubByPool = latestScrubByPool;
 
     ANAS.views['scrubs'] = {
         itemId: 'anas-scrubs',

@@ -183,14 +183,15 @@
         return out;
     }
 
-    // cr3 (AHR-PANEL-L5): THE panel's disk-candidacy predicate, mirroring
-    // the shared `isComposableDisk` (shared/schemas/disks.ts) condition for
-    // condition: available, and not hands-off (an iSCSI LUN this node serves
-    // to itself reads as a blank available disk, GT-43). Every AHR picker
-    // filters through it — the spare, cache, expand and replace pickers here
-    // and the create composer's tray (as ANAS.ahr.isComposableDisk).
+    // cr3 (AHR-PANEL-L5): the disk-candidacy predicate every AHR picker
+    // filters through (the spare, cache, expand and replace pickers here and
+    // the create composer's tray). cr3.followup: it is the ONE panel copy of
+    // the shared `isComposableDisk`, ANAS.gfx.isComposableDisk (15-gfx.js,
+    // which the ZFS pickers use too), read at call time; without it nothing
+    // is offered.
     function composable(disk) {
-        return !!disk && disk.status === 'available' && disk.handsOff === undefined;
+        var g = ANAS.gfx;
+        return !!(g && typeof g.isComposableDisk === 'function' && g.isComposableDisk(disk));
     }
     function composableDisks(all) {
         var out = [];

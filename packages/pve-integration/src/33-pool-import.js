@@ -7,7 +7,9 @@
  * job helper.
  *
  * Data:
- *   GET  /pools/import   → { data: [{ name, guid, state }] }  (scan, synchronous)
+ *   GET  /pools/import   → { data: [{ name, guid, state }],    (scan, synchronous)
+ *                             unreadableEntries?: string[] }    (cr3: scan entries
+ *                             that could not be read; each is the daemon's sentence)
  *   POST /pools/import   → 202 { job }                        (ImportPoolRequest)
  *
  * ES5, no build step. Fail open: guarded so a standalone load never throws.
@@ -26,6 +28,61 @@
         return ANAS.t ? ANAS.t(str) : str;
     }
 
+    // The scan entries the daemon could not read (`unreadableEntries`, cr3):
+    // its own sentences, or [] when the answer carries none (an older daemon,
+    // or a scan that read every entry).
+    function unreadableEntriesOf(res) {
+        var list = (res && res.unreadableEntries && res.unreadableEntries.length) ? res.unreadableEntries : [];
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            if (typeof list[i] === 'string' && list[i]) {
+                out.push(list[i]);
+            }
+        }
+        return out;
+    }
+
+    // Show the unreadable scan entries above the grid, every one encoded, or
+    // hide the notice when there are none (cr3.followup).
+    function showUnreadable(win, entries) {
+        var box = win.down('#importUnreadable');
+        if (!box) {
+            return;
+        }
+        try {
+            if (!entries.length) {
+                box.update('');
+                box.setHidden(true);
+                return;
+            }
+            var items = [];
+            for (var i = 0; i < entries.length; i++) {
+                items.push('<li>' + ANAS.enc(entries[i]) + '</li>');
+            }
+            box.update('<div style="color:var(--anas-warn,#b06a12);">'
+                + ANAS.enc(t('Scan entries that could not be read') + ' (' + entries.length + ')') + ':</div>'
+                + '<ul style="margin:4px 0 0 18px;padding:0;">' + items.join('') + '</ul>');
+            box.setHidden(false);
+        } catch (e) {
+            // non-fatal — the grid's empty text still names them
+        }
+    }
+
+    // What the grid says when it lists no pool (cr3.followup): the ZFS-absent
+    // sentence; else, when entries could not be read, never "No importable
+    // pools found" alone, since an entry nobody could read may be a pool;
+    // else the honest empty.
+    function importEmptyText(zfsNo, entries) {
+        if (zfsNo) {
+            return zfsNo;
+        }
+        if (entries.length) {
+            return t('No pool in the scan can be imported from here') + ': ' + entries.length + ' '
+                + t('scan entr(ies) could not be read (listed above)');
+        }
+        return t('No importable pools found');
+    }
+
     function scan(win, node) {
         var poolGrid = win.down('#importGrid');
         if (!poolGrid) {
@@ -40,8 +97,10 @@
             // cr3 daemon contract: ZFS not available on this node — the
             // node's sentence (encoded) in place of "No importable pools".
             var zfsNo = ANAS.pools.zfsUnavailableOf ? ANAS.pools.zfsUnavailableOf(res) : null;
+            var entries = unreadableEntriesOf(res);
+            showUnreadable(win, entries);
             if (ANAS.pools.setGridEmptyText) {
-                ANAS.pools.setGridEmptyText(poolGrid, zfsNo || t('No importable pools found'));
+                ANAS.pools.setGridEmptyText(poolGrid, importEmptyText(zfsNo, entries));
             }
             poolGrid.getStore().loadData((res && res.data) || []);
         }, function (err) {
@@ -49,6 +108,13 @@
                 return;
             }
             poolGrid.setLoading(false);
+            // cr3.followup: a scan that could not be read leaves no earlier
+            // scan's rows or notice standing, and never reads as "no pools".
+            showUnreadable(win, []);
+            if (ANAS.pools.setGridEmptyText) {
+                ANAS.pools.setGridEmptyText(poolGrid, t('The scan could not be read') + ': ' + ANAS.errText(err));
+            }
+            poolGrid.getStore().loadData([]);
             ANAS.warn('import scan failed: ' + ANAS.errText(err));
             ANAS.alertMsg('Error', t('Failed to scan for pools') + ': ' + ANAS.errText(err));
         });
@@ -117,7 +183,9 @@
                     itemId: 'importGrid',
                     cls: 'anas-grid-import',
                     border: false,
-                    emptyText: t('No importable pools found'),
+                    // Set by each scan (importEmptyText); nothing is claimed
+                    // before the first one answers.
+                    emptyText: '',
                     store: importStore,
                     selModel: { mode: 'SINGLE' },
                     columns: [
@@ -149,6 +217,16 @@
                             },
                         },
                     ]),
+                    // cr3.followup: the scan entries that could not be read.
+                    dockedItems: [{
+                        xtype: 'component',
+                        dock: 'top',
+                        itemId: 'importUnreadable',
+                        cls: 'anas-import-unreadable',
+                        hidden: true,
+                        padding: '6 10',
+                        html: '',
+                    }],
                 }],
                 buttons: [
                     {
@@ -178,6 +256,9 @@
         win.show();
         scan(win, node);
     }
+
+    // cr3.followup: for cr3-followup.harness.mjs.
+    ANAS.pools.importScan = scan;
 
     ANAS.pools.registerAction({
         itemId: 'importPool',

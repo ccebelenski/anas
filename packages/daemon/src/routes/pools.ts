@@ -10,12 +10,13 @@ import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
 import type { ResolvedVdev } from '../services/zfs-vdev-remove.js'
 import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, DestroyPoolQuery, ExportPoolRequest, ImportPoolRequest, isComposableDisk, isRemovableVdevRole, PoolMountpointRequest, PoolName, pveStoragePath, RemoveVdevRequest, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
+import { CommandTimeoutError } from '../executor/deadline.js'
 import { parseByIdToKernel, parseByIdToKernelFull, parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseZpoolFeature, parseZpoolGet } from '../parsers/zpool-get.js'
-import { execZpool, parseZpoolList, unmanagedPoolName, zfsUnavailableReason, zpoolListUnreadable } from '../parsers/zpool-list.js'
+import { execZpool, parseZpoolList, unmanagedPoolName, zfsUnavailableReason, zfsUnavailableRefusal, zpoolListUnreadable } from '../parsers/zpool-list.js'
 import { parsePoolBusyState, parseZpoolStatusPool, readZpoolStatusAnswer } from '../parsers/zpool-status.js'
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { diskClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, LockClaimsUnreadableError, mountClaim, poolClaims, sendRefusal, znameClaim, zpoolClaim } from '../safety/guard.js'
@@ -38,14 +39,6 @@ import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
 const ZPOOL = '/usr/sbin/zpool'
-/**
- * The refusal of a ZFS verb on a node where ZFS is not available (cr3): the
- * plain statement from {@link zfsUnavailableReason}, 409 reason
- * `zfs-unavailable` — never a 500, a bare 404 or a generic unreadable.
- */
-function zfsUnavailableRefusal(statement: string): { status: 409, code: 'CONFLICT', reason: 'zfs-unavailable', message: string } {
-  return { status: 409, code: 'CONFLICT', reason: 'zfs-unavailable', message: `${statement} — ZFS pools cannot be managed here until it is` }
-}
 
 /** What `zpool import` prints on stderr when nothing is importable (the honest empty scan). */
 const ZPOOL_IMPORT_NONE = 'no pools available to import'
@@ -392,9 +385,40 @@ function datasetOfPool(name: string, pool: string): boolean {
   return name.split(ZFS_NAME_POOL_END_RE, 1)[0] === pool
 }
 
-/** Read every dataset's mountpoint + mounted flag, FAIL-OPEN (→ empty map). */
+/**
+ * `zfs` itself could not be STARTED for a reason other than its absence
+ * (cr3.followup: EACCES, a broken binary). The server answers it 503
+ * UNAVAILABLE with this sentence (server.ts `UNREADABLE_LIST_ERRORS`, matched
+ * by name), never a bare 500.
+ */
+export class ZfsCommandUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ZfsCommandUnavailableError'
+  }
+}
+
+/**
+ * Read every dataset's mountpoint + mounted flag, FAIL-OPEN (→ empty map) on
+ * an answer that failed. cr3.followup: a `zfs` that could not be started is
+ * the treatment `zpool` got (`execZpool`): absent (spawn ENOENT) is ZFS not
+ * being available — no datasets, so an empty map, and the pool list says why
+ * — while any other spawn failure throws {@link ZfsCommandUnavailableError}
+ * (503 with its sentence). A timeout still rejects.
+ */
 async function readPoolMountpoints(executor: CommandExecutor): Promise<Map<string, PoolMount>> {
-  const res = await executor.exec(ZFS, ['list', '-H', '-o', 'name,mountpoint,mounted'])
+  let res
+  try {
+    res = await executor.exec(ZFS, ['list', '-H', '-o', 'name,mountpoint,mounted'])
+  }
+  catch (err: unknown) {
+    if (err instanceof CommandTimeoutError)
+      throw err
+    const e = err as NodeJS.ErrnoException
+    if (e?.code === 'ENOENT')
+      return new Map()
+    throw new ZfsCommandUnavailableError(`the zfs command could not be run (${e?.code ?? 'spawn failed'}: ${e instanceof Error ? e.message : String(err)})`)
+  }
   return res.exitCode === 0 ? parsePoolMountpoints(res.stdout) : new Map()
 }
 

@@ -180,6 +180,14 @@ const Ext = {
   Date: { format: d => `FMT:${d.toISOString()}` },
   Msg: { prompt() {}, confirm() {}, alert() {} },
 }
+// cr3.followup: the AHR pickers ask the ONE panel predicate,
+// ANAS.gfx.isComposableDisk (15-gfx.js) — the REAL one, loaded from its file
+// into a sandbox of its own and set on this world's gfx stub.
+{
+  const gfxWindow = { document }
+  vm.runInNewContext(readFileSync(join(SRC, '15-gfx.js'), 'utf8'), { window: gfxWindow, document, Ext, console, Promise, Date, setTimeout: () => 1, clearTimeout() {} }, { filename: '15-gfx.js' })
+  ANAS.gfx.isComposableDisk = gfxWindow.ANAS.gfx.isComposableDisk
+}
 const sandbox = { window: { ANAS, document }, document, Ext, console, Promise, Date, setTimeout: (fn) => { fn(); return 1 }, clearTimeout() {} }
 vm.createContext(sandbox)
 vm.runInContext(splice('39-ahr-composer.js', '{ makeState: makeState, loadDisks: loadDisks, wireStatic: wireStatic, commit: commit, nameValid: nameValid, syncCreateButton: syncCreateButton }'), sandbox, { filename: '39-ahr-composer.js' })
@@ -715,10 +723,12 @@ const OFFERABLE = ['ata-BLANK']
   }
 
   // The source: no picker in either file filters on `status` alone any more.
-  for (const f of ['39-ahr.js', '39-ahr-composer.js']) {
+  // cr3.followup: the predicate itself lives in 15-gfx.js only (one panel
+  // copy), so neither AHR file tests the status at all.
+  for (const f of ['39-ahr.js', '39-ahr-composer.js', '15-gfx.js']) {
     const src = readFileSync(join(SRC, f), 'utf8')
     const raw = src.match(/status === 'available'/g) || []
-    ok(`L5: ${f} tests status === 'available' only inside isComposableDisk`, raw.length === (f === '39-ahr.js' ? 1 : 0), raw.length)
+    ok(`L5: ${f} tests status === 'available' only inside isComposableDisk`, raw.length === (f === '15-gfx.js' ? 1 : 0), raw.length)
   }
   // The predicate is the shared one, condition for condition.
   const shared = readFileSync(join(REPO, 'packages', 'shared', 'src', 'schemas', 'disks.ts'), 'utf8')

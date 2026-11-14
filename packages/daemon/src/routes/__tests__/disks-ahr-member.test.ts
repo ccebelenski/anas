@@ -223,17 +223,20 @@ describe('collectDisks — AHR members classify as ahr_member (issue #3)', () =>
     assert.equal(sdg.ahrArray, null)
   })
 
-  it('fail-soft: an AHR read error leaves members as their pre-AHR status', async () => {
-    // Break the AHR read (mdstat unreadable) — collectDisks must not crash and
-    // the former-AHR disks fall through to 'other' exactly as before the fix.
+  it('an AHR read error makes membership unknown: no member reads free, no free disk reads available (cr3.followup)', async () => {
+    // Break the AHR read (mdstat unreadable) — collectDisks must not crash,
+    // and a read that failed never reads as "no AHR members": every disk
+    // without positive evidence of its use reads `unknown`, as on a failed
+    // `zpool status`.
     const mock = makeExecutor({ breakAhr: true })
     const disks = await collectDisks(mock, new DiskIdentityCache(mock))
     const byName = new Map(disks.map(d => [d.name, d]))
-    assert.equal(byName.get('sdb')!.status, 'other')
+    assert.equal(byName.get('sdb')!.status, 'unknown')
     assert.equal(byName.get('sdb')!.ahrArray, null)
-    // ZFS + free classification are unaffected by the AHR failure.
+    // A ZFS member is positive evidence the AHR failure cannot hide.
     assert.equal(byName.get('sde')!.status, 'pool_member')
-    assert.equal(byName.get('sdf')!.status, 'available')
+    // The blank disk may be an AHR member md could not report: never offered.
+    assert.equal(byName.get('sdf')!.status, 'unknown')
   })
 
   it('cr.35r: an AHR TIMEOUT is not an empty membership — collectDisks rejects it', async () => {

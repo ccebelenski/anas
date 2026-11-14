@@ -1,4 +1,4 @@
-import type { AhrDiskRole, AhrMemberState, Disk, DiskHealthStatus, VdevRole, VdevState } from '@anas/shared'
+import type { AhrDiskRole, AhrMemberState, AhrPool, Disk, DiskHealthStatus, VdevRole, VdevState } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
@@ -9,7 +9,7 @@ import { LSBLK_ARGS, parseLsblk, zfsMemberKernels } from '../parsers/lsblk.js'
 import { isSmartctlProbeFailure, isSmartctlStandby, parseSmartctl, standbySmartData } from '../parsers/smartctl.js'
 import { execZpool } from '../parsers/zpool-list.js'
 import { readZpoolStatusAnswer } from '../parsers/zpool-status.js'
-import { readAhrPools } from '../services/ahr-topology.js'
+import { isLsblkTree, readAhrPools } from '../services/ahr-topology.js'
 import { iscsiServedSerialsStrict, normalizeSerial } from '../services/iscsi-held.js'
 import { readSystemMountPools } from '../services/system-mounts.js'
 
@@ -262,6 +262,19 @@ export async function collectDisks(
   return (await collectDiskInventory(executor, diskIdentityCache, iscsiPaths)).disks
 }
 
+/**
+ * The disk list itself (`lsblk`) could not be read (cr3.followup 9(a)). The
+ * server answers it 503 UNAVAILABLE with this sentence (server.ts
+ * `UNREADABLE_LIST_ERRORS`, matched by name); the dashboard's disk section is
+ * then unavailable with it; a job fails with it.
+ */
+export class DiskListUnreadableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DiskListUnreadableError'
+  }
+}
+
 /** The disk list, and which of the facts behind it could not be read (cr3). */
 export interface DiskInventory {
   disks: Disk[]
@@ -282,6 +295,14 @@ export interface DiskInventory {
    * {@link zfsUnreadable} (status and health `unknown`).
    */
   byIdUnreadable?: string
+  /**
+   * Why the AHR topology (`/proc/mdstat`, `mdadm --detail`, the LVM and block
+   * reads behind it) could not be read, when it could not (cr3.followup): AHR
+   * membership is then as unknown as pool membership is for
+   * {@link zfsUnreadable}. An ABSENT `/proc/mdstat` is not this: no md stack
+   * is honestly no AHR members.
+   */
+  ahrUnreadable?: string
 }
 
 /**
@@ -308,8 +329,14 @@ export async function collectDiskInventory(
   diskIdentityCache: DiskIdentityCache,
   iscsiPaths: IscsiPaths = {},
 ): Promise<DiskInventory> {
-  const [lsblkResult, byIdResult, byPartuuidResult, statusResult, ahrPools, servedSerials, systemMountPools] = await Promise.all([
-    executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
+  const [lsblkResult, byIdResult, byPartuuidResult, statusResult, ahrRead, servedSerials, systemMountPools] = await Promise.all([
+    // cr3.followup 9(a): a lsblk that could not be started is a failed read
+    // like an exit that failed (said below); a timeout still propagates.
+    executor.exec('/usr/bin/lsblk', LSBLK_ARGS).catch((err: unknown) => {
+      if (err instanceof CommandTimeoutError)
+        throw err
+      return { stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: -1 }
+    }),
     executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/'], C_LOCALE),
     // Some pools reference vdev members by GPT partition GUID (`zpool status`
     // leaves under /dev/disk/by-partuuid/ — issue #32); this listing is the only
@@ -320,17 +347,21 @@ export async function collectDiskInventory(
       .catch((err: unknown) => ({ stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: -1 })),
     execZpool(executor, ['status', '-jv']),
     // Single-source AHR membership from the topology reader (never re-parse
-    // mdstat here). Fail-soft: an AHR read error (or md absent) yields no AHR
-    // membership and disks fall through to their existing status — the disks
-    // endpoint must never crash because AHR is unreadable. A TIMEOUT is the
-    // exception (cr.35r, mirroring the zpool-status read beside it): "no AHR
-    // members" is a fact a hung read cannot establish, and rendering a member
-    // disk as free on one is worse than a 503. Let it propagate.
-    readAhrPools(executor).catch((err: unknown) => {
-      if (err instanceof CommandTimeoutError)
-        throw err
-      return []
-    }),
+    // mdstat here). md ABSENT is honestly "no AHR members" (readAhrPools
+    // answers [] itself). A read that FAILED is kept as such (cr3.followup):
+    // it never reads as "no AHR members" — every disk without positive
+    // evidence of its use then reads `unknown`, exactly as a failed
+    // `zpool status` makes it (membershipUnreadable below), and the disk list
+    // still answers. A TIMEOUT still propagates (cr.35r, mirroring the
+    // zpool-status read beside it): a hung read is a 503.
+    readAhrPools(executor).then(
+      (pools): { pools: AhrPool[] } => ({ pools }),
+      (err: unknown): { unreadable: string } => {
+        if (err instanceof CommandTimeoutError)
+          throw err
+        return { unreadable: err instanceof Error ? err.message : String(err) }
+      },
+    ),
     // The serials of the LUNs THIS node serves (story iscsi.6). Costs two stats
     // on a node with no LIO (the read layer short-circuits before it touches
     // ZFS, PVE or the network). A failed read is kept distinct (cr3): it marks
@@ -345,6 +376,16 @@ export async function collectDiskInventory(
     // down, and it may never make a disk read `available`.
     readSystemMountPools(executor).catch(() => null),
   ])
+
+  // cr3.followup 9(a): the disk list itself. A lsblk that failed, or answered
+  // something that is not its JSON tree, is said — it used to surface as
+  // JSON.parse's "Unexpected end of JSON input".
+  if (lsblkResult.exitCode !== 0) {
+    const line = lsblkResult.stderr.trim().split('\n')[0]
+    throw new DiskListUnreadableError(`the disk list (lsblk) could not be read (lsblk exited ${lsblkResult.exitCode}: ${line || 'no stderr'})`)
+  }
+  if (!isLsblkTree(lsblkResult.stdout))
+    throw new DiskListUnreadableError('the disk list (lsblk) could not be read (the output is not lsblk\'s JSON tree)')
 
   const byIdMap = parseDiskByIdListing(byIdResult.stdout)
   // Complete by-id → kernel map (every ata-/wwn-/scsi-/nvme- form), used to
@@ -390,7 +431,11 @@ export async function collectDiskInventory(
   const byIdUnreadable = listingFor(byIdResult, '/dev/disk/by-id/', BY_ID_PREFIX, parseByIdToKernel(byIdResult.stdout).size)
     ?? listingFor(byPartuuidResult, '/dev/disk/by-partuuid/', BY_PARTUUID_PREFIX, parseByIdToKernel(byPartuuidResult.stdout).size)
     ?? undefined
-  const membershipUnreadable = zfsUnreadable ?? byIdUnreadable
+  // cr3.followup: a failed AHR topology read hides AHR membership the way a
+  // failed status hides pool membership: a member would read `available`.
+  const ahrUnreadable = 'unreadable' in ahrRead ? ahrRead.unreadable : undefined
+  const ahrPools = 'pools' in ahrRead ? ahrRead.pools : []
+  const membershipUnreadable = zfsUnreadable ?? byIdUnreadable ?? ahrUnreadable
   const zfsLabelledDisks = zfsMemberKernels(lsblkResult.stdout)
   if ('pools' in statusAnswer) {
     for (const pool of statusAnswer.pools) {
@@ -570,6 +615,7 @@ export async function collectDiskInventory(
     disks: enriched,
     ...(zfsUnreadable !== undefined && { zfsUnreadable }),
     ...(byIdUnreadable !== undefined && { byIdUnreadable }),
+    ...(ahrUnreadable !== undefined && { ahrUnreadable }),
     ...('unreadable' in servedSerials && { servedSerialsUnreadable: servedSerials.unreadable }),
   }
 }
@@ -601,7 +647,7 @@ function listingUnreadable(r: { exitCode: number, stdout: string, stderr: string
  * read. A read that failed is never blamed on the request.
  */
 export function inventoryUnreadableFor(inv: DiskInventory, ids: readonly string[]): string | null {
-  const membership = inv.zfsUnreadable ?? inv.byIdUnreadable
+  const membership = inv.zfsUnreadable ?? inv.byIdUnreadable ?? inv.ahrUnreadable
   if (membership)
     return `the disk inventory could not tell pool members from free disks (${membership})`
   const unverified = inv.disks.find(d => ids.includes(d.id) && d.handsOff === 'iscsi-unverified')
@@ -614,8 +660,8 @@ export function inventoryUnreadableFor(inv: DiskInventory, ids: readonly string[
  * Thrown by {@link collectComposableInventory}. A plain `Error` on purpose:
  * it passes through the guard's doors untouched, so at a ROUTE the server's
  * error handler answers it with {@link inventoryUnreadableRefusal} (409
- * `unreadable`, the ZFS doors' answer — the mapping is handed to the core
- * area's `server.ts`), and in a JOB it fails the job with its sentence.
+ * `unreadable`, the ZFS doors' answer — `server.ts` `setErrorHandler` maps
+ * it, cr3.followup), and in a JOB it fails the job with its sentence.
  */
 export class DiskInventoryUnreadableError extends Error {
   constructor(readonly reason: string) {

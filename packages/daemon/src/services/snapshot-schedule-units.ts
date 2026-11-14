@@ -16,7 +16,7 @@ import {
   systemdTimersStampDir,
   unlinkQuiet,
 } from './systemd-unit-store.js'
-import { deriveUnitRunStatus, readUnitJournal, toSystemdRunResult } from './unit-run-status.js'
+import { deriveUnitRunStatus, readUnitJournal, showReadFailed, toSystemdRunResult } from './unit-run-status.js'
 
 /**
  * Snapshot SCHEDULES (Epic 17.3/17.4/17.5) — the systemd units ARE the store,
@@ -594,6 +594,9 @@ async function computeStatus(
       nextRunAt,
       overdue,
       ...(run.lastRunNote ? { lastRunNote: run.lastRunNote } : {}),
+      // cr3.followup: a `systemctl show` that could not answer is a failed
+      // read, never the `unknown` result it derives to.
+      ...(showReadFailed(run.serviceProps) ? { statusUnreadable: true as const } : {}),
     },
     lastRunExitCode,
   }
@@ -749,6 +752,14 @@ export function buildUnparseableScheduleWarnings(units: UnparseableScheduleUnit[
 export async function collectScheduleWarnings(
   executor: CommandExecutor,
   dir: string,
+  /**
+   * cr3.followup: the dashboard's partial-read callback, as the task stores'
+   * `collectTaskWarnings` takes it. With it, a section where SOME schedules'
+   * status could not be read keeps its readable warnings and says what it
+   * could not see. Without it, or when NO schedule could be read, it throws
+   * (never "all clear").
+   */
+  incomplete?: (reason: string) => void,
 ): Promise<DashboardWarning[]> {
   const read = await readScheduleList(dir)
   if (!read.complete && read.unparseable.length === 0) {
@@ -760,5 +771,15 @@ export async function collectScheduleWarnings(
       throw new Error(`the schedule unit directory ${dir} could not be listed`)
   }
   const statuses = await Promise.all(read.schedules.map(s => deriveScheduleStatus(executor, s)))
-  return [...buildScheduleWarnings(statuses), ...buildUnparseableScheduleWarnings(read.unparseable)]
+  // cr3.followup: a row whose status could not be read derives `unknown`,
+  // which warns about nothing — the section would read all clear.
+  const unread = statuses.filter(s => s.statusUnreadable).map(s => s.schedule.name)
+  const readable = statuses.filter(s => !s.statusUnreadable)
+  if (unread.length) {
+    const reason = `systemd could not be asked about snapshot schedule${unread.length === 1 ? '' : 's'} ${unread.map(n => `'${n}'`).join(', ')}`
+    if (readable.length === 0 || !incomplete)
+      throw new Error(reason)
+    incomplete(reason)
+  }
+  return [...buildScheduleWarnings(readable), ...buildUnparseableScheduleWarnings(read.unparseable)]
 }

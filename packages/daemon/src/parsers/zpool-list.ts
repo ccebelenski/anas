@@ -130,6 +130,49 @@ export function zfsUnavailableReason(r: { stdout: string, stderr: string }): str
 }
 
 /**
+ * The refusal of a ZFS verb on a node where ZFS is not available (cr3): the
+ * plain statement from {@link zfsUnavailableReason}, 409 reason
+ * `zfs-unavailable` — never a 500, a bare 404 or a generic unreadable.
+ * (cr3.followup: moved here from routes/pools.ts so every ZFS door answers it.)
+ */
+export function zfsUnavailableRefusal(statement: string): { status: 409, code: 'CONFLICT', reason: 'zfs-unavailable', message: string } {
+  return { status: 409, code: 'CONFLICT', reason: 'zfs-unavailable', message: `${statement} — ZFS pools cannot be managed here until it is` }
+}
+
+/**
+ * Does `pool` exist, three-valued (cr3.followup): the pools `zpool list -j`
+ * names (through {@link execZpool}), ZFS not being available on the node (the
+ * statement), or why the list could not be read. The ONE existence probe the
+ * schedule, dataset and scrub doors ask: a list that could not be read is
+ * never "the pool does not exist".
+ */
+export type ZpoolNamesAnswer
+  = | { names: string[] }
+    | { zfsUnavailable: string }
+    | { unreadable: string }
+
+export async function readZpoolNames(executor: CommandExecutor): Promise<ZpoolNamesAnswer> {
+  const r = await execZpool(executor, ['list', '-j'])
+  const missing = zfsUnavailableReason(r)
+  if (missing)
+    return { zfsUnavailable: missing }
+  // The sentence names the command and its exit as the scrub route always
+  // has ("zpool list -j exited 1: <first stderr line>").
+  if (zpoolJsonUnreadable(r, 'zpool list -j')) {
+    const line = (r.stderr.trim() || r.stdout.trim()).split('\n')[0]
+    return { unreadable: r.exitCode === 0
+      ? `zpool list -j answered with output that is not its JSON: ${line.slice(0, 120)}`
+      : `zpool list -j exited ${r.exitCode}: ${line || 'no stderr'}` }
+  }
+  try {
+    return { names: zpoolJsonShape(r.stdout) === 'json' ? parseZpoolList(r.stdout).map(p => p.name) : [] }
+  }
+  catch (err) {
+    return { unreadable: `the zpool list -j output could not be parsed (${err instanceof Error ? err.message : String(err)})` }
+  }
+}
+
+/**
  * A zpool `-j` listing's stdout, judged (cr3): `'empty'` (nothing printed),
  * `'json'` (a JSON object whose `pools` is an object — OpenZFS always emits
  * `pools` when it prints JSON), or `'other'` (anything else: text, an array,

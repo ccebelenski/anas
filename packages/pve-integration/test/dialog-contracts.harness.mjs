@@ -8232,6 +8232,13 @@ const SCRUB_STATES = {
   ],
 }
 
+// cr3.followup: the Scrubs view reads GET /ahr for the AHR pools' states (the
+// writing verbs are gated on an unknown one). Every AHR pool of the world
+// above answers, healthy, so the checks below see the verbs as before.
+const SCRUB_AHR = {
+  data: SCRUB_STATES.data.filter(s => s.target.kind === 'ahr').map(s => ({ name: s.target.pool, state: 'healthy' })),
+}
+
 const FINDING_A = {
   path: '/mnt/anas-ahr/ahr0/@data/movies/a very long name.mkv',
   subvolume: '@data',
@@ -8459,6 +8466,7 @@ const SCRUB_FAILED_JOBS = {
 
 const SCRUB_ROUTES = {
   'GET /scrub': SCRUB_STATES,
+  'GET /ahr': SCRUB_AHR,
   // One key, two answers (scrub.r2): the stub resolves route values by path,
   // and the panel now asks for both statuses.
   'GET /jobs': path => (path.includes('status=failed') ? SCRUB_FAILED_JOBS : SCRUB_JOBS),
@@ -8763,7 +8771,7 @@ async function scrubUnverifiedWindowCheck() {
       result: { scrubbed: 'ahr0', btrfsErrors: 'csum=1', checkedArrays: 2, findings: [FINDING_UV], errorsReported: 1, errorsAttributed: 1, unattributed: 0, truncated: false },
     })],
   }
-  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': UV_JOBS })
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /ahr': SCRUB_AHR, 'GET /jobs': UV_JOBS })
   const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
   const grid = view.down('#scrubGrid')
   view.fireEvent('afterrender', view)
@@ -8812,7 +8820,7 @@ async function scrubParityWindowCheck() {
       },
     })],
   }
-  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': PARITY_JOBS })
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /ahr': SCRUB_AHR, 'GET /jobs': PARITY_JOBS })
   const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
   const grid = view.down('#scrubGrid')
   view.fireEvent('afterrender', view)
@@ -8838,7 +8846,7 @@ async function scrubParityWindowCheck() {
 // with the reason rather than hidden.
 async function rewriteParityChecks() {
   // ahr3 is the parity-only row (j8): mismatches on r1, no findings.
-  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': SCRUB_JOBS })
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /ahr': SCRUB_AHR, 'GET /jobs': SCRUB_JOBS })
   const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
   const grid = view.down('#scrubGrid')
   view.fireEvent('afterrender', view)
@@ -8988,7 +8996,7 @@ async function rewriteParityRefusedChecks() {
       },
     })],
   }
-  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': MIXED })
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /ahr': SCRUB_AHR, 'GET /jobs': MIXED })
   const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
   const grid = view.down('#scrubGrid')
   view.fireEvent('afterrender', view)
@@ -9039,7 +9047,7 @@ async function rewriteParityMirrorChecks() {
       },
     })],
   }
-  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': MIRROR })
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /ahr': SCRUB_AHR, 'GET /jobs': MIRROR })
   const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
   const grid = view.down('#scrubGrid')
   view.fireEvent('afterrender', view)
@@ -9116,7 +9124,7 @@ async function mirrorReconcileChecks() {
       },
     })],
   }
-  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': MIRROR })
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /ahr': SCRUB_AHR, 'GET /jobs': MIRROR })
   const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
   const grid = view.down('#scrubGrid')
   view.fireEvent('afterrender', view)
@@ -9306,7 +9314,7 @@ async function mirrorReconcileRefusedChecks() {
       },
     })],
   }
-  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': PARITY_BAND })
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /ahr': SCRUB_AHR, 'GET /jobs': PARITY_BAND })
   const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
   const grid = view.down('#scrubGrid')
   view.fireEvent('afterrender', view)
@@ -9337,7 +9345,7 @@ async function mirrorReconcileRefusedChecks() {
   // either: the two mismatch verbs are not interchangeable, and guessing which
   // one a band needs is exactly the guess this epic exists to avoid.
   created.windows.length = 0
-  const ANAS2 = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': SCRUB_JOBS })
+  const ANAS2 = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /ahr': SCRUB_AHR, 'GET /jobs': SCRUB_JOBS })
   const view2 = makeComponent(ANAS2.views.scrubs.factory('harness'), null)
   const grid2 = view2.down('#scrubGrid')
   view2.fireEvent('afterrender', view2)
@@ -9383,7 +9391,7 @@ async function parityResidualFromRepairChecks() {
       },
     }],
   }
-  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /jobs': REPAIR_RESIDUAL })
+  const ANAS = loadSource(['69-schedules-common.js', '69-scrubs.js'], { 'GET /scrub': SCRUB_STATES, 'GET /ahr': SCRUB_AHR, 'GET /jobs': REPAIR_RESIDUAL })
   const view = makeComponent(ANAS.views.scrubs.factory('harness'), null)
   const grid = view.down('#scrubGrid')
   view.fireEvent('afterrender', view)
@@ -9598,6 +9606,7 @@ const FINDING_F = {
 
 const REPAIR_ROUTES = {
   'GET /scrub': SCRUB_STATES,
+  'GET /ahr': SCRUB_AHR,
   'GET /jobs': {
     data: [scrubJob({
       id: 'r1',

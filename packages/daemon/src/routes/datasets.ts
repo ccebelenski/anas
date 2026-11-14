@@ -14,8 +14,8 @@ import { parseExports } from '../parsers/exports.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseZfsJson } from '../parsers/utils.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs, zfsSweepSnapshotListArgs } from '../parsers/zfs-list.js'
-import { parseZpoolList } from '../parsers/zpool-list.js'
-import { guardCheck, guardConfirm, guarded, GuardReads, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
+import { readZpoolNames, zfsUnavailableRefusal } from '../parsers/zpool-list.js'
+import { guardCheck, guardConfirm, guarded, GuardReads, LockClaimsUnreadableError, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readDatasetGuid, readPoolGuid, readRollbackIds } from '../safety/stable-id.js'
 import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
@@ -415,11 +415,16 @@ export async function datasetRoutes(
     ...(opts.systemdDir ? { systemdDir: opts.systemdDir } : {}),
   })
 
-  /** Does the named pool exist? (source of truth is `zpool list`). */
+  /**
+   * Does the named pool exist? (source of truth is `zpool list`, through the
+   * wave's one reader since cr3.followup). The boolean the replication
+   * handlers' deps declare; the doors in this file ask {@link readZpoolNames}
+   * themselves, so a list that could not be read or a node without ZFS is
+   * said rather than read as "no such pool".
+   */
   async function poolExists(poolName: string): Promise<boolean> {
-    const r = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
-    const pools = r.exitCode === 0 && r.stdout.trim() ? parseZpoolList(r.stdout) : []
-    return pools.some(p => p.name === poolName)
+    const listed = await readZpoolNames(executor)
+    return 'names' in listed && listed.names.includes(poolName)
   }
 
   /**
@@ -1157,11 +1162,25 @@ export async function datasetRoutes(
    * the point of pvepool.1.
    */
   function createGuardSpec(poolName: string, fullName: string, mountpoint?: string): GuardSpec<CreateObject> {
+    // cr3.followup: the pool list through the wave's one reader. A list that
+    // could not be read is the door's 503 (never "not found"); ZFS not being
+    // available on the node is its 409 statement.
+    let zfsMissing: string | null = null
     return {
       operation: 'zfs.create',
       object: {
         what: `Pool '${poolName}'`,
-        read: async reads => (await reads.once(`pool-exists:${poolName}`, () => poolExists(poolName))) ? { pool: poolName, name: fullName } : null,
+        notFound: () => zfsMissing ? zfsUnavailableRefusal(zfsMissing) : { status: 404, code: 'NOT_FOUND', message: `Pool '${poolName}' not found` },
+        read: async (reads) => {
+          const listed = await reads.once('zpool-names', () => readZpoolNames(executor))
+          if ('unreadable' in listed)
+            throw new LockClaimsUnreadableError(`the pools could not be listed: ${listed.unreadable}`)
+          if ('zfsUnavailable' in listed) {
+            zfsMissing = listed.zfsUnavailable
+            return null
+          }
+          return listed.names.includes(poolName) ? { pool: poolName, name: fullName } : null
+        },
         id: nameId('dataset', fullName),
         unbound: () => `Could not read pool '${poolName}'`,
       },
@@ -1478,7 +1497,17 @@ export async function datasetRoutes(
     }
     const poolName = nameParsed.data
 
-    if (!(await poolExists(poolName))) {
+    // cr3.followup: a node without ZFS is said (409 zfs-unavailable, the
+    // pool doors' answer) and a pool list that could not be read is 503 —
+    // neither is "not found".
+    const pools = await readZpoolNames(executor)
+    if ('zfsUnavailable' in pools)
+      return sendRefusal(reply, zfsUnavailableRefusal(pools.zfsUnavailable))
+    if ('unreadable' in pools) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `The pools could not be listed: ${pools.unreadable}` } }
+    }
+    if (!pools.names.includes(poolName)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }

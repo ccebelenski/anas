@@ -108,7 +108,12 @@ export type JobBrief = z.infer<typeof JobBrief>
  */
 export const AhrBandMemberBrief = z.object({
   id: DiskId,
-  sizeBytes: z.number().int().nonnegative(),
+  /**
+   * The raw disk size, or null when the pool's disk list does not carry the
+   * member (cr3.followup: unknown, never an invented 0; the panel's
+   * `bytesOrUnknown` renders it as unknown).
+   */
+  sizeBytes: z.number().int().nonnegative().nullable(),
 })
 export type AhrBandMemberBrief = z.infer<typeof AhrBandMemberBrief>
 
@@ -161,8 +166,13 @@ export type AhrBandBrief = z.infer<typeof AhrBandBrief>
 export const AhrPoolBrief = z.object({
   name: z.string(),
   state: AhrPoolState,
-  /** Bytes the filesystem sits on (LV size / btrfs device size). */
-  usableBytes: z.number().int().nonnegative(),
+  /**
+   * Bytes the filesystem sits on (LV size / btrfs device size), or null when
+   * the topology read could not say (cr3.followup: `GET /v1/ahr`'s own
+   * `capacity.usableBytes: null`, never an invented 0; the panel's
+   * `knownNumber` renders it as unknown).
+   */
+  usableBytes: z.number().int().nonnegative().nullable(),
   /** Bytes in use; omitted when unavailable (e.g. the pool is unmounted). */
   usedBytes: z.number().int().nonnegative().optional(),
   /** Mountpoint when mounted, else the LV device path (check `mounted`). */

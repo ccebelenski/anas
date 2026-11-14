@@ -6,6 +6,7 @@ import { MockExecutor } from '../../executor/mock.js'
 import { LSBLK_ARGS } from '../../parsers/lsblk.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
 import { collectDisks } from '../disks.js'
+import { serveMdAbsent } from './md-absent.js'
 
 /**
  * The disk payload must tell the UI when a SMART reading is the disk's LAST
@@ -93,6 +94,9 @@ function world(results: ExecResult[]) {
   // OpenZFS 2.4.x `zpool_do_status` -j shape: exit 0, an empty `pools` object.
   executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '{"output_version":{"command":"zpool status","vers_major":0,"vers_minor":1},"pools":{}}\n', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: SMARTCTL, args: SMART_ARGS, results })
+  // No md stack either (cr3.followup: an unanswered mdstat is a failed AHR
+  // read, and a disk whose AHR membership is unknown is health unknown).
+  serveMdAbsent(executor)
   const cache = new DiskIdentityCache(executor)
   async function fetch(): Promise<Disk> {
     const disks = await collectDisks(executor, cache)

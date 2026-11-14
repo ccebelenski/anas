@@ -385,7 +385,7 @@ describe('buildAhrPoolBriefs (story 11.13, AHR-DESIGN §10 revision)', () => {
     assert.equal(b.subvolLayout, pool.subvolLayout)
     // usable from the LV; used from btrfs (mounted → present, not a wrong number).
     assert.equal(b.usableBytes, pool.capacity.usableBytes)
-    assert.ok(b.usableBytes > 0)
+    assert.ok(b.usableBytes !== null && b.usableBytes > 0)
     assert.equal(b.usedBytes, pool.capacity.usedBytes)
     assert.notEqual(b.usedBytes, undefined)
 
@@ -398,7 +398,7 @@ describe('buildAhrPoolBriefs (story 11.13, AHR-DESIGN §10 revision)', () => {
     // Full member ids (never truncated) + their raw disk sizes for the tiles.
     assert.deepEqual(b.bands[0].members.map(m => m.id).sort(), [HOT1, HOT2, HOT3])
     for (const m of b.bands[0].members)
-      assert.ok(m.sizeBytes > 0, `${m.id} carries a disk size`)
+      assert.ok(m.sizeBytes !== null && m.sizeBytes > 0, `${m.id} carries a disk size`)
     assert.equal(b.bands[1].level, 'raid1')
     assert.equal(b.bands[1].memberCount, 2)
 
@@ -424,7 +424,7 @@ describe('buildAhrPoolBriefs (story 11.13, AHR-DESIGN §10 revision)', () => {
     assert.equal(b.mounted, false)
     assert.equal(b.usedBytes, undefined)
     // Usable still reports — it comes from the LV, not the (absent) btrfs read.
-    assert.ok(b.usableBytes > 0)
+    assert.ok(b.usableBytes !== null && b.usableBytes > 0)
   })
 })
 

@@ -526,7 +526,7 @@ describe('GET /v1/status — ahrPools briefs (story 11.13, AHR-DESIGN §10 revis
     assert.ok(ahr0, 'ahr0 present in ahrPools')
     assert.equal(ahr0!.state, 'healthy')
     assert.equal(ahr0!.mounted, true)
-    assert.ok(ahr0!.usableBytes > 0)
+    assert.ok(ahr0!.usableBytes !== null && ahr0!.usableBytes > 0)
     assert.notEqual(ahr0!.usedBytes, undefined) // mounted → used is trustworthy
 
     // Bands render the composite: r1 raid5×3, r2 raid1×2.

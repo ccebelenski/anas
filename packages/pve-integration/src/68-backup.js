@@ -785,6 +785,35 @@
         return parts.length ? (t('keep') + ' ' + parts.join(', ')) : '';
     }
 
+    // cr3.followup: what pbc would refuse on every run of the task (the
+    // daemon's `problems`, BackupTaskView), or [] — its own sentences.
+    function taskProblemsOf(task) {
+        var list = (task && isArray(task.problems)) ? task.problems : [];
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            if (typeof list[i] === 'string' && list[i]) {
+                out.push(list[i]);
+            }
+        }
+        return out;
+    }
+
+    // The problems as a block, every sentence encoded: a task whose every run
+    // is refused says why (row tooltip and detail window share it).
+    function taskProblemsHtml(problems) {
+        if (!problems || !problems.length) {
+            return '';
+        }
+        var items = [];
+        for (var i = 0; i < problems.length; i++) {
+            items.push('<li>' + enc(problems[i]) + '</li>');
+        }
+        return '<div class="anas-backup-task-problems" style="margin:8px 0;color:var(--anas-danger,#c23b2c);">'
+            + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:6px;"></i>'
+            + enc(t('Every run of this task would be refused')) + ':'
+            + '<ul style="margin:4px 0 0 18px;padding:0;">' + items.join('') + '</ul></div>';
+    }
+
     // Flatten a { task, ...runtime } entry into a grid record; keep the raw task
     // under 'raw' so edit / toggle can round-trip it.
     function taskRow(entry) {
@@ -823,6 +852,8 @@
             // targets, and a cancelled run's "cancelled by <user> at <time>".
             runningJobId: entry.runningJobId || '',
             lastRunNote: entry.lastRunNote || '',
+            // cr3.followup: what pbc would refuse on every run (the daemon's).
+            problems: taskProblemsOf(task),
             raw: task,
         };
     }
@@ -1035,6 +1066,13 @@
         var rel = at ? relTime(at) : '';
         if (rel) {
             pill += ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">' + enc(rel) + '</span>';
+        }
+        // cr3.followup: a task the daemon says every run of would be refused
+        // says so on its row; the daemon's sentences are the tooltip (pillHtml
+        // encodes it) and the detail window lists them.
+        var problems = rec.get('problems');
+        if (problems && problems.length) {
+            pill += ' ' + pillHtml(t('every run refused'), 'var(--anas-danger,#c23b2c)', problems.join('\n'));
         }
         return pill;
     }
@@ -1877,6 +1915,7 @@
                 for (var i = 0; i < list.length; i++) {
                     rows.push(taskRow(list[i]));
                 }
+                showUnreadableTasks(view, res && res.unreadableTasks);
                 // loadData fires a transient empty selectionchange — guard so the
                 // detail panel does not blank during a poll refresh (mounts fix).
                 grid.anasReloading = true;
@@ -1940,6 +1979,50 @@
      * as the last good read (with its time), and an empty grid says the list
      * could not be read instead of "No backup tasks defined".
      */
+    // cr3.followup: list the task units the daemon could not read (each
+    // { name, reason }, both encoded) above the grid, or hide the note when
+    // there are none. Rows they are not: no verb can act on a task nobody
+    // could read.
+    function unreadableTasksHtml(list) {
+        var items = [];
+        var src = isArray(list) ? list : [];
+        for (var i = 0; i < src.length; i++) {
+            var u = src[i] || {};
+            if (typeof u.name !== 'string' || !u.name) {
+                continue;
+            }
+            items.push('<li><span style="font-family:monospace;">' + enc(u.name) + '</span>: '
+                + enc(typeof u.reason === 'string' && u.reason ? u.reason : t('the reason was not given')) + '</li>');
+        }
+        if (!items.length) {
+            return '';
+        }
+        return '<div style="font-size:12px;color:var(--anas-danger,#c23b2c);">'
+            + '<i class="fa fa-exclamation-triangle" style="margin-right:6px;"></i>'
+            + enc(t('Backup tasks that could not be read') + ' (' + items.length + '). '
+                + t('They are not listed below and cannot be run, edited or deleted from here until their units can be read'))
+            + ':<ul style="margin:4px 0 0 18px;padding:0;">' + items.join('') + '</ul></div>';
+    }
+
+    function showUnreadableTasks(view, list) {
+        var note = null;
+        try {
+            note = view && view.down ? view.down('#backupUnreadableNote') : null;
+        } catch (e) {
+            note = null;
+        }
+        if (!note) {
+            return;
+        }
+        try {
+            var html = unreadableTasksHtml(list);
+            note.update(html);
+            note.setHidden(!html);
+        } catch (e2) {
+            ANAS.warn('backup unreadable-task note failed: ' + ANAS.errText(e2));
+        }
+    }
+
     function showTaskLoadFailure(view, grid, reason) {
         var note = null;
         try {
@@ -2014,6 +2097,10 @@
     ANAS.backup.toggleTask = toggleTask;
     // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
     ANAS.backup.renderLastRun = renderLastRun;
+    // cr3.followup: for cr3-followup.harness.mjs.
+    ANAS.backup.taskRow = taskRow;
+    ANAS.backup.taskDetailHtml = taskDetailHtml;
+    ANAS.backup.unreadableTasksHtml = unreadableTasksHtml;
     // The second doors (a door opens the EXISTING dialog, never a second
     // implementation): the iSCSI LUN toolbar (75-iscsi.js) reaches in here.
     // runTaskNow is the Backup menu's Run Now on a task name; openEditTask is
@@ -2551,6 +2638,8 @@
             + lastRunRow(d);
 
         var html = '<div style="padding:10px 14px;">'
+            // cr3.followup: why every run would be refused, before anything else.
+            + taskProblemsHtml(taskProblemsOf(task))
             + '<table style="border-collapse:collapse;width:100%;">' + rows + '</table>';
         // The last run's NOTES (backup2 fix-ups): the run's completion toast
         // points the operator here when it did not open a modal (notes without
@@ -6045,6 +6134,7 @@
                 { name: 'lunName', type: 'auto' },
                 'schedule', 'mode', 'notify', 'lastRunResult', 'lastRunAt', 'nextRunAt', 'runningProgress',
                 'runningJobId', 'lastRunNote',
+                { name: 'problems', type: 'auto' },
                 { name: 'archiveCount', type: 'auto' },
                 { name: 'cadence', type: 'auto' },
                 { name: 'limitNofile', type: 'auto' },
@@ -6215,6 +6305,18 @@
                     xtype: 'component',
                     itemId: 'backupLoadNote',
                     cls: 'anas-backup-load-note',
+                    hidden: true,
+                    padding: '4 8',
+                    html: '',
+                },
+                {
+                    // cr3.followup: the task units the daemon could not read
+                    // or parse (`unreadableTasks`), listed by name with the
+                    // reason: not rows, so no action can reach them, and never
+                    // gone from the view. Shown only while there are some.
+                    xtype: 'component',
+                    itemId: 'backupUnreadableNote',
+                    cls: 'anas-backup-unreadable-note',
                     hidden: true,
                     padding: '4 8',
                     html: '',

@@ -183,7 +183,7 @@ export async function dashboardRoutes(
       readSection('ahrPools', [] as AhrPoolBrief[], exec => collectAhrPoolBriefs(exec, mdadmConfPath, ahrCreateStatus)),
       // Snapshot schedules (17.7): failed/overdue enabled schedules → 'schedule'
       // warnings; healthy/idle and disabled contribute nothing.
-      readSection('schedules', [] as DashboardWarning[], exec => collectScheduleWarnings(exec, systemdDir)),
+      readSection('schedules', [] as DashboardWarning[], (exec, incomplete) => collectScheduleWarnings(exec, systemdDir, incomplete)),
       // iSCSI (iscsi.5): the saveconfig ⟷ configfs diff → 'iscsi' warnings. A
       // boot restore whose backing device was missing reports systemd SUCCESS
       // and silently drops the LUN, so this PULL is the ONLY place a missing
@@ -260,7 +260,20 @@ export async function dashboardRoutes(
     const { tasks, complete } = await readAllTasksChecked(systemdDir)
     if (!complete)
       incomplete(`the replication task units in ${systemdDir} could not all be read`)
-    return buildReplicationWarnings(await Promise.all(tasks.map(t => deriveTaskStatus(exec, t))))
+    const statuses = await Promise.all(tasks.map(t => deriveTaskStatus(exec, t)))
+    // cr3.followup: a row whose status systemd could not answer derives
+    // `unknown`, which warns about nothing — as the task stores' collector
+    // does, it is reported incomplete, and with no readable row the section
+    // fails (never "no failed tasks").
+    const unread = statuses.filter(s => s.statusUnreadable).map(s => s.task.name)
+    const readable = statuses.filter(s => !s.statusUnreadable)
+    if (unread.length) {
+      const reason = `systemd could not be asked about replication task${unread.length === 1 ? '' : 's'} ${unread.map(n => `'${n}'`).join(', ')}`
+      if (readable.length === 0)
+        throw new Error(reason)
+      incomplete(reason)
+    }
+    return buildReplicationWarnings(readable)
   }
 
   /**
@@ -326,7 +339,7 @@ export async function dashboardRoutes(
   async function collectDiskHealth(exec: CommandExecutor, incomplete: (reason: string) => void): Promise<{ counts: DiskHealthCounts, disks: Disk[] }> {
     const counts = { total: 0, healthy: 0, warning: 0, critical: 0, unknown: 0 }
     const inventory = await collectDiskInventory(exec, diskIdentityCache, iscsiPaths)
-    const membership = inventory.zfsUnreadable ?? inventory.byIdUnreadable
+    const membership = inventory.zfsUnreadable ?? inventory.byIdUnreadable ?? inventory.ahrUnreadable
     if (membership)
       incomplete(`${membership}: the health of a disk that may be a pool member is unknown`)
     for (const d of inventory.disks) {

@@ -6,7 +6,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { Gate, GuardSpec } from '../safety/guard.js'
 import { AhrScrubToggleRequest, PoolName, ScrubToggleRequest } from '@anas/shared'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
-import { parseZpoolList } from '../parsers/zpool-list.js'
+import { execZpool, readZpoolNames, zfsUnavailableRefusal } from '../parsers/zpool-list.js'
 import { parseScrubScans } from '../parsers/zpool-status.js'
 import { ahrPoolClaims, guardCheck, guarded, poolClaims, sendRefusal } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
@@ -24,7 +24,6 @@ import {
 import { DEFAULT_SYSTEMD_DIR } from '../services/snapshot-schedule-units.js'
 import { requireIdentity } from './identity.js'
 
-const ZPOOL = '/usr/sbin/zpool'
 const CAT = '/usr/bin/cat'
 
 /**
@@ -47,12 +46,12 @@ const SCRUB_UNITS_CLAIM: LockClaim = { key: 'unit:anas-scrub', mode: 'exclusive'
  */
 class ZfsPoolListUnreadableError extends Error {
   constructor(
-    /** The command whose non-zero exit made the pool list unreadable — names what could not be read. */
+    /** The command whose answer made the pool list unreadable — names what could not be read. */
     readonly command: string,
-    readonly exitCode: number,
-    readonly stderr: string,
+    /** Why (cr3.followup: `zpoolJsonUnreadable`'s sentence). */
+    readonly why: string,
   ) {
-    super(`the ZFS pool list could not be read (${command} exited ${exitCode}: ${stderr.trim().split('\n')[0] || 'no stderr'})`)
+    super(`the ZFS pool list could not be read (${why})`)
     this.name = 'ZfsPoolListUnreadableError'
   }
 }
@@ -110,11 +109,18 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
    * before, a failed read was an empty list, so `PUT /scrub/zfs/:pool`
    * answered 404 for a live pool and GET silently dropped every ZFS row.
    */
-  async function zfsPoolNames(): Promise<string[]> {
-    const r = await executor.exec(ZPOOL, ['list', '-j'])
-    if (r.exitCode !== 0)
-      throw new ZfsPoolListUnreadableError('zpool list -j', r.exitCode, r.stderr)
-    return r.stdout.trim() ? parseZpoolList(r.stdout).map(p => p.name) : []
+  //
+  // cr3.followup: through the wave's one reader (parsers/zpool-list.ts
+  // `readZpoolNames` → `execZpool`): ZFS not being available on the node is
+  // NOT a failed read — it answers no ZFS pools WITH the statement, and the
+  // AHR half of the view still answers.
+  async function zfsPoolNames(): Promise<{ names: string[], zfsUnavailable?: string }> {
+    const listed = await readZpoolNames(executor)
+    if ('unreadable' in listed)
+      throw new ZfsPoolListUnreadableError('zpool list -j', listed.unreadable)
+    if ('zfsUnavailable' in listed)
+      return { names: [], zfsUnavailable: listed.zfsUnavailable }
+    return { names: listed.names }
   }
 
   /**
@@ -152,7 +158,7 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
    */
   async function zfsScrubScans(): Promise<Map<string, { lastScrub: LastScrub | null, running: ScrubRunning | null }> | null> {
     try {
-      const r = await executor.exec(ZPOOL, ['status', '-jv'])
+      const r = await execZpool(executor, ['status', '-jv'])
       if (r.exitCode !== 0 || !r.stdout.trim())
         return null
       return parseScrubScans(r.stdout)
@@ -186,14 +192,20 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
   function zfsScrubToggleSpec(pool: string): GuardSpec<{ name: string }> {
     const guid = async (reads: Parameters<Gate<{ name: string }>>[1]) =>
       reads.once(`pool-guid:${pool}`, () => readPoolGuid(executor, pool))
+    // cr3.followup: ZFS not available on the node is the pool doors' 409.
+    let zfsMissing: string | undefined
     return {
       operation: 'scrub.zfs.toggle',
       object: {
         what: `ZFS pool '${pool}'`,
-        read: async () => (await zfsPoolNames()).includes(pool) ? { name: pool } : null,
+        read: async () => {
+          const listed = await zfsPoolNames()
+          zfsMissing = listed.zfsUnavailable
+          return listed.names.includes(pool) ? { name: pool } : null
+        },
         id: async (_o, reads) => await guid(reads),
         revision: async (_o, reads) => (await guid(reads))?.guid ?? null,
-        notFound: () => ({ status: 404, code: 'NOT_FOUND', message: `ZFS pool '${pool}' not found` }),
+        notFound: () => zfsMissing ? zfsUnavailableRefusal(zfsMissing) : ({ status: 404, code: 'NOT_FOUND', message: `ZFS pool '${pool}' not found` }),
         unbound: () => `Could not read the guid of pool '${pool}' — refusing a periodic-scrub toggle that cannot be bound to it`,
       },
       gates: [],
@@ -242,8 +254,11 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
       throw err
     }
     let zfsPools: string[]
+    let zfsUnavailable: string | undefined
     try {
-      zfsPools = await zfsPoolNames()
+      const listed = await zfsPoolNames()
+      zfsPools = listed.names
+      zfsUnavailable = listed.zfsUnavailable
     }
     catch (err) {
       if (err instanceof ZfsPoolListUnreadableError)
@@ -251,7 +266,8 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
       throw err
     }
     const [scans, mdstat] = await Promise.all([
-      zfsScrubScans(),
+      // No ZFS on the node: no status to read (and none would answer).
+      zfsUnavailable ? Promise.resolve(new Map()) : zfsScrubScans(),
       // The node's md arrays — diffed against the AHR bands so a foreign array
       // (one ANAS's scrub never covers) is said in the note, never silent.
       executor.exec(CAT, MDSTAT_CAT_ARGS).then(r => r.exitCode === 0 ? parseMdstat(r.stdout) : []).catch(() => []),
@@ -288,7 +304,9 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
         return readAhrScrubState(executor, p.name, running, ctx)
       })),
     ]
-    return { data: states }
+    // cr3.followup: the ZFS half is empty WITH the statement (GET /pools's
+    // `zfsUnavailable`), never a 503 for the whole view.
+    return { data: states, ...(zfsUnavailable ? { zfsUnavailable } : {}) }
   })
 
   // --- PUT /scrub/zfs/:pool — flip the ZFS periodic-scrub property ----------

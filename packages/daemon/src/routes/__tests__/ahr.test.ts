@@ -15,6 +15,7 @@ import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
 import { ahrRoutes } from '../ahr.js'
+import { serveMdAbsent } from './md-absent.js'
 
 // Every disk in the stock mock inventory is in use (system / testpool member /
 // spare) — a testpool mirror member for the ineligibility tests:
@@ -66,6 +67,9 @@ async function previewServer() {
   executor.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: { stdout: JSON.stringify(lsblk), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: byId, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 0 } })
+  // Three blank disks and no md stack (cr3.followup: an unanswered mdstat is
+  // an AHR read that failed, and would make every disk `unknown`).
+  serveMdAbsent(executor)
   // smartctl identity probes fail-open (unregistered → 127) via the cache.
   const server = Fastify({ logger: false })
   await server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache: new DiskIdentityCache(executor) })

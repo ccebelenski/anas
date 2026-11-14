@@ -7,7 +7,7 @@ import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { UnitTaskObject } from '../services/task-units.js'
 import { createHash } from 'node:crypto'
 import { PRUNED_NAMES_PER_DATASET, ScheduleId, snapshotFireShapeIssues, SnapshotSchedule } from '@anas/shared'
-import { parseZpoolList } from '../parsers/zpool-list.js'
+import { readZpoolNames, zfsUnavailableRefusal } from '../parsers/zpool-list.js'
 import { ConfirmStore } from '../safety/confirm.js'
 import { guardCheck, guardConfirm, guarded, scheduleClaim, sendRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -32,7 +32,6 @@ import { inSweep, isAtOrUnder, sweepSet, zfsTreeListArgs } from '../services/zfs
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
-const ZPOOL = '/usr/sbin/zpool'
 
 /** The four optional fire fields (snaptime.1, #83), in the order a PUT inherits them. */
 type FireField = 'time' | 'weekday' | 'dayOfMonth' | 'month'
@@ -162,13 +161,6 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     return { names, perDataset }
   }
 
-  /** Does the named ZFS pool exist? (source of truth is `zpool list`). */
-  async function zpoolExists(poolName: string): Promise<boolean> {
-    const r = await executor.exec(ZPOOL, ['list', '-j'])
-    const pools = r.exitCode === 0 && r.stdout.trim() ? parseZpoolList(r.stdout) : []
-    return pools.some(p => p.name === poolName)
-  }
-
   /** Does a ZFS dataset exist? (`zfs list -H -o name <ds>` exit 0). */
   async function zfsDatasetExists(dataset: string): Promise<boolean> {
     // cr.21: `--` ends option parsing so `dataset` is always the operand.
@@ -247,7 +239,20 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
   ): Promise<boolean> {
     if (target.kind === 'zfs') {
       const pool = target.dataset.split('/')[0]
-      if (!(await zpoolExists(pool))) {
+      // cr3.followup: the pool list through the wave's one reader — ZFS not
+      // available on the node is said (409 zfs-unavailable), a list that
+      // could not be read is 503, and only a list that answered says "does
+      // not exist".
+      const listed = await readZpoolNames(executor)
+      if ('zfsUnavailable' in listed) {
+        reply.send(sendRefusal(reply, zfsUnavailableRefusal(listed.zfsUnavailable)))
+        return false
+      }
+      if ('unreadable' in listed) {
+        reply.code(503).send({ error: { code: 'UNAVAILABLE', message: `Could not list the pools on this node: ${listed.unreadable} — refusing a schedule whose pool cannot be checked` } })
+        return false
+      }
+      if (!listed.names.includes(pool)) {
         reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `Pool '${pool}' does not exist` } })
         return false
       }

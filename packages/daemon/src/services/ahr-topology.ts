@@ -73,6 +73,13 @@ const MIB = 1024 ** 2
 
 /** coreutils `cat`'s stderr line for an ABSENT file — the md-stack-less /proc/mdstat shape (F1). */
 const CAT_MISSING_RE = /No such file or directory/
+/**
+ * The mdstat read runs in the C locale (cr3.followup): {@link CAT_MISSING_RE}
+ * reads `cat`'s English strerror text, and a daemon started under a localized
+ * LANG (systemd hands the unit the system locale) would otherwise turn "no md
+ * stack" into an unreadable topology on every node without md.
+ */
+const MDSTAT_READ_OPTS = { env: { LC_ALL: 'C' } }
 
 /**
  * lsblk args for the AHR stack view: the FULL device tree (partitions → md →
@@ -538,7 +545,7 @@ export class AhrTopologyUnreadableError extends Error {
  * arrays (coordinator-proven on the stunt node and the dev box).
  */
 export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: string): Promise<AhrPool[]> {
-  const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
+  const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS, MDSTAT_READ_OPTS)
   if (mdstatRes.exitCode !== 0) {
     // An ABSENT /proc/mdstat — coreutils cat exits 1 printing
     // `cat: /proc/mdstat: No such file or directory`, nothing else — is
@@ -1381,7 +1388,9 @@ export function buildAhrPoolBriefs(pools: AhrPool[]): AhrPoolBrief[] {
         // failover the failed row and the row being rebuilt onto are both
         // listed, and counting rows would read a raid5×4 as ×5.
         memberCount: array.raidDevices ?? members.length,
-        members: members.map(m => ({ id: m.disk, sizeBytes: sizeById.get(m.disk) ?? 0 })),
+        // cr3.followup: a member the disk list does not carry has an unknown
+        // size (null), never an invented 0.
+        members: members.map(m => ({ id: m.disk, sizeBytes: sizeById.get(m.disk) ?? null })),
         // 11.19 — PURE PROJECTION: heightBytes/state/sync are already in hand on
         // the AhrArray this brief is derived from; they were simply dropped.
         // No extra system read, no extra command, no new truth.
@@ -1396,11 +1405,10 @@ export function buildAhrPoolBriefs(pools: AhrPool[]): AhrPoolBrief[] {
     return AhrPoolBrief.parse({
       name: pool.name,
       state: pool.state,
-      // HANDED (cr3): the dashboard brief's usableBytes cannot say unknown yet
-      // (shared/schemas/dashboard.ts is another area's); a pool with no LV and
-      // no readable filesystem carries 0 here until it can, and the capacity
-      // card below skips usableBytes <= 0, so no percentage is invented from it.
-      usableBytes: pool.capacity.usableBytes ?? 0,
+      // cr3.followup: unknown is null here as it is in GET /v1/ahr (a pool
+      // with no LV and no readable filesystem), never an invented 0; the
+      // capacity card below makes no percentage from it.
+      usableBytes: pool.capacity.usableBytes,
       // Used bytes only when the pool is mounted and btrfs usage was READ
       // (cr3: null = unknown).
       ...(pool.mounted && pool.capacity.usedBytes !== null ? { usedBytes: pool.capacity.usedBytes } : {}),
@@ -1430,7 +1438,7 @@ export function buildAhrCapacityWarnings(briefs: AhrPoolBrief[]): DashboardWarni
   const warnings: DashboardWarning[] = []
   for (const pool of briefs) {
     // No usage read (unmounted) or no capacity → no honest percentage to card.
-    if (pool.usedBytes === undefined || pool.usableBytes <= 0)
+    if (pool.usedBytes === undefined || pool.usableBytes === null || pool.usableBytes <= 0)
       continue
     const capacity = Math.round((pool.usedBytes / pool.usableBytes) * 100)
     if (capacity >= 95) {

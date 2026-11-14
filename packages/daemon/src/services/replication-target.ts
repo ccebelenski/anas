@@ -2,7 +2,7 @@ import type { ReplicationTarget } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { PveFootprint } from './pve-footprint.js'
 import type { PoolExistence, ResolvedLocation, Transport } from './replication-transport.js'
-import { parseZpoolList } from '../parsers/zpool-list.js'
+import { execZpool, parseZpoolList, zfsUnavailableReason } from '../parsers/zpool-list.js'
 import { pveNamingGuardMessage } from './pve-footprint.js'
 
 /** C0 control characters and DEL: a quoted failure line carries none. */
@@ -35,11 +35,16 @@ function localFailureLine(r: ExecResult, command: string): string {
 export async function readLocalPoolExistence(executor: CommandExecutor, pool: string): Promise<PoolExistence> {
   let r: ExecResult
   try {
-    r = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
+    // cr3.followup: through the wave's one reader, so a node without ZFS
+    // (no zpool, or the module absent) is told apart from a failed read.
+    r = await execZpool(executor, ['list', '-j'])
   }
   catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
+  const zfsMissing = zfsUnavailableReason(r)
+  if (zfsMissing)
+    return { ok: true, exists: false, zfsUnavailable: zfsMissing }
   // The legacy shape of "this node has no pools" (older `zpool list`): a
   // non-zero exit whose whole stderr is exactly `no pools available`. It is
   // the node's answer, not a failure (review 2 of cr3; OpenZFS 2.4's `-j`
@@ -218,7 +223,7 @@ export async function guardReplicationTarget(
     return { ok: false, message: `Could not list the pools${where || ' on this node'}: ${pool.error}` }
   }
   if (!pool.exists)
-    return { ok: false, message: `Target pool '${target.pool}' does not exist${where}` }
+    return { ok: false, message: `Target pool '${target.pool}' does not exist${where}${pool.zfsUnavailable ? `: ${pool.zfsUnavailable}` : ''}` }
 
   // PVE footprint ownership (story pvepool.1): never write into PVE's
   // territory — but ONLY the dataset itself is judged, not the pool. A target

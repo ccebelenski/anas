@@ -185,7 +185,8 @@ describe('cr3.mounts review 2 (6) — the start-up sweep of probe directories a 
     const umounts: string[][] = []
     const orig = exec.exec.bind(exec)
     exec.exec = async (command, args, opts) => {
-      if (command === UMOUNT) {
+      // cr3.followup 9(b): the umount runs bounded, under timeout(1).
+      if (command === '/usr/bin/timeout' && args.includes(UMOUNT)) {
         umounts.push(args)
         return args.at(-1) === stuck ? { stdout: '', stderr: 'umount: target is busy.', exitCode: 32 } : { stdout: '', stderr: '', exitCode: 0 }
       }
@@ -193,7 +194,7 @@ describe('cr3.mounts review 2 (6) — the start-up sweep of probe directories a 
     }
     // The directories stand for ones a crashed daemon left: made before "now".
     const report = await sweepStaleMountProbes(exec, base, Date.now() + 60_000)
-    assert.deepEqual(umounts, [['--', mounted], ['--', stuck]], 'one plain umount per probe mount — no -l, no -f')
+    assert.deepEqual(umounts, [['-k', '1', '10', UMOUNT, '--', mounted], ['-k', '1', '10', UMOUNT, '--', stuck]], 'one plain umount per probe mount — no -l, no -f — bounded by timeout -k 1 10')
     await assert.rejects(stat(mounted), { code: 'ENOENT' })
     await assert.rejects(stat(idle), { code: 'ENOENT' })
     await assert.rejects(stat(creds), { code: 'ENOENT' })
@@ -248,6 +249,30 @@ describe('cr3.mounts review 2 (6) — the start-up sweep of probe directories a 
     const again = await sweepStaleMountProbes(exec, base, Date.now() - 60_000)
     await stat(mine)
     assert.ok(!again.removed.includes(`${MOUNT_PROBE_MOUNT_PREFIX}mine`))
+  })
+
+  it('cr3.followup 9(b): a umount that does not finish is bounded — reported, the directory left, the sweep goes on', async () => {
+    const { mkdir: mk } = await import('node:fs/promises')
+    const { sweepStaleMountProbes, MOUNT_PROBE_MOUNT_PREFIX } = await import('../mounts.js')
+    const base = process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR!
+    const dead = join(base, `${MOUNT_PROBE_MOUNT_PREFIX}dead`)
+    const idle = join(base, `${MOUNT_PROBE_MOUNT_PREFIX}idle`)
+    for (const d of [dead, idle])
+      await mk(d, { recursive: true })
+    const exec = new MockExecutor()
+    const table = { filesystems: [{ target: '/', source: 'rpool/ROOT/pve-1', fstype: 'zfs', options: 'rw', children: [
+      { target: dead, source: 'deadnas:/e', fstype: 'nfs4', options: 'rw,hard' },
+    ] }] }
+    exec.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: JSON.stringify(table), stderr: '', exitCode: 0 } })
+    // timeout(1)'s own answer when TERM ended the umount at its bound.
+    exec.addFixture({ command: '/usr/bin/timeout', args: ['-k', '1', '10', UMOUNT, '--', dead], result: { stdout: '', stderr: '', exitCode: 124 } })
+    const report = await sweepStaleMountProbes(exec, base, Date.now() + 60_000)
+    assert.ok(report.failures.some(f => f.includes(`'${dead}' could not be unmounted (umount did not finish within 10 s)`)), JSON.stringify(report))
+    await stat(dead)
+    assert.ok(report.removed.includes(`${MOUNT_PROBE_MOUNT_PREFIX}idle`), 'the sweep went on to the next directory')
+    // The call carries its own short deadline, never the 300 s background budget.
+    const d = exec.deadlines.find(x => x.command === '/usr/bin/timeout')
+    assert.ok(d && d.source === 'call' && d.budgetMs !== null && d.budgetMs <= 15_000, JSON.stringify(d))
   })
 
   it('no runtime directory is nothing to sweep', async () => {

@@ -9,10 +9,12 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { LSBLK_ARGS } from '../../parsers/lsblk.js'
+import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { diskLsblkArgs } from '../ahr-expand-exec.js'
 import { resumeExpansion } from '../ahr-expand-resume.js'
 import { readIntent, writeIntent } from '../ahr-intent.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../ahr-topology.js'
 import { DiskIdentityCache } from '../disk-identity-cache.js'
 
 /**
@@ -370,6 +372,33 @@ describe('resumeExpansion — the shared §5.3 recompute-and-continue core', () 
       // an unanswered read would make every disk `unknown` and stop the
       // resume before the half-joined check this test is about.
       executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '{"output_version":{"command":"zpool status","vers_major":0,"vers_minor":1},"pools":{}}\n', stderr: '', exitCode: 0 } })
+      // cr3.followup: the inventory's AHR read must ANSWER too — a topology
+      // read that failed now makes every disk without positive evidence
+      // `unknown` (as a failed zpool status does), which would stop the
+      // resume before the half-joined check. The answers are the stack the
+      // world's mdstat implies: X/Y/Z's slices under md126/md127, the arrays
+      // PVs of VG `tank`, its LV not mounted; W's two slices carry the
+      // expansion's partlabels and no md.
+      const md = (name: string, level: string) => ({ name, type: level, size: GIB, fstype: 'LVM2_member', mountpoint: null, partlabel: null })
+      const slice = (name: string, label: string, array?: ReturnType<typeof md>) =>
+        ({ name, type: 'part', size: GIB, fstype: array ? 'linux_raid_member' : null, mountpoint: null, partlabel: label, ...(array ? { children: [array] } : {}) })
+      const r1 = md('md127', 'raid5')
+      const r2 = md('md126', 'raid1')
+      const ahrTree = { blockdevices: [
+        { name: 'sdq', type: 'disk', size: SIZE_2G, fstype: null, mountpoint: null, partlabel: null, children: [slice('sdq1', 'tank-d1-b1', r1)] },
+        { name: 'sdr', type: 'disk', size: SIZE_3G, fstype: null, mountpoint: null, partlabel: null, children: [slice('sdr1', 'tank-d2-b1', r1), slice('sdr2', 'tank-d2-b2', r2)] },
+        { name: 'sds', type: 'disk', size: SIZE_3G, fstype: null, mountpoint: null, partlabel: null, children: [slice('sds1', 'tank-d3-b1', r1), slice('sds2', 'tank-d3-b2', r2)] },
+        { name: 'sdt', type: 'disk', size: SIZE_4G, fstype: null, mountpoint: null, partlabel: null, children: [slice('sdt1', 'tank-d4-b1'), slice('sdt2', 'tank-d4-b2')] },
+      ] }
+      const report = (key: string, rows: object[]) => ({ stdout: JSON.stringify({ report: [{ [key]: rows }] }), stderr: '', exitCode: 0 })
+      executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: { stdout: JSON.stringify(ahrTree), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: report('vg', [{ vg_name: 'tank', pv_count: '2', lv_count: '1', snap_count: '0', vg_attr: 'wz--n-', vg_size: '5.00g', vg_free: '0 ' }]) })
+      executor.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: report('pv', [
+        { pv_name: '/dev/md126', vg_name: 'tank', pv_fmt: 'lvm2', pv_attr: 'a--', pv_size: '1.00g', pv_free: '0 ' },
+        { pv_name: '/dev/md127', vg_name: 'tank', pv_fmt: 'lvm2', pv_attr: 'a--', pv_size: '4.00g', pv_free: '0 ' },
+      ]) })
+      executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: report('lv', [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-a-----', lv_size: '5.00g', pool_lv: '', origin: '' }]) })
+      executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
       // W's own GPT (readDiskTree): both slices carry THIS pool's labels.
       executor.addFixture({ command: '/usr/bin/lsblk', args: diskLsblkArgs(`/dev/disk/by-id/${W}`), result: { stdout: JSON.stringify({ blockdevices: [{ name: 'sdt', type: 'disk', size: SIZE_4G, partlabel: null, children: [
         { name: 'sdt1', type: 'part', size: 2 * GIB - MIB, partlabel: 'tank-d4-b1' },

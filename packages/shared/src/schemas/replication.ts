@@ -352,6 +352,13 @@ export const ReplicationTaskStatus = z.object({
    * ADDITIVE/optional.
    */
   lastRunNote: z.string().optional(),
+  /**
+   * cr3.followup: `systemctl show` of the unit's service could not be read
+   * at all (a running systemd always answers the asked properties), so the
+   * row's result is a failed read, not a finding — the name the task stores
+   * use for the same fact. ADDITIVE/optional: absent when the read answered.
+   */
+  statusUnreadable: z.literal(true).optional(),
 })
 export type ReplicationTaskStatus = z.infer<typeof ReplicationTaskStatus>
 

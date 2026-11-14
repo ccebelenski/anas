@@ -18,12 +18,14 @@ import { isTransientRunSnapshot } from './snapshot-naming.js'
  * other non-zero exit, a thrown spawn, an ssh failure (exit 255) or output the
  * parser refuses is "could not read".
  *
- * ORDER (cr3, from the datasets review): `parseSnapshotList` orders by the
- * `creation` TIME, which a clock stepped backwards makes disagree with the
- * order ZFS took the snapshots in. The local read here re-orders by
+ * ORDER (cr3, from the datasets review): "newer than" in the base search,
+ * the newest-common search and the task lag means "taken later", i.e. by
  * `createtxg` — the transaction group the snapshot was taken in, which only
- * grows — whenever every row carries one, so "newer than" in the base search,
- * the newest-common search and the task lag means "taken later".
+ * grows — never the `creation` TIME a stepped clock or a received snapshot
+ * makes disagree with it. `parseSnapshotList` itself orders by `createtxg`
+ * (cr3 DATASETS-SCHEDULES-H1; cr3.followup: this paragraph used to say it
+ * ordered by creation time), and the local read here re-orders by it again
+ * whenever every row carries one.
  */
 
 /** ZFS's own "the dataset is not there" (stderr of a non-zero `zfs list`). */

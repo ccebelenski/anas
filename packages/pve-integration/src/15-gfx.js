@@ -1734,6 +1734,11 @@
     // gate refuses on: status 'available' AND no hands-off tag. Every disk
     // picker asks this one helper, so a hands-off disk (an iSCSI LUN served
     // by this node, say) is never offered only to be refused at commit.
+    // cr3.followup: the ONLY panel copy: the AHR pickers (39-ahr.js) and the
+    // AHR composer (39-ahr-composer.js) call it too. It answers as the shared
+    // function does for every disk object; it differs only on a non-object
+    // (null/undefined), where the shared function throws and this one says
+    // false.
     function isComposableDisk(d) {
         return !!d && d.status === 'available' && d.handsOff === undefined;
     }

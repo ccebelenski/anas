@@ -75,6 +75,12 @@ const MD_UUID_RE = /^[0-9a-f]{8}(?::[0-9a-f]{8}){3}$/i
  * ahr-topology.ts (not exported there); the two must say the same.
  */
 const MDSTAT_MISSING_RE = /No such file or directory/
+/**
+ * The mdstat read runs in the C locale (cr3.followup, as readAhrPools'):
+ * {@link MDSTAT_MISSING_RE} reads `cat`'s English strerror text, and a daemon
+ * under a localized LANG would read "no md stack" as an unreadable topology.
+ */
+const MDSTAT_READ_OPTS = { env: { LC_ALL: 'C' } }
 
 /** mdadm UUIDs compare case-insensitively; the canonical form is lowercase. */
 export function normalizeMdUuid(uuid: string): string {
@@ -227,7 +233,7 @@ export interface NamedMdArray {
 export async function readNamedMdArrays(executor: CommandExecutor, mdstatText?: string): Promise<NamedMdArray[]> {
   let text = mdstatText
   if (text === undefined) {
-    const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
+    const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS, MDSTAT_READ_OPTS)
     if (mdstatRes.exitCode !== 0) {
       if (MDSTAT_MISSING_RE.test(mdstatRes.stderr))
         return []

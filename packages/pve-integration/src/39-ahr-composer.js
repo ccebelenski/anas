@@ -74,12 +74,12 @@
     }
 
     // cr3 L5: the tray offers only what the shared `isComposableDisk`
-    // accepts — through the ONE panel copy of it, ANAS.ahr.isComposableDisk
-    // (39-ahr.js, which every other AHR picker uses too). Read at call time;
-    // without it nothing is offered.
+    // accepts — through the ONE panel copy of it, ANAS.gfx.isComposableDisk
+    // (15-gfx.js; cr3.followup: every ZFS and AHR picker uses it). Read at
+    // call time; without it nothing is offered.
     function isComposableDisk(disk) {
-        var a = ANAS.ahr;
-        return !!(a && typeof a.isComposableDisk === 'function' && a.isComposableDisk(disk));
+        var g = ANAS.gfx;
+        return !!(g && typeof g.isComposableDisk === 'function' && g.isComposableDisk(disk));
     }
 
     // cr3 L4: "Mount at" sends what was typed, trimmed at the ends only, and
