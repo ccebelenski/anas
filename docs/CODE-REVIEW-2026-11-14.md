@@ -8,7 +8,7 @@
 
 **Coverage is stated per area** (files read in full, in part, not reached). A file not reached was not reviewed.
 
-**Not yet in this document (reviews still running when it was first committed):** AHR scrub and self-heal, iSCSI, Cross-cutting: values shown as state that no read supplied.
+**Not yet in this document (reviews still running when it was first committed):** Cross-cutting: values shown as state that no read supplied.
 
 ---
 
@@ -226,6 +226,50 @@ Coverage: ahr-panel (39-ahr.js, 39-ahr-composer.js) — both read in full.
 
 Other doors: ahr-topology.ts:873-887 mounted pool whose btrfs usage read fails reports 0 used/free (schema has no unknown). 10-api.js:915 confirm drops the 409 headline = already in EPICS.
 Could not verify: QuickTip HTML; whether Expand is admitted mid btrfs scrub.
+
+## AHR scrub and self-heal
+
+Coverage: ahr-heal — 10 files in full; ahr-scrub.ts lines 180-520 and 880-1930 in full, rest skimmed; bin/selfheal-mirror.ts, bin/selfheal-repair.ts NOT reached (dev-only: make-release.sh:163 removes the bins).
+
+- **AHR-HEAL-H1** DEFECT repro  services/selfheal-repair.ts:1229-1235 + ahr-repair.ts:352-357, 406-418 — any non-verdict failure ends "unrepairable — restore this file from backup": (A) AFTER the block was written and arbitrated, a post-check that does not settle in 180 s (md check `delayed`) throws a plain Error; `written` consulted only for ForeignSyncOpError (1219); (B) BEFORE any write, a csum leaf unreadable (D3) / tree-walk / member-read / pin failure takes the same path. Probe probe-postcheck-timeout.test.mts (TMPDIR=<dir> node --import tsx --test --test-name-pattern=PROBE <file>). Fix: classify by phase: after written => repaired with confirmation skipped; before => not-examined with reason; repairAhrFiles never maps a thrown block to restore advice.
+- **AHR-HEAL-H2** DEFECT repro  services/ahr-mirror-reconcile.ts:745-779 (state.nodes keyed by nodeLogical only), :1110 — arm B reuses a METADATA|DUP node's verdict across both DUP copies (logicalForMdByte ignores `copy`, selfheal-map.ts:1312-1314) and WRITES A ROTTEN ROW OVER THE GOOD ONE, reports reconciled. Probe probe-dup-node-cache.mts (PROBE_DIR=<dir> npx tsx <file>). Fix: key on (logical, copy) or the node's md byte; verify the node at the location being written.
+- **AHR-HEAL-H3** POSSIBLE (missing guard reproduced in a constructed race)  ahr-mirror-reconcile.ts:1073-1110 — arm B writes row bytes read at T0 with no re-read before the write, no pin, csum from the run-long cache (ctx.csums; verifyNode checks neither owner nor generation): extent recycled in the window => old row over new live data. Probe probe-armb-stale-row.mts. Fix: re-read both legs right before writeDirect and require equality with T0; uncached csum for a row about to be written.
+- **AHR-HEAL-H4** POSSIBLE  selfheal-repair.ts:444-448, 523-529, 551-554; selfheal-reconcile.ts:245-253 — sync_max narrowed to one stripe is left in place when md starts a FOREIGN op (member fails mid-check, spare takes over): recovery pauses at sync_max forever, array stays degraded. Kernel pause from memory. Fix: under a foreign op still write sync_max=max (never sync_min, never idle). SETTLE LIVE: narrow window, fail a member with a spare, watch sync_completed.
+- **AHR-HEAL-M5** POSSIBLE  selfheal-map.ts:190-203 memberHasBadBlock (leaf H5) — bad-block ranges compared in data-area coordinates; kernel records absolute member sectors (data_offset): covered row reads false, row data_offset further reads true. Probe probe-geometry.mts part 2. No GT capture for H5. SETTLE LIVE: rd<n>/bad_blocks with an injected range.
+- **AHR-HEAL-M6** POSSIBLE  selfheal-repair.ts:1629-1646, 1199-1201 — flat pool: a file in a nested subvolume is neither pinned nor readable through the pin (snapshot does not recurse) -> correct write then "unrepairable: still reads back with an error" (ENOENT counted as bad).
+- **AHR-HEAL-L7** NOTICED  selfheal-repair.ts:1104-1114 — read-back guard runs after precheck and arbitration (should be straight after reverify).
+- **AHR-HEAL-L8** NOTICED  selfheal-map.ts:1071 — unreadable rd<n>/offset of a present member becomes data offset 0 (throw band-unreadable).
+- **AHR-HEAL-L9** NOTICED  selfheal-map.ts:196-198, 206-213 — unreadable bad-block list (null) treated as clean; parity rewrite proceeds silently.
+- **AHR-HEAL-L10** NOTICED selfheal-map.ts:1302-1318, ahr-mirror-reconcile.ts:1039 — reverse map wrong when one md has several dm segments (after expansion): rows come out unresolved, never a wrong write; latent.
+- **AHR-HEAL-L11** NOTICED selfheal-io.ts:189 — staged payload named <pid>-<byteOffset>: two long-lane jobs on different pools writing the same offset swap payloads. Fix: mkdtemp / counter.
+- **AHR-HEAL-L12** NOTICED ahr-mirror-reconcile.ts:1077 — one URE in a 4 MiB leg window throws out of reconcileMirrorBand: job fails with no result, no notification.
+
+Other doors: routes/scrub.ts:267 btrfsScrubRunning null on failed/slow read => "not running".
+Could not verify: btrfs dump-tree -b page-cache staleness; kernel bad_blocks coords; recovery pause at sync_max.
+Clean: RAID5/6 placement arithmetic vs kernel (23,256 samples, 0 disagreements); every data write goes through md; pre-write re-checks; knobs restored; argv.
+
+## iSCSI
+
+Coverage: iscsi — all 19 files reached; 75-iscsi.js renderers, sinks, dialogs, handlers in full, LUN window layout and backup-coverage menu skimmed.
+
+- **ISCSI-H1** DEFECT repro  services/iscsi-ownership.ts:346 (+ services/iscsi.ts:623-703) — on a ZFS-ROOT node an AHR image LUN whose AHR pool did not mount: the 0-byte placeholder sits on `/` = rpool/ROOT/pve-1; deriveOwnership checks pveOwnership BEFORE backingExists:false -> target becomes foreign/backing-pve-storage -> F2 placeholder quarantine skipped (iscsi-quarantine.ts:228), health not degraded (iscsi-health.ts:291): an EMPTY disk with the right serial keeps being served. Probe probe-zfsroot-ahr-stub.ts. (Interaction with this release's #85 matchMountpoint gate.) Fix: absent/stub backing must not take PVE ownership from the dataset it falls through to; or classify file LUNs on an ANAS-IQN target by AHR fstab mountpoint first. Live check: iscsi.8 F2 recipe on the ZFS-root stunt node.
+- **ISCSI-H2** DEFECT repro  services/iscsi.ts:544-545 — read layer builds every target from tpgs[0] only: (a) a hole in tpg2 not in missingLuns -> degraded=false -> next saveconfig drops that LUN; (b) claimsFromTargets (iscsi-mutate.ts:1637) has no claim for a tpg2 LUN -> rollback/rename/shrink of its zvol not refused (findLunHolder walks all TPGs: divergence); (c) target delete gates (iscsi-guard.ts:169-191) blind to a hand-added tpg2 session -> session dropped. Also served serials (iscsi-held.ts:285-303). Probe probe-multi-tpg.ts. Fix: read every TPG, or refuse to mutate a target with >1 TPG and degrade on holes in any.
+- **ISCSI-M3** DEFECT repro  services/iscsi-mutate.ts:1591-1616 — LUN delete unmaps + deletes backstore BEFORE destroying backing, saves at the end: a failed zfs destroy/unlink leaves a missingLun -> node degraded, every mutation refused, Repair would recreate the LUN. zvolSnapshotNames gate (iscsi-guard.ts:370-379) fail-open on failed zfs list. Same shape resizeFileLun :1457-1503. Probe probe-delete-wedge.test.ts. Fix: unmap -> delete backstore -> saveconfig -> destroy backing; failed destroy = "LUN deleted, backing kept: <reason>".
+- **ISCSI-M4** DEFECT repro  routes/iscsi-mutate.ts:459 — "initiator could never log in" check only when the PUT carries acls: {auth:'chap'} alone locks out every initiator silently (75-iscsi.js:1741-1749 sends that); mutual-CHAP -> CHAP silent no-op (iscsi-mutate.ts:664-671). Probe probe-auth-no-acls.test.ts.
+- **ISCSI-M5** DEFECT repro (fake executor)  routes/iscsi-mutate.ts:840-859, :219-230, iscsi-guard.ts:198-205 — add-LUN undo can delete a pre-existing unmapped backstore of the same name (backstoreTouched set before create; lunNameFreeGate checks LUN names only). Caveat: undo uses the object-level `/backstores/<plugin>/<name> delete`, GT-42 proves only the parent form (backup-restore.ts:1191 uses the same) — node command settles. Also createSparseImage (:809) before the try leaves the image on failure. Probe probe-namesake-backstore.test.ts.
+- **ISCSI-M6** POSSIBLE  iscsi-mutate.ts:1594-1595 + iscsi-guard.ts:407-414 — LUN delete deletes the backstore by name, session gate looks only at this LUN's initiators; same backstore mapped in another target with a live session (rtslib cascade unverified).
+- **ISCSI-L7** NOTICED  iscsi-repair.ts:150, iscsi-health.ts:291 — a hole on a FOREIGN target degrades the node and Repair then recreates on that hands-off target. NEEDS A RULING.
+- **ISCSI-L8** DEFECT read  iscsi-mutate.ts:454-458 — degraded refusal says "restart rtslib-fb-targetctl" (drops every session; iscsi-repair.ts:21-29 says ANAS never does it); should name Repair.
+- **ISCSI-L9** DEFECT read  routes/iscsi-mutate.ts:361 — "target name exists" guard compares the full IQN incl. yyyy-mm: same display name next month.
+- **ISCSI-L10** NOTICED  targetcli joins argv with spaces and re-parses: dev=/dev/zvol/<backing>, file_or_dev=<dir>/<name>.raw (iscsi-mutate.ts:1236, 1242), stored udev_path in resize/repair unvalidated against that grammar (space, '=').
+- **ISCSI-L11** DEFECT read  services/pve-firewall.ts:52, 239-245 — advisory only ever checks port 3260.
+- **ISCSI-L12** POSSIBLE  shared/schemas/iscsi.ts:892-911 — CHAP user/secret starting "NULL" (kernel prefix compare, unverified).
+- **ISCSI-L13** DEFECT read  iscsi-mutate.ts:675-691 — edit deletes removed portals before creating new ones (failed create = no listener).
+- **ISCSI-L14** NOTICED  routes/iscsi-mutate.ts:1353-1360 — parseLunIndex uses Number(): ' ', '0x1', '1e0' accepted.
+- **ISCSI-L15** NOTICED  parsers/lio-saveconfig.ts:381-398 — unreadable/unparseable saveconfig.json reads as null = "nothing persisted" -> no holes, next mutation overwrites.
+
+Other doors: backup new-LUN restore releases the iSCSI lock during the stream (backup-restore.ts:1026-1043): another verb's saveconfig persists the half-restored LUN; failed restore cleanup leaves a missingLun.
+Could not verify: targetcli object-level delete; rtslib cascade; kernel NULL prefix; zfs destroy vs udev race; F2 on the ZFS-root node.
 
 ## Remote mounts
 
