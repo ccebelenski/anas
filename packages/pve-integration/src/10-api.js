@@ -1286,6 +1286,234 @@
         },
     };
 
+    // ---- Shared Exclude picker (snapx.1, rrep.3) ----------------------------
+    //
+    // A recursive snapshot schedule (69-snapshots.js) and a recursive
+    // replication task (65-replication.js, rrep R10/R11) skip the same thing
+    // the same way: child datasets of the root, each with everything beneath
+    // it. The picker is ONE helper so the two dialogs cannot drift:
+    //   rowsOf    — the rows it can offer: every dataset of a pool listing
+    //               below the pool root as { name, own }, PVE-owned ones KEPT
+    //               with their ownership (for the badge) — excluding guest
+    //               volumes from a recursive sweep is what the list is for;
+    //   fieldCfg  — the tag field ('#exclude'); hintCfg — its hint
+    //               ('#excludeHint'), the shared sentences plus the dialog's own;
+    //   create    — the controller: setRows() after each listing, refresh()
+    //               with the root picked right now. The options are the root's
+    //               STRICT descendants; a pick that is no longer one is
+    //               dropped; on edit the stored list seeds the selection once,
+    //               and a stored entry the listing did not return stays
+    //               selected and marked "(unavailable)" (the daemon accepts an
+    //               entry the object already carried);
+    //   labelHtml — the grid's "(-r)" / "(-r, N excluded)" marker, the names
+    //               in its tooltip.
+    // It lives here, beside ANAS.pve (which it calls) and ANAS.editGuard
+    // (shared by the same two dialogs), because this file loads before both
+    // consumers and every harness that drives them loads it for real.
+    // Fail-open: a malformed row is skipped, never a thrown dialog.
+
+    function pickT(str) {
+        return ANAS.t ? ANAS.t(str) : str;
+    }
+
+    ANAS.excludePicker = {
+        // rowsOf(list, pool, poolSummary) → [{ name, own }] for every dataset
+        // of a `/pools/:pool/datasets` listing except the pool root. `own` is
+        // the PVE ownership (null when ANAS may manage the dataset); a row
+        // whose verdict cannot be read degrades to OWNED (the tightening
+        // answer), as the target pickers do.
+        rowsOf: function (list, pool, poolSummary) {
+            list = list || [];
+            // Did the daemon stamp per-node ownership on any row of this
+            // payload? (Unowned rows carry no `pve` key.)
+            var perNode = false;
+            for (var k = 0; k < list.length; k++) {
+                var row = list[k];
+                if (row && row.pve && typeof row.pve === 'object') {
+                    perNode = true;
+                    break;
+                }
+            }
+            var rows = [];
+            for (var i = 0; i < list.length; i++) {
+                var ds = list[i] || {};
+                var owned;
+                var own = null;
+                try {
+                    own = ANAS.pve.ownership(ds, poolSummary, perNode);
+                    owned = !!own;
+                } catch (eRow) {
+                    owned = perNode
+                        || ANAS.pve.storagesOf(poolSummary).length > 0;
+                }
+                if (ds.name && ds.name !== pool) {
+                    rows.push({ name: ds.name, own: owned ? (own || { reason: '' }) : null });
+                }
+            }
+            return rows;
+        },
+
+        // fieldCfg({ cls, store, hidden }) → the tag field. The store's
+        // fields are name / label / badge (create() fills it).
+        fieldCfg: function (o) {
+            o = o || {};
+            return {
+                xtype: 'tagfield',
+                itemId: 'exclude',
+                cls: o.cls,
+                fieldLabel: pickT('Exclude datasets'),
+                store: o.store,
+                valueField: 'name',
+                displayField: 'label',
+                queryMode: 'local',
+                anyMatch: true,
+                filterPickList: true,
+                forceSelection: true,
+                createNewOnEnter: false,
+                createNewOnBlur: false,
+                emptyText: pickT('(none)'),
+                listConfig: {
+                    tpl: '<tpl for="."><div class="x-boundlist-item">'
+                        + '{label:htmlEncode}{badge}</div></tpl>'
+                },
+                hidden: !!o.hidden,
+                value: []
+            };
+        },
+
+        // hintCfg({ hidden, extra }) → the hint under the field: the two
+        // shared sentences, then `extra` (already translated) — what an
+        // exclusion does to what the dialog's own object already made.
+        hintCfg: function (o) {
+            o = o || {};
+            return {
+                xtype: 'component',
+                itemId: 'excludeHint',
+                style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                hidden: !!o.hidden,
+                html: ANAS.enc(pickT('Each excluded dataset is skipped together with everything beneath it. '
+                    + 'Datasets PVE owns are listed so they can be excluded.')
+                    + (o.extra ? ' ' + o.extra : ''))
+            };
+        },
+
+        // create({ win, store, seed, badgeCls }) → { setRows(rows), refresh(rootFull, pool) }.
+        // `seed` is the stored list (edit) or []; `badgeCls` is the screen's
+        // hook class on the span around a PVE badge.
+        create: function (o) {
+            o = o || {};
+            var win = o.win;
+            var store = o.store;
+            var seed = (o.seed || []).slice();
+            var badgeCls = o.badgeCls || 'anas-exclude-pve';
+            var rows = [];
+            var loaded = false;
+            var seeded = false;
+            var relOf = function (name, pool) {
+                if (!name || name === pool) {
+                    return '';
+                }
+                var p = pool + '/';
+                return name.indexOf(p) === 0 ? name.substring(p.length) : name;
+            };
+            return {
+                setRows: function (r) {
+                    rows = r || [];
+                    loaded = true;
+                },
+                refresh: function (rootFull, pool) {
+                    var fld = win.down('#exclude');
+                    if (!fld || !loaded) {
+                        return;
+                    }
+                    var prefix = rootFull + '/';
+                    var data = [];
+                    var have = {};
+                    if (rootFull) {
+                        for (var i = 0; i < rows.length; i++) {
+                            var row = rows[i];
+                            if (row.name.indexOf(prefix) !== 0 || have[row.name]) {
+                                continue;
+                            }
+                            var badge = '';
+                            if (row.own) {
+                                try {
+                                    badge = ' <span class="' + badgeCls + '">'
+                                        + (ANAS.pve.badge(row.own).html || '') + '</span>';
+                                } catch (eBadge) {
+                                    badge = '';
+                                }
+                            }
+                            data.push({ name: row.name, label: relOf(row.name, pool), badge: badge });
+                            have[row.name] = true;
+                        }
+                    }
+                    var keep = seeded ? (fld.getValue() || []) : seed;
+                    // A kept name the listing does not return can only be a
+                    // stored entry (every pick comes from this store): keep
+                    // it, marked.
+                    if (rootFull) {
+                        for (var k = 0; k < keep.length; k++) {
+                            var name = keep[k];
+                            if (!have[name] && name.indexOf(prefix) === 0) {
+                                data.push({ name: name, label: relOf(name, pool) + ' ' + pickT('(unavailable)'), badge: '' });
+                                have[name] = true;
+                            }
+                        }
+                    }
+                    seeded = true;
+                    data.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+                    store.loadData(data);
+                    fld.setValue(keep.filter(function (n) { return have[n]; }));
+                }
+            };
+        },
+
+        // labelHtml(exclude, cls) → ' <span class=cls title=...>(-r...)</span>'.
+        // `tip` is the caller's own first sentence when "-r" is not what it
+        // does: a snapshot schedule really runs `zfs snapshot -r`; a recursive
+        // replication sends each dataset on its own and never `zfs send -R`.
+        labelHtml: function (exclude, cls, tip) {
+            var excl = exclude || [];
+            tip = tip || pickT('recursive (-r): includes child datasets');
+            var label = '(-r)';
+            if (excl.length) {
+                tip += '; ' + pickT('excluded') + ': ' + excl.join(', ');
+                label = '(-r, ' + excl.length + ' ' + pickT('excluded') + ')';
+            }
+            return ' <span class="' + cls + '" title="' + ANAS.enc(tip) + '"'
+                + ' style="color:var(--anas-muted,gray);font-size:0.85em;">' + ANAS.enc(label) + '</span>';
+        }
+    };
+
+    // ---- Shared dialog viewport cap (snaptime.2, rrep.3) --------------------
+    //
+    // A dialog whose optional rows are all shown can be taller than a 720px
+    // browser window, and its button bar then falls below the view (the
+    // schedule dialog's exclude proof could not click Save). A dialog using
+    // this stops short of the viewport — maxHeight() is its `maxHeight`, its
+    // form is `scrollable: true` and takes the overflow, the button bar stays
+    // docked — and `resize` is its window's resize listener: a window
+    // centred while SHORT grows downward when a row appears, so it is moved
+    // back up whenever its bottom edge would leave the view.
+    ANAS.dialogFit = {
+        maxHeight: function () {
+            var E = (typeof Ext !== 'undefined') ? Ext.Element : null;
+            return Math.max(360, ((E && E.getViewportHeight) ? E.getViewportHeight() : 720) - 40);
+        },
+        resize: function (w) {
+            var E = (typeof Ext !== 'undefined') ? Ext.Element : null;
+            if (!(E && E.getViewportHeight) || !w.getY || !w.setY) {
+                return;
+            }
+            var vh = E.getViewportHeight();
+            var over = w.getY() + w.getHeight() - (vh - 10);
+            if (over > 0) {
+                w.setY(Math.max(0, w.getY() - over));
+            }
+        }
+    };
+
     // ---- Shared SMB self-service rule (smbsvc.1) ---------------------------
     //
     // The browser bundle cannot import @anas/shared, so the custom-`vfs objects`

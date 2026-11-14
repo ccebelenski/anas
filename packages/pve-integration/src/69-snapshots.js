@@ -213,16 +213,10 @@
         var tag = sched.fsTag(kind, kind === 'ahr' ? t('AHR pool') : t('ZFS dataset'));
         var rec2 = '';
         if (rec.get('recursive')) {
-            // snapx.1: "(-r, N excluded)" with the excluded names in the tooltip.
-            var excl = rec.get('exclude') || [];
-            var tip = t('recursive (-r): includes child datasets');
-            var label = '(-r)';
-            if (excl.length) {
-                tip += '; ' + t('excluded') + ': ' + excl.join(', ');
-                label = '(-r, ' + excl.length + ' ' + t('excluded') + ')';
-            }
-            rec2 = ' <span class="anas-sched-recursive" title="' + enc(tip) + '"'
-                + ' style="color:var(--anas-muted,gray);font-size:0.85em;">' + enc(label) + '</span>';
+            // snapx.1: "(-r, N excluded)" with the excluded names in the
+            // tooltip — the shared marker (10-api.js), the replication grid
+            // draws the same one (rrep.3).
+            rec2 = ANAS.excludePicker.labelHtml(rec.get('exclude'), 'anas-sched-recursive');
         }
         return tag + '<span style="font-family:monospace;font-size:0.92em;">' + enc(path) + '</span>' + rec2;
     }
@@ -736,15 +730,14 @@
                 // snapx.1: EVERY row below the pool root, owned ones included
                 // (with their ownership, for the badge) — the Exclude picker
                 // lists them, because excluding guest volumes from a recursive
-                // schedule is exactly what it is for.
-                var rows = [];
+                // schedule is exactly what it is for. The shared picker's own
+                // reader (10-api.js), so the replication task reads the same.
+                var rows = ANAS.excludePicker.rowsOf(list, pool, poolSummary);
                 for (var i = 0; i < list.length; i++) {
                     var ds = list[i] || {};
                     var owned;
-                    var own = null;
                     try {
-                        own = ANAS.pve.ownership(ds, poolSummary, perNode);
-                        owned = !!own;
+                        owned = ANAS.pve.isOwned(ds, poolSummary, perNode);
                     } catch (eRow) {
                         // A throw in the helper would REJECT this promise
                         // silently (no catch further down the chain). Degrade
@@ -755,9 +748,6 @@
                         // cannot be read must never be offered.
                         owned = perNode
                             || ANAS.pve.storagesOf(poolSummary).length > 0;
-                    }
-                    if (ds.name && ds.name !== pool) {
-                        rows.push({ name: ds.name, own: owned ? (own || { reason: '' }) : null });
                     }
                     if (owned) {
                         if (ds.name === pool) {
@@ -1030,23 +1020,14 @@
                 // window and the Save button fell below it (the exclude
                 // browser proof could not click it). The window stops short of
                 // the viewport; the form (scrollable) takes the overflow and
-                // the button bar stays docked in view.
-                maxHeight: Math.max(360, ((Ext.Element && Ext.Element.getViewportHeight)
-                    ? Ext.Element.getViewportHeight() : 720) - 40),
-                // The window is centred when it opens SHORT (Recursive off);
-                // ticking Recursive grows it downward from that spot, so it is
-                // moved back up whenever its bottom edge would leave the view.
+                // the button bar stays docked in view. The window is centred
+                // when it opens SHORT (Recursive off); ticking Recursive grows
+                // it downward from that spot, so it is moved back up whenever
+                // its bottom edge would leave the view. One helper (10-api.js)
+                // shared with the replication task dialog (rrep.3).
+                maxHeight: ANAS.dialogFit.maxHeight(),
                 listeners: {
-                    resize: function (w) {
-                        if (!(Ext.Element && Ext.Element.getViewportHeight) || !w.getY || !w.setY) {
-                            return;
-                        }
-                        var vh = Ext.Element.getViewportHeight();
-                        var over = w.getY() + w.getHeight() - (vh - 10);
-                        if (over > 0) {
-                            w.setY(Math.max(0, w.getY() - over));
-                        }
-                    }
+                    resize: ANAS.dialogFit.resize
                 },
                 resizable: false,
                 layout: 'fit',
@@ -1239,37 +1220,17 @@
                         // each with everything beneath it. Shown only for a
                         // recursive ZFS schedule; lists the target's strict
                         // descendants, PVE-owned ones badged and selectable.
-                        {
-                            xtype: 'tagfield',
-                            itemId: 'exclude',
+                        // The shared picker (10-api.js, ANAS.excludePicker) —
+                        // the replication task dialog offers the same one.
+                        ANAS.excludePicker.fieldCfg({
                             cls: 'anas-fld-sched-exclude',
-                            fieldLabel: t('Exclude datasets'),
                             store: excludeStore,
-                            valueField: 'name',
-                            displayField: 'label',
-                            queryMode: 'local',
-                            anyMatch: true,
-                            filterPickList: true,
-                            forceSelection: true,
-                            createNewOnEnter: false,
-                            createNewOnBlur: false,
-                            emptyText: t('(none)'),
-                            listConfig: {
-                                tpl: '<tpl for="."><div class="x-boundlist-item">'
-                                    + '{label:htmlEncode}{badge}</div></tpl>'
-                            },
+                            hidden: !(startKind === 'zfs' && sched.recursive)
+                        }),
+                        ANAS.excludePicker.hintCfg({
                             hidden: !(startKind === 'zfs' && sched.recursive),
-                            value: []
-                        },
-                        {
-                            xtype: 'component',
-                            itemId: 'excludeHint',
-                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
-                            hidden: !(startKind === 'zfs' && sched.recursive),
-                            html: enc(t('Each excluded dataset is skipped together with everything beneath it. '
-                                + 'Datasets PVE owns are listed so they can be excluded.')
-                                + ' ' + t('This schedule\'s own snapshots already on an excluded dataset are removed on its next run.'))
-                        },
+                            extra: t('This schedule\'s own snapshots already on an excluded dataset are removed on its next run.')
+                        }),
                         // --- Retention: presets + advanced per-bucket expander --
                         {
                             xtype: 'combobox',
@@ -1415,56 +1376,18 @@
         // a stored entry the listing did not return stays selected and marked
         // (preserve and mark, as for a stored pool; the daemon accepts an
         // entry the schedule already carried).
-        var dsRows = [];
-        var dsLoaded = false;
+        // The controller is the shared one (10-api.js, ANAS.excludePicker).
         var excludeSeed = (isEdit && sched.recursive && sched.exclude) ? sched.exclude.slice() : [];
-        var excludeSeeded = false;
+        var excluder = ANAS.excludePicker.create({
+            win: win,
+            store: excludeStore,
+            seed: excludeSeed,
+            badgeCls: 'anas-sched-exclude-pve'
+        });
         var refreshExclude = function () {
-            var fld = win.down('#exclude');
-            if (!fld || !dsLoaded) {
-                return;
-            }
             var pool = valOf(win, '#zfsPool') || '';
             var rel = ('' + (valOf(win, '#zfsDataset') || '')).replace(/^\/+|\/+$/g, '');
-            var targetFull = pool ? (rel ? (pool + '/' + rel) : pool) : '';
-            var prefix = targetFull + '/';
-            var data = [];
-            var have = {};
-            if (targetFull) {
-                for (var i = 0; i < dsRows.length; i++) {
-                    var row = dsRows[i];
-                    if (row.name.indexOf(prefix) !== 0 || have[row.name]) {
-                        continue;
-                    }
-                    var badge = '';
-                    if (row.own) {
-                        try {
-                            badge = ' <span class="anas-sched-exclude-pve">'
-                                + (ANAS.pve.badge(row.own).html || '') + '</span>';
-                        } catch (eBadge) {
-                            badge = '';
-                        }
-                    }
-                    data.push({ name: row.name, label: relOfFull(row.name, pool), badge: badge });
-                    have[row.name] = true;
-                }
-            }
-            var keep = excludeSeeded ? (fld.getValue() || []) : excludeSeed;
-            // A kept name the listing does not return can only be a stored
-            // entry (every pick comes from this store): keep it, marked.
-            if (targetFull) {
-                for (var k = 0; k < keep.length; k++) {
-                    var name = keep[k];
-                    if (!have[name] && name.indexOf(prefix) === 0) {
-                        data.push({ name: name, label: relOfFull(name, pool) + ' ' + UNAVAILABLE, badge: '' });
-                        have[name] = true;
-                    }
-                }
-            }
-            excludeSeeded = true;
-            data.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
-            excludeStore.loadData(data);
-            fld.setValue(keep.filter(function (n) { return have[n]; }));
+            excluder.refresh(pool ? (rel ? (pool + '/' + rel) : pool) : '', pool);
         };
 
         // Reload the ZFS dataset combo when the ZFS pool changes. The pool's
@@ -1483,8 +1406,7 @@
                     return;
                 }
                 var opts = res.opts;
-                dsRows = res.rows;
-                dsLoaded = true;
+                excluder.setRows(res.rows);
                 zfsDsStore.loadData(opts);
                 var fld = win.down('#zfsDataset');
                 if (fld) {

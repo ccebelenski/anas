@@ -174,6 +174,20 @@
  *       truncated / errors / a 400 guard sentence), the everything-deleted
  *       sync in red with the empty-source sentence, and the line clears when
  *       a field it was computed from changes.
+ *   13. Recursive replication in the task dialog (rrep.3, #84): "Include child
+ *       datasets" sits with the source fields and reveals the schedule
+ *       dialog's Exclude picker (the ONE shared ANAS.excludePicker), listing
+ *       the source's descendants with PVE-owned ones badged; ticked, it greys
+ *       snapshot-first off with the R3 hint, un-ticked it gives it back as it
+ *       was. The body: recursive + exclude always as a key + snapshotFirst
+ *       false; never recursive = today's body exactly; was recursive =
+ *       recursive:false + exclude:[]. Turning it on or off is a confirmed
+ *       ?retarget=true. Edit seeds the stored list (a gone entry kept,
+ *       marked, sent back); the toggle round-trips recursion; the grid reads
+ *       "(-r, N excluded)"; R12's read-back says when the daemon stored the
+ *       task without the field (or could not be read back); a recursive run's
+ *       result (mode absent when nothing was sent) never prints `undefined`;
+ *       the window is capped short of the viewport.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -183,7 +197,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncPreviewRequest, CloudSyncTaskRequest, CreateGroupRequest, CreateShareUserRequest, CreateSmbShareRequest, deriveArchiveName, lunBackupId, SetAccessRequest, UpdateGroupMembersRequest } from '@anas/shared'
+import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncPreviewRequest, CloudSyncTaskRequest, CreateGroupRequest, CreateShareUserRequest, CreateSmbShareRequest, deriveArchiveName, lunBackupId, ReplicationTask, SetAccessRequest, UpdateGroupMembersRequest } from '@anas/shared'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, '..', 'src')
@@ -647,6 +661,10 @@ function makeComponent(cfg, parent) {
   // readable serial derives it — readOnly, not disabled: the value is still
   // read (and asserted), the operator just cannot type over it.
   c.setReadOnly = function (v) { c.readOnly = !!v; return c }
+  // ExtJS's combo setter — the replication task dialog's target-pool combo
+  // flips between a pick-list and free text with it (rrep.3 drives that
+  // dialog here).
+  c.setEditable = function (v) { c.editable = !!v; return c }
   c.setText = function (v) { c.text = v; return c }
   c.setIconCls = function (v) { c.iconCls = v; return c }
   c.update = function (h) { c.html = h; return c }
@@ -16641,7 +16659,9 @@ ok('snaptime: nothing warned', warnings.length === 0, warnings.join(' | '))
 // body, driven through the REAL dialog (openDialog + the Save button's
 // handler), the way the other dialog groups drive theirs.
 async function snaptimeDialogChecks() {
-  const A = loadSources(['69-schedules-common.js', '69-snapshots.js'], {
+  // 10-api.js first, as the page loads it: the dialog's Exclude picker and
+  // viewport cap are the shared helpers it defines (rrep.3).
+  const A = loadSources(['10-api.js', '69-schedules-common.js', '69-snapshots.js'], {
     'GET /pools': { data: [{ name: 'tank' }] },
     'GET /ahr': { data: [] },
     'GET /pools/tank/datasets': { data: [{ name: 'tank/media' }] },
@@ -16844,6 +16864,427 @@ created.windows.length = 0
 jobs.length = 0
 await snaptimeDialogChecks()
 ok('snaptime(dialog): nothing warned', warnings.length === 0, warnings.join(' | '))
+
+// ============================================================================
+//  13. rrep.3 (GitHub #84) — the Replication panel offers recursive replication
+// ============================================================================
+//
+// The task dialog gains the schedule dialog's Recursive ("Include child
+// datasets") and its Exclude picker (one shared helper, ANAS.excludePicker in
+// 10-api.js), and greys snapshot-first while it is ticked (R3). The body:
+// ticked = recursive:true + exclude ALWAYS (a key, [] when none) +
+// snapshotFirst:false; never recursive = today's body, byte for byte; was
+// recursive and un-ticked = recursive:false + exclude:[] (a PUT without the
+// keys keeps the stored values). Turning Recursive on or off is a retarget
+// (R10). The toggle round-trips recursion; the grid marks it as the schedule
+// grid does; R12 — after a save with Recursive ticked the panel reads the task
+// back and says so when the daemon stored it without the field; a recursive
+// run's result (mode ABSENT when nothing was sent) never prints `undefined`.
+async function rrepPanelChecks() {
+  const GUEST = { kind: 'guest-volume', storage: 'local-zfs', reason: 'PVE storage local-zfs owns tank/media/vm-100-disk-0 as a guest volume' }
+  // A PVE-owned row in the listing: the payload carries per-node stamps.
+  const RREP_DS = { data: [
+    { name: 'tank' },
+    { name: 'tank/media' },
+    { name: 'tank/media/child' },
+    { name: 'tank/media/child/deep' },
+    { name: 'tank/media/vm-100-disk-0', pve: GUEST },
+    { name: 'tank/other' },
+  ] }
+  // What GET /replication/tasks answers right now (a check sets it), or an
+  // Error to make the read-back fail.
+  let tasksReply = { data: [] }
+  const A = loadSources(['10-api.js', '69-schedules-common.js', '65-replication.js'], {
+    // ONE pool: the target pool combo of the harness's Ext stub is re-applied
+    // to the first pool when the location combo is re-set (the stub fires
+    // change on an unchanged value, ExtJS does not), so a task here targets
+    // the first pool and an untouched edit stays untouched.
+    'GET /pools': { data: [{ name: 'tank' }] },
+    'GET /pools/tank/datasets': RREP_DS,
+    'GET /replication/locations': { data: { peers: [], remotes: [] } },
+    'GET /replication/tasks': () => {
+      if (tasksReply instanceof Error) { throw tasksReply }
+      return tasksReply
+    },
+    'POST /replication/tasks/rrep-task/run': { job: { id: 'job-run-1' } },
+  })
+  // api.get resolves a function route by calling it inside Promise.resolve —
+  // a throw there would escape, so a failing read-back gets its own wrapper.
+  const realGet = A.api.get
+  A.api.get = function (node, path) {
+    if (path === '/replication/tasks' && tasksReply instanceof Error) {
+      apiGets.push(path)
+      return Promise.reject(tasksReply)
+    }
+    return realGet.call(this, node, path)
+  }
+  const grid = makeComponent({ xtype: 'gridpanel', store: { fields: ['name'] }, destroyed: false })
+  async function openTask(existing) {
+    created.windows.length = 0
+    A.replication.openTaskDialog('n1', grid, existing)
+    await settle(10)
+    return openWindow()
+  }
+  function save(dlg) {
+    const before = jobs.length
+    const btn = findCmp(dlg, 'anas-btn-repl-task-submit')
+    ok('rrep(dlg): the dialog has its Save button', !!btn)
+    if (btn) { btn.handler() }
+    return jobs.length > before ? jobs[jobs.length - 1] : null
+  }
+  function bodyOf(job) { return (job && job.body) || {} }
+  function has(o, k) { return Object.prototype.hasOwnProperty.call(o || {}, k) }
+  function formIds(dlg) {
+    const form = dlg.down('#form')
+    return form ? form.items.getRange().map(c => c.itemId || '') : []
+  }
+  function tasksGets() { return apiGets.filter(p => p === '/replication/tasks').length }
+  const PLAIN = {
+    name: 'rrep-task',
+    source: { pool: 'tank', dataset: 'media' },
+    target: { pool: 'tank', dataset: 'backup/media' },
+    schedule: 'daily',
+    snapshotFirst: true,
+    notify: 'on-failure',
+    enabled: false,
+  }
+  const RECURSIVE = Object.assign({}, PLAIN, {
+    snapshotFirst: false,
+    recursive: true,
+    exclude: ['tank/media/child', 'tank/media/gone'],
+  })
+  const status = task => ({ task, lastReplicatedSnapshot: null, lastReplicatedAt: null, snapshotsBehind: null, lastRunResult: 'never-run' })
+
+  // --- 1. Create: Recursive sits with the source fields; ticking it reveals
+  //        the picker and greys snapshot-first with the R3 hint. -------------
+  const d1 = await openTask(null)
+  ok('rrep(1): the task dialog opened', !!d1)
+  const rc = d1.down('#recursive')
+  ok('rrep(1): the dialog has a Recursive checkbox', !!rc)
+  eq('rrep(1): it reads as the schedule\'s does', [rc && rc.fieldLabel, rc && rc.boxLabel], ['Recursive', 'Include child datasets'])
+  eq('rrep(1): it carries its own hook class', rc && rc.cls, 'anas-fld-repl-recursive')
+  const ids = formIds(d1)
+  eq('rrep(1): placed with the source fields — Recursive, Exclude and its hint follow the source dataset',
+    ids.slice(ids.indexOf('sourceDataset'), ids.indexOf('sourceDataset') + 4),
+    ['sourceDataset', 'recursive', 'exclude', 'excludeHint'])
+  eq('rrep(1): a new task starts unticked', rc && rc.getValue(), false)
+  const ex1 = d1.down('#exclude')
+  eq('rrep(1): the Exclude picker is the shared tag field', [ex1 && ex1.xtype, ex1 && ex1.cls], ['tagfield', 'anas-fld-repl-exclude'])
+  eq('rrep(1): hidden (and disabled) while Recursive is off', [ex1.hidden, ex1.disabled], [true, true])
+  eq('rrep(1): its hint is hidden too', d1.down('#excludeHint').hidden, true)
+  eq('rrep(1): the snapshot-first hint is hidden', d1.down('#snapshotFirstHint').hidden, true)
+  eq('rrep(1): snapshot-first starts ticked and live', [d1.down('#snapshotFirst').getValue(), d1.down('#snapshotFirst').disabled], [true, false])
+
+  d1.down('#sourceDataset').setValue('media')
+  rc.setValue(true)
+  eq('rrep(1): ticked, the picker shows', [ex1.hidden, ex1.disabled], [false, false])
+  eq('rrep(1): with its hint', d1.down('#excludeHint').hidden, false)
+  ok('rrep(1): the hint carries the shared sentences and the replication one',
+    /skipped together with everything beneath it/.test(d1.down('#excludeHint').html)
+    && /already on the target is kept and no longer updated/.test(d1.down('#excludeHint').html),
+    d1.down('#excludeHint').html)
+  eq('rrep(1): ticked, snapshot-first is unticked and DISABLED',
+    [d1.down('#snapshotFirst').getValue(), d1.down('#snapshotFirst').disabled], [false, true])
+  const sfHint = d1.down('#snapshotFirstHint')
+  eq('rrep(1): the R3 hint shows under it', sfHint.hidden, false)
+  ok('rrep(1): the hint says what a recursive task sends and where to schedule it',
+    /recursive snapshot schedule of the source already took/.test(sfHint.html)
+    && /Schedule the source recursively in the Snapshots menu/.test(sfHint.html), sfHint.html)
+  const rows1 = ex1.getStore().getRange().map(r => r.data)
+  eq('rrep(1): the picker lists the source\'s strict descendants, the PVE-owned one included',
+    rows1.map(r => r.name), ['tank/media/child', 'tank/media/child/deep', 'tank/media/vm-100-disk-0'])
+  eq('rrep(1): labelled relative to the pool', rows1.map(r => r.label), ['media/child', 'media/child/deep', 'media/vm-100-disk-0'])
+  const owned1 = rows1.find(r => r.name === 'tank/media/vm-100-disk-0') || {}
+  ok('rrep(1): the PVE-owned row carries its badge, in the panel\'s hook class',
+    /anas-repl-exclude-pve/.test(owned1.badge || '') && /anas-gfx-badge/.test(owned1.badge || ''), owned1.badge)
+  eq('rrep(1): an unowned row carries none', (rows1.find(r => r.name === 'tank/media/child') || {}).badge, '')
+  ok('rrep(1): the source picker itself still omits the PVE-owned dataset',
+    !d1.down('#sourceDataset').getStore().getRange().some(r => r.get('rel') === 'media/vm-100-disk-0'))
+  d1.down('#sourceDataset').setValue('other')
+  eq('rrep(1): the options follow the source', ex1.getStore().getCount(), 0)
+  d1.down('#sourceDataset').setValue('media')
+
+  rc.setValue(false)
+  eq('rrep(1): un-ticked, snapshot-first is live again and back as it was (ticked)',
+    [d1.down('#snapshotFirst').getValue(), d1.down('#snapshotFirst').disabled], [true, false])
+  eq('rrep(1): the picker and both hints hide',
+    [ex1.hidden, d1.down('#excludeHint').hidden, sfHint.hidden], [true, true, true])
+  // What it was before is what comes back — an operator who had turned it off.
+  d1.down('#snapshotFirst').setValue(false)
+  rc.setValue(true)
+  rc.setValue(false)
+  eq('rrep(1): an operator\'s own "off" comes back off', d1.down('#snapshotFirst').getValue(), false)
+
+  // --- 1b. The window cannot push its buttons out of the view. --------------
+  eq('rrep(1b): the window is capped short of the viewport (720 - 40 with no Ext.Element)', d1.maxHeight, 680)
+  ok('rrep(1b): the form scrolls inside that cap', d1.down('#form').scrollable === true)
+  const resize = d1.listeners && d1.listeners.resize
+  ok('rrep(1b): the window carries the shared resize listener', typeof resize === 'function' && resize === A.dialogFit.resize)
+  Ext.Element = { getViewportHeight: () => 720 }
+  let movedTo = null
+  if (typeof resize === 'function') {
+    resize({ getY: () => 100, getHeight: () => 700, setY: (y) => { movedTo = y } })
+  }
+  eq('rrep(1b): grown past the bottom edge, it is moved back up into view', movedTo, 10)
+  eq('rrep(1b): and with a viewport, the cap follows it', A.dialogFit.maxHeight(), 680)
+  Ext.Element = { getViewportHeight: () => 1080 }
+  eq('rrep(1b): a taller viewport, a taller cap', A.dialogFit.maxHeight(), 1040)
+  delete Ext.Element
+
+  // --- 2. The body. ---------------------------------------------------------
+  // Never ticked: today's body, byte for byte.
+  tasksReply = { data: [] }
+  let gets = tasksGets()
+  const d2 = await openTask(null)
+  d2.down('#name').setValue('rrep-task')
+  d2.down('#sourceDataset').setValue('media')
+  d2.down('#targetDataset').setValue('backup/media')
+  d2.down('#schedule').setValue('daily')
+  d2.down('#enabled').setValue(false)
+  const plainJob = save(d2)
+  eq('rrep(2): a task never made recursive POSTs today\'s body exactly',
+    JSON.stringify(bodyOf(plainJob)),
+    JSON.stringify({ name: 'rrep-task', source: { pool: 'tank', dataset: 'media' }, target: { pool: 'tank', dataset: 'backup/media' }, schedule: 'daily', snapshotFirst: true, notify: 'on-failure', enabled: false }))
+  ok('rrep(2): no recursive key, no exclude key', !has(bodyOf(plainJob), 'recursive') && !has(bodyOf(plainJob), 'exclude'))
+  await settle(4)
+  eq('rrep(R12): a non-recursive save reads nothing back (one list load: the grid\'s)', tasksGets() - gets, 1)
+
+  // Ticked then un-ticked before saving: still today's body.
+  const d2b = await openTask(null)
+  d2b.down('#name').setValue('rrep-task')
+  d2b.down('#sourceDataset').setValue('media')
+  d2b.down('#targetDataset').setValue('backup/media')
+  d2b.down('#schedule').setValue('daily')
+  d2b.down('#enabled').setValue(false)
+  d2b.down('#recursive').setValue(true)
+  d2b.down('#exclude').setValue(['tank/media/child'])
+  d2b.down('#recursive').setValue(false)
+  eq('rrep(2): ticked and un-ticked again, the body is today\'s', JSON.stringify(bodyOf(save(d2b))), JSON.stringify(bodyOf(plainJob)))
+
+  // Ticked with one pick.
+  tasksReply = { data: [status(Object.assign({}, PLAIN, { snapshotFirst: false, recursive: true, exclude: ['tank/media/child'] }))] }
+  gets = tasksGets()
+  const d2c = await openTask(null)
+  d2c.down('#name').setValue('rrep-task')
+  d2c.down('#sourceDataset').setValue('media')
+  d2c.down('#targetDataset').setValue('backup/media')
+  d2c.down('#schedule').setValue('daily')
+  d2c.down('#enabled').setValue(false)
+  d2c.down('#recursive').setValue(true)
+  d2c.down('#exclude').setValue(['tank/media/child'])
+  const recJob = save(d2c)
+  const recBody = bodyOf(recJob)
+  eq('rrep(2): a recursive create POSTs', [recJob && recJob.method, recJob && recJob.path], ['post', '/replication/tasks'])
+  eq('rrep(2): recursive:true, the pick, snapshot-first OFF',
+    [recBody.recursive, recBody.exclude, recBody.snapshotFirst], [true, ['tank/media/child'], false])
+  validates('rrep(2): the recursive body passes the shared ReplicationTask schema', ReplicationTask, recBody)
+  await settle(4)
+  eq('rrep(R12): a recursive save reads the task list back (the grid\'s load + the read-back)', tasksGets() - gets, 2)
+  ok('rrep(R12): stored recursive, nothing is said',
+    !warnings.some(w => /Recursive replication not/.test(w)), warnings.join(' | '))
+
+  // Ticked, nothing picked: the key is still there, empty.
+  tasksReply = { data: [status(Object.assign({}, PLAIN, { snapshotFirst: false, recursive: true }))] }
+  const d2d = await openTask(null)
+  d2d.down('#name').setValue('rrep-task')
+  d2d.down('#sourceDataset').setValue('media')
+  d2d.down('#schedule').setValue('daily')
+  d2d.down('#recursive').setValue(true)
+  const emptyBody = bodyOf(save(d2d))
+  ok('rrep(2): ticked with nothing excluded, exclude is sent as []',
+    has(emptyBody, 'exclude') && JSON.stringify(emptyBody.exclude) === '[]', JSON.stringify(emptyBody))
+  validates('rrep(2): and passes the schema', ReplicationTask, emptyBody)
+  await settle(4)
+
+  // --- R12: the daemon stored it WITHOUT the field. -------------------------
+  warnings.length = 0
+  tasksReply = { data: [status(Object.assign({}, PLAIN, { snapshotFirst: false }))] }
+  const d12 = await openTask(null)
+  d12.down('#name').setValue('rrep-task')
+  d12.down('#sourceDataset').setValue('media')
+  d12.down('#schedule').setValue('daily')
+  d12.down('#recursive').setValue(true)
+  save(d12)
+  await settle(4)
+  const r12 = warnings.find(w => /^alert: Recursive replication not supported:/.test(w)) || ''
+  ok('rrep(R12): a stripped field raises the alert', !!r12, warnings.join(' | '))
+  ok('rrep(R12): it says this node\'s ANAS does not support recursive replication',
+    /This node's ANAS does not support recursive replication/.test(r12), r12)
+  ok('rrep(R12): that the task was saved as a single-dataset task of its source',
+    /saved as a single-dataset task: it replicates tank\/media only/.test(r12), r12)
+  // A read-back that cannot see never says "recursive".
+  warnings.length = 0
+  tasksReply = new Error('502 Bad Gateway')
+  const d12b = await openTask(null)
+  d12b.down('#name').setValue('rrep-task')
+  d12b.down('#sourceDataset').setValue('media')
+  d12b.down('#schedule').setValue('daily')
+  d12b.down('#recursive').setValue(true)
+  save(d12b)
+  await settle(4)
+  ok('rrep(R12): a failed read-back says it cannot confirm',
+    warnings.some(w => /^alert: Recursive replication not confirmed:/.test(w) && /502 Bad Gateway/.test(w)), warnings.join(' | '))
+  warnings.length = 0
+  tasksReply = { data: [] }
+  const d12c = await openTask(null)
+  d12c.down('#name').setValue('rrep-task')
+  d12c.down('#sourceDataset').setValue('media')
+  d12c.down('#schedule').setValue('daily')
+  d12c.down('#recursive').setValue(true)
+  save(d12c)
+  await settle(4)
+  ok('rrep(R12): a read-back that does not list the task says it cannot confirm',
+    warnings.some(w => /^alert: Recursive replication not confirmed:/.test(w) && /not in the task list/.test(w)), warnings.join(' | '))
+  warnings.length = 0
+
+  // --- 3. Edit a stored recursive task. -------------------------------------
+  tasksReply = { data: [status(RECURSIVE)] }
+  confirms.length = 0
+  const d3 = await openTask(RECURSIVE)
+  eq('rrep(3): a stored recursive task opens ticked', d3.down('#recursive').getValue(), true)
+  eq('rrep(3): the picker shows', d3.down('#exclude').hidden, false)
+  eq('rrep(3): the stored excludes are selected, the gone one included',
+    d3.down('#exclude').getValue(), ['tank/media/child', 'tank/media/gone'])
+  const gone = d3.down('#exclude').getStore().getRange().map(r => r.data).find(r => r.name === 'tank/media/gone') || {}
+  ok('rrep(3): the one no longer under the source is marked "(unavailable)"', /\(unavailable\)/.test(gone.label || ''), JSON.stringify(gone))
+  eq('rrep(3): snapshot-first opens off and greyed, its hint shown',
+    [d3.down('#snapshotFirst').getValue(), d3.down('#snapshotFirst').disabled, d3.down('#snapshotFirstHint').hidden], [false, true, false])
+  const unchanged = save(d3)
+  eq('rrep(3): an untouched edit PUTs, with no retarget flag', [unchanged && unchanged.method, unchanged && unchanged.path], ['put', '/replication/tasks/rrep-task'])
+  eq('rrep(3): and no confirmation', confirms.length, 0)
+  const ub = bodyOf(unchanged)
+  eq('rrep(3): it sends back what was stored', [ub.recursive, ub.exclude, ub.snapshotFirst], [true, ['tank/media/child', 'tank/media/gone'], false])
+  validates('rrep(3): a body the schema accepts', ReplicationTask, ub)
+  await settle(4)
+
+  // Un-tick a stored recursive task: said out loud, through the retarget door.
+  confirms.length = 0
+  const d3b = await openTask(RECURSIVE)
+  d3b.down('#recursive').setValue(false)
+  eq('rrep(3): un-ticked, snapshot-first comes back as stored (off), live',
+    [d3b.down('#snapshotFirst').getValue(), d3b.down('#snapshotFirst').disabled], [false, false])
+  const offJob = save(d3b)
+  eq('rrep(3): turning Recursive off is confirmed', confirms.length, 1)
+  ok('rrep(3): with a sentence that says what changes',
+    confirms.length === 1 && /only the source dataset is replicated from now on/.test(confirms[0].msg)
+    && /This edit changes what the task replicates/.test(confirms[0].msg), confirms.length ? confirms[0].msg : '')
+  eq('rrep(3): and declares itself with ?retarget=true', offJob && offJob.path, '/replication/tasks/rrep-task?retarget=true')
+  // Review of rrep.3: the stored excludes this edit stops sending are named in
+  // the confirmation, and a scope-only change is not titled a retarget.
+  ok('rrep(3): the confirmation names the excludes that are dropped',
+    confirms.length === 1 && /No longer excluded: tank\/media\/child, tank\/media\/gone/.test(confirms[0].msg), confirms.length ? confirms[0].msg : '')
+  eq('rrep(3): a recursion-only change is titled for what it is', confirms.length ? confirms[0].title : '', 'Change what the task replicates')
+  const ob = bodyOf(offJob)
+  ok('rrep(2): un-ticked on a task that WAS recursive, the body says recursive:false and exclude:[]',
+    ob.recursive === false && has(ob, 'exclude') && JSON.stringify(ob.exclude) === '[]', JSON.stringify(ob))
+  validates('rrep(2): a body the schema accepts', ReplicationTask, ob)
+
+  // Tick it on an existing single-dataset task: confirmed, flagged; a "no"
+  // sends nothing.
+  confirms.length = 0
+  tasksReply = { data: [status(Object.assign({}, PLAIN, { snapshotFirst: false, recursive: true, exclude: [] }))] }
+  const d3c = await openTask(PLAIN)
+  d3c.down('#recursive').setValue(true)
+  const onJob = save(d3c)
+  eq('rrep(3): turning Recursive on is confirmed', confirms.length, 1)
+  ok('rrep(3): with a sentence that says what changes',
+    confirms.length === 1 && /child datasets are replicated too/.test(confirms[0].msg), confirms.length ? confirms[0].msg : '')
+  eq('rrep(3): through ?retarget=true', onJob && onJob.path, '/replication/tasks/rrep-task?retarget=true')
+  eq('rrep(3): carrying recursive, exclude [] and snapshot-first off',
+    [bodyOf(onJob).recursive, bodyOf(onJob).exclude, bodyOf(onJob).snapshotFirst], [true, [], false])
+  await settle(4)
+  confirmAnswer = 'no'
+  const d3d = await openTask(PLAIN)
+  d3d.down('#recursive').setValue(true)
+  eq('rrep(3): a declined change sends nothing', save(d3d), null)
+  confirmAnswer = 'yes'
+  // A target move AND the recursion change: both lines, the move's wording.
+  confirms.length = 0
+  const d3e = await openTask(PLAIN)
+  d3e.down('#targetDataset').setValue('elsewhere')
+  d3e.down('#recursive').setValue(true)
+  save(d3e)
+  ok('rrep(3): a move and the recursion change are named together',
+    confirms.length === 1 && /This edit moves where the task replicates/.test(confirms[0].msg)
+    && /tank\/elsewhere/.test(confirms[0].msg) && /child datasets are replicated too/.test(confirms[0].msg),
+    confirms.length ? confirms[0].msg : '')
+  // A plain edit of a plain task: today's body, no confirm.
+  confirms.length = 0
+  const d3f = await openTask(PLAIN)
+  const plainEdit = bodyOf(save(d3f))
+  eq('rrep(2): an untouched edit of a never-recursive task is today\'s body', JSON.stringify(plainEdit), JSON.stringify(PLAIN))
+  eq('rrep(3): with no confirmation', confirms.length, 0)
+  await settle(4)
+
+  // --- 4. The Enable/Disable toggle keeps recursion. -------------------------
+  function recOf(row) { return { get: k => row[k] } }
+  const togRow = A.replication.taskRow(status(Object.assign({}, RECURSIVE, { enabled: true })))
+  A.replication.toggle('n1', grid, recOf(togRow))
+  const tb = bodyOf(jobs[jobs.length - 1])
+  eq('rrep(4): the toggle flips enabled', tb.enabled, false)
+  eq('rrep(4): and keeps recursive, the exclude list and snapshot-first off',
+    [tb.recursive, tb.exclude, tb.snapshotFirst], [true, ['tank/media/child', 'tank/media/gone'], false])
+  validates('rrep(4): a body the schema accepts', ReplicationTask, tb)
+  const togEmpty = A.replication.taskRow(status(Object.assign({}, PLAIN, { snapshotFirst: false, recursive: true })))
+  A.replication.toggle('n1', grid, recOf(togEmpty))
+  ok('rrep(4): a recursive task with no list toggles with exclude: [] as a key',
+    JSON.stringify(bodyOf(jobs[jobs.length - 1]).exclude) === '[]', JSON.stringify(bodyOf(jobs[jobs.length - 1])))
+  // A record with no raw task (rebuilt from the row's own fields).
+  const noRaw = Object.assign({}, togRow, { raw: undefined })
+  A.replication.toggle('n1', grid, recOf(noRaw))
+  const nb = bodyOf(jobs[jobs.length - 1])
+  eq('rrep(4): rebuilt from the row, a recursive task still toggles recursive', [nb.recursive, nb.exclude], [true, ['tank/media/child', 'tank/media/gone']])
+  const togPlain = A.replication.taskRow(status(PLAIN))
+  A.replication.toggle('n1', grid, recOf(togPlain))
+  eq('rrep(4): a single-dataset task toggles with today\'s body',
+    JSON.stringify(bodyOf(jobs[jobs.length - 1])), JSON.stringify(Object.assign({}, PLAIN, { enabled: true })))
+
+  // --- 5. The grid row. -----------------------------------------------------
+  const row1 = A.replication.taskRow(status(Object.assign({}, RECURSIVE, { exclude: ['tank/media/child'] })))
+  const html1 = A.replication.renderRoute(null, {}, recOf(row1))
+  ok('rrep(5): the row reads "(-r, 1 excluded)"', /\(-r, 1 excluded\)/.test(html1), html1)
+  ok('rrep(5): in the panel\'s hook class', /class="anas-repl-recursive"/.test(html1), html1)
+  ok('rrep(5): the tooltip names the excluded dataset', /title="[^"]*excluded: tank\/media\/child"/.test(html1), html1)
+  ok('rrep(5): the marker follows the source, before the arrow', html1.indexOf('(-r, 1 excluded)') < html1.indexOf('&rarr;'), html1)
+  const html0 = A.replication.renderRoute(null, {}, recOf(A.replication.taskRow(status(Object.assign({}, PLAIN, { snapshotFirst: false, recursive: true })))))
+  ok('rrep(5): a recursive task with no list reads (-r)', />\(-r\)</.test(html0), html0)
+  const htmlP = A.replication.renderRoute(null, {}, recOf(A.replication.taskRow(status(PLAIN))))
+  ok('rrep(5): a single-dataset task carries no marker', !/anas-repl-recursive/.test(htmlP), htmlP)
+  eq('rrep(R12): a task without the field reads as not recursive', A.replication.taskRow(status(PLAIN)).recursive, false)
+  eq('rrep(R12): only a stored `true` reads as recursive', A.replication.taskRow(status(Object.assign({}, PLAIN, { recursive: 'yes' }))).recursive, false)
+  ok('rrep(5): the lag and last-run cells are untouched by recursion (root-derived)',
+    !/undefined/.test(A.replication.renderLastRun(null, {}, recOf(Object.assign({}, row1, { lastRunResult: 'success', lastReplicatedAt: '2026-11-13T03:00:00Z' })))))
+
+  // --- 7. Run Now. -----------------------------------------------------------
+  // The job the panel polls is the TRIGGER: the route's job runs
+  // `systemctl start --no-block` and resolves { started: <name> } (see
+  // routes/replication-tasks.ts, the run handler). The replication itself goes
+  // on in the unit; its result never reaches this poll. So the toast says
+  // "started", for a recursive task and a single-dataset one alike, and
+  // nothing here pretends to read a run's result.
+  function runWith(result) {
+    toasts.length = 0
+    alerts.length = 0
+    polls.length = 0
+    A.replication.runTask('n1', grid, recOf(togRow))
+    return settle(4).then(() => {
+      const p = polls[polls.length - 1]
+      if (p && p.opts && p.opts.onComplete) { p.opts.onComplete({ status: 'completed', result }) }
+      return toasts.slice()
+    })
+  }
+  const started = await runWith({ started: 'rrep-task' })
+  eq('rrep(7): Run Now says the run STARTED, as the trigger job is all it saw', started, ['Replication started: rrep-task'])
+  eq('rrep(7): and raises no alert', alerts.length, 0)
+  const bare = await runWith(undefined)
+  eq('rrep(7): a trigger job with no result reads the same', bare, ['Replication started: rrep-task'])
+}
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await rrepPanelChecks()
+ok('rrep: nothing warned', warnings.length === 0, warnings.join(' | '))
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

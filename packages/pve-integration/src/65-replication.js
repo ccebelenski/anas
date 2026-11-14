@@ -70,7 +70,17 @@
  *              snapshotFirst, enabled,
  *              notify ('always'|'on-failure' — when a finished run notifies
  *              through PVE; 9.4. ABSENT = 'on-failure', the quiet default a task
- *              stored before the field reads back as) }
+ *              stored before the field reads back as),
+ *              recursive? (rrep.3, #84: replicate the source's child datasets
+ *              too; ABSENT = a single-dataset task), exclude? (full names of
+ *              child datasets a recursive task skips, each with its subtree) }
+ *     A recursive task always sends snapshotFirst:false (R3) and its exclude
+ *     list as a key ([] when none, so clearing it is explicit); a PUT that
+ *     omits either keeps the stored value, so un-ticking Recursive sends
+ *     recursive:false and exclude:[]. Turning Recursive on or off is a
+ *     retarget (?retarget=true). R12: after a save with Recursive ticked the
+ *     panel re-reads the task list and says so when the daemon stored the task
+ *     without the field (an older daemon strips keys it does not know).
  *   POST   /replication/tasks            → ReplicationTask body (create)
  *   PUT    /replication/tasks/:name      → ReplicationTask body (edit / toggle);
  *                                          ?retarget=true when the edit MOVES the
@@ -92,7 +102,9 @@
  * 'anas-grid-replication', toolbar buttons 'anas-btn-repl-new' /
  * 'anas-btn-repl-once' / 'anas-btn-repl-run' / 'anas-btn-repl-edit' /
  * 'anas-btn-repl-toggle' / 'anas-btn-repl-delete', task dialog window
- * 'anas-win-repl-task', once dialog window 'anas-win-replicate' with plan line
+ * 'anas-win-repl-task' (Recursive 'anas-fld-repl-recursive', Exclude
+ * 'anas-fld-repl-exclude', the snapshot-first hint 'anas-repl-snapfirst-hint';
+ * the grid's recursion marker 'anas-repl-recursive'), once dialog window 'anas-win-replicate' with plan line
  * 'anas-repl-plan' (danger class 'anas-repl-diverged'), one-shot submit
  * 'anas-btn-replicate-submit'.
  *
@@ -225,6 +237,13 @@
     // A non-local target is prefixed with a location tag: "→ remote: nas pool/ds".
     function renderRoute(v, meta, rec) {
         var src = enc(routeSide(rec.get('sourcePool'), rec.get('sourceDataset')));
+        if (rec.get('recursive')) {
+            // rrep.3 (R11): the schedule grid's own marker, "(-r)" or
+            // "(-r, N excluded)" with the names in its tooltip, beside the
+            // source it recurses from.
+            src += ANAS.excludePicker.labelHtml(rec.get('exclude'), 'anas-repl-recursive',
+                t('recursive: each child dataset is replicated on its own'));
+        }
         var tgt = enc(routeSide(rec.get('targetPool'), rec.get('targetDataset')));
         var kind = rec.get('targetLocationKind');
         var lname = rec.get('targetLocationName');
@@ -470,6 +489,10 @@
             targetLocationName: loc.name || '',
             schedule: task.schedule,
             snapshotFirst: !!task.snapshotFirst,
+            // rrep.3: true only when the daemon STORED it (R12 — an older
+            // daemon's task never carries the field, and never reads as one).
+            recursive: task.recursive === true,
+            exclude: (task.exclude || []).slice(),
             notify: notifyOf(task),
             enabled: task.enabled !== false,
             lastReplicatedSnapshot: entry.lastReplicatedSnapshot,
@@ -489,6 +512,14 @@
     ANAS.replication.deleteTask = deleteTask;
     // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
     ANAS.replication.renderLastRun = renderLastRun;
+    // rrep.3: the row builder, the Source -> Target cell, the Enable/Disable
+    // toggle and Run Now, exposed for the dialog contract harness (a toggle
+    // must round-trip recursive + exclude; the row must say what it excludes;
+    // a recursive run's result must not print `undefined`).
+    ANAS.replication.taskRow = taskRow;
+    ANAS.replication.renderRoute = renderRoute;
+    ANAS.replication.toggle = toggleTask;
+    ANAS.replication.runTask = runTask;
 
     // ---- Selection + toolbar state -----------------------------------------
 
@@ -548,9 +579,20 @@
     // owned rows (any kind) are omitted, siblings stay. `poolSummary` carries
     // the pool's pveStorages for the skew fallback. Never rejects.
     function loadDatasetOptions(node, pool, poolSummary) {
+        return loadDatasetListing(node, pool, poolSummary).then(function (res) {
+            return res.opts;
+        });
+    }
+
+    // The same listing, read once, as { opts, rows }: `opts` as above; `rows`
+    // every dataset below the pool root, PVE-owned ones INCLUDED with their
+    // ownership — the task dialog's Exclude picker (rrep.3) reads them through
+    // the shared ANAS.excludePicker, exactly as the schedule dialog does.
+    // Never rejects; a failed listing has no rows.
+    function loadDatasetListing(node, pool, poolSummary) {
         var rootOpt = [{ rel: '', label: t('(pool root)') }];
         if (!pool) {
-            return Promise.resolve(rootOpt);
+            return Promise.resolve({ opts: rootOpt, rows: [] });
         }
         return ANAS.api.get(node, '/pools/' + encodeURIComponent(pool) + '/datasets').then(
             function (res) {
@@ -606,7 +648,13 @@
                 for (var j = 0; j < rels.length; j++) {
                     opts.push({ rel: rels[j], label: rels[j] });
                 }
-                return opts;
+                var rows = [];
+                try {
+                    rows = ANAS.excludePicker.rowsOf(list, pool, poolSummary);
+                } catch (eRows) {
+                    rows = [];
+                }
+                return { opts: opts, rows: rows };
             },
             function (err) {
                 ANAS.warn('replication datasets load failed for ' + pool + ': ' + ANAS.errText(err));
@@ -621,7 +669,7 @@
                     // a malformed summary cannot be classified — the old
                     // behaviour (offer the root) stands; the daemon refuses
                 }
-                return rootOwned ? [] : rootOpt;
+                return { opts: rootOwned ? [] : rootOpt, rows: [] };
             }
         );
     }
@@ -1850,6 +1898,12 @@
         var srcPoolStore = poolComboStore(names);
         var tgtPoolStore = poolComboStore(names);
         var srcDsStore = Ext.create('Ext.data.Store', { fields: ['rel', 'label'], data: [] });
+        // rrep.3: the source's strict descendants, owned ones badged — the
+        // schedule dialog's Exclude picker (ANAS.excludePicker, 10-api.js).
+        var excludeStore = Ext.create('Ext.data.Store', { fields: ['name', 'label', 'badge'], data: [] });
+        // Recursive only when the daemon STORED it (an older daemon's task
+        // never carries the field — R12).
+        var startRecursive = isEdit && task.recursive === true;
 
         // Seed a pool combo WITHOUT substituting on edit (#39). On create the
         // first pool is a fine default; on edit a stored pool the inventory no
@@ -1878,6 +1932,15 @@
                     : t('New Replication Task'),
                 modal: true,
                 width: 520,
+                // rrep.3: Recursive, its Exclude picker and the two hints make
+                // the form taller than a 720px browser window. The window
+                // stops short of the viewport, the form scrolls, the button
+                // bar stays in view — the schedule dialog's own cap (one
+                // helper, 10-api.js).
+                maxHeight: ANAS.dialogFit.maxHeight(),
+                listeners: {
+                    resize: ANAS.dialogFit.resize,
+                },
                 resizable: false,
                 layout: 'fit',
                 items: [{
@@ -1885,6 +1948,7 @@
                     itemId: 'form',
                     bodyPadding: 12,
                     border: false,
+                    scrollable: true,
                     defaults: { anchor: '100%', labelWidth: 150 },
                     items: [
                         ANAS.editGuard.noteCfg(),
@@ -1928,6 +1992,26 @@
                             forceSelection: true,
                             emptyText: t('(loading…)'),
                         },
+                        // rrep.3 (R11): the schedule dialog's Recursive, read
+                        // the same way. A loop of single-dataset sends over
+                        // the source's tree (R1), never `zfs send -R`.
+                        {
+                            xtype: 'checkboxfield',
+                            itemId: 'recursive',
+                            cls: 'anas-fld-repl-recursive',
+                            fieldLabel: t('Recursive'),
+                            boxLabel: t('Include child datasets'),
+                            checked: startRecursive,
+                        },
+                        ANAS.excludePicker.fieldCfg({
+                            cls: 'anas-fld-repl-exclude',
+                            store: excludeStore,
+                            hidden: !startRecursive,
+                        }),
+                        ANAS.excludePicker.hintCfg({
+                            hidden: !startRecursive,
+                            extra: t('A copy of an excluded dataset already on the target is kept and no longer updated.'),
+                        }),
                         locationComboCfg(),
                         {
                             xtype: 'combobox',
@@ -1973,6 +2057,18 @@
                             fieldLabel: t('Snapshot first'),
                             boxLabel: t('Take a fresh snapshot before each run'),
                             checked: task.snapshotFirst !== false,
+                            // R3: off and greyed while Recursive is ticked.
+                            disabled: startRecursive,
+                        },
+                        {
+                            xtype: 'component',
+                            itemId: 'snapshotFirstHint',
+                            cls: 'anas-repl-snapfirst-hint',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                            hidden: !startRecursive,
+                            html: enc(t('Off while child datasets are included: a recursive task sends the snapshots '
+                                + 'a recursive snapshot schedule of the source already took. Schedule the source '
+                                + 'recursively in the Snapshots menu.')),
                         },
                         // --- Notifications (9.4) — the same knob Backup has ---
                         ANAS.notifyMode.field({
@@ -2030,10 +2126,12 @@
                     break;
                 }
             }
-            loadDatasetOptions(node, pool, summary).then(function (opts) {
+            loadDatasetListing(node, pool, summary).then(function (res) {
                 if (win.destroyed || win.destroying) {
                     return;
                 }
+                var opts = res.opts;
+                excluder.setRows(res.rows);
                 srcDsStore.loadData(opts);
                 var fld = win.down('#sourceDataset');
                 if (fld) {
@@ -2041,12 +2139,69 @@
                         : (opts.length ? opts[0].rel : '');
                     fld.setValue(want);
                 }
+                refreshExclude();
             });
+        };
+
+        // rrep.3: the Exclude picker lists the strict descendants of the
+        // source picked right now (the shared controller, 10-api.js): a pick
+        // that is no longer one is dropped; on edit the stored list seeds it,
+        // and a stored entry the listing lost stays selected, marked
+        // "(unavailable)", and is sent back unchanged.
+        var excluder = ANAS.excludePicker.create({
+            win: win,
+            store: excludeStore,
+            seed: (startRecursive && task.exclude) ? task.exclude.slice() : [],
+            badgeCls: 'anas-repl-exclude-pve',
+        });
+        var refreshExclude = function () {
+            var pool = valOf(win, '#sourcePool') || '';
+            var rel = ('' + (valOf(win, '#sourceDataset') || '')).replace(/^\/+|\/+$/g, '');
+            excluder.refresh(pool ? (rel ? (pool + '/' + rel) : pool) : '', pool);
+        };
+        // A hidden control must not block Save (ExtJS validates hidden
+        // fields; only disabled ones are skipped) — as the schedule dialog.
+        var setVis = function (sel, vis) {
+            var f = win.down(sel);
+            if (f) {
+                f.setHidden(!vis);
+                if (f.setDisabled) {
+                    f.setDisabled(!vis);
+                }
+            }
+        };
+        var applyExcludeVis = function (on) {
+            setVis('#exclude', on);
+            setVis('#excludeHint', on);
+            setVis('#snapshotFirstHint', on);
+        };
+        // R3: ticking Recursive turns snapshot-first off and greys it, with
+        // the hint saying why; un-ticking gives it back as it was before the
+        // tick (a task opened recursive: as stored, which is off).
+        var snapFirstBefore = task.snapshotFirst !== false;
+        var applyRecursive = function (on) {
+            applyExcludeVis(on);
+            var sf = win.down('#snapshotFirst');
+            if (!sf) {
+                return;
+            }
+            if (on) {
+                snapFirstBefore = !!sf.getValue();
+                sf.setValue(false);
+                sf.setDisabled(true);
+            } else {
+                sf.setDisabled(false);
+                sf.setValue(snapFirstBefore);
+            }
         };
 
         try {
             win.down('#sourcePool').on('change', function (f) {
                 loadSrcDatasets(f.getValue(), undefined);
+            });
+            win.down('#sourceDataset').on('change', function () { refreshExclude(); });
+            win.down('#recursive').on('change', function () {
+                applyRecursive(!!valOf(win, '#recursive'));
             });
         } catch (eWire) {
             ANAS.warn('replication task wiring failed: ' + ANAS.errText(eWire));
@@ -2055,8 +2210,14 @@
         // What the task reads and writes TODAY — the yardstick submitTask uses to
         // notice a retarget (and the daemon re-checks against the stored unit).
         win._storedEndpoints = isEdit ? taskEndpoints(task) : null;
+        // rrep.3: whether the STORED task is recursive — turning it on or off
+        // is a retarget (R10), and un-ticking a stored one must say so
+        // explicitly (a PUT without the key keeps the stored value).
+        win._storedRecursive = startRecursive;
+        win._storedExclude = (isEdit && task.exclude) ? task.exclude.slice() : [];
 
         win.show();
+        applyExcludeVis(startRecursive);
         // A stored pool the inventory no longer lists blocks Save by name (#39).
         if (srcSeed.missing) {
             ANAS.editGuard.block(win, 'sourcePool', t('Source pool') + ' "' + srcSeed.missing + '" '
@@ -2164,6 +2325,23 @@
         if (loc.kind === 'peer' || loc.kind === 'remote') {
             body.target.location = { kind: loc.kind, name: loc.name };
         }
+        // rrep.3 (R10, R3). Ticked: recursive, the exclude list ALWAYS as a
+        // key ([] when none — the daemon keeps a stored list when the key is
+        // absent, so clearing must say so, as the schedule dialog does) and
+        // snapshot-first off (the schema refuses the pair; it defaults to
+        // true when absent). Un-ticked on a task that never was recursive:
+        // neither key — the body is today's, byte for byte. Un-ticked on a
+        // task that WAS: recursive:false and exclude:[] said out loud, or the
+        // daemon would keep both stored values.
+        var recursive = !!valOf(win, '#recursive');
+        if (recursive) {
+            body.recursive = true;
+            body.exclude = (valOf(win, '#exclude') || []).slice();
+            body.snapshotFirst = false;
+        } else if (isEdit && win._storedRecursive) {
+            body.recursive = false;
+            body.exclude = [];
+        }
 
         var send = function (retarget) {
             // Create → POST; edit → PUT :name. The daemon may answer with a job
@@ -2185,6 +2363,12 @@
                         win.close();
                     }
                     loadTasks(grid, node);
+                    // R12: a daemon that does not know the field strips it
+                    // and saves a single-dataset task. Read back what was
+                    // stored and say so, never leave it believed recursive.
+                    if (recursive) {
+                        confirmRecursiveSaved(node, name, routeSide(sourcePool, sourceDataset));
+                    }
                 },
             });
         };
@@ -2192,18 +2376,34 @@
         // A DELIBERATE retarget is allowed; a silent one is not. When the edit
         // moves the source or the target, name the move and let the operator
         // confirm — the daemon refuses the write without ?retarget=true anyway.
+        // rrep.3 (R10): turning Recursive on or off changes what the task
+        // replicates, and takes the same confirmation and the same flag.
         var moved = isEdit ? movedEndpoints(win._storedEndpoints, taskEndpoints(body)) : [];
-        if (!moved.length) {
+        var scope = isEdit ? recursionChange(win._storedRecursive, recursive) : '';
+        if (!moved.length && !scope) {
             send(false);
             return;
         }
+        var lines = moved.slice();
+        if (scope) {
+            lines.push(scope);
+        }
+        // A stored exclude that the edit no longer sends (the source moved, so
+        // it is not a child of the new one; or the operator removed it) is
+        // named here: the confirmation is the one place this edit is read
+        // back before it is written (review of rrep.3).
+        var dropped = droppedExcludes(win._storedExclude, recursive ? body.exclude : []);
+        if (dropped) {
+            lines.push(dropped);
+        }
         try {
             Ext.Msg.confirm(
-                t('Retarget replication task'),
-                t('This edit moves where the task replicates:') + '<br><br>'
-                    + moved.join('<br>') + '<br><br>'
-                    + t('Data already at the old target is left untouched; the next run '
-                        + 'replicates to the new one. Continue?'),
+                moved.length ? t('Retarget replication task') : t('Change what the task replicates'),
+                (moved.length ? t('This edit moves where the task replicates:')
+                    : t('This edit changes what the task replicates:')) + '<br><br>'
+                    + lines.join('<br>') + '<br><br>'
+                    + (moved.length ? t('Data already at the old target is left untouched; the next run '
+                        + 'replicates to the new one. Continue?') : t('Continue?')),
                 function (btn) {
                     if (btn === 'yes') {
                         send(true);
@@ -2213,6 +2413,75 @@
         } catch (e) {
             ANAS.warn('retarget confirm failed: ' + ANAS.errText(e));
         }
+    }
+
+    // The sentence for stored excludes this edit stops sending ('' = none),
+    // encoded like movedEndpoints' lines.
+    function droppedExcludes(stored, sent) {
+        var gone = [];
+        stored = stored || [];
+        sent = sent || [];
+        for (var i = 0; i < stored.length; i++) {
+            if (sent.indexOf(stored[i]) === -1) {
+                gone.push(stored[i]);
+            }
+        }
+        if (!gone.length) {
+            return '';
+        }
+        return enc(t('No longer excluded') + ': ' + gone.join(', '));
+    }
+
+    // The sentence for an edit that turns Recursive on or off ('' = no change),
+    // encoded like movedEndpoints' lines.
+    function recursionChange(was, now) {
+        if (!!was === !!now) {
+            return '';
+        }
+        return enc(now
+            ? t('Child datasets: the source\'s child datasets are replicated too, each to the same '
+                + 'path under the target.')
+            : t('Child datasets: only the source dataset is replicated from now on; the copies of '
+                + 'its child datasets already on the target are kept and no longer updated.'));
+    }
+
+    // R12 (rrep.3): after a save with Recursive ticked, read the task back and
+    // say so when the daemon stored it without `recursive` — an ANAS daemon
+    // that predates the field strips it and saves a single-dataset task. The
+    // grid reload (loadTasks, beside this call) then shows what was stored.
+    // A read-back that fails or does not list the task cannot confirm the
+    // field, and says that instead (never read as "recursive").
+    function confirmRecursiveSaved(node, name, sourceLabel) {
+        ANAS.api.get(node, '/replication/tasks').then(function (res) {
+            var list = (res && res.data) || [];
+            var stored = null;
+            for (var i = 0; i < list.length; i++) {
+                var task = list[i] && list[i].task;
+                if (task && task.name === name) {
+                    stored = task;
+                    break;
+                }
+            }
+            if (stored && stored.recursive === true) {
+                return;
+            }
+            if (!stored) {
+                ANAS.alertMsg('Recursive replication not confirmed', t('The task') + ' "' + name + '" '
+                    + t('was saved, but it is not in the task list read back afterwards, so this '
+                        + 'panel cannot confirm that it includes child datasets. Reload the view and '
+                        + 'check its Source → Target column for (-r).'));
+                return;
+            }
+            ANAS.alertMsg('Recursive replication not supported', t('This node\'s ANAS does not support '
+                + 'recursive replication. The task') + ' "' + name + '" ' + t('was saved as a '
+                + 'single-dataset task: it replicates') + ' ' + sourceLabel + ' '
+                + t('only, with "Take a fresh snapshot before each run" off. Edit it, or update '
+                    + 'ANAS on this node.'));
+        }, function (err) {
+            ANAS.alertMsg('Recursive replication not confirmed', t('The task') + ' "' + name + '" '
+                + t('was saved, but reading the task list back failed, so this panel cannot confirm '
+                    + 'that it includes child datasets') + ': ' + ANAS.errText(err));
+        });
     }
 
     // Which endpoints an edit moves, as readable "was → now" lines ([] = none).
@@ -2255,8 +2524,15 @@
                     // The toast/alert below carry the task's name — no modal
                     // from pollJob on top of them.
                     alerts: false,
-                    onComplete: function () {
-                        ANAS.toast(t('Replication finished') + ': ' + name);
+                    onComplete: function (j) {
+                        // The job that ends here is the TRIGGER (`systemctl
+                        // start --no-block` of the task's unit; its result is
+                        // { started }), not the replication: the run goes on
+                        // in the unit. The toast says what happened; the
+                        // outcome arrives in the Last run column and in the
+                        // task's notification. (It read "finished" until
+                        // rrep.3, which was never true of a long send.)
+                        ANAS.toast(t('Replication started') + ': ' + name);
                         loadTasks(grid, node);
                     },
                     // Failed OR lost: the job's own sentence, then the reload —
@@ -2307,6 +2583,16 @@
             if (lk === 'peer' || lk === 'remote') {
                 body.target.location = { kind: lk, name: rec.get('targetLocationName') };
             }
+        }
+        // rrep.3: carry recursion, or a toggle silently turns a recursive task
+        // into a single-dataset one on a daemon that stores what it is sent
+        // (the trap the schedule toggle closed for its exclude list, snapx.1):
+        // recursive, the exclude list always as a key, snapshot-first off. A
+        // task that is not recursive keeps today's body, byte for byte.
+        if (raw.recursive === true || (raw.source === undefined && rec.get('recursive'))) {
+            body.recursive = true;
+            body.exclude = (raw.exclude || rec.get('exclude') || []).slice();
+            body.snapshotFirst = false;
         }
         ANAS.runJob({
             node: node,
@@ -2890,6 +3176,8 @@
                 'targetLocationKind', 'targetLocationName',
                 'schedule', 'notify', 'lastReplicatedSnapshot', 'lastReplicatedAt', 'lastRunResult', 'lastRunNote', 'nextRunAt',
                 { name: 'snapshotFirst', type: 'auto' },
+                { name: 'recursive', type: 'auto' },
+                { name: 'exclude', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
                 { name: 'snapshotsBehind', type: 'auto' },
                 { name: 'raw', type: 'auto' },
@@ -3108,7 +3396,7 @@
         if (lk === 'peer' || lk === 'remote') {
             target.location = { kind: lk, name: rec.get('targetLocationName') };
         }
-        return {
+        var out = {
             name: rec.get('name'),
             source: { pool: rec.get('sourcePool'), dataset: rec.get('sourceDataset') },
             target: target,
@@ -3117,6 +3405,12 @@
             notify: rec.get('notify') || 'on-failure',
             enabled: !!rec.get('enabled'),
         };
+        // rrep.3: a recursive row reopens recursive, with its exclude list.
+        if (rec.get('recursive')) {
+            out.recursive = true;
+            out.exclude = (rec.get('exclude') || []).slice();
+        }
+        return out;
     }
 
     // ---- View registration -------------------------------------------------
