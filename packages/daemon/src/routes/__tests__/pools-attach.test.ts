@@ -458,7 +458,9 @@ describe('attach/replace refuses when the pool status cannot be read', () => {
     const { error } = res.json() as { error: { code: string, reason: string, message: string } }
     assert.equal(error.code, 'CONFLICT')
     assert.equal(error.reason, 'unreadable')
-    assert.match(error.message, /pool testpool's status could not be read/)
+    // cr3: the composability pre-flight reads the same failed status first —
+    // the inventory cannot tell pool members from free disks.
+    assert.match(error.message, /zpool status -jv could not be read/)
     assert.match(error.message, /refusing to replace a device it cannot identify/)
     assert.match(error.message, /I\/O error/)
     assert.equal(spy.calls.find(c => c.args[0] === 'replace' || c.args[0] === 'attach'), undefined)
@@ -473,7 +475,7 @@ describe('attach/replace refuses when the pool status cannot be read', () => {
     const { error } = res.json() as { error: { reason: string, message: string } }
     assert.equal(error.reason, 'unreadable')
     assert.match(error.message, /refusing to attach to a device it cannot identify/)
-    assert.match(error.message, /zpool status exited with code 1/)
+    assert.match(error.message, /zpool status -jv could not be read \(exit 1\)/)
     assert.equal(spy.calls.find(c => c.args[0] === 'replace' || c.args[0] === 'attach'), undefined)
   })
 

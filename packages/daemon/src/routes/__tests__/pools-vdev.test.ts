@@ -328,6 +328,8 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     // cr.36: the guard's guid read, from the capture (pool-guard-reads.ts).
     servePoolGuardReads(mock)
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
+    // cr3: the composability check reads `zpool status` (unmocked = unreadable = 409).
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({
       command: '/usr/sbin/zpool',
       args: ['add', '--', 'testpool', 'mirror', `${BY_ID}${DISK_A}`, `${BY_ID}${DISK_B}`],

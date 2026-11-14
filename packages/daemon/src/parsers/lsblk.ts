@@ -77,6 +77,31 @@ export function isInventoryDisk(dev: { type: string, name: string }): boolean {
 }
 
 /**
+ * The whole disks (kernel names) lsblk shows carrying a ZFS label — a
+ * `zfs_member` FSTYPE on the disk itself or on any partition below it (cr3).
+ * The evidence a FAULTED/OFFLINE/REMOVED/UNAVAIL kernel-named pool leaf needs
+ * before it is joined onto the disk now holding its kernel name: a blank
+ * replacement in the same slot carries none. Unparseable input names none.
+ */
+export function zfsMemberKernels(json: string): Set<string> {
+  const out = new Set<string>()
+  let data: LsblkOutput
+  try {
+    data = JSON.parse(json) as LsblkOutput
+  }
+  catch {
+    return out
+  }
+  const labelled = (node: { fstype?: string | null, children?: LsblkPartRaw[] }): boolean =>
+    node.fstype === 'zfs_member' || (node.children ?? []).some(labelled)
+  for (const dev of data?.blockdevices ?? []) {
+    if (labelled(dev))
+      out.add(dev.name)
+  }
+  return out
+}
+
+/**
  * Parse lsblk JSON output into Disk objects.
  * Filters to physical disks (type=disk), excluding CD-ROMs, zram, loop, zvols.
  * @param json raw lsblk JSON output (string or pre-parsed object)

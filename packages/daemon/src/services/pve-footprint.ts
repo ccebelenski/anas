@@ -4,6 +4,7 @@ import type { ZfsMountpoint } from '../parsers/pve-storage.js'
 import type { Refusal } from '../safety/guard.js'
 import type { SystemMountFacts } from './system-mounts.js'
 import { isPathWithin, pveOwnership, wouldBeClaimedByPve } from '@anas/shared'
+import { parseFindmntTable, readFindmntTable } from '../parsers/findmnt.js'
 import { matchMountpoint, pathOnZfsFilesystem, PVE_STORAGE_CFG, readPveStorages, readZfsMountpointsFull } from '../parsers/pve-storage.js'
 import { readSystemMountPools, systemMountPoolsFromNodes } from './system-mounts.js'
 
@@ -165,6 +166,12 @@ export function ownershipWithFallback(
   systemFacts: SystemPoolFacts[] | null,
   dataset: string,
   storagesUnavailable = false,
+  /**
+   * Why the storages cannot be judged, when it is not storage.cfg itself
+   * (cr3: its `dir` storages could not be placed on a pool because the ZFS
+   * mountpoint table could not be read). Absent = the config is unreadable.
+   */
+  unavailableCause?: string,
 ): PveOwnership | null {
   const poolRoot = dataset.split('/')[0]
   // UNREADABLE storage.cfg (pvepool.1 review fix 1): nothing can be judged, so
@@ -175,7 +182,9 @@ export function ownershipWithFallback(
   if (storagesUnavailable) {
     return {
       kind: 'config-unreadable',
-      reason: `PVE storage configuration is unreadable (/etc/pve/storage.cfg) — pool '${poolRoot}' is treated as PVE's until it can be read`,
+      reason: unavailableCause
+        ? `${unavailableCause} — pool '${poolRoot}' is treated as PVE's until it can be read`
+        : `PVE storage configuration is unreadable (/etc/pve/storage.cfg) — pool '${poolRoot}' is treated as PVE's until it can be read`,
     }
   }
   const refs = storagesByPool.get(poolRoot) ?? []
@@ -285,6 +294,23 @@ export type SharePathClaim
   = | { kind: 'dataset', dataset: string, ownership: PveOwnership }
     | { kind: 'dir-path', storage: string, path: string }
 
+/**
+ * The share-path backstop's THREE-valued answer (cr3, reviews POOLS-DISKS-H1
+ * and SHARES-M4) — the contract a share door refuses through:
+ *  - `no-claim` — the ONE answer that opens the gate: every read behind it
+ *    answered and PVE claims nothing at the path;
+ *  - `claim` — PVE claims the path ({@link SharePathClaim}, as before);
+ *  - `cannot-see` — the daemon could not judge the path: the ZFS mountpoint
+ *    table (`zfs list`) could not be read, or storage.cfg could not, and the
+ *    path is not on a filesystem the mount table proves non-ZFS. `reason` is
+ *    the sentence a refusal quotes (a 400-class "cannot see" fact, like the
+ *    `config-unreadable` verdict — not a PVE claim).
+ */
+export type SharePathVerdict
+  = | { kind: 'no-claim' }
+    | { kind: 'claim', claim: SharePathClaim }
+    | { kind: 'cannot-see', reason: string }
+
 /** What one request's worth of PVE-footprint reads can answer. */
 export interface PveFootprint {
   /** `poolRoot -> PveStorageRef[]` from storage.cfg (dir refs resolved; EMPTY while unavailable). */
@@ -321,12 +347,21 @@ export interface PveFootprint {
   systemFactsUnavailable: boolean
   /**
    * True when storage.cfg could NOT be read (pvepool.1 review fix 1) —
-   * UNREADABLE, as opposed to absent on a non-PVE host. While this is true,
-   * EVERY dataset on EVERY pool is answered PVE-owned ({@link ownershipOf})
-   * and {@link isSystemPool} is true for every pool, until the config can be
-   * read. Missing facts may only tighten the gate, never loosen it.
+   * UNREADABLE, as opposed to absent on a non-PVE host — OR (cr3, review
+   * POOLS-DISKS-H1) when it names a `dir` storage and the ZFS mountpoint table
+   * could not be read, so which pool that storage sits on is unknown. While
+   * this is true, EVERY dataset on EVERY pool is answered PVE-owned
+   * ({@link ownershipOf}) and {@link isSystemPool} is true for every pool,
+   * until the reads answer. Missing facts may only tighten the gate, never
+   * loosen it.
    */
   storagesUnavailable: boolean
+  /**
+   * Why {@link storagesUnavailable} is true when the cause is NOT storage.cfg
+   * itself (cr3: the dir storages it names could not be placed); undefined
+   * when the config is unreadable or everything was read.
+   */
+  storagesUnavailableCause?: string
   /**
    * PVE's ownership claim on one full dataset name, or null when it is
    * outside PVE's footprint and ANAS may manage it. A non-null answer carries
@@ -364,14 +399,30 @@ export interface PveFootprint {
    */
   datasetOfPath: (path: string) => string | null
   /**
+   * {@link datasetOfPath} with "cannot see" kept distinct (cr3): `{ dataset }`
+   * is a reading (null = the path is on no ZFS dataset); `{ unreadable }` is
+   * the sentence saying why it could not be judged — the ZFS mountpoint table
+   * could not be read and the mount table does not prove the path non-ZFS.
+   */
+  datasetOfPathVerdict: (path: string) => { dataset: string | null } | { unreadable: string }
+  /**
    * The share-path backstop (pvepool.1 review fixes): what PVE claims at
    * `path` — {@link SharePathClaim}, or null when the path is outside PVE's
    * footprint and a share may serve it. Asks {@link PveFootprint.datasetOfPath}
    * first (a path on an owned dataset), then the unresolvable-dir path rule
    * (a path a `dir` storage claims by its configured `path`). The ONE answerer
    * the SMB and NFS share routes both refuse through.
+   *
+   * cr3: when the path cannot be judged ({@link sharePathVerdict} answers
+   * `cannot-see`), this answers a fail-closed claim of kind `dataset` whose
+   * ownership is `config-unreadable` with the cannot-see sentence (its
+   * `dataset` is the path itself — no dataset could be resolved), so every
+   * existing caller refuses it with its config-unreadable 400. `null` still
+   * means exactly "no claim, every read answered".
    */
   sharePathClaim: (path: string) => SharePathClaim | null
+  /** The share-path backstop's three-valued answer ({@link SharePathVerdict}). */
+  sharePathVerdict: (path: string) => SharePathVerdict
   /**
    * Does this pool hold this node's boot filesystem (bootfs set or hosting /),
    * or does the live mount table show one of its filesystems at a system path
@@ -412,12 +463,20 @@ export async function loadPveFootprint(
 ): Promise<PveFootprint> {
   // The mountpoint read goes THROUGH the executor (mock-driven in tests) and
   // feeds BOTH consumers: the `dir`-storage resolution and datasetOfPath. A
-  // null read (zfs list failed) only disables those — the parser's secondary
-  // signal — never the storage.cfg verdict itself. The full read also carries
-  // the findmnt table the share-path backstop's ZFS-backed test needs.
+  // null read (zfs list failed) means neither can be judged: cr3 (review
+  // POOLS-DISKS-H1) — a dir stanza in storage.cfg then makes every pool answer
+  // as for an unreadable config (which pool it sits on is unknown), and a share
+  // path that cannot be resolved is "cannot see", never "no claim". The full
+  // read also carries the findmnt table the share-path backstop's ZFS-backed
+  // test needs.
   const mountRead = await readZfsMountpointsFull(executor)
   const zfsMountpoints = mountRead?.mountpoints ?? null
-  const findmntNodes = mountRead?.findmntNodes ?? null
+  // When the zfs side failed, the mount table it read beside it is not
+  // returned: read it once here (cr3) — it places the dir storages the
+  // missing mountpoint table cannot, and it is the system-mount facts' table.
+  const findmntNodes = mountRead
+    ? mountRead.findmntNodes
+    : await readFindmntTable(executor).then(text => (text === null ? null : parseFindmntTable(text)))
   const [readStorages, readFacts, readMountFacts] = await Promise.all([
     // Explicit override, then the daemon-wide env override, then the real path
     // — the same resolution server.ts hands the route-level consumers.
@@ -432,8 +491,15 @@ export async function loadPveFootprint(
       : readSystemMountPools(executor),
   ])
   // UNREADABLE ≠ empty (pvepool.1 review fix 1): null storages tighten every
-  // answer below until the config can be read again.
-  const storagesUnavailable = readStorages === null
+  // answer below until the config can be read again. cr3: so do dir storages
+  // the config names that could not be placed on a pool (the mountpoint table
+  // read failed) — before cr3 they vanished from the footprint and the
+  // pool-level PVE gate opened.
+  const unplacedDirs = zfsMountpoints === null ? (readStorages?.unplacedDirs ?? []) : []
+  const storagesUnavailableCause = readStorages !== null && unplacedDirs.length > 0
+    ? `ZFS dataset mountpoints could not be read (zfs list failed), so ANAS cannot tell which pool PVE dir storage${unplacedDirs.length === 1 ? '' : 's'} ${unplacedDirs.map(d => `'${d.storage}' (${d.path})`).join(', ')} ${unplacedDirs.length === 1 ? 'is' : 'are'} on`
+    : undefined
+  const storagesUnavailable = readStorages === null || storagesUnavailableCause !== undefined
   const storagesByPool = readStorages?.byPool ?? new Map<string, PveStorageRef[]>()
   // pvepool.1 review fix 5, narrowed by the 2026-09-22 caveat-emptor ruling
   // (EPICS §2): dir storages whose path resolved onto no dataset AND sits on a
@@ -471,7 +537,7 @@ export async function loadPveFootprint(
   // goes through the raw closure — the stamped wrapper recursing into itself
   // would never terminate.
   const rawOwnershipOf = (dataset: string): PveOwnership | null =>
-    ownershipWithFallback(storagesByPool, readFacts, dataset, storagesUnavailable)
+    ownershipWithFallback(storagesByPool, readFacts, dataset, storagesUnavailable, storagesUnavailableCause)
   const CHILDREN_PROBE_BASENAME = 'anas-probe'
   const ownershipOf = (dataset: string): PveOwnership | null => {
     const owned = rawOwnershipOf(dataset)
@@ -490,6 +556,42 @@ export async function loadPveFootprint(
   const datasetOf = (path: string): string | null =>
     matchMountpoint(path, zfsMountpoints ?? [], findmntNodes)?.dataset ?? null
 
+  // cr3 (reviews POOLS-DISKS-H1, SHARES-M4): when may a path that resolved
+  // onto no dataset be read as "no dataset"? Only when the mountpoint table
+  // was read (or the mount table proves the path's serving filesystem is not
+  // ZFS — then no dataset can host it whatever zfs list would say).
+  const pathBlind = (path: string): string | null => {
+    if (pathOnZfsFilesystem(path, findmntNodes) === false)
+      return null
+    if (zfsMountpoints === null)
+      return `ZFS dataset mountpoints could not be read (zfs list failed), so ANAS cannot tell which dataset serves ${path} or whether PVE claims it`
+    if (storagesUnavailable) {
+      return storagesUnavailableCause
+        ? `${storagesUnavailableCause}, so ANAS cannot tell whether PVE claims ${path}`
+        : `PVE storage configuration is unreadable (${PVE_STORAGE_CFG}), so ANAS cannot tell whether a PVE dir storage claims ${path}`
+    }
+    return null
+  }
+  const datasetOfPathVerdict = (path: string): { dataset: string | null } | { unreadable: string } => {
+    const dataset = datasetOf(path)
+    if (dataset)
+      return { dataset }
+    const blind = zfsMountpoints === null ? pathBlind(path) : null
+    return blind ? { unreadable: blind } : { dataset: null }
+  }
+  const sharePathVerdict = (path: string): SharePathVerdict => {
+    const dataset = datasetOf(path)
+    if (dataset) {
+      const owned = ownershipOf(dataset)
+      return owned ? { kind: 'claim', claim: { kind: 'dataset', dataset, ownership: owned } } : { kind: 'no-claim' }
+    }
+    const dir = unresolvedDirPaths.find(d => isPathWithin(d.path, path))
+    if (dir)
+      return { kind: 'claim', claim: { kind: 'dir-path', storage: dir.storage, path: dir.path } }
+    const blind = pathBlind(path)
+    return blind ? { kind: 'cannot-see', reason: blind } : { kind: 'no-claim' }
+  }
+
   return {
     storagesByPool,
     unresolvedDirPaths,
@@ -497,16 +599,17 @@ export async function loadPveFootprint(
     systemFacts,
     systemFactsUnavailable,
     storagesUnavailable,
+    ...(storagesUnavailableCause !== undefined && { storagesUnavailableCause }),
     ownershipOf,
     ownedDescendant: (candidates, dataset) => ownedDescendantIn(candidates, dataset, ownershipOf),
     // The ONE path → dataset resolver (pvepool.1 review fixes) — the closure
-    // above. Null opens the share-path gate ONLY for a path on no known ZFS
-    // dataset — including #85's shape: a readable table that says the serving
-    // filesystem is NOT ZFS. When the mountpoint read itself failed the answer
-    // is equally null, and the shares routes' sentence never fires;
-    // storage.cfg's own unreadable verdict still tightens ownershipOf for
-    // every path that DOES resolve.
+    // above. Null is a path on no known ZFS dataset — including #85's shape: a
+    // readable table that says the serving filesystem is NOT ZFS. When the
+    // mountpoint read itself failed the answer is equally null HERE; cr3 keeps
+    // that case distinct in datasetOfPathVerdict and sharePathVerdict
+    // ("cannot see"), and sharePathClaim answers it fail-closed.
     datasetOfPath: datasetOf,
+    datasetOfPathVerdict,
     // The share-path backstop (pvepool.1 review fixes): the dataset answer
     // first (the same `datasetOf` expression, never a second copy), then —
     // only for a path on no known dataset — the unresolvable-dir path rule.
@@ -514,14 +617,16 @@ export async function loadPveFootprint(
     // emptor ruling dropped the non-ZFS paths at load time; a null findmnt
     // table kept them all), so missing facts here may only tighten.
     sharePathClaim: (path: string): SharePathClaim | null => {
-      const dataset = datasetOf(path)
-      if (dataset) {
-        const owned = ownershipOf(dataset)
-        return owned ? { kind: 'dataset', dataset, ownership: owned } : null
-      }
-      const dir = unresolvedDirPaths.find(d => isPathWithin(d.path, path))
-      return dir ? { kind: 'dir-path', storage: dir.storage, path: dir.path } : null
+      const verdict = sharePathVerdict(path)
+      if (verdict.kind === 'no-claim')
+        return null
+      if (verdict.kind === 'claim')
+        return verdict.claim
+      // cr3: cannot-see refuses through every existing caller's
+      // config-unreadable branch (400), never "no claim".
+      return { kind: 'dataset', dataset: path, ownership: { kind: 'config-unreadable', reason: verdict.reason } }
     },
+    sharePathVerdict,
     claimedByPve: (dataset: string) => storagesUnavailable
       ? null // nothing can be judged; the ownership refusal already blocks creation
       : wouldBeClaimedByPve(storagesByPool.get(dataset.split('/')[0]) ?? [], dataset),
@@ -601,6 +706,8 @@ export function systemPoolRefusal(
   facts: SystemPoolFacts | null,
   opts: {
     storagesUnavailable?: boolean
+    /** Why the storages are unavailable when it is not storage.cfg itself (cr3). */
+    storagesUnavailableCause?: string
     /** The system path one of the pool's filesystems is mounted at (cr.23). */
     mountTarget?: string | null
     /** The boot-facts probe failed (cr.23). */
@@ -609,6 +716,14 @@ export function systemPoolRefusal(
     mountTableUnavailable?: boolean
   } = {},
 ): { reason: 'system-pool', message: string } {
+  if (opts.storagesUnavailable && opts.storagesUnavailableCause) {
+    // cr3: storage.cfg was read, but a dir storage it names could not be
+    // placed on a pool — the sentence names that cause.
+    return {
+      reason: 'system-pool',
+      message: `${opts.storagesUnavailableCause} — pool '${pool}' is treated as a system pool until it can be read — ANAS never destroys, exports or remounts a system pool`,
+    }
+  }
   if (opts.storagesUnavailable) {
     // The real cause is the storage configuration: with it unreadable nothing
     // can be judged — not whether the pool hosts a zfspool storage, not the
@@ -677,11 +792,12 @@ export function systemPoolRefusal(
  * identically (cr.23).
  */
 export function systemPoolRefusalFrom(
-  pve: Pick<PveFootprint, 'systemPoolFacts' | 'systemMountTarget' | 'systemMountFacts' | 'systemFactsUnavailable' | 'storagesUnavailable'>,
+  pve: Pick<PveFootprint, 'systemPoolFacts' | 'systemMountTarget' | 'systemMountFacts' | 'systemFactsUnavailable' | 'storagesUnavailable' | 'storagesUnavailableCause'>,
   pool: string,
 ): { reason: 'system-pool', message: string } {
   return systemPoolRefusal(pool, pve.systemPoolFacts(pool), {
     storagesUnavailable: pve.storagesUnavailable,
+    ...(pve.storagesUnavailableCause !== undefined && { storagesUnavailableCause: pve.storagesUnavailableCause }),
     mountTarget: pve.systemMountTarget(pool),
     bootFactsUnavailable: pve.systemFactsUnavailable,
     mountTableUnavailable: pve.systemMountFacts === null,

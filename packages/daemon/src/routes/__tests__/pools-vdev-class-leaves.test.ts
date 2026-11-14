@@ -70,11 +70,16 @@ describe('vdev-class leaves — every class counts as a leaf (vdevs.1)', () => {
     ])
   })
 
-  it('nf.2/D5: an in-use spare is wiped once (its data-vdev leg), a leaf that is not ONLINE is kept', () => {
+  it('nf.2/D5 + cr3 L9: an in-use spare is KEPT (a spare can serve other pools), a leaf that is not ONLINE is kept', () => {
     const [active] = statusFixture('zpool-status-spare-active.json')
     const { wipe, kept } = cleanupLeaves(leavesFromStatus(active))
-    assert.deepEqual(wipe.map(l => l.leafId), ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1', 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3-part1'])
-    assert.deepEqual(kept, [{ leaf: 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part1', why: 'the leaf was REMOVED' }])
+    // cr3 (POOLS-DISKS-L9): before, the in-use spare HOT3 was wiped by its
+    // data-vdev leg — and with it every other pool's spare on the same device.
+    assert.deepEqual(wipe.map(l => l.leafId), ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1'])
+    assert.deepEqual(kept, [
+      { leaf: 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part1', why: 'the leaf was REMOVED' },
+      { leaf: 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3-part1', why: 'a hot spare\'s ZFS label names no pool (a spare can serve other pools)' },
+    ])
   })
 
   it('a kernel-name leaf is addressed by its kernel device, not a made-up by-id', () => {

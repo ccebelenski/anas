@@ -16,8 +16,9 @@ import { LSBLK_ARGS } from '../../parsers/lsblk.js'
  * without any by-id symlink fixture, and the route still composes
  * `/dev/disk/by-id/<id>` — the argv pins stay exactly as written.
  *
- * The base is the dev lsblk fixture regardless of the server's fixture state,
- * so this also RESTORES a readable inventory on servers that `clearFixtures()`
+ * The base is the dev lsblk fixture regardless of the server's fixture state
+ * (and the dev by-id listing when the server serves none — cr3), so this also
+ * RESTORES a readable inventory on servers that `clearFixtures()`
  * (those tests exercise other unreadable reads, e.g. pool status, and must not
  * trip the inventory check on the way).
  *
@@ -58,6 +59,15 @@ export function serveBlankInventoryDisksOn(
         })
       })
       return { stdout: JSON.stringify(inventory), stderr: '', exitCode: 0 }
+    }
+    // cr3 (re-review item 3): the by-id listing is part of a readable
+    // inventory now (a failed listing makes membership unknown and the doors
+    // refuse 409 unreadable). A server that `clearFixtures()` and never served
+    // it gets the dev listing back, as it gets the dev lsblk; a test that
+    // registered its own answer keeps it.
+    if (command === '/usr/bin/ls' && args.join(' ') === '-la /dev/disk/by-id/') {
+      const own = await orig(command, args)
+      return own.exitCode === 127 && own.stderr.startsWith('mock: command not found') ? mockFixtures.diskByIdListing() : own
     }
     return orig(command, args)
   }

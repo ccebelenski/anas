@@ -293,7 +293,9 @@ function buildExecutor(opts: { mdstat?: string, driveReplaceOf?: string, retireT
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }, { target: '/mnt/anas-ahr/quad', source: '/dev/mapper/quad-quad--vol', fstype: 'btrfs', options: 'rw,relatime' }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: BTRFS_USAGE, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/quad'], result: { stdout: BTRFS_USAGE_QUAD, stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 1 } })
+  // No ZFS pools, in the shape OpenZFS 2.4.x prints it: `zpool_do_status`
+  // (cmd/zpool/zpool_main.c) with -j answers exit 0 and an empty `pools` object.
+  executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '{"output_version":{"command":"zpool status","vers_major":0,"vers_minor":1},"pools":{}}\n', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
   return executor
 }

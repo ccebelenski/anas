@@ -4,7 +4,9 @@
  */
 
 import type { PoolProperties } from '@anas/shared'
-import { parseIntOrZero, parseZfsBool, parseZfsJson } from './utils.js'
+import { parseZfsJson } from './utils.js'
+
+const ASHIFT_RE = /^\d+$/
 
 interface ZfsPropertyRaw {
   value: string
@@ -35,13 +37,20 @@ export function parseZpoolGet(
   if (!pool)
     return null
 
-  const prop = (name: string) => pool.properties[name]?.value ?? ''
+  // cr3: a property the read did not return is null (unknown), never a
+  // default; so is a value outside the property's domain.
+  const prop = (name: string): string | undefined => pool.properties?.[name]?.value
+  const bool = (name: string): boolean | null => {
+    const v = prop(name)
+    return v === 'on' ? true : v === 'off' ? false : null
+  }
+  const ashift = prop('ashift')
 
   const result: PoolProperties = {
-    ashift: parseIntOrZero(prop('ashift')),
-    autoexpand: parseZfsBool(prop('autoexpand')),
-    autoreplace: parseZfsBool(prop('autoreplace')),
-    autotrim: parseZfsBool(prop('autotrim')),
+    ashift: ashift !== undefined && ASHIFT_RE.test(ashift) ? Number(ashift) : null,
+    autoexpand: bool('autoexpand'),
+    autoreplace: bool('autoreplace'),
+    autotrim: bool('autotrim'),
     failmode: parseFailmode(prop('failmode')),
   }
 
@@ -56,10 +65,10 @@ export function parseZpoolGet(
   return result
 }
 
-function parseFailmode(val: string): 'wait' | 'continue' | 'panic' {
-  if (val === 'continue' || val === 'panic')
+function parseFailmode(val: string | undefined): 'wait' | 'continue' | 'panic' | null {
+  if (val === 'wait' || val === 'continue' || val === 'panic')
     return val
-  return 'wait' // default
+  return null // not returned, or not a failmode: unknown (cr3)
 }
 
 /**

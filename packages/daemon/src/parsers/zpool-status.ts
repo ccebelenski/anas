@@ -5,6 +5,7 @@
 
 import type { LastScrub, PoolDisk, PoolHealthMessage, PoolState, ScanStatus, ScrubRunning, Vdev, VdevGroup, VdevRole, VdevState, VdevType } from '@anas/shared'
 import { parseHumanSize, parseIntOrZero, parseZfsDate, parseZfsJson } from './utils.js'
+import { zpoolJsonShape, zpoolJsonUnreadable } from './zpool-list.js'
 
 /** Raw ZFS JSON types (what `zpool status -j` actually returns) */
 interface ZfsVdevRaw {
@@ -109,7 +110,37 @@ export interface ParsedPoolStatus {
  */
 export function parseZpoolStatus(json: string | ZpoolStatusOutput): ParsedPoolStatus[] {
   const data: ZpoolStatusOutput = parseZfsJson(json, { pools: {} })
+  // cr3: OpenZFS always emits `pools`; a document without it is not its answer.
+  if (typeof data.pools !== 'object' || data.pools === null)
+    throw new Error('zpool status -j printed JSON without a pools object')
   return Object.values(data.pools).map(parsePool)
+}
+
+/**
+ * A `zpool status -jv` answer read strictly (cr3): the pools it reports, or
+ * WHY it could not be read — the same answered/unreadable split as the pool
+ * list ({@link zpoolJsonUnreadable}): exit 0 with JSON (`pools` empty or
+ * absent) or nothing, or zpool's no-pools sentence on either stream at any
+ * exit, or `zpool` not installed ({@link execZpool}) is "no pools"; a
+ * non-zero exit without the sentence, or exit 0 with output that is neither
+ * JSON nor the sentence, is unreadable — and a reader built on it says
+ * unknown, never reads a pool member as free or a faulted leaf as healthy.
+ */
+export function readZpoolStatusAnswer(
+  r: { exitCode: number, stdout: string, stderr: string },
+): { pools: ParsedPoolStatus[] } | { unreadable: string } {
+  const unreadable = zpoolJsonUnreadable(r, 'zpool status -jv')
+  if (unreadable)
+    return { unreadable }
+  // Answered with no JSON at all (nothing printed, or the sentence): none.
+  if (zpoolJsonShape(r.stdout) !== 'json')
+    return { pools: [] }
+  try {
+    return { pools: parseZpoolStatus(r.stdout) }
+  }
+  catch (err: unknown) {
+    return { unreadable: `zpool status -jv could not be parsed (${err instanceof Error ? err.message : String(err)})` }
+  }
 }
 
 /**

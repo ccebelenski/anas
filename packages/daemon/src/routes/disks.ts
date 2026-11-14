@@ -5,17 +5,28 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { parseByIdToKernel, parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
-import { LSBLK_ARGS, parseLsblk } from '../parsers/lsblk.js'
-import { isSmartctlStandby, parseSmartctl, standbySmartData } from '../parsers/smartctl.js'
-import { parseZpoolStatus } from '../parsers/zpool-status.js'
+import { LSBLK_ARGS, parseLsblk, zfsMemberKernels } from '../parsers/lsblk.js'
+import { isSmartctlProbeFailure, isSmartctlStandby, parseSmartctl, standbySmartData } from '../parsers/smartctl.js'
+import { execZpool } from '../parsers/zpool-list.js'
+import { readZpoolStatusAnswer } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
-import { iscsiServedSerials, normalizeSerial } from '../services/iscsi-held.js'
+import { normalizeSerial } from '../services/iscsi-held.js'
+import { readIscsiState } from '../services/iscsi-mutate.js'
 import { readSystemMountPools } from '../services/system-mounts.js'
 
 const BY_ID_PATH_RE = /^\/dev\/disk\/by-(?:id|partuuid)\/(.+)$/
 const KERNEL_PATH_RE = /^\/dev\/([a-z0-9]+)$/
 const PART_SUFFIX_RE = /-part\d+$/
 const BARE_KERNEL_RE = /^(?:sd|vd|hd)[a-z]+\d*$|^nvme\d+n\d+|^mmcblk\d+/
+
+const BY_PARTUUID_PREFIX = '/dev/disk/by-partuuid/'
+const BY_ID_PREFIX = '/dev/disk/by-id/'
+/** Leaf states ZFS reports for a device it has open (see resolveLeafKernel). */
+const OPEN_LEAF_STATES: ReadonlySet<VdevState> = new Set<VdevState>(['ONLINE', 'DEGRADED', 'AVAIL', 'INUSE'])
+/** `ls` reads in the C locale: the absent-directory verdict reads its English message (cr3). */
+const C_LOCALE = { env: { LC_ALL: 'C' } }
+/** `ls` of a directory that does not exist (GNU coreutils' own sentence). */
+const LS_NO_SUCH_DIR_RE = /No such file or directory/
 
 /**
  * Resolve a `zpool status` leaf to its whole-disk KERNEL name so both sides of
@@ -33,12 +44,31 @@ const BARE_KERNEL_RE = /^(?:sd|vd|hd)[a-z]+\d*$|^nvme\d+n\d+|^mmcblk\d+/
  *      a `/dev/sdX[N]` / `/dev/nvmeXnY[pN]` form is reduced to its parent kernel;
  *   3. the leaf `id` treated as a bare kernel name.
  * Returns null when nothing resolves — that leaf simply won't cross-reference.
+ *
+ * The kernel-name fallback (the bare kernel path of step 2, and step 3) is
+ * decided by the leaf's state (cr3, review M7 and two re-reviews):
+ *  - ONLINE, DEGRADED, AVAIL, INUSE — the device ZFS has open (OpenZFS
+ *    `zpool_main.c`: "For hot spares, we use the terms 'INUSE' and
+ *    'AVAILABLE' for online drives"): it resolves by its kernel name;
+ *  - FAULTED, OFFLINE, REMOVED, UNAVAIL — the leaf may no longer be the
+ *    device at that name (the `zpool offline`, swap, `zpool replace`
+ *    workflow; the kernel reuses the name for the next disk): it resolves to
+ *    the kernel name ONLY when `evidence` holds that disk — lsblk shows a
+ *    `zfs_member` signature on it or one of its partitions, or an ONLINE leaf
+ *    of the same pool already resolved to it. A blank replacement in the same
+ *    slot carries neither, so it never inherits the leaf's pool, vdev and
+ *    health; a present FAULTED member carries its label and keeps them.
+ * `state` absent (a caller with no state, the trim probe) keeps the fallback.
  */
 export function resolveLeafKernel(
   id: string,
   path: string,
   byIdToKernel: Map<string, string>,
+  state?: VdevState,
+  evidence?: ReadonlySet<string>,
 ): string | null {
+  const kernelOk = (kernel: string): string | null =>
+    state === undefined || OPEN_LEAF_STATES.has(state) || evidence?.has(kernel) ? kernel : null
   // 1. id is the leaf's devid (or by-id from path/name) in the common case.
   const fromId = byIdToKernel.get(id.replace(PART_SUFFIX_RE, ''))
   if (fromId)
@@ -54,12 +84,12 @@ export function resolveLeafKernel(
     }
     const kernelPath = path.match(KERNEL_PATH_RE)
     if (kernelPath)
-      return wholeDiskKernel(kernelPath[1])
+      return kernelOk(wholeDiskKernel(kernelPath[1]))
   }
 
   // 3. id may itself be a bare kernel name (ZFS had nothing better).
   if (BARE_KERNEL_RE.test(id))
-    return wholeDiskKernel(id)
+    return kernelOk(wholeDiskKernel(id))
 
   return null
 }
@@ -155,11 +185,17 @@ function contextWeight(info: PoolDiskInfo): number {
  * Fuse SMART pass/fail with live ZFS state into one health level — the signal
  * PVE's disk view never combines. Cheap: uses already-collected data, no extra
  * smartctl call per disk.
+ *
+ * `zfsUnreadable` (cr3): `zpool status` could not be read, so `info` being
+ * absent says nothing — the disk may be a FAULTED pool member. Positive bad
+ * evidence (SMART failed, a bad AHR band) still answers; a disk with no AHR
+ * membership is then `unknown`, never healthy from SMART alone.
  */
 export function computeHealth(
   smartHealthy: boolean | null,
   info: PoolDiskInfo | undefined,
   ahrStates?: readonly AhrMemberState[],
+  zfsUnreadable = false,
 ): DiskHealthStatus {
   if (smartHealthy === false)
     return 'critical'
@@ -182,6 +218,9 @@ export function computeHealth(
     return 'critical'
   if (ahrStates?.includes('rebuilding'))
     return 'warning'
+  // ZFS could not be read and the disk is no AHR member: it may be in a pool.
+  if (zfsUnreadable && ahrStates === undefined)
+    return 'unknown'
   // Not in a pool: only SMART tells us anything.
   return smartHealthy === true ? 'healthy' : 'unknown'
 }
@@ -221,16 +260,78 @@ export async function collectDisks(
   diskIdentityCache: DiskIdentityCache,
   iscsiPaths: IscsiPaths = {},
 ): Promise<Disk[]> {
+  return (await collectDiskInventory(executor, diskIdentityCache, iscsiPaths)).disks
+}
+
+/** The disk list, and which of the facts behind it could not be read (cr3). */
+export interface DiskInventory {
+  disks: Disk[]
+  /**
+   * Why `zpool status` could not be read, when it could not: every disk
+   * without positive evidence of its use then reads status `unknown` and
+   * health `unknown` (never `available`, never healthy from SMART alone).
+   */
+  zfsUnreadable?: string
+  /**
+   * Why this node's own LUN serials could not be read, when they could not:
+   * every iSCSI-transport disk is then hands-off `iscsi-unverified`.
+   */
+  servedSerialsUnreadable?: string
+  /**
+   * Why the /dev/disk/by-id (or by-partuuid) listing could not be read, when
+   * it could not (cr3): pool membership is then as unknown as for
+   * {@link zfsUnreadable} (status and health `unknown`).
+   */
+  byIdUnreadable?: string
+}
+
+/**
+ * The serials of the LUNs THIS node serves (story iscsi.6), or `null` when the
+ * LIO tree could not be read (cr3). `iscsiServedSerials` answers an empty set
+ * on a failed read, which would clear the hands-off mark; this reader keeps
+ * "could not read" distinct so a missing fact can only tighten. Same read
+ * (`readIscsiState`), same normalisation.
+ */
+async function readServedSerials(
+  executor: CommandExecutor,
+  iscsiPaths: IscsiPaths,
+): Promise<{ serials: Set<string> } | { unreadable: string }> {
+  try {
+    const { targets } = await readIscsiState(executor, iscsiPaths)
+    const serials = new Set<string>()
+    for (const target of targets) {
+      for (const lun of target.luns) {
+        if (lun.serial)
+          serials.add(normalizeSerial(lun.serial))
+      }
+    }
+    return { serials }
+  }
+  catch (err: unknown) {
+    // A timeout is a failed read like any other (cr3 re-review item 7): it
+    // marks the iSCSI-transport disks `iscsi-unverified` and never fails the
+    // whole inventory.
+    return { unreadable: `this node's iSCSI LUNs could not be read (${err instanceof Error ? err.message : String(err)})` }
+  }
+}
+
+/** {@link collectDisks}, with the facts it could not read named (cr3). */
+export async function collectDiskInventory(
+  executor: CommandExecutor,
+  diskIdentityCache: DiskIdentityCache,
+  iscsiPaths: IscsiPaths = {},
+): Promise<DiskInventory> {
   const [lsblkResult, byIdResult, byPartuuidResult, statusResult, ahrPools, servedSerials, systemMountPools] = await Promise.all([
     executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
-    executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
+    executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/'], C_LOCALE),
     // Some pools reference vdev members by GPT partition GUID (`zpool status`
     // leaves under /dev/disk/by-partuuid/ — issue #32); this listing is the only
-    // way to resolve those to a kernel device. Fail-soft: no listing (dir absent,
-    // exec error) just means partuuid leaves won't cross-reference.
-    executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-partuuid/'])
-      .catch(() => ({ stdout: '', stderr: '', exitCode: 1 })),
-    executor.exec('/usr/sbin/zpool', ['status', '-jv']),
+    // way to resolve those to a kernel device. cr3: an ABSENT directory is an
+    // honest empty (no partition carries a GUID link); any other failure is
+    // a listing that could not be read (see listingUnreadable below).
+    executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-partuuid/'], C_LOCALE)
+      .catch((err: unknown) => ({ stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: -1 })),
+    execZpool(executor, ['status', '-jv']),
     // Single-source AHR membership from the topology reader (never re-parse
     // mdstat here). Fail-soft: an AHR read error (or md absent) yields no AHR
     // membership and disks fall through to their existing status — the disks
@@ -245,8 +346,9 @@ export async function collectDisks(
     }),
     // The serials of the LUNs THIS node serves (story iscsi.6). Costs two stats
     // on a node with no LIO (the read layer short-circuits before it touches
-    // ZFS, PVE or the network) and fail-opens to an empty set.
-    iscsiServedSerials(executor, iscsiPaths),
+    // ZFS, PVE or the network). A failed read is kept distinct (cr3): it marks
+    // every iSCSI-transport disk hands-off rather than none.
+    readServedSerials(executor, iscsiPaths),
     // Which ZFS pools hold a filesystem at a system path (disks.r1) — the
     // mount table's own answer, read through the ONE strict findmnt reader.
     // Fail-soft on EVERY failure including a timeout, deliberately SOFTER than
@@ -273,40 +375,76 @@ export async function collectDisks(
 
   // Rich ZFS context per disk (vdev/role/state/error counts), keyed by the
   // whole-disk KERNEL name — the identity both zpool-status and lsblk share.
+  // A status that could not be read is kept as such (cr3): an empty map then
+  // says nothing about membership.
   const poolInfo = new Map<string, PoolDiskInfo>()
-  if (statusResult.exitCode === 0 && statusResult.stdout.trim()) {
-    try {
-      const pools = parseZpoolStatus(statusResult.stdout)
-      for (const pool of pools) {
-        for (const group of pool.vdevGroups) {
-          for (const vdev of group.vdevs) {
-            for (const disk of vdev.disks) {
-              const kernel = resolveLeafKernel(disk.id, disk.path, byIdToKernel)
-              if (!kernel)
-                continue
-              const candidate: PoolDiskInfo = {
-                pool: pool.name,
-                vdevName: vdev.name,
-                role: group.role,
-                state: disk.state,
-                read: disk.readErrors,
-                write: disk.writeErrors,
-                checksum: disk.checksumErrors,
-              }
-              // Several leaves can resolve to ONE disk (partition-backed vdev
-              // classes on a single device); keep the context that most
-              // deserves the row rather than whichever class ZFS printed last.
-              const standing = poolInfo.get(kernel)
-              if (standing && contextWeight(standing) >= contextWeight(candidate))
-                continue
-              poolInfo.set(kernel, candidate)
-            }
+  const statusAnswer = readZpoolStatusAnswer(statusResult)
+  const zfsUnreadable = 'unreadable' in statusAnswer ? statusAnswer.unreadable : undefined
+  // cr3 re-review item 3: the by-id (and by-partuuid) listings are how a pool
+  // leaf finds its disk; one that could not be read makes membership as
+  // unknown as a failed status does — a FAULTED member would read healthy, a
+  // member would lose its pool and a member with no partitions read
+  // `available`.
+  // The by-partuuid listing counts only when a leaf is named through it
+  // (issue #32's shape): elsewhere it resolves nothing either way.
+  // The same condition holds for by-id (cr3 re-review 2 item 4): an absent
+  // or empty by-id directory is an honest empty only while no leaf is named
+  // through it.
+  const leavesUnder = (prefix: string): boolean => 'pools' in statusAnswer && statusAnswer.pools.some(p =>
+    p.vdevGroups.some(g => g.vdevs.some(v => v.disks.some(d => d.path.startsWith(prefix)))))
+  const listingFor = (r: { exitCode: number, stdout: string, stderr: string }, dir: string, prefix: string, links: number): string | null => {
+    if (!leavesUnder(prefix))
+      return r.exitCode === 0 || prefix === BY_PARTUUID_PREFIX ? null : listingUnreadable(r, dir)
+    const unreadable = listingUnreadable(r, dir)
+    if (unreadable)
+      return unreadable
+    return links === 0 ? `the ${dir} listing is absent or empty while zpool status names leaves by ${prefix} paths` : null
+  }
+  const byIdUnreadable = listingFor(byIdResult, '/dev/disk/by-id/', BY_ID_PREFIX, parseByIdToKernel(byIdResult.stdout).size)
+    ?? listingFor(byPartuuidResult, '/dev/disk/by-partuuid/', BY_PARTUUID_PREFIX, parseByIdToKernel(byPartuuidResult.stdout).size)
+    ?? undefined
+  const membershipUnreadable = zfsUnreadable ?? byIdUnreadable
+  const zfsLabelledDisks = zfsMemberKernels(lsblkResult.stdout)
+  if ('pools' in statusAnswer) {
+    for (const pool of statusAnswer.pools) {
+      // The disks a FAULTED/OFFLINE/REMOVED/UNAVAIL leaf may join by kernel
+      // name (resolveLeafKernel): those carrying a ZFS label per lsblk, and
+      // those an ONLINE leaf of this pool already resolved to.
+      const evidence = new Set<string>(zfsLabelledDisks)
+      for (const group of pool.vdevGroups) {
+        for (const vdev of group.vdevs) {
+          for (const disk of vdev.disks) {
+            const kernel = disk.state === 'ONLINE' ? resolveLeafKernel(disk.id, disk.path, byIdToKernel, disk.state) : null
+            if (kernel)
+              evidence.add(kernel)
           }
         }
       }
-    }
-    catch {
-      // continue with empty pool map
+      for (const group of pool.vdevGroups) {
+        for (const vdev of group.vdevs) {
+          for (const disk of vdev.disks) {
+            const kernel = resolveLeafKernel(disk.id, disk.path, byIdToKernel, disk.state, evidence)
+            if (!kernel)
+              continue
+            const candidate: PoolDiskInfo = {
+              pool: pool.name,
+              vdevName: vdev.name,
+              role: group.role,
+              state: disk.state,
+              read: disk.readErrors,
+              write: disk.writeErrors,
+              checksum: disk.checksumErrors,
+            }
+            // Several leaves can resolve to ONE disk (partition-backed vdev
+            // classes on a single device); keep the context that most
+            // deserves the row rather than whichever class ZFS printed last.
+            const standing = poolInfo.get(kernel)
+            if (standing && contextWeight(standing) >= contextWeight(candidate))
+              continue
+            poolInfo.set(kernel, candidate)
+          }
+        }
+      }
     }
   }
 
@@ -351,7 +489,13 @@ export async function collectDisks(
   // every disk keeps the status it has today (disks.r1 — a label, never a gate).
   const systemPools = new Set<string>(systemMountPools ? systemMountPools.zfs.keys() : [])
 
-  const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks, systemPools)
+  // A failed status read leaves no disk `available` (cr3): a disk with no
+  // positive answer (system, a Ceph OSD, an AHR membership below) may be a
+  // pool member ZFS could not report, so it reads `unknown` — never offered.
+  const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks, systemPools).map(d =>
+    membershipUnreadable !== undefined && (d.status === 'available' || d.status === 'other')
+      ? { ...d, status: 'unknown' as const }
+      : d)
 
   // Lazy-load identity cache for all disks in parallel. The list doubles as
   // the topology refresh, which may prune entries — but only when it can
@@ -377,7 +521,7 @@ export async function collectDisks(
   )
 
   // Enrich each disk with cached identity, ZFS context, and derived health.
-  return disks.map((d) => {
+  const enriched = disks.map((d): Disk => {
     const identity = diskIdentityCache.getCached(d.id)
     const smartHealthy = identity ? identity.smartHealthy : null
     // The reading is STALE when it is the disk's last known state, not a fresh
@@ -431,10 +575,90 @@ export async function collectDisks(
       powerMode: identity?.powerMode,
       ...zfsContext,
       ...ahrContext,
-      ...handsOffContext(d, servedSerials),
-      healthStatus: computeHealth(smartHealthy, info, ahr?.memberStates),
+      ...handsOffContext(d, 'serials' in servedSerials ? servedSerials.serials : null),
+      healthStatus: computeHealth(smartHealthy, info, ahr?.memberStates, membershipUnreadable !== undefined),
     }
   })
+  return {
+    disks: enriched,
+    ...(zfsUnreadable !== undefined && { zfsUnreadable }),
+    ...(byIdUnreadable !== undefined && { byIdUnreadable }),
+    ...('unreadable' in servedSerials && { servedSerialsUnreadable: servedSerials.unreadable }),
+  }
+}
+
+/**
+ * Whether an `ls -la <dir>` of a /dev/disk link directory could not be read
+ * (cr3): exit 0 is the listing; a non-zero exit whose stderr is coreutils'
+ * "No such file or directory" is the directory being ABSENT — udev creates
+ * `/dev/disk/by-id` only when some disk has an id link (a VM whose virtio
+ * disks carry no serial has none), so absent is an honest empty. Anything
+ * else (a spawn failure, another error) is the sentence saying why it is
+ * unreadable.
+ */
+function listingUnreadable(r: { exitCode: number, stdout: string, stderr: string }, dir: string): string | null {
+  if (r.exitCode === 0)
+    return null
+  if (r.exitCode > 0 && r.stdout.trim() === '' && LS_NO_SUCH_DIR_RE.test(r.stderr))
+    return null
+  const line = r.stderr.trim().split('\n')[0]
+  return `the ${dir} listing could not be read (ls exited ${r.exitCode}${line ? `: ${line}` : ''})`
+}
+
+/**
+ * Why a composability answer read from `inv` cannot be trusted for `ids`, or
+ * null (cr3 re-review item 2) — the ONE question every door that offers a
+ * disk for writing asks before it calls a disk "not available": pool
+ * membership could not be read (`zpool status` or the by-id listings), or a
+ * requested disk is hands-off only because this node's LUNs could not be
+ * read. A read that failed is never blamed on the request.
+ */
+export function inventoryUnreadableFor(inv: DiskInventory, ids: readonly string[]): string | null {
+  const membership = inv.zfsUnreadable ?? inv.byIdUnreadable
+  if (membership)
+    return `the disk inventory could not tell pool members from free disks (${membership})`
+  const unverified = inv.disks.find(d => ids.includes(d.id) && d.handsOff === 'iscsi-unverified')
+  if (unverified)
+    return `disk '${unverified.id}' could not be checked against this node's own iSCSI LUNs (${inv.servedSerialsUnreadable ?? 'the LUN read failed'})`
+  return null
+}
+
+/**
+ * Thrown by {@link collectComposableInventory}. A plain `Error` on purpose:
+ * it passes through the guard's doors untouched, so at a ROUTE the server's
+ * error handler answers it with {@link inventoryUnreadableRefusal} (409
+ * `unreadable`, the ZFS doors' answer — the mapping is handed to the core
+ * area's `server.ts`), and in a JOB it fails the job with its sentence.
+ */
+export class DiskInventoryUnreadableError extends Error {
+  constructor(readonly reason: string) {
+    super(reason)
+    this.name = 'DiskInventoryUnreadableError'
+  }
+}
+
+/**
+ * The disk list a composability check may judge `ids` against (cr3 re-review
+ * item 2), or THROW {@link DiskInventoryUnreadableError} with
+ * {@link inventoryUnreadableFor}'s sentence (see the error for how it is
+ * answered).
+ */
+export async function collectComposableInventory(
+  executor: CommandExecutor,
+  diskIdentityCache: DiskIdentityCache,
+  ids: readonly string[],
+  iscsiPaths: IscsiPaths = {},
+): Promise<Disk[]> {
+  const inv = await collectDiskInventory(executor, diskIdentityCache, iscsiPaths)
+  const unreadable = inventoryUnreadableFor(inv, ids)
+  if (unreadable)
+    throw new DiskInventoryUnreadableError(unreadable)
+  return inv.disks
+}
+
+/** The ZFS doors' answer to an unreadable inventory: 409, reason `unreadable`. */
+export function inventoryUnreadableRefusal(reason: string): { status: 409, code: 'CONFLICT', reason: 'unreadable', message: string } {
+  return { status: 409, code: 'CONFLICT', reason: 'unreadable', message: `${reason}; refusing a disk it cannot judge` }
 }
 
 /**
@@ -449,12 +673,26 @@ export async function collectDisks(
  * Only a disk that arrived over the ISCSI TRANSPORT is ever considered. A local
  * disk cannot be one of our LUNs, and a serial collision with a real SATA drive
  * would otherwise be enough to hide it from the composer.
+ *
+ * `servedSerials` null = this node's LUNs could not be read (cr3): every
+ * iSCSI-transport disk is then hands-off `iscsi-unverified` — the missing fact
+ * may only tighten, so the composer is never offered what might be this
+ * node's own loop-back LUN.
  */
 export function handsOffContext(
   disk: Pick<Disk, 'transport' | 'serial' | 'model'>,
-  servedSerials: Set<string>,
+  servedSerials: Set<string> | null,
 ): { handsOff?: Disk['handsOff'], handsOffReason?: string } {
-  if (disk.transport !== 'iscsi' || !disk.serial || servedSerials.size === 0)
+  if (disk.transport !== 'iscsi')
+    return {}
+  if (servedSerials === null) {
+    return {
+      handsOff: 'iscsi-unverified',
+      handsOffReason: 'This disk arrived over iSCSI, and ANAS could not read the LUNs this node serves, so it cannot rule out that this is one of them coming back over the node\'s own initiator. '
+        + 'It is not offered for a pool until that read answers.',
+    }
+  }
+  if (!disk.serial || servedSerials.size === 0)
     return {}
   if (!servedSerials.has(normalizeSerial(disk.serial)))
     return {}
@@ -516,7 +754,23 @@ export async function diskRoutes(
     if (isSmartctlStandby(smartResult))
       return { data: standbySmartData() }
 
-    const smartData = parseSmartctl(smartResult.stdout)
+    // cr3 (review POOLS-DISKS-L11): a probe that could not read the disk is
+    // 503, never "SMART not supported"; output that is not smartctl's JSON is
+    // 503 too, never a 500 from a throwing parse.
+    let doc: Parameters<typeof isSmartctlProbeFailure>[0]
+    try {
+      doc = JSON.parse(smartResult.stdout) as Parameters<typeof isSmartctlProbeFailure>[0]
+    }
+    catch {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `SMART data for disk '${id}' could not be read: smartctl exited ${smartResult.exitCode} without its JSON report` } }
+    }
+    if (isSmartctlProbeFailure(doc)) {
+      const said = doc.smartctl?.messages?.find(m => m.severity === 'error')?.string
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `SMART data for disk '${id}' could not be read: smartctl exited ${smartResult.exitCode}${said ? ` (${said})` : ''}` } }
+    }
+    const smartData = parseSmartctl(doc as Parameters<typeof parseSmartctl>[0])
     return { data: smartData }
   })
 }

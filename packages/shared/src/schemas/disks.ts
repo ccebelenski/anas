@@ -20,6 +20,10 @@ export const DiskUsageStatus = z.enum([
   'ceph_osd',
   'system',
   'other',
+  // cr3: the disk's use could not be read — `zpool status` failed, so ANAS
+  // cannot tell a pool member from a blank or leftover disk. Never offered
+  // (isComposableDisk is false); a read that failed never reads `available`.
+  'unknown',
 ])
 export type DiskUsageStatus = z.infer<typeof DiskUsageStatus>
 
@@ -35,7 +39,13 @@ export type DiskUsageStatus = z.infer<typeof DiskUsageStatus>
  * An enum rather than a boolean so a second reason can be added without a new
  * field, and so the UI badge can key off the reason rather than parse prose.
  */
-export const DiskHandsOffTag = z.enum(['iscsi-served-here'])
+export const DiskHandsOffTag = z.enum([
+  'iscsi-served-here',
+  // cr3: the disk arrived over the iSCSI transport and this node's own LUN
+  // serials could not be read, so ANAS cannot rule out that it is one of
+  // them. A missing fact only tightens: hands-off until the read answers.
+  'iscsi-unverified',
+])
 export type DiskHandsOffTag = z.infer<typeof DiskHandsOffTag>
 
 /** Derived disk-health level (fuses SMART pass/fail with ZFS error counts) */
@@ -155,7 +165,9 @@ export const Disk = z.object({
    * - critical: SMART FAILED, or read/write errors, or a faulted vdev state
    * - warning: checksum errors (silent corruption ZFS is repairing)
    * - healthy: SMART passed (or n/a) and no ZFS errors
-   * - unknown: no usable signal (SMART unsupported, not in a pool)
+   * - unknown: no usable signal (SMART unsupported, not in a pool), or the
+   *   ZFS context could not be read (`zpool status` failed: cr3, never
+   *   healthy from SMART alone when the disk may be a faulted pool member)
    */
   healthStatus: DiskHealthStatus,
   /** Partitions on this disk */

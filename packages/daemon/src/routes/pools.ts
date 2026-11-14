@@ -10,17 +10,17 @@ import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
 import type { ResolvedVdev } from '../services/zfs-vdev-remove.js'
 import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, DestroyPoolQuery, ExportPoolRequest, ImportPoolRequest, isComposableDisk, isRemovableVdevRole, PoolMountpointRequest, PoolName, pveStoragePath, RemoveVdevRequest, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
-import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
+import { parseByIdToKernel, parseByIdToKernelFull, parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseZpoolFeature, parseZpoolGet } from '../parsers/zpool-get.js'
-import { parseZpoolList } from '../parsers/zpool-list.js'
-import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
+import { execZpool, parseZpoolList, unmanagedPoolName, zfsUnavailableReason, zpoolListUnreadable } from '../parsers/zpool-list.js'
+import { parsePoolBusyState, parseZpoolStatusPool, readZpoolStatusAnswer } from '../parsers/zpool-status.js'
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { diskClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, LockClaimsUnreadableError, mountClaim, poolClaims, sendRefusal, znameClaim, zpoolClaim } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
-import { ahrSliceLabelOwner } from '../services/ahr-identity.js'
+import { ahrSliceLabelOwner, classifyPartitionWithReason } from '../services/ahr-identity.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
@@ -29,15 +29,26 @@ import { mountTargetGate, mountTargetRefusal, normalizeMountpointPath, swapStage
 import { BLKID_AMBIVALENT, BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures, blkidPartEntryName, LSBLK_NONE_FOUND, parsePartitionProbe, PART_BY_ID_RE, PARTITION_PROBE_ARGS } from '../services/partition-device.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
 import { loadPveFootprint, systemPoolRefusalFrom } from '../services/pve-footprint.js'
-import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
+import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzDegradedDetail, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
 import { isVdevRefusal, resolveLeafDevice, unknownVdevMessage } from '../services/zfs-vdev-leaf.js'
 import { NON_REMOVABLE_VDEV_MESSAGE, resolveVdev, stillPresentMessage, unreadablePoolMessage, vdevStillPresent } from '../services/zfs-vdev-remove.js'
-import { collectDisks, resolveLeafKernel } from './disks.js'
+import { collectDiskInventory, collectDisks, inventoryUnreadableFor, resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
 const ZPOOL = '/usr/sbin/zpool'
+/**
+ * The refusal of a ZFS verb on a node where ZFS is not available (cr3): the
+ * plain statement from {@link zfsUnavailableReason}, 409 reason
+ * `zfs-unavailable` — never a 500, a bare 404 or a generic unreadable.
+ */
+function zfsUnavailableRefusal(statement: string): { status: 409, code: 'CONFLICT', reason: 'zfs-unavailable', message: string } {
+  return { status: 409, code: 'CONFLICT', reason: 'zfs-unavailable', message: `${statement} — ZFS pools cannot be managed here until it is` }
+}
+
+/** What `zpool import` prints on stderr when nothing is importable (the honest empty scan). */
+const ZPOOL_IMPORT_NONE = 'no pools available to import'
 const WIPEFS = '/usr/sbin/wipefs'
 const SGDISK = '/usr/sbin/sgdisk'
 const LSBLK = '/usr/bin/lsblk'
@@ -136,18 +147,22 @@ const KEPT_ROLE_WHY: Partial<Record<VdevRole, string>> = {
 /**
  * Split a pool's leaves into what a cleanup wipes and what it keeps (see
  * {@link CleanupLeaves}). A leaf listed twice — an in-use spare sits in its
- * data vdev AND in the spares section — is decided by its wiped occurrence.
+ * data vdev AND in the spares section — is KEPT (cr3, review POOLS-DISKS-L9):
+ * a hot spare can be shared with other pools, and wiping it because this pool
+ * had it in use takes it from every pool that still lists it. The disk under
+ * it then reads in use to the zap guard and keeps its table.
  *
  * Exported for the consumer-audit tests.
  */
 export function cleanupLeaves(leaves: PoolLeaf[]): CleanupLeaves {
-  const wipe = leaves.filter(l => WIPED_ROLES.includes(l.role) && (!l.state || l.state === 'ONLINE'))
+  const spares = new Set(leaves.filter(l => l.role === 'spare').map(l => l.leafId))
+  const wipe = leaves.filter(l => WIPED_ROLES.includes(l.role) && (!l.state || l.state === 'ONLINE') && !spares.has(l.leafId))
   const wiped = new Set(wipe.map(l => l.leafId))
   const kept: CleanupLeaves['kept'] = []
   for (const leaf of leaves) {
     if (wiped.has(leaf.leafId) || kept.some(k => k.leaf === leaf.leafId))
       continue
-    kept.push({ leaf: leaf.leafId, why: KEPT_ROLE_WHY[leaf.role] ?? `the leaf was ${leaf.state}` })
+    kept.push({ leaf: leaf.leafId, why: spares.has(leaf.leafId) ? KEPT_ROLE_WHY.spare! : KEPT_ROLE_WHY[leaf.role] ?? `the leaf was ${leaf.state}` })
   }
   return { wipe, kept }
 }
@@ -251,6 +266,13 @@ export function parseLsblkLeaf(json: string): { kernel: string, wholeKernel: str
   return { kernel: dev.name, wholeKernel: dev.name }
 }
 
+/**
+ * The identity the destroy-cleanup classifier asks with: no md array is this
+ * ZFS pool's, so any md superblock found on a neighbouring partition is
+ * `foreign` (a tenant), never `ours`.
+ */
+const NO_AHR_IDENTITY = { uuids: new Set<string>() }
+
 /** Whole-disk ownership verdict for the destroy-cleanup GPT-zap guard. */
 type DiskOwnership = 'exclusive' | 'shared' | 'uncertain'
 
@@ -262,18 +284,25 @@ interface LsblkOwnChild { name?: string, type?: string, fstype?: string | null, 
  *
  * Enumerate the disk's partitions (structured `lsblk -J`). Every partition that
  * is NOT one of this pool's just-cleared leaves is examined for foreign use — a
- * mountpoint, any filesystem/RAID/LVM/zpool signature, or an active device-mapper
- * child. ANY such partition ⇒ `shared` (never zap; the neighbour's data is
- * untouchable). ZFS's own blank reserved `-part9` carries none of these, so it
- * does not block the zap. If the probe errors or can't be parsed ⇒ `uncertain`,
- * and the CONSERVATIVE default leaves the disk partitioned.
+ * mountpoint or an active device-mapper/holder child (lsblk), and then its
+ * CONTENT through the same low-level probe the AHR destroy classifies with
+ * (cr3, review POOLS-DISKS-H2): `classifyPartitionWithReason` — an md
+ * superblock, or `blkid -p` reading the partition itself rather than udev's
+ * cached FSTYPE. Only a partition that probe calls `blank` (exit 0 with
+ * `PART_ENTRY_*` keys alone, the captured shape) is no tenant; anything else —
+ * a filesystem, a nested partition table (a VM's disk written onto a raw
+ * partition), more than one signature, or a probe that could not read the
+ * device — is `shared` (never zap; the neighbour's data is untouchable). ZFS's
+ * own reserved `-part9` is expected to read blank (no node capture yet: the
+ * report's "Needs the node"). If the lsblk probe errors or can't be parsed ⇒
+ * `uncertain`, and the CONSERVATIVE default leaves the disk partitioned.
  */
 async function evaluateDiskOwnership(
   executor: CommandExecutor,
   wholeDiskPath: string,
   diskLeaves: PoolLeaf[],
   byIdToKernel: Map<string, string>,
-): Promise<DiskOwnership> {
+): Promise<DiskOwnership | { ownership: 'uncertain', detail: string }> {
   // Kernel names of OUR leaves on this disk — excluded from the foreign scan.
   // A leaf ZFS named by its kernel device carries that name itself; every other
   // leaf resolves through the by-id map.
@@ -309,6 +338,16 @@ async function evaluateDiskOwnership(
         || (child.fstype != null && child.fstype !== '')
         || (Array.isArray(child.children) && child.children.length > 0)
     if (inUse)
+      return 'shared'
+    // cr3 (H2): lsblk's FSTYPE is udev's cache and asks for no PTTYPE; a raw
+    // open by qemu or LIO leaves no child. The partition itself is read.
+    const { verdict, reason } = await classifyPartitionWithReason(executor, NO_AHR_IDENTITY, `/dev/${child.name}`)
+    // A partition the probe could NOT READ is not known to be a tenant's:
+    // the disk is kept as `uncertain`, with the classifier's sentence (cr3
+    // re-review item 5). Content found is `shared`.
+    if (verdict === 'foreign' && reason !== null)
+      return { ownership: 'uncertain', detail: reason }
+    if (verdict !== 'blank')
       return 'shared'
   }
   return 'exclusive'
@@ -445,6 +484,22 @@ export function parseDiscardCapableKernels(lsblkJson: string): Set<string> {
 }
 
 /**
+ * Whether a `lsblk -Jbno NAME,DISC-GRAN` answer is a readable table (cr3): an
+ * object whose `blockdevices` is an array. {@link parseDiscardCapableKernels}
+ * answers an empty set for anything else, which would read as "no device
+ * supports TRIM" — the pool list asks this first and says unknown instead.
+ */
+export function isDiscardTable(lsblkJson: string): boolean {
+  try {
+    const data = JSON.parse(lsblkJson) as unknown
+    return typeof data === 'object' && data !== null && Array.isArray((data as { blockdevices?: unknown }).blockdevices)
+  }
+  catch {
+    return false
+  }
+}
+
+/**
  * Whether ANY leaf of a pool lives on a discard-capable device. Each leaf is
  * canonicalized to its whole-disk kernel name (the identity both zpool-status
  * and lsblk agree on — see resolveLeafKernel) and tested against the capable
@@ -490,11 +545,7 @@ function firstStderrLine(stderr: string): string {
  * review's L: a failed list read as `[]` made a pool verb answer "not found").
  */
 function listUnreadable(list: { exitCode: number, stdout: string, stderr: string }): string | null {
-  if (list.exitCode === 0)
-    return null
-  if (list.stdout.trim() === '' && list.stderr.trim() === 'no pools available')
-    return null
-  return `zpool list -j could not be read (exit ${list.exitCode}${firstStderrLine(list.stderr)})`
+  return zpoolListUnreadable(list)
 }
 
 /**
@@ -517,6 +568,20 @@ type ComposableCheck = { problems: string[], diskId?: string } | { unreadable: s
  */
 function isRedundantSpec(vdev: { type: string }): boolean {
   return vdev.type !== 'stripe'
+}
+
+/**
+ * A log vdev ZFS can build (cr3, node ground truth on ZFS 2.4.2 `zpool create
+ * -n`): `log raidz...` is always refused ("invalid vdev specification:
+ * unsupported 'log' device: raidz"), while a single disk and a mirror are
+ * accepted. Refused at the boundary so the request fails with a sentence, not
+ * the job with zpool's. A single-disk log stays allowed (operator ruling
+ * 2026-11-14: "not a recommended thing, but allowable if ZFS allows it").
+ */
+function logVdevProblem(vdev: { type: string }): string | null {
+  return vdev.type.startsWith('raidz')
+    ? `A log vdev cannot be ${vdev.type} — ZFS supports only single disks and mirrors as log devices`
+    : null
 }
 
 /**
@@ -634,14 +699,30 @@ interface ImportablePool {
  * We extract the pool: / id: / state: header fields of each block.
  */
 function parseImportScan(stdout: string): ImportablePool[] {
+  return scanImportBlocks(stdout).pools
+}
+
+/**
+ * The `zpool import` scan, every block judged (cr3 re-review 2 item 7): a
+ * block with no `id:` line cannot be imported by guid and is no answer about
+ * an importable pool — it is NOT offered (`pools` holds only blocks with an
+ * id) and is named in `unreadable` so the scan says one entry could not be
+ * read.
+ */
+function scanImportBlocks(stdout: string): { pools: ImportablePool[], unreadable: string[] } {
   const pools: ImportablePool[] = []
+  const unreadable: string[] = []
   let current: Partial<ImportablePool> | null = null
 
   const push = () => {
     if (current && current.name) {
+      if (!current.guid) {
+        unreadable.push(current.name)
+        return
+      }
       pools.push({
         name: current.name,
-        guid: current.guid ?? '',
+        guid: current.guid,
         state: current.state ?? '',
       })
     }
@@ -668,7 +749,7 @@ function parseImportScan(stdout: string): ImportablePool[] {
   }
   push()
 
-  return pools
+  return { pools, unreadable }
 }
 
 /**
@@ -837,7 +918,15 @@ export async function poolRoutes(
   async function composableDiskProblems(ids: string[]): Promise<ComposableCheck> {
     let inventory: Disk[]
     try {
-      inventory = await collectDisks(executor, diskIdentityCache, iscsiPaths)
+      const read = await collectDiskInventory(executor, diskIdentityCache, iscsiPaths)
+      // cr3: a disk ANAS could not judge is a read that failed (409
+      // unreadable), not a disk the request got wrong — `zpool status`
+      // unread leaves every disk `unknown`, this node's LUN serials unread
+      // leaves every iSCSI disk hands-off.
+      const unreadable = inventoryUnreadableFor(read, ids)
+      if (unreadable)
+        return { unreadable }
+      inventory = read.disks
     }
     catch (err: unknown) {
       const detail = err instanceof Error && err.message ? err.message : String(err)
@@ -913,6 +1002,10 @@ export async function poolRoutes(
     if (!disk)
       return { problems: [`partition '${id}' is on a disk the inventory does not know (${part.pkname ?? 'lsblk names no parent disk'})`] }
 
+    // cr3 re-review item 6: hands-off only because this node's LUNs could
+    // not be read is an unread fact — 409 unreadable, not a 400.
+    if (disk.handsOff === 'iscsi-unverified')
+      return { unreadable: `partition '${id}' is on an iSCSI disk that could not be checked against this node's own LUNs (${disk.handsOffReason ?? disk.handsOff})` }
     const problems: string[] = []
     if (disk.handsOff)
       problems.push(`partition '${id}' is on a hands-off disk: ${disk.handsOffReason ?? disk.handsOff}`)
@@ -1021,7 +1114,8 @@ export async function poolRoutes(
 
   /** The per-run reads the pool gates share (one per guard run, never across doors). */
   const poolReads = {
-    list: (reads: GuardReads) => reads.once('zpool-list', () => executor.exec(ZPOOL, ['list', '-j'])),
+    // cr3: execZpool keeps "zpool is not installed" an answer (ZFS unavailable).
+    list: (reads: GuardReads) => reads.once('zpool-list', () => execZpool(executor, ['list', '-j'])),
     footprint: (reads: GuardReads) => reads.once('pve-footprint', () => pveFootprint()),
     claims: (reads: GuardReads) => reads.once('iscsi-claims', async () => createIscsiClaimCache(executor, iscsiPaths)),
     leaves: (reads: GuardReads, pool: string) => reads.once(`pool-leaves:${pool}`, () => readPoolLeaves(pool)),
@@ -1038,7 +1132,7 @@ export async function poolRoutes(
     /** The partition pre-flight (story nf.1) — fresh at each door, like every read here. */
     partition: (reads: GuardReads, id: string) => reads.once(`partition:${id}`, () => partitionDeviceProblems(id)),
     /** The `zpool import` scan — the name an importable guid will carry (cr.64b2-i (P)). */
-    importScan: (reads: GuardReads) => reads.once('zpool-import-scan', () => executor.exec(ZPOOL, ['import'])),
+    importScan: (reads: GuardReads) => reads.once('zpool-import-scan', () => execZpool(executor, ['import'])),
     mountpoints: (reads: GuardReads) => reads.once('pool-mountpoints', () => readPoolMountpoints(executor)),
     // cr.60 (review L26): the WHOLE table (a tmpfs or an armed automount at
     // the path is a mountpoint too — `--real` hid both), read strictly: null
@@ -1319,8 +1413,47 @@ export async function poolRoutes(
       const busy = parsePoolBusyState(statusResult.stdout, poolName)
       if (busy.busy)
         return { status: 409, code: 'CONFLICT', reason: 'busy', message: busyDetail(busy, poolName) }
+      // GATE 3 (degraded, cr3 review POOLS-DISKS-M6): the read model refuses a
+      // raidz that is not ONLINE (EPICS §2: a hard 409 with no bypass for a
+      // degraded array); the door now says the same, so a direct POST or a
+      // stale composer cannot widen it. Same sentence, one source.
+      if (vdev.state !== 'ONLINE')
+        return { status: 409, code: 'CONFLICT', reason: 'degraded', message: `${raidzDegradedDetail(vdev.name, vdev.state)} This refusal has no confirm bypass.` }
       return null
     }
+  }
+
+  /**
+   * The `disk:` keys of a destroy cleanup's disks, in the INVENTORY's spelling
+   * (cr3, review POOLS-DISKS-L10; the cr.57 L14 "one spelling" rule the attach
+   * family already follows): ZFS names a leaf by the by-id IT chose (`wwn-...`)
+   * while the inventory — and every AHR verb's lock — names the disk by the
+   * highest-priority by-id (`ata-...`), so the leaf's whole disk is resolved to
+   * its kernel device and back through the same listing the inventory reads.
+   * A kernel-named leaf (`/dev/sdb1`) now carries its disk's key too. A
+   * listing that could not be read refuses the lock (never a key in the wrong
+   * spelling, which would serialise with nothing).
+   */
+  async function cleanupDiskKeys(wipe: PoolLeaf[]): Promise<string[]> {
+    if (wipe.length === 0)
+      return []
+    const listing = await executor.exec('/usr/bin/ls', ['-la', BY_ID_PREFIX])
+    if (listing.exitCode !== 0)
+      throw new LockClaimsUnreadableError(`the disk by-id listing could not be read (ls exited ${listing.exitCode}${firstStderrLine(listing.stderr)}), so the disks a cleanup wipes cannot be locked by their inventory ids`)
+    const byIdToKernel = parseByIdToKernel(listing.stdout)
+    const inventoryId = parseDiskByIdListing(listing.stdout)
+    const keys: string[] = []
+    for (const leaf of wipe) {
+      if (!leaf.wholeDiskId)
+        continue
+      const kernel = leaf.leafPath.startsWith(BY_ID_PREFIX) ? byIdToKernel.get(leaf.wholeDiskId) : leaf.wholeDiskId
+      const id = kernel ? inventoryId.get(kernel) : undefined
+      if (id)
+        keys.push(id)
+      else if (leaf.leafPath.startsWith(BY_ID_PREFIX))
+        keys.push(leaf.wholeDiskId)
+    }
+    return keys
   }
 
   /** One exclusive `disk:` key per distinct disk id a verb writes, sorted (§4.2). */
@@ -1363,13 +1496,20 @@ export async function poolRoutes(
     noun: string,
     extend?: (reads: GuardReads) => Promise<X>,
   ): ObjectView<PoolObject & X> {
+    // cr3: when ZFS itself is not available on the node, "not found" says so
+    // — a 409 naming it, never a bare 404 or a generic unreadable.
+    let zfsMissing: string | null = null
     return {
       what: `Pool '${poolName}'`,
+      notFound: () => zfsMissing ? zfsUnavailableRefusal(zfsMissing) : { status: 404, code: 'NOT_FOUND', message: `Pool '${poolName}' not found` },
       read: async (reads) => {
         const list = await poolReads.list(reads)
         const unreadable = listUnreadable(list)
         if (unreadable)
           throw new LockClaimsUnreadableError(unreadable)
+        zfsMissing = zfsUnavailableReason(list)
+        if (zfsMissing)
+          return null
         const pools = parseZpoolList(list.stdout)
         if (!pools.some(p => p.name === poolName))
           return null
@@ -1421,9 +1561,7 @@ export async function poolRoutes(
         const claims = poolClaims(pool.name, bound.id.guid, 'exclusive', { namespace: true })
         if (!cleanup)
           return claims
-        return [...claims, ...diskClaims((pool.cleanup?.wipe ?? [])
-          .filter(l => l.leafPath.startsWith(BY_ID_PREFIX) && l.wholeDiskId)
-          .map(l => l.wholeDiskId as string))]
+        return [...claims, ...diskClaims(await cleanupDiskKeys(pool.cleanup?.wipe ?? []))]
       },
     }
   }
@@ -1510,6 +1648,9 @@ export async function poolRoutes(
     const unreadable = listUnreadable(list)
     if (unreadable)
       return { status: 503, code: 'UNAVAILABLE', message: `Could not verify that the name '${pool.name}' is free: ${unreadable} — refusing a create that must never be told a name is free by a read that could not see` }
+    const zfsMissing = zfsUnavailableReason(list)
+    if (zfsMissing)
+      return zfsUnavailableRefusal(zfsMissing)
     const pools = parseZpoolList(list.stdout)
     return pools.some(p => p.name === pool.name)
       ? { status: 409, code: 'CONFLICT', message: `Pool '${pool.name}' already exists` }
@@ -1632,17 +1773,19 @@ export async function poolRoutes(
     return out
   }
 
-  server.get('/pools', async (_request, _reply) => {
+  server.get('/pools', async (_request, reply) => {
+    // cr3: every zpool read goes through execZpool — no binary is ZFS
+    // unavailable, another spawn failure an unreadable (503), never a 500.
     const [listResult, statusResult, byIdResult, lsblkDiscardResult, upgradeResult, pve, poolMounts] = await Promise.all([
-      executor.exec('/usr/sbin/zpool', ['list', '-j']),
-      executor.exec('/usr/sbin/zpool', ['status', '-jv']),
+      execZpool(executor, ['list', '-j']),
+      execZpool(executor, ['status', '-jv']),
       // by-id → kernel map, to canonicalize pool leaves for the discard probe.
       executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
       // Per-device discard capability (Epic 4.12 Trim gating). Fail-open.
       executor.exec('/usr/bin/lsblk', LSBLK_DISCARD_ARGS),
       // Pools with supported-but-disabled features (Epic 4.12 Upgrade gating).
       // `zpool upgrade` (no args) has no -j; text-parsed. Fail-open.
-      executor.exec('/usr/sbin/zpool', ['upgrade']),
+      execZpool(executor, ['upgrade']),
       // Read-only PVE storage detection (Epic 3.25). Fail-open: off-PVE hosts
       // and parse errors yield an empty map, so this never breaks GET /pools.
       // The footprint service reads storage.cfg WITH the ZFS mountpoint map
@@ -1653,15 +1796,26 @@ export async function poolRoutes(
       readPoolMountpoints(executor),
     ])
 
-    // If no pools exist, zpool list exits non-zero with no stdout
-    if (listResult.exitCode !== 0 && !listResult.stdout.trim()) {
-      return { data: [] }
+    // The honest empty ("no pools available") is []; a listing that could not
+    // be read is 503, never "no pools" (cr3, review POOLS-DISKS-M4). ZFS not
+    // available on the node is [] with `zfsUnavailable`, the statement the
+    // panel shows (cr3 review item 1).
+    const unreadableList = listUnreadable(listResult)
+    if (unreadableList) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `The pools could not be listed: ${unreadableList}` } }
     }
+    const zfsMissing = zfsUnavailableReason(listResult)
+    if (zfsMissing)
+      return { data: [], zfsUnavailable: zfsMissing }
+    if (listResult.exitCode !== 0)
+      return { data: [] }
 
     const listData = parseZpoolList(listResult.stdout)
-    const statusData = statusResult.exitCode === 0
-      ? parseZpoolStatus(statusResult.stdout)
-      : []
+    // A status that could not be read leaves every pool's scan, trim and
+    // health facts unknown (cr3) — never idle / unsupported.
+    const statusAnswer = readZpoolStatusAnswer(statusResult)
+    const statusData = 'pools' in statusAnswer ? statusAnswer.pools : []
 
     // Build a lookup from status data
     const statusByName = new Map(statusData.map(s => [s.name, s]))
@@ -1678,10 +1832,14 @@ export async function poolRoutes(
 
     // Upgrade availability (Epic 4.12): pools with disabled features. `zpool
     // upgrade` exits 0 whether or not any pool needs upgrading; a non-zero exit
-    // (probe failure) → empty set → all upgradeAvailable false.
+    // (probe failure) → null: every upgradeAvailable unknown (cr3, never false).
     const upgradablePools = upgradeResult.exitCode === 0
       ? parseZpoolUpgrade(upgradeResult.stdout)
-      : new Set<string>()
+      : null
+    // Whether a "no discard-capable leaf" answer is a reading (cr3): the leaves
+    // come from status, their kernel names from the by-id map, and the discard
+    // columns from lsblk; with any of those unread, "false" is unknown.
+    const trimReadsComplete = byIdResult.exitCode === 0 && lsblkDiscardResult.exitCode === 0 && isDiscardTable(lsblkDiscardResult.stdout)
 
     // Collect a pool's leaf devices (id + path) from its parsed topology — the
     // SAME all-classes walk the destroy cleanup uses, so a pool whose only
@@ -1695,6 +1853,10 @@ export async function poolRoutes(
       const status = statusByName.get(pool.name)
       const scanning = status?.scan?.state === 'SCANNING'
       const mount = poolMounts.get(pool.name)
+      const trim = poolTrimSupported(leavesOf(status), byIdToKernel, capableKernels)
+      // cr3 (operator ruling 2026-11-14): a name PoolName refuses is listed
+      // with its marker; the panel offers no verb on it.
+      const unmanaged = unmanagedPoolName(pool.name)
       // Pool-root PVE ownership (pvepool.1 review fix 3): the SAME per-request
       // footprint as pveStorages asks about the pool's ROOT dataset, so a
       // system pool, a bare-path storage root, a dir storage on the root, and
@@ -1704,17 +1866,21 @@ export async function poolRoutes(
       return {
         ...pool,
         state: status?.state ?? pool.state,
-        scanRunning: scanning,
+        // Unknown when status could not be read or did not report the pool.
+        scanRunning: status ? scanning : null,
         // scanFunction is meaningful only while a scan is actually running — the
         // UI keys "Stop Scrub" (SCRUB only, never a RESILVER) off it.
         ...(scanning && status?.scan && { scanFunction: status.scan.function }),
-        trimSupported: poolTrimSupported(leavesOf(status), byIdToKernel, capableKernels),
-        upgradeAvailable: upgradablePools.has(pool.name),
+        // A capable leaf found is a reading; "none found" is one only when
+        // every read behind it answered.
+        trimSupported: trim || (status && trimReadsComplete) ? trim : null,
+        upgradeAvailable: upgradablePools ? upgradablePools.has(pool.name) : null,
         ...(status?.health && { health: status.health }),
         // Pool root mountpoint (story 3.27) — the Mount column. Absent ⇒ omitted.
         ...(mount && { mountpoint: mount.mountpoint, mounted: mount.mounted }),
         pveStorages: pve.storagesByPool.get(pool.name) ?? [],
         ...(pveOwned && { pve: pveOwned }),
+        ...(unmanaged && { unmanaged }),
       }
     })
 
@@ -1731,9 +1897,9 @@ export async function poolRoutes(
     const poolName = request.params.name
 
     const [statusResult, listResult, getResult, pve, poolMounts] = await Promise.all([
-      executor.exec('/usr/sbin/zpool', ['status', '-jv']),
-      executor.exec('/usr/sbin/zpool', ['list', '-j']),
-      executor.exec('/usr/sbin/zpool', ['get', 'all', '-j']),
+      execZpool(executor, ['status', '-jv']),
+      execZpool(executor, ['list', '-j']),
+      execZpool(executor, ['get', 'all', '-j']),
       // Read-only PVE storage detection (Epic 3.25) — fail-open (see GET /pools).
       // The footprint service always passes the ZFS mountpoint map, so a `dir`
       // storage backed by a dataset resolves here too (pvepool.1).
@@ -1742,39 +1908,62 @@ export async function poolRoutes(
       readPoolMountpoints(executor),
     ])
 
-    // Parse status for this specific pool
-    const status = statusResult.exitCode === 0
-      ? parseZpoolStatusPool(statusResult.stdout, poolName)
-      : null
-
-    if (!status) {
+    // cr3 (review POOLS-DISKS-M4 / INVENTED-STATE-M8): 404 only when BOTH
+    // readable listings say the pool is not there; a read that failed — or two
+    // that disagree — is 503, never "not found" for a live pool. ZFS not
+    // available on the node is the 409 naming it.
+    const zfsMissing = zfsUnavailableReason(listResult) ?? zfsUnavailableReason(statusResult)
+    if (zfsMissing) {
+      const refusal = zfsUnavailableRefusal(zfsMissing)
+      reply.code(refusal.status)
+      return { error: { code: refusal.code, reason: refusal.reason, message: refusal.message } }
+    }
+    const statusAnswer = readZpoolStatusAnswer(statusResult)
+    const unreadableList = listUnreadable(listResult)
+    const unreadable = [
+      ...('unreadable' in statusAnswer ? [statusAnswer.unreadable] : []),
+      ...(unreadableList ? [unreadableList] : []),
+    ]
+    if (unreadable.length > 0) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `Pool '${poolName}' could not be read: ${unreadable.join('; ')}` } }
+    }
+    const status = 'pools' in statusAnswer ? statusAnswer.pools.find(p => p.name === poolName) ?? null : null
+    const listPool = listResult.exitCode === 0
+      ? parseZpoolList(listResult.stdout).find(p => p.name === poolName)
+      : undefined
+    if (!status && !listPool) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
+    if (!status || !listPool) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `Pool '${poolName}' could not be read: zpool ${status ? 'list' : 'status'} did not report it while zpool ${status ? 'status' : 'list'} did (it may be being imported or exported); try again` } }
+    }
 
-    // Parse list data and find this pool
-    const listData = listResult.exitCode === 0
-      ? parseZpoolList(listResult.stdout)
-      : []
-    const listPool = listData.find(p => p.name === poolName)
-
-    // Parse properties
+    // Parse properties — the pool exists, so a property read that failed or
+    // does not name it is unreadable, not "not found".
     const properties = getResult.exitCode === 0
       ? parseZpoolGet(getResult.stdout, poolName)
       : null
-
-    if (!listPool || !properties) {
-      reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    if (!properties) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `Pool '${poolName}' could not be read: zpool get all -j ${getResult.exitCode !== 0 ? `exited ${getResult.exitCode}${firstStderrLine(getResult.stderr)}` : 'did not report it'}` } }
     }
 
     // Pool-root PVE ownership (pvepool.1 review fix 3) — the same per-request
     // footprint asks about the pool's ROOT dataset, so the detail view carries
     // the same verdict the list does. Absent for an ANAS pool.
     const pveOwned = poolStamp(pve, poolName)
+    // cr3 (operator ruling 2026-11-14): a pool whose name PoolName refuses is
+    // still READ — the detail is a read of the node, no argv carries the name
+    // here — and carries the same marker the list does, so the panel shows it
+    // read-only with the rename sentence instead of a verb that 400s.
+    const unmanaged = unmanagedPoolName(poolName)
 
     const detail: PoolDetail = {
       name: poolName,
+      ...(unmanaged && { unmanaged }),
       state: status.state,
       guid: status.guid,
       size: listPool.size,
@@ -2157,6 +2346,14 @@ export async function poolRoutes(
       }
     }
 
+    for (const vdev of req.logVdevs ?? []) {
+      const problem = logVdevProblem(vdev)
+      if (problem) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: problem } }
+      }
+    }
+
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
@@ -2242,13 +2439,28 @@ export async function poolRoutes(
   // --- Story 3.7: scan for importable pools (read, synchronous) -----------
   // GET /pools/import lists pools available to import (`zpool import` no args).
   // A read, not a mutation, so it returns 200 { data } synchronously — no job.
-  server.get('/pools/import', async (_request, _reply) => {
-    const scanResult = await executor.exec('/usr/sbin/zpool', ['import'])
-    // `zpool import` with no importable pools exits non-zero with no stdout.
-    if (scanResult.exitCode !== 0 && !scanResult.stdout.trim()) {
-      return { data: [] }
+  server.get('/pools/import', async (_request, reply) => {
+    const scanResult = await execZpool(executor, ['import'])
+    // cr3: ZFS not available on the node — nothing can be imported; say so.
+    const zfsMissing = zfsUnavailableReason(scanResult)
+    if (zfsMissing)
+      return { data: [], zfsUnavailable: zfsMissing }
+    // `zpool import` with no importable pools prints its "no pools available
+    // to import" sentence on stderr and nothing on stdout: the honest empty.
+    // Any other non-zero exit with nothing on stdout is a scan that could not
+    // be read — 503, never "no importable pools" (cr3, pools-panel review).
+    if (!scanResult.stdout.trim()) {
+      if (scanResult.stderr.trim() === ZPOOL_IMPORT_NONE || scanResult.exitCode === 0)
+        return { data: [] }
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `The importable pools could not be listed: zpool import exited ${scanResult.exitCode}${firstStderrLine(scanResult.stderr)}` } }
     }
-    return { data: parseImportScan(scanResult.stdout) }
+    // cr3: a block with no id is not offered; the scan says it could not be read.
+    const scan = scanImportBlocks(scanResult.stdout)
+    return {
+      data: scan.pools,
+      ...(scan.unreadable.length > 0 && { unreadableEntries: scan.unreadable.map(name => `the scan entry for '${name}' carries no pool id and cannot be imported from here`) }),
+    }
   })
 
   // --- Story 3.7: import a pool by name or guid ---------------------------
@@ -2324,8 +2536,13 @@ export async function poolRoutes(
         // refusal would then export them all — cr.52r defect 1).
         const before = await importListedNames(`the currently imported pools could not be listed for the import of '${target}'`)
 
-        const result = await executor.exec('/usr/sbin/zpool', args)
+        const result = await execZpool(executor, args)
         if (result.exitCode !== 0) {
+          // cr3: ZFS not available on the node fails the import with the
+          // plain statement (409 zfs-unavailable), nothing imported.
+          const zfsMissing = zfsUnavailableReason(result)
+          if (zfsMissing)
+            throw new GuardRefusalError(zfsUnavailableRefusal(zfsMissing))
           throw new Error(result.stderr.trim() || `zpool import exited with code ${result.exitCode}`)
         }
 
@@ -2558,6 +2775,11 @@ export async function poolRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `A ${role} vdev must be redundant (mirror or raidz) — a single-disk or striped ${role} vdev would risk the entire pool` } }
     }
+    const logProblem = role === 'log' && vdev ? logVdevProblem(vdev) : null
+    if (logProblem) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: logProblem } }
+    }
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -2734,14 +2956,18 @@ export async function poolRoutes(
     const poolName = nameParsed.data
 
     const [statusResult, getResult, version] = await Promise.all([
-      executor.exec(ZPOOL, ['status', '-jv']),
-      executor.exec(ZPOOL, ['get', 'all', '-j']),
+      execZpool(executor, ['status', '-jv']),
+      execZpool(executor, ['get', 'all', '-j']),
       detectLocalZfsVersion(executor),
     ])
 
-    const status = statusResult.exitCode === 0
-      ? parseZpoolStatusPool(statusResult.stdout, poolName)
-      : null
+    // cr3: a status that could not be read is 503, never "not found".
+    const statusAnswer = readZpoolStatusAnswer(statusResult)
+    if ('unreadable' in statusAnswer) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `Pool '${poolName}' could not be read: ${statusAnswer.unreadable}` } }
+    }
+    const status = statusAnswer.pools.find(p => p.name === poolName) ?? null
     if (!status) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
@@ -2751,9 +2977,7 @@ export async function poolRoutes(
       ? parseZpoolFeature(getResult.stdout, poolName, RAIDZ_EXPANSION_FEATURE)
       : null
     const capability = buildCapability(version, featureValue)
-    const busy = statusResult.exitCode === 0
-      ? parsePoolBusyState(statusResult.stdout, poolName)
-      : { busy: false }
+    const busy = parsePoolBusyState(statusResult.stdout, poolName)
     const targets: ExpansionTarget[] = buildExpansionTargets(status, poolName, capability, busy)
 
     const report: PoolExpansionReport = { pool: poolName, capability, busy, targets }
@@ -3164,10 +3388,14 @@ export async function poolRoutes(
         }
 
         const zapped: string[] = []
-        const preserved: { disk: string, reason: 'shared' | 'uncertain' }[] = []
+        const preserved: { disk: string, reason: 'shared' | 'uncertain', detail?: string }[] = []
         for (const [wholeDiskId, diskLeaves] of byWholeDisk) {
           const wholeDiskPath = diskLeaves[0].wholeDiskPath!
           const ownership = await evaluateDiskOwnership(executor, wholeDiskPath, diskLeaves, byIdToKernel)
+          if (typeof ownership === 'object') {
+            preserved.push({ disk: wholeDiskId, reason: ownership.ownership, detail: ownership.detail })
+            continue
+          }
           if (ownership !== 'exclusive') {
             preserved.push({ disk: wholeDiskId, reason: ownership })
             continue
@@ -3183,7 +3411,7 @@ export async function poolRoutes(
           wiped?: string[]
           wipedFailed?: string[]
           zapped?: string[]
-          preserved?: { disk: string, reason: 'shared' | 'uncertain' }[]
+          preserved?: { disk: string, reason: 'shared' | 'uncertain', detail?: string }[]
           skipped?: { leaf: string, reason: string }[]
           warnings?: string[]
         } = { destroyed: poolName }

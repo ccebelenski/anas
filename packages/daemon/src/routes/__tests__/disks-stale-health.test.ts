@@ -88,6 +88,10 @@ function world(results: ExecResult[]) {
   const executor = new MockExecutor()
   executor.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: ok(FLAT_LSBLK) })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(BY_ID) })
+  // No pools, said the way zpool says it (cr3: an unmocked status is a failed
+  // read, and a disk ZFS could not be asked about is health unknown) — the
+  // OpenZFS 2.4.x `zpool_do_status` -j shape: exit 0, an empty `pools` object.
+  executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '{"output_version":{"command":"zpool status","vers_major":0,"vers_minor":1},"pools":{}}\n', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: SMARTCTL, args: SMART_ARGS, results })
   const cache = new DiskIdentityCache(executor)
   async function fetch(): Promise<Disk> {

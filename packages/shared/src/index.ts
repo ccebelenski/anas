@@ -710,6 +710,7 @@ export {
   PoolQueryFlag,
   PoolState,
   PoolSummary,
+  PoolUnmanaged,
   PveOwnership,
   PveOwnershipKind,
   PveStorageRef,

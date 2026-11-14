@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { AhrArraySync, AhrPoolState, ArrayLevel, ArrayState } from './ahr.js'
 import { DiskId, ISODateTime } from './common.js'
-import { PoolState, VdevRole, VdevState, VdevType } from './zfs.js'
+import { PoolState, PoolUnmanaged, VdevRole, VdevState, VdevType } from './zfs.js'
 
 /**
  * Dashboard schemas (Epic 2). Two endpoints:
@@ -39,30 +39,45 @@ export type DashboardWarning = z.infer<typeof DashboardWarning>
 /** Compact per-pool health/capacity for the dashboard (subset of PoolSummary). */
 export const PoolStatusBrief = z.object({
   name: z.string(),
+  /** Present when ANAS does not manage this pool (cr3; see `PoolUnmanaged`). */
+  unmanaged: PoolUnmanaged.optional(),
   state: PoolState,
   /** Capacity used, 0–100. */
   capacity: z.number().min(0).max(100),
   size: z.number().nonnegative(),
   allocated: z.number().nonnegative(),
   free: z.number().nonnegative(),
-  scanRunning: z.boolean(),
+  /**
+   * A scan is running. `null` = unknown (cr3): `zpool status` could not be
+   * read or did not report this pool; the `pools` section is then also listed
+   * in `StatusSummary.unavailable`.
+   */
+  scanRunning: z.boolean().nullable(),
 })
 export type PoolStatusBrief = z.infer<typeof PoolStatusBrief>
 
-/** Fleet health roll-up, keyed by the fused SMART+ZFS healthStatus. */
+/**
+ * Fleet health roll-up, keyed by the fused SMART+ZFS healthStatus. Each count
+ * is `null` when it could not be read (cr3: the disk inventory itself failed —
+ * never a row of zeros); the `disks` section is then listed in `unavailable`.
+ */
 export const DiskHealthCounts = z.object({
-  total: z.number().int().nonnegative(),
-  healthy: z.number().int().nonnegative(),
-  warning: z.number().int().nonnegative(),
-  critical: z.number().int().nonnegative(),
-  unknown: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative().nullable(),
+  healthy: z.number().int().nonnegative().nullable(),
+  warning: z.number().int().nonnegative().nullable(),
+  critical: z.number().int().nonnegative().nullable(),
+  unknown: z.number().int().nonnegative().nullable(),
 })
 export type DiskHealthCounts = z.infer<typeof DiskHealthCounts>
 
-/** Share service status (2.3). Active flags omitted when not detectable. */
+/**
+ * Share service status (2.3). Active flags omitted when not detectable. A
+ * count is `null` when its config file could not be read (cr3: unreadable is
+ * never zero); the `shares` section is then listed in `unavailable`.
+ */
 export const ShareStatusBrief = z.object({
-  smbCount: z.number().int().nonnegative(),
-  nfsCount: z.number().int().nonnegative(),
+  smbCount: z.number().int().nonnegative().nullable(),
+  nfsCount: z.number().int().nonnegative().nullable(),
   smbActive: z.boolean().optional(),
   nfsActive: z.boolean().optional(),
 })
@@ -202,6 +217,13 @@ export const StatusSummary = z.object({
    * daemon; `[]` when everything answered.
    */
   unavailable: z.array(DashboardSection).optional(),
+  /**
+   * cr3: ZFS is not available on this node (its kernel module could not be
+   * loaded, or `zpool` is not installed) — the plain statement the panel shows
+   * in place of "No pools". `pools` is then `[]` as an answer: no ZFS pool can
+   * exist. Absent when ZFS answered, and on an older daemon.
+   */
+  zfsUnavailable: z.string().optional(),
 })
 export type StatusSummary = z.infer<typeof StatusSummary>
 
@@ -257,10 +279,17 @@ export const VdevTelemetry = IoStats.extend({
   name: z.string(),
   /** Topology type (mirror/raidz/…/disk). */
   type: VdevType,
-  /** Role within the pool (data/log/cache/special/dedup/spare). */
-  role: VdevRole,
-  /** Vdev state (ONLINE/DEGRADED/FAULTED/…). */
-  state: VdevState,
+  /**
+   * Role within the pool (data/log/cache/special/dedup/spare). Absent when
+   * `zpool status` could not be read or did not name this vdev (cr3: never a
+   * guessed 'data').
+   */
+  role: VdevRole.optional(),
+  /**
+   * Vdev state (ONLINE/DEGRADED/FAULTED/...). Absent when `zpool status` could
+   * not be read or did not name this vdev (cr3: never a guessed 'ONLINE').
+   */
+  state: VdevState.optional(),
   disks: z.array(DiskTelemetry),
 })
 export type VdevTelemetry = z.infer<typeof VdevTelemetry>
@@ -330,15 +359,24 @@ export const Telemetry = z.object({
   sampledAt: ISODateTime,
   /** Length of the sample window in ms (~1000). */
   windowMs: z.number().nonnegative(),
-  arc: ArcTelemetry,
+  /** `null` when arcstats could not be read (cr3: never a 0% ARC). */
+  arc: ArcTelemetry.nullable(),
   /** Nested pool → vdevs[] → disks[] I/O tree. */
   pools: z.array(PoolTelemetry),
+  /**
+   * Why the ZFS pool I/O tree could not be sampled (cr3): `zpool list -j` or
+   * `zpool iostat` could not be read, or the whole sample failed. `pools` is
+   * then not an observation: it may be empty while pools exist. Absent when
+   * the pool sample was read, and on an older daemon.
+   */
+  poolsUnavailable: z.string().optional(),
   /**
    * AHR pools' I/O tree (pool LV → band md → member disk), diskstats-derived
    * (11.15). Name-matched to the /v1/status `ahrPools` briefs. `[]` fail-open —
    * an AHR resolve error degrades this to empty without touching ZFS telemetry.
    */
   ahrPools: z.array(AhrPoolTelemetry),
-  net: NetTelemetry,
+  /** `null` when /proc/net/dev could not be read (cr3: never zero traffic). */
+  net: NetTelemetry.nullable(),
 })
 export type Telemetry = z.infer<typeof Telemetry>

@@ -211,9 +211,28 @@ export const SystemPoolFacts = z.object({
 })
 export type SystemPoolFacts = z.infer<typeof SystemPoolFacts>
 
+/**
+ * Why ANAS lists a pool it does not manage (cr3, operator ruling 2026-11-14):
+ * `pool-name` — the pool exists on the node, but its name is one ZFS allows
+ * and ANAS's `PoolName` refuses (a `.`, `:` or space). No verb is offered;
+ * `message` is the sentence the panel shows (it names the export/import
+ * rename). Additive and optional: absent on every pool ANAS manages.
+ */
+export const PoolUnmanaged = z.object({
+  reason: z.enum(['pool-name']),
+  message: z.string(),
+})
+export type PoolUnmanaged = z.infer<typeof PoolUnmanaged>
+
 /** Pool summary for list views (GET /v1/pools) */
 export const PoolSummary = z.object({
-  name: PoolName,
+  /**
+   * The pool's name as ZFS reports it. A plain string since cr3: a pool whose
+   * name `PoolName` refuses is still listed, carrying `unmanaged`.
+   */
+  name: z.string(),
+  /** Present when ANAS does not manage this pool ({@link PoolUnmanaged}): offer no verb on it. */
+  unmanaged: PoolUnmanaged.optional(),
   state: PoolState,
   /** Total pool size in bytes */
   size: z.number().nonnegative(),
@@ -227,20 +246,32 @@ export const PoolSummary = z.object({
   capacity: z.number().min(0).max(100),
   /** Dedup ratio as a float (1.0 = no dedup) */
   dedupRatio: z.number().nonnegative(),
-  /** Whether a scan (scrub/resilver) is currently running */
-  scanRunning: z.boolean(),
+  /**
+   * Whether a scan (scrub/resilver) is currently running. `null` = unknown:
+   * `zpool status` could not be read, or did not report this pool (cr3, the
+   * wave's rule: a read that failed never reads as idle). An older panel
+   * treats null as not running; a current one renders unknown.
+   */
+  scanRunning: z.boolean().nullable(),
   /**
    * Scan operation type — present ONLY while a scan runs. Lets the UI offer
    *  "Stop Scrub" for a SCRUB but not a RESILVER (a resilver cannot be stopped).
    */
   scanFunction: ScanFunction.optional(),
-  /** Any member device of the pool supports discard (TRIM). Gates the Trim action. */
-  trimSupported: z.boolean().default(false),
+  /**
+   * Any member device of the pool supports discard (TRIM). Gates the Trim
+   * action. `null` = unknown (cr3): the pool's leaves (`zpool status`), the
+   * by-id map or lsblk's discard columns could not be read. A pool whose reads
+   * all answered always carries a boolean. (`.default(false)` dropped in cr3:
+   * absent is unknown too, never false.)
+   */
+  trimSupported: z.boolean().nullable(),
   /**
    * The pool has supported-but-disabled features (a `zpool upgrade` would enable
-   *  them). Gates the Upgrade action.
+   *  them). Gates the Upgrade action. `null` = unknown (cr3): `zpool upgrade`
+   *  could not be read.
    */
-  upgradeAvailable: z.boolean().default(false),
+  upgradeAvailable: z.boolean().nullable(),
   /** Health message, present only when pool is not ONLINE */
   health: PoolHealthMessage.optional(),
   /**
@@ -280,12 +311,18 @@ export const PoolSummary = z.object({
 export type PoolSummary = z.infer<typeof PoolSummary>
 
 /** Selected pool properties as typed fields */
+/**
+ * Typed pool properties from `zpool get all -j`. cr3: each is `null` when the
+ * read did not return it (or returned a value outside its domain) — never a
+ * default (`failmode` 'wait', a boolean false, an ashift of 0). The Edit Pool
+ * dialog refuses to open on a null.
+ */
 export const PoolProperties = z.object({
-  ashift: z.number().int(),
-  autoexpand: z.boolean(),
-  autoreplace: z.boolean(),
-  autotrim: z.boolean(),
-  failmode: z.enum(['wait', 'continue', 'panic']),
+  ashift: z.number().int().nullable(),
+  autoexpand: z.boolean().nullable(),
+  autoreplace: z.boolean().nullable(),
+  autotrim: z.boolean().nullable(),
+  failmode: z.enum(['wait', 'continue', 'panic']).nullable(),
   /** Full property bag for advanced users (property name → value string) */
   all: z.record(z.string(), z.string()).optional(),
 })
@@ -293,7 +330,10 @@ export type PoolProperties = z.infer<typeof PoolProperties>
 
 /** Full pool detail (GET /v1/pools/:name) */
 export const PoolDetail = z.object({
-  name: PoolName,
+  /** The pool's name as ZFS reports it (a plain string since cr3, as on PoolSummary). */
+  name: z.string(),
+  /** Present when ANAS does not manage this pool (cr3, {@link PoolUnmanaged}): the detail is read-only. */
+  unmanaged: PoolUnmanaged.optional(),
   state: PoolState,
   /** Pool GUID as string (64-bit, exceeds JS safe integer range) */
   guid: z.string(),

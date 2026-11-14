@@ -20,7 +20,7 @@ const ZFS = '/usr/sbin/zfs'
 /** The pool feature flag that gates raidz expansion. */
 export const RAIDZ_EXPANSION_FEATURE = 'feature@raidz_expansion'
 
-/** Detect the LOCAL OpenZFS module version via `zfs version`. Fail-soft → null. */
+/** Detect the LOCAL OpenZFS module version via `zfs version` (its `zfs-kmod-` line, cr3 L12). Fail-soft → null. */
 export async function detectLocalZfsVersion(executor: CommandExecutor): Promise<ZfsVersion | null> {
   const res = await executor.exec(ZFS, ['version'])
   if (res.exitCode !== 0)
@@ -64,6 +64,14 @@ export function buildCapability(
     featureEnabled: enabled,
     raidzExpandAvailable: moduleSupported && enabled,
   }
+}
+
+/**
+ * The ONE sentence for a raidz that is not ONLINE (cr3, review POOLS-DISKS-M6):
+ * the read model's `degraded` reason and the expand door's refusal both say it.
+ */
+export function raidzDegradedDetail(vdevName: string, state: string): string {
+  return `Vdev ${vdevName} is ${state} — a raidz cannot be widened while degraded; restore it first.`
 }
 
 /** The honest raidz capacity delta of widening a vdev by one disk. */
@@ -174,7 +182,7 @@ export function buildExpansionTargets(
       else if (degraded) {
         allowed = false
         reason = 'degraded'
-        reasonDetail = `Vdev ${vdev.name} is ${vdev.state} — a raidz cannot be widened while degraded; restore it first.`
+        reasonDetail = raidzDegradedDetail(vdev.name, vdev.state)
       }
       targets.push({
         vdevName: vdev.name,

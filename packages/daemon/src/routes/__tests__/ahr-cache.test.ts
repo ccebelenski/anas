@@ -316,7 +316,9 @@ function buildExecutor(world: World): MockExecutor {
     : ok(DM_STATUS[world]) })
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: ok(JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }] })) })
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: ok(BTRFS_USAGE) })
-  executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 1 } })
+  // No ZFS pools, in the shape OpenZFS 2.4.x prints it: `zpool_do_status`
+  // (cmd/zpool/zpool_main.c) with -j answers exit 0 and an empty `pools` object.
+  executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '{"output_version":{"command":"zpool status","vers_major":0,"vers_minor":1},"pools":{}}\n', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/perl', result: ok('') })
   // cr.38: the attach's signature probe. A blank disk is `blkid -p`'s captured
   // "nothing found": exit 2, no output (docs/BACKUP-RESTORE-GROUND-TRUTH.md).

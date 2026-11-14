@@ -83,12 +83,13 @@ describe('GET /v1/telemetry — nested pool → vdev → disk tree', () => {
     assert.equal(mirror0.role, 'data')
     assert.equal(mirror0.state, 'ONLINE')
 
-    // mirror-2 is NOT in the status fixture → name-derived fallback (type from
-    // the `mirror` prefix, role 'data', state 'ONLINE').
+    // mirror-2 is NOT in the status fixture → type from the `mirror` prefix,
+    // and NO role or state (cr3, INVENTED-STATE-H2: never a guessed 'data' /
+    // 'ONLINE' — the panel draws no state pill for it).
     const mirror2 = pool.vdevs.find(v => v.name === 'mirror-2')!
     assert.equal(mirror2.type, 'mirror')
-    assert.equal(mirror2.role, 'data')
-    assert.equal(mirror2.state, 'ONLINE')
+    assert.equal(mirror2.role, undefined)
+    assert.equal(mirror2.state, undefined)
   })
 
   it('maps iostat leaf kernel names to stable by-id identities', async () => {
@@ -115,12 +116,12 @@ describe('GET /v1/telemetry — nested pool → vdev → disk tree', () => {
     const t = await fetchTelemetry()
     const pool = t.pools.find(p => p.name === 'testpool')!
     assert.ok(pool, 'pool still built from iostat without topology')
-    // Every vdev falls back: type from its `mirror` name prefix, role 'data',
-    // state 'ONLINE' — and disks are still nested.
+    // Every vdev falls back: type from its `mirror` name prefix, and no role
+    // or state (cr3, INVENTED-STATE-H2) — and disks are still nested.
     for (const v of pool.vdevs) {
       assert.equal(v.type, 'mirror')
-      assert.equal(v.role, 'data')
-      assert.equal(v.state, 'ONLINE')
+      assert.equal(v.role, undefined)
+      assert.equal(v.state, undefined)
       assert.equal(v.disks.length, 2)
     }
   })
@@ -340,6 +341,9 @@ describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () =>
    *  Every non-AHR source fail-opens (unmatched mock commands → exit 127).
    */
   async function bareDashboardServer(executor: MockExecutor, tmp: string) {
+    // cr3: the unit dir exists on every node; a missing one is a task store
+    // that could not be read in full (the replication section cards it).
+    mkdirSync(join(tmp, 'systemd'), { recursive: true })
     const srv = Fastify({ logger: false })
     await srv.register(dashboardRoutes, {
       prefix: '/v1',
@@ -418,6 +422,10 @@ describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () =>
     mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: Permission denied', exitCode: 1 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
+    // cr3: the disk inventory is read too (an unmocked lsblk is a failed read
+    // and would card the disks section, which this test is not about).
+    mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: mockFixtures.lsblk() })
+    mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
 
     server = await bareDashboardServer(mock, dir)
     const summary = await fetchStatus(server)
@@ -445,6 +453,9 @@ describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () =>
     mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'cat: /proc/mdstat: No such file or directory', exitCode: 1 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
+    // cr3: the disk inventory is read too (an unmocked lsblk is a failed read).
+    mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: mockFixtures.lsblk() })
+    mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
 
     server = await bareDashboardServer(mock, dir)
     const summary = await fetchStatus(server)
@@ -636,6 +647,9 @@ lrwxrwxrwx 1 root root   9 Jul 22 22:43 scsi-0QEMU_QEMU_HARDDISK_BLANK -> ../../
 
   /** A bare Fastify server with ONLY dashboardRoutes and a controlled executor. */
   async function bareDashboardServer(executor: MockExecutor, tmp: string) {
+    // cr3: the unit dir exists on every node; a missing one is a task store
+    // that could not be read in full (the replication section cards it).
+    mkdirSync(join(tmp, 'systemd'), { recursive: true })
     const srv = Fastify({ logger: false })
     await srv.register(dashboardRoutes, {
       prefix: '/v1',

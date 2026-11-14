@@ -26,12 +26,23 @@ const DEV_PREFIX_RE = /^\/dev\//
  * matched here, ahead of it (vdevs.1 kernel-name leaf resolution).
  */
 const MMC_PART_RE = /^(mmcblk\d+)(?:p\d+)?$/
-const SCSI_PART_RE = /^(\D+)\d+$/
+/**
+ * The letter-named disks whose partitions are a bare number suffix
+ * (`sdb1`, `vda2`, `hdc3`, `xvda1`). cr3 (review POOLS-DISKS-L13): the old
+ * rule — any non-digits then digits — reduced every NUMBERED whole device to
+ * a name that is not a device (`md127` → `md`, `loop0` → `loop`, `nbd0` →
+ * `nbd`). A numbered device's partitions carry `p<N>` (`md127p1`,
+ * `loop0p1`, `nbd0p1`, `zd16p1`), handled beside it.
+ */
+const SCSI_PART_RE = /^((?:sd|vd|hd|xvd)[a-z]+)\d+$/
+const NUMBERED_PART_RE = /^([a-z][a-z-]*\d+)p\d+$/
 
 /**
  * Reduce a kernel partition name to its whole-disk parent:
- *   sdb1 → sdb, sda15 → sda, nvme0n1p1 → nvme0n1, mmcblk0p1 → mmcblk0.
- * A whole-disk name (no partition suffix) is returned unchanged.
+ *   sdb1 → sdb, sda15 → sda, nvme0n1p1 → nvme0n1, mmcblk0p1 → mmcblk0,
+ *   md127p1 → md127, loop0p1 → loop0.
+ * A whole-disk name (no partition suffix) is returned unchanged — `md127`,
+ * `loop0`, `nbd0`, `zd16`, `dm-0` included (cr3, L13).
  */
 export function wholeDiskKernel(kernel: string): string {
   const nvme = kernel.match(NVME_PART_RE)
@@ -43,6 +54,9 @@ export function wholeDiskKernel(kernel: string): string {
   const scsi = kernel.match(SCSI_PART_RE)
   if (scsi)
     return scsi[1]
+  const numbered = kernel.match(NUMBERED_PART_RE)
+  if (numbered)
+    return numbered[1]
   return kernel
 }
 

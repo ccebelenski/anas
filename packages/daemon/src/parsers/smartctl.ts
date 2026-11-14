@@ -149,8 +149,13 @@ export function standbySmartData(): SmartData {
 export function parseSmartctl(json: string | SmartctlOutput): SmartData {
   const data: SmartctlOutput = typeof json === 'string' ? JSON.parse(json) : json
 
-  const supported = data.smart_support?.available ?? false
-  const enabled = data.smart_support?.enabled ?? false
+  // cr3 (review POOLS-DISKS-L11): an absent `smart_support` block is not
+  // "unsupported" when the document carries SMART results anyway (smartctl's
+  // NVMe report may omit the block — unverified on a node); only a document
+  // with neither says so.
+  const smartEvidence = data.smart_status !== undefined || data.nvme_smart_health_information_log !== undefined
+  const supported = data.smart_support?.available ?? smartEvidence
+  const enabled = data.smart_support?.enabled ?? smartEvidence
 
   if (!supported) {
     return {

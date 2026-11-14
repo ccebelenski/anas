@@ -39,8 +39,8 @@ import { parseExports } from '../parsers/exports.js'
 import { computeNetTelemetry, parseProcNetDev } from '../parsers/net-dev.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { nodeToIoStats, parseZpoolIostat } from '../parsers/zpool-iostat.js'
-import { parseZpoolList } from '../parsers/zpool-list.js'
-import { parseZpoolStatus } from '../parsers/zpool-status.js'
+import { execZpool, parseZpoolList, unmanagedPoolName, zfsUnavailableReason, zpoolListUnreadable } from '../parsers/zpool-list.js'
+import { readZpoolStatusAnswer } from '../parsers/zpool-status.js'
 import { buildFailedCreateWarnings, withAhrCreateStatus } from '../services/ahr-create-status.js'
 import { collectAhrTelemetry } from '../services/ahr-io.js'
 import { buildAhrCapacityWarnings, collectAhrPoolBriefs, collectAhrWarnings } from '../services/ahr-topology.js'
@@ -49,10 +49,10 @@ import { collectCloudWarnings } from '../services/cloud-units.js'
 import { readConfig } from '../services/config-writer.js'
 import { collectIscsiWarnings } from '../services/iscsi-warnings.js'
 import { collectMountWarnings } from '../services/mounts.js'
-import { buildReplicationWarnings, collectTaskStatuses } from '../services/replication-units.js'
+import { buildReplicationWarnings, deriveTaskStatus, readAllTasksChecked } from '../services/replication-units.js'
 import { probeSharePaths } from '../services/share-path.js'
 import { collectScheduleWarnings } from '../services/snapshot-schedule-units.js'
-import { collectDisks } from './disks.js'
+import { collectDiskInventory } from './disks.js'
 
 const ARCSTATS_PATH = '/proc/spl/kstat/zfs/arcstats'
 const PROC_NET_DEV = '/proc/net/dev'
@@ -91,10 +91,14 @@ const CRITICAL_POOL_STATES = new Set(['FAULTED', 'UNAVAIL', 'REMOVED', 'SUSPENDE
  *                       per-disk I/O, and network throughput.
  *
  * Both are read-only (no jobs, no mutations) and FAIL-OPEN: any sub-part that
- * errors contributes empty/zero rather than failing the whole panel. On
- * /v1/status that empty part is never silent (cr.35): a section whose read
- * failed, timed out or overran its budget is listed in `unavailable` and
- * carded, so an empty pool list there is never "no pools".
+ * errors never fails the whole panel. On /v1/status that part is never silent
+ * (cr.35): a section whose read failed, timed out or overran its budget is
+ * listed in `unavailable` and carded, so an empty pool list there is never
+ * "no pools". cr3: a collector never catches its own failed read and answers
+ * the empty shape as a successful one — it throws (the section is then
+ * unavailable) or, when part of what it read is still true, reports the part
+ * it could not read through `incomplete` and keeps the rest. A value that
+ * could not be read is `null`/absent, never 0, false, 'ONLINE' or 'data'.
  */
 export async function dashboardRoutes(
   server: FastifyInstance,
@@ -156,11 +160,15 @@ export async function dashboardRoutes(
     // a 503 (Promise.all over collectors that could reject did), and never
     // reads as "no pools".
     const [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, cloudWarnings, ahrWarnings, ahrPools, scheduleWarnings, iscsiWarnings] = await Promise.all([
-      readSection('pools', { pools: [], scanErrors: new Map<string, number>() }, exec => collectPoolStatus(exec)),
-      readSection('disks', { counts: { total: 0, healthy: 0, warning: 0, critical: 0, unknown: 0 }, disks: [] as Disk[] }, exec => collectDiskHealth(exec)),
-      readSection('shares', { brief: { smbCount: 0, nfsCount: 0 }, warnings: [] as DashboardWarning[] }, exec => collectShareStatus(exec)),
+      readSection('pools', { pools: [], scanErrors: new Map<string, number>() }, (exec, incomplete) => collectPoolStatus(exec, incomplete)),
+      readSection('disks', { counts: { total: null, healthy: null, warning: null, critical: null, unknown: null } as DiskHealthCounts, disks: [] as Disk[] }, (exec, incomplete) => collectDiskHealth(exec, incomplete)),
+      readSection('shares', { brief: { smbCount: null, nfsCount: null }, warnings: [] as DashboardWarning[] }, (exec, incomplete) => collectShareStatus(exec, incomplete)),
       readSection('jobs', [] as JobBrief[], async () => collectJobs()),
-      readSection('replication', [] as DashboardWarning[], exec => collectReplicationWarnings(exec)),
+      readSection('replication', [] as DashboardWarning[], (exec, incomplete) => collectReplicationWarnings(exec, incomplete)),
+      // The six collectors below live in their own services (cr3 contract):
+      // each THROWS when its whole read failed — the section is then
+      // unavailable with the error's message as the reason — and never
+      // answers [] for a read it could not make.
       readSection('mounts', [] as DashboardWarning[], exec => collectMountWarnings(exec, { fstabPath, storagePath, mdadmConfPath })),
       readSection('backup', [] as DashboardWarning[], exec => collectBackupWarnings(exec, systemdDir)),
       // Cloud sync (rclone.2): failed/overdue enabled tasks → 'cloud' warnings,
@@ -226,6 +234,7 @@ export async function dashboardRoutes(
       ],
       ahrPools: ahrPools.value,
       unavailable: unavailable.map(u => u.section),
+      ...(poolStatus.value.zfsUnavailable && { zfsUnavailable: poolStatus.value.zfsUnavailable }),
     }
     return { data: summary }
   })
@@ -234,80 +243,97 @@ export async function dashboardRoutes(
   function readSection<T>(
     section: DashboardSection,
     fallback: T,
-    read: (exec: CommandExecutor) => Promise<T>,
+    read: (exec: CommandExecutor, incomplete: (reason: string) => void) => Promise<T>,
   ): Promise<SectionRead<T>> {
     return readDashboardSection(executor, sectionBudgetMs, section, fallback, read)
   }
 
   /**
    * Replication tasks whose last run failed → 'replication' warnings (5.5.3).
-   *  Reuses the same task-status derivation the Replication view uses; fail-open
-   *  to no warnings (units-as-store, ZFS + systemd truth).
+   *  Reuses the same task-status derivation the Replication view uses
+   *  (`deriveTaskStatus`, the body of `collectTaskStatuses`). A task store
+   *  that could not be read in full reports the section incomplete (cr3):
+   *  the tasks it did read still card, and the rest is never "no failed
+   *  tasks". A throw makes the section unavailable.
    */
-  async function collectReplicationWarnings(exec: CommandExecutor): Promise<DashboardWarning[]> {
-    try {
-      return buildReplicationWarnings(await collectTaskStatuses(exec, systemdDir))
-    }
-    catch {
-      return []
-    }
+  async function collectReplicationWarnings(exec: CommandExecutor, incomplete: (reason: string) => void): Promise<DashboardWarning[]> {
+    const { tasks, complete } = await readAllTasksChecked(systemdDir)
+    if (!complete)
+      incomplete(`the replication task units in ${systemdDir} could not all be read`)
+    return buildReplicationWarnings(await Promise.all(tasks.map(t => deriveTaskStatus(exec, t))))
   }
 
-  /** Pool briefs + the scan/state context the warnings pass needs. */
-  async function collectPoolStatus(exec: CommandExecutor): Promise<{
+  /**
+   * Pool briefs + the scan/state context the warnings pass needs. A pool list
+   * that could not be read THROWS (cr3, review INVENTED-STATE-H1 / M4): the
+   * section is unavailable, never "No pools". A status that could not be read
+   * keeps the list's pools (their state is `zpool list`'s own health column)
+   * and reports the rest as incomplete: scan progress and scan errors are
+   * unknown, so `scanRunning` is null.
+   */
+  async function collectPoolStatus(exec: CommandExecutor, incomplete: (reason: string) => void): Promise<{
     pools: PoolStatusBrief[]
     scanErrors: Map<string, number>
+    /** cr3: ZFS is not available on the node — the plain statement. */
+    zfsUnavailable?: string
   }> {
     const pools: PoolStatusBrief[] = []
     const scanErrors = new Map<string, number>()
-    try {
-      const [listResult, statusResult] = await Promise.all([
-        exec.exec(ZPOOL, ['list', '-j']),
-        exec.exec(ZPOOL, ['status', '-jv']),
-      ])
-      if (listResult.exitCode !== 0 && !listResult.stdout.trim())
-        return { pools, scanErrors }
+    const [listResult, statusResult] = await Promise.all([
+      execZpool(exec, ['list', '-j']),
+      execZpool(exec, ['status', '-jv']),
+    ])
+    const listUnreadable = zpoolListUnreadable(listResult)
+    if (listUnreadable)
+      throw new Error(listUnreadable)
+    const zfsUnavailable = zfsUnavailableReason(listResult)
+    if (zfsUnavailable)
+      return { pools, scanErrors, zfsUnavailable }
 
-      const list = parseZpoolList(listResult.stdout)
-      const status = statusResult.exitCode === 0 ? parseZpoolStatus(statusResult.stdout) : []
-      const statusByName = new Map(status.map(s => [s.name, s]))
+    const list = parseZpoolList(listResult.stdout)
+    const statusAnswer = readZpoolStatusAnswer(statusResult)
+    if ('unreadable' in statusAnswer)
+      incomplete(`${statusAnswer.unreadable}: pool state is zpool list's own, and whether a scan is running or found errors is unknown`)
+    const statusByName = new Map(('pools' in statusAnswer ? statusAnswer.pools : []).map(s => [s.name, s]))
 
-      for (const pool of list) {
-        const s = statusByName.get(pool.name)
-        pools.push({
-          name: pool.name,
-          state: s?.state ?? pool.state,
-          capacity: pool.capacity,
-          size: pool.size,
-          allocated: pool.allocated,
-          free: pool.free,
-          scanRunning: s?.scan?.state === 'SCANNING',
-        })
-        if (s?.scan && s.scan.errors > 0)
-          scanErrors.set(pool.name, s.scan.errors)
-      }
-    }
-    catch {
-      // fail-open: no pools
+    for (const pool of list) {
+      const s = statusByName.get(pool.name)
+      const unmanaged = unmanagedPoolName(pool.name)
+      pools.push({
+        name: pool.name,
+        state: s?.state ?? pool.state,
+        capacity: pool.capacity,
+        size: pool.size,
+        allocated: pool.allocated,
+        free: pool.free,
+        // Unknown when status did not report this pool (cr3) — never idle.
+        scanRunning: s ? s.scan?.state === 'SCANNING' : null,
+        ...(unmanaged && { unmanaged }),
+      })
+      if (s?.scan && s.scan.errors > 0)
+        scanErrors.set(pool.name, s.scan.errors)
     }
     return { pools, scanErrors }
   }
 
-  /** Fused SMART+ZFS health counts plus the disk list (for per-disk warnings). */
-  async function collectDiskHealth(exec: CommandExecutor): Promise<{ counts: DiskHealthCounts, disks: Disk[] }> {
-    const counts: DiskHealthCounts = { total: 0, healthy: 0, warning: 0, critical: 0, unknown: 0 }
-    let disks: Disk[] = []
-    try {
-      disks = await collectDisks(exec, diskIdentityCache)
-      for (const d of disks) {
-        counts.total++
-        counts[d.healthStatus]++
-      }
+  /**
+   * Fused SMART+ZFS health counts plus the disk list (for per-disk warnings).
+   * An inventory that could not be read THROWS (cr3): every count is null and
+   * the section unavailable, never a row of zeros. A `zpool status` that
+   * could not be read keeps the inventory — each disk it could not judge
+   * counts `unknown` — and reports the section incomplete.
+   */
+  async function collectDiskHealth(exec: CommandExecutor, incomplete: (reason: string) => void): Promise<{ counts: DiskHealthCounts, disks: Disk[] }> {
+    const counts = { total: 0, healthy: 0, warning: 0, critical: 0, unknown: 0 }
+    const inventory = await collectDiskInventory(exec, diskIdentityCache, iscsiPaths)
+    const membership = inventory.zfsUnreadable ?? inventory.byIdUnreadable
+    if (membership)
+      incomplete(`${membership}: the health of a disk that may be a pool member is unknown`)
+    for (const d of inventory.disks) {
+      counts.total++
+      counts[d.healthStatus]++
     }
-    catch {
-      // fail-open: zero counts, no disks
-    }
-    return { counts, disks }
+    return { counts, disks: inventory.disks }
   }
 
   /**
@@ -318,8 +344,11 @@ export async function dashboardRoutes(
    * false stale). Every stale share is emitted; the dashboard renders warnings
    * as compact wrap cards, so volume is fine.
    */
-  async function collectShareStatus(exec: CommandExecutor): Promise<{ brief: ShareStatusBrief, warnings: DashboardWarning[] }> {
-    const brief: ShareStatusBrief = { smbCount: 0, nfsCount: 0 }
+  async function collectShareStatus(exec: CommandExecutor, incomplete: (reason: string) => void): Promise<{ brief: ShareStatusBrief, warnings: DashboardWarning[] }> {
+    // cr3: a config that could not be read is a null count and an incomplete
+    // section, never "0 shares" (a missing file is the honest 0: readConfig
+    // answers '' for ENOENT and throws for everything else).
+    const brief: ShareStatusBrief = { smbCount: null, nfsCount: null }
     const warnings: DashboardWarning[] = []
     try {
       const smbShares = parseSmbConf(await readConfig(smbConfPath)).shares
@@ -328,7 +357,9 @@ export async function dashboardRoutes(
       for (const share of smbShares)
         warnings.push(...sharePathWarnings('smb', share.name, share.path, probes.get(share.path)!))
     }
-    catch { /* fail-open */ }
+    catch (err: unknown) {
+      incomplete(`${smbConfPath} or its share paths could not be read (${err instanceof Error ? err.message : String(err)})`)
+    }
     try {
       const exports = parseExports(await readConfig(exportsPath))
       brief.nfsCount = exports.length
@@ -336,7 +367,9 @@ export async function dashboardRoutes(
       for (const exp of exports)
         warnings.push(...sharePathWarnings('nfs', exp.path, exp.path, probes.get(exp.path)!))
     }
-    catch { /* fail-open */ }
+    catch (err: unknown) {
+      incomplete(`${exportsPath} or its export paths could not be read (${err instanceof Error ? err.message : String(err)})`)
+    }
     const smbActive = await serviceActive(exec, 'smbd')
     if (smbActive !== undefined)
       brief.smbActive = smbActive
@@ -362,33 +395,28 @@ export async function dashboardRoutes(
     }
   }
 
-  /** Recent + active jobs, newest first, as compact briefs. */
+  /** Recent + active jobs, newest first, as compact briefs (a throw = unavailable). */
   async function collectJobs(): Promise<JobBrief[]> {
-    try {
-      return jobQueue
-        .list()
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-        .slice(0, 20)
-        .map((j): JobBrief => {
-          const brief: JobBrief = { id: j.id, kind: j.operation, status: j.status }
-          if (j.startedAt) {
-            brief.startedAt = j.startedAt
-            const start = Date.parse(j.startedAt)
-            if (!Number.isNaN(start)) {
-              // Finished job: measure to completedAt. Still running: measure to now.
-              const end = j.completedAt ? Date.parse(j.completedAt) : Date.now()
-              if (j.completedAt && !Number.isNaN(Date.parse(j.completedAt)))
-                brief.finishedAt = j.completedAt
-              if (!Number.isNaN(end))
-                brief.durationMs = Math.max(0, end - start)
-            }
+    return jobQueue
+      .list()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 20)
+      .map((j): JobBrief => {
+        const brief: JobBrief = { id: j.id, kind: j.operation, status: j.status }
+        if (j.startedAt) {
+          brief.startedAt = j.startedAt
+          const start = Date.parse(j.startedAt)
+          if (!Number.isNaN(start)) {
+            // Finished job: measure to completedAt. Still running: measure to now.
+            const end = j.completedAt ? Date.parse(j.completedAt) : Date.now()
+            if (j.completedAt && !Number.isNaN(Date.parse(j.completedAt)))
+              brief.finishedAt = j.completedAt
+            if (!Number.isNaN(end))
+              brief.durationMs = Math.max(0, end - start)
           }
-          return brief
-        })
-    }
-    catch {
-      return []
-    }
+        }
+        return brief
+      })
   }
 
   // --- GET /v1/telemetry ---------------------------------------------------
@@ -404,14 +432,19 @@ export async function dashboardRoutes(
       const t0 = Date.now()
       const [arc0, net0, diskstats0] = await Promise.all([readArcstats(), readNetDev(), readDiskstats()])
 
-      // Pool names for the iostat call (fail-open to none).
+      // Pool names for the iostat call. cr3: a list or an iostat that could
+      // not be read is said in `poolsUnavailable`, never an empty pool tree.
       let poolNames: string[] = []
+      let poolsUnavailable: string | undefined
       try {
-        const listResult = await executor.exec(ZPOOL, ['list', '-j'])
-        if (listResult.exitCode === 0 || listResult.stdout.trim())
+        const listResult = await execZpool(executor, ['list', '-j'])
+        poolsUnavailable = zpoolListUnreadable(listResult) ?? undefined
+        if (!poolsUnavailable)
           poolNames = parseZpoolList(listResult.stdout).map(p => p.name)
       }
-      catch { /* no pools */ }
+      catch (err: unknown) {
+        poolsUnavailable = `zpool list -j could not be read (${err instanceof Error ? err.message : String(err)})`
+      }
 
       // The ~1s sampling window: `iostat ... 1 2` prints a since-boot sample,
       // waits one second, prints the interval sample, then exits. cr.21: `--`
@@ -422,8 +455,12 @@ export async function dashboardRoutes(
           const r = await executor.exec(ZPOOL, ['iostat', '-plv', '--', ...poolNames, '1', '2'])
           if (r.exitCode === 0)
             iostatText = r.stdout
+          else
+            poolsUnavailable = `zpool iostat exited ${r.exitCode}${r.stderr.trim() ? `: ${r.stderr.trim().split('\n')[0]}` : ''}`
         }
-        catch { /* no iostat */ }
+        catch (err: unknown) {
+          poolsUnavailable = `zpool iostat could not be read (${err instanceof Error ? err.message : String(err)})`
+        }
       }
 
       // t1 snapshots, AFTER the window closed.
@@ -431,33 +468,24 @@ export async function dashboardRoutes(
       const [arc1, net1, diskstats1] = await Promise.all([readArcstats(), readNetDev(), readDiskstats()])
       const windowMs = t1 - t0
 
-      const arc = computeArc(arc0, arc1)
+      const arc = arcFromSnapshots(arc0, arc1)
       const net = computeNet(net0, net1, windowMs)
       const pools = await computeIo(iostatText, new Set(poolNames))
       // AHR I/O rides its own diskstats deltas (11.15), fully fail-open to []:
       // an AHR resolve error never disturbs the ZFS/ARC/net telemetry above.
       const ahrPools = await collectAhrTelemetry(executor, diskstats0, diskstats1, windowMs, mdadmConfPath)
 
-      return { sampledAt, windowMs, arc, pools, ahrPools, net }
+      return { sampledAt, windowMs, arc, pools, ahrPools, net, ...(poolsUnavailable && { poolsUnavailable }) }
     }
-    catch {
-      return emptyTelemetry(sampledAt)
+    catch (err: unknown) {
+      return emptyTelemetry(sampledAt, `the telemetry sample failed (${err instanceof Error ? err.message : String(err)})`)
     }
   }
 
-  /** ARC telemetry from two snapshots; zeroed when arcstats is unreadable. */
-  function computeArc(prev: string | null, cur: string | null): ArcTelemetry {
+  /** Net telemetry from two snapshots; null when /proc/net/dev is unreadable (cr3: never zero traffic). */
+  function computeNet(prev: string | null, cur: string | null, windowMs: number): NetTelemetry | null {
     if (!cur)
-      return { hitRatio: 0, size: 0, target: 0, max: 0, l2: null }
-    const curStats = parseArcstats(cur)
-    const prevStats = prev ? parseArcstats(prev) : curStats
-    return computeArcTelemetry(prevStats, curStats)
-  }
-
-  /** Net telemetry from two snapshots; empty when /proc/net/dev is unreadable. */
-  function computeNet(prev: string | null, cur: string | null, windowMs: number): NetTelemetry {
-    if (!cur)
-      return { interfaces: [], totalRxBytesPerSec: 0, totalTxBytesPerSec: 0 }
+      return null
     return computeNetTelemetry(
       prev ? parseProcNetDev(prev) : [],
       parseProcNetDev(cur),
@@ -512,11 +540,15 @@ export async function dashboardRoutes(
 
       if (node.depth === 1) {
         const info = topology.get(currentPool.name)?.get(node.name)
+        // cr3 (review INVENTED-STATE-H2): role and state come from `zpool
+        // status` or not at all — an unjoined vdev carries neither, never a
+        // guessed 'data' / 'ONLINE' (the panel then shows no state pill). The
+        // TYPE is still read from the vdev's own name, which ZFS composes from
+        // it (`mirror-0`, `raidz2-1`), so it is a reading, not a guess.
         const vdev: VdevTelemetry = {
           name: node.name,
           type: info?.type ?? typeFromName(node.name),
-          role: info?.role ?? 'data',
-          state: info?.state ?? 'ONLINE',
+          ...(info && { role: info.role, state: info.state }),
           disks: [],
           ...nodeToIoStats(node),
         }
@@ -555,16 +587,17 @@ export async function dashboardRoutes(
 
   /**
    * One `zpool status -jv` read per sample, reduced to pool → (vdev name →
-   * type/role/state). Reuses the same parser /status uses. Fail-open: an
-   * unmatched vdev falls back to a name-derived type + role 'data' + 'ONLINE'.
+   * type/role/state). Reuses the same strict reader /status uses. An unread
+   * or unmatched vdev falls back to a name-derived type and NO role or state
+   * (cr3).
    */
   async function fetchVdevTopology(): Promise<Map<string, Map<string, VdevJoin>>> {
     const map = new Map<string, Map<string, VdevJoin>>()
     try {
-      const r = await executor.exec(ZPOOL, ['status', '-jv'])
-      if (r.exitCode !== 0 && !r.stdout.trim())
+      const answer = readZpoolStatusAnswer(await execZpool(executor, ['status', '-jv']))
+      if ('unreadable' in answer)
         return map
-      for (const pool of parseZpoolStatus(r.stdout)) {
+      for (const pool of answer.pools) {
         const vmap = new Map<string, VdevJoin>()
         for (const group of pool.vdevGroups) {
           for (const vdev of group.vdevs) {
@@ -600,7 +633,7 @@ export async function dashboardRoutes(
         map.set(pool.name, vmap)
       }
     }
-    catch { /* fail-open: no topology, callers use name-derived fallback */ }
+    catch { /* no topology: callers carry no role or state */ }
     return map
   }
 }
@@ -610,6 +643,18 @@ interface VdevJoin {
   type: VdevType
   role: VdevRole
   state: VdevState
+}
+
+/**
+ * ARC telemetry from two arcstats snapshots; null when arcstats could not be
+ * read (cr3, review INVENTED-STATE-L11: never a 0% ARC of 0 B / 0 B).
+ */
+export function arcFromSnapshots(prev: string | null, cur: string | null): ArcTelemetry | null {
+  if (!cur)
+    return null
+  const curStats = parseArcstats(cur)
+  const prevStats = prev ? parseArcstats(prev) : curStats
+  return computeArcTelemetry(prevStats, curStats)
 }
 
 /** Fallback vdev type from its iostat name when topology has no match. */
@@ -655,15 +700,19 @@ async function readProc(path: string): Promise<string | null> {
   }
 }
 
-/** A fully-zeroed telemetry payload for the total fail-open case. */
-function emptyTelemetry(sampledAt: string): Telemetry {
+/**
+ * The telemetry payload for the total fail-open case: nothing was sampled, so
+ * ARC and network are null (cr3: never a zeroed reading) and the trees empty.
+ */
+function emptyTelemetry(sampledAt: string, poolsUnavailable: string): Telemetry {
   return {
     sampledAt,
     windowMs: 0,
-    arc: { hitRatio: 0, size: 0, target: 0, max: 0, l2: null },
+    arc: null,
     pools: [],
     ahrPools: [],
-    net: { interfaces: [], totalRxBytesPerSec: 0, totalTxBytesPerSec: 0 },
+    net: null,
+    poolsUnavailable,
   }
 }
 
@@ -687,19 +736,27 @@ export interface UnavailableSection {
  * CommandTimeoutError it may have caught and turned into an empty answer. A
  * read that finished keeps its value even then: the reason says it is
  * incomplete, and the value is never presented as complete.
+ *
+ * cr3: a read may also REPORT that part of it could not be read, through the
+ * `incomplete` callback, while keeping what it did read (pools listed while
+ * their status failed). The section is then unavailable with that reason and
+ * its value kept, exactly as for a caught timeout. A thrown error is the
+ * whole read failing: the fallback, never presented as an observation.
  */
 export async function readDashboardSection<T>(
   executor: CommandExecutor,
   budgetMs: number,
   section: DashboardSection,
   fallback: T,
-  read: (exec: CommandExecutor) => Promise<T>,
+  read: (exec: CommandExecutor, incomplete: (reason: string) => void) => Promise<T>,
 ): Promise<SectionRead<T>> {
   const watch = new WatchedExecutor(executor)
+  const reported: string[] = []
   let timer: NodeJS.Timeout | undefined
   type Outcome = { kind: 'done', value: T } | { kind: 'threw', err: unknown } | { kind: 'late' }
   const outcome = await Promise.race<Outcome>([
-    read(watch).then(value => ({ kind: 'done', value }), (err: unknown) => ({ kind: 'threw', err })),
+    // A synchronous throw inside `read` becomes a rejection here too.
+    Promise.resolve().then(() => read(watch, reason => reported.push(reason))).then(value => ({ kind: 'done', value }), (err: unknown) => ({ kind: 'threw', err })),
     new Promise<Outcome>((resolve) => {
       timer = setTimeout(resolve, budgetMs, { kind: 'late' })
     }),
@@ -719,6 +776,8 @@ export async function readDashboardSection<T>(
   }
   if (watch.timeouts.length > 0)
     return { value: outcome.value, unavailable: { section, reason: watch.timeouts[0].message } }
+  if (reported.length > 0)
+    return { value: outcome.value, unavailable: { section, reason: reported.join('; ') } }
   return { value: outcome.value }
 }
 

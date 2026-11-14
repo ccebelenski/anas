@@ -158,6 +158,37 @@ export function pathOnZfsFilesystem(path: string, nodes: FindmntNode[] | null): 
 }
 
 /**
+ * The ZFS dataset the mount table says SERVES `path` (cr3): the `source` of
+ * the longest-prefix mount containing it, when that mount is zfs (a stacked
+ * zfs mount at the same target wins, as in {@link pathOnZfsFilesystem}).
+ * `null` when the table is unavailable, holds no mount containing the path,
+ * or the serving mount is not zfs. The placement a `dir` storage gets when
+ * `zfs list` could not be read — a reading of the live mount, not a guess.
+ */
+export function servingZfsDataset(path: string, nodes: FindmntNode[] | null): string | null {
+  if (nodes === null)
+    return null
+  const target = stripTrailingSlash(path)
+  let bestLen = -1
+  let source: string | null = null
+  for (const n of nodes) {
+    if (!n.target)
+      continue
+    const t = stripTrailingSlash(n.target)
+    if (!isUnder(target, t))
+      continue
+    if (t.length > bestLen) {
+      bestLen = t.length
+      source = n.fstype === 'zfs' && n.source ? n.source : null
+    }
+    else if (t.length === bestLen && n.fstype === 'zfs' && n.source) {
+      source = n.source
+    }
+  }
+  return source
+}
+
+/**
  * The ONE longest-prefix path → dataset resolver: resolve an absolute path
  * onto the ZFS dataset that hosts it. A path is hosted by a ZFS dataset only
  * if the filesystem that actually serves the path — the longest-prefix mount
@@ -223,6 +254,13 @@ export interface PveStorageParse {
   byPool: Map<string, PveStorageRef[]>
   /** `dir` storages whose path resolved onto no dataset (see above). */
   unresolvedDirs: { storage: string, path: string }[]
+  /**
+   * `dir` storages that could not be PLACED at all because no mountpoint table
+   * was supplied (cr3, review POOLS-DISKS-H1): present only in the
+   * zfspool-only mode. A caller whose table read FAILED must not read their
+   * absence from `byPool` as "no dir storage on this pool".
+   */
+  unplacedDirs?: { storage: string, path: string }[]
 }
 
 /**
@@ -266,6 +304,7 @@ export function parsePveStorageCfg(
 ): PveStorageParse {
   const byPool = new Map<string, PveStorageRef[]>()
   const unresolvedDirs: { storage: string, path: string }[] = []
+  const unplacedDirs: { storage: string, path: string }[] = []
 
   const pushRef = (root: string, ref: PveStorageRef) => {
     const list = byPool.get(root)
@@ -290,9 +329,9 @@ export function parsePveStorageCfg(
         content: splitContent(current.content),
       })
     }
-    // dir: resolve the path onto a ZFS dataset (secondary signal). Only when a
-    // mountpoint table is supplied (even an empty one — then nothing resolves);
-    // without one, dir stanzas are ignored (the zfspool-only mode). A path that
+    // dir: resolve the path onto a ZFS dataset (secondary signal), through the
+    // mountpoint table when one is supplied (even an empty one — then nothing
+    // resolves); without one, see the branch below (cr3). A path that
     // matches no dataset keeps its configured path in `unresolvedDirs` instead
     // of vanishing — the share-path backstop needs it (pvepool.1 review fix 5).
     else if (current.type === 'dir' && current.path && mountpoints) {
@@ -307,6 +346,27 @@ export function parsePveStorageCfg(
       }
       else {
         unresolvedDirs.push({ storage: current.id, path: current.path })
+      }
+    }
+    // cr3 (review POOLS-DISKS-H1): no mountpoint table — `zfs list` could
+    // not be read. A dir stanza is never silently dropped here: the live
+    // mount table places it when it can (a path served by a zfs mount is on
+    // that mount's dataset; a path served by a non-ZFS filesystem is on no
+    // pool, the caveat-emptor rule above); anything it cannot place is
+    // UNPLACED, and the caller must treat every pool as possibly its.
+    else if (current.type === 'dir' && current.path) {
+      const onZfs = pathOnZfsFilesystem(current.path, findmntNodes ?? null)
+      const dataset = onZfs ? servingZfsDataset(current.path, findmntNodes ?? null) : null
+      if (dataset) {
+        pushRef(poolRoot(dataset), {
+          storage: current.id,
+          type: 'dir',
+          dataset,
+          content: splitContent(current.content),
+        })
+      }
+      else if (onZfs !== false) {
+        unplacedDirs.push({ storage: current.id, path: current.path })
       }
     }
     current = null
@@ -350,7 +410,7 @@ export function parsePveStorageCfg(
   }
   flush() // final stanza (no trailing blank line)
 
-  return { byPool, unresolvedDirs }
+  return { byPool, unresolvedDirs, ...(mountpoints ? {} : { unplacedDirs }) }
 }
 
 /**
@@ -401,8 +461,10 @@ export async function readPveStorages(
     return parsePveStorageCfg(text, mountpoints ?? undefined, findmntNodes ?? null)
   }
   catch (err: unknown) {
-    console.warn(`anasd: could not parse ${path} for PVE storage detection:`, err)
-    return { byPool: new Map(), unresolvedDirs: [] }
+    // cr3: a config that could not be parsed is UNREADABLE (gates tighten),
+    // never "no storages".
+    console.warn(`anasd: could not parse ${path} for PVE storage detection — treated as UNREADABLE:`, err)
+    return null
   }
 }
 
@@ -846,26 +908,39 @@ export function parsePbsStorages(text: string): PbsStorageDef[] {
 }
 
 /**
- * Read storage.cfg and return its `pbs` storage definitions, FAIL-OPEN (missing
- * file / parse error → empty array, never throws). Path is overridable for
- * tests. ANAS NEVER writes this file — it is read purely to offer the storage as
- * a hands-off tier-1 backup repository (Epic 16.8).
+ * Read storage.cfg's `pbs` storage definitions, keeping "could not read"
+ * distinct (cr3): the definitions (`[]` for a file that does not exist — a
+ * node off PVE has none), or `{ unreadable }` naming why the file could not be
+ * read or parsed. Path is overridable for tests. ANAS NEVER writes this file —
+ * it is read purely to offer the storage as a hands-off tier-1 backup
+ * repository (Epic 16.8).
  */
-export async function readPbsStorages(path: string = PVE_STORAGE_CFG): Promise<PbsStorageDef[]> {
+export async function readPbsStoragesChecked(path: string = PVE_STORAGE_CFG): Promise<{ defs: PbsStorageDef[] } | { unreadable: string }> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
   }
   catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
-      console.warn(`anasd: could not read ${path} for PVE PBS storage detection:`, err)
-    return []
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return { defs: [] }
+    console.warn(`anasd: could not read ${path} for PVE PBS storage detection:`, err)
+    return { unreadable: `${path} could not be read (${err instanceof Error ? err.message : String(err)})` }
   }
   try {
-    return parsePbsStorages(text)
+    return { defs: parsePbsStorages(text) }
   }
   catch (err: unknown) {
     console.warn(`anasd: could not parse ${path} for PVE PBS storage detection:`, err)
-    return []
+    return { unreadable: `${path} could not be parsed (${err instanceof Error ? err.message : String(err)})` }
   }
+}
+
+/**
+ * The `pbs` definitions, FAIL-OPEN (an unreadable file → `[]`): the pre-cr3
+ * shape its callers (routes/backup.ts) still use. cr3: a caller that must not
+ * read "unreadable" as "no PBS storages" asks {@link readPbsStoragesChecked}.
+ */
+export async function readPbsStorages(path: string = PVE_STORAGE_CFG): Promise<PbsStorageDef[]> {
+  const read = await readPbsStoragesChecked(path)
+  return 'defs' in read ? read.defs : []
 }

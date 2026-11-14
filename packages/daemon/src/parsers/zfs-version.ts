@@ -11,8 +11,11 @@
  *     zfs-2.3.1-1
  *     zfs-kmod-2.3.1-1
  *
- * The first (userland) line is preferred; on PVE the two match. Fail-soft:
- * anything unparseable yields null and the caller treats the node as unsupported.
+ * The KERNEL MODULE line is preferred (cr3, review L12): the module is what
+ * runs a raidz expansion, and after a userland upgrade without a reboot the
+ * two differ, the userland newer. The userland line is the fallback for an
+ * output with no kmod line. Fail-soft: anything unparseable yields null and
+ * the caller treats the node as unsupported.
  */
 
 /** A parsed OpenZFS version triple. */
@@ -25,17 +28,17 @@ export interface ZfsVersion {
 }
 
 const ZFS_VERSION_RE = /zfs-(?:kmod-)?(\d+)\.(\d+)\.(\d+)/
+const ZFS_KMOD_VERSION_RE = /zfs-kmod-(\d+)\.(\d+)\.(\d+)/
 
-/** Parse `zfs version` stdout into a version triple, or null if unrecognizable. */
+/** Parse `zfs version` stdout into a version triple (the module's when printed), or null if unrecognizable. */
 export function parseZfsVersion(stdout: string): ZfsVersion | null {
-  for (const line of stdout.split('\n')) {
-    const m = line.match(ZFS_VERSION_RE)
-    if (m) {
-      const [major, minor, patch] = [Number(m[1]), Number(m[2]), Number(m[3])]
-      return { raw: `${major}.${minor}.${patch}`, major, minor, patch }
-    }
-  }
-  return null
+  const lines = stdout.split('\n')
+  const m = lines.map(line => line.match(ZFS_KMOD_VERSION_RE)).find(x => x !== null)
+    ?? lines.map(line => line.match(ZFS_VERSION_RE)).find(x => x !== null)
+  if (!m)
+    return null
+  const [major, minor, patch] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  return { raw: `${major}.${minor}.${patch}`, major, minor, patch }
 }
 
 /**
