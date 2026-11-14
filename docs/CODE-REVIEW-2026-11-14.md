@@ -8,7 +8,7 @@
 
 **Coverage is stated per area** (files read in full, in part, not reached). A file not reached was not reviewed.
 
-**Not yet in this document (reviews still running when it was first committed):** AHR scrub and self-heal, iSCSI, Remote mounts, Cross-cutting: values shown as state that no read supplied.
+**Not yet in this document (reviews still running when it was first committed):** AHR scrub and self-heal, iSCSI, Cross-cutting: values shown as state that no read supplied.
 
 ---
 
@@ -226,3 +226,28 @@ Coverage: ahr-panel (39-ahr.js, 39-ahr-composer.js) — both read in full.
 
 Other doors: ahr-topology.ts:873-887 mounted pool whose btrfs usage read fails reports 0 used/free (schema has no unknown). 10-api.js:915 confirm drops the 409 headline = already in EPICS.
 Could not verify: QuickTip HTML; whether Expand is admitted mid btrfs scrub.
+
+## Remote mounts
+
+Coverage: mounts — 9 daemon/shared files in full; 67-mounts.js mostly in full (buildOptionList 1274-1455, static tier configs, view shell skimmed).
+
+- **MOUNTS-H1** DEFECT repro (daemon half; title render not run in a browser)  67-mounts.js:2161 + parsers/findmnt.ts:312-317 — Edit window title = 'Edit Remote Share: ' + e.mountpoint unencoded (window titles are HTML). classifyKind falls back to SOURCE SHAPE (`^[^/]+:\/`) so an unprivileged local user's FUSE mount (fusermount3 -o fsname=nas:/backup on /home/alice/<img src=x onerror=…>) reads type nfs, remote true -> Edit / row double-click opens it -> script in the admin's PVE session. Probe p5. Same unencoded-title pattern: 69-snapshots.js:1014,1968; 65-replication.js:1710,1942; 68-backup.js:3503,4989; 75-iscsi.js:1103; 40-disks.js:587; 70-shares.js:1882. Fix: enc() every title; classify remote by fstype only.
+- **MOUNTS-H2** POSSIBLE  routes/mounts.ts:384-385, :1346 — Edit (PUT) unmounts in remountEntry but lunGate runs only for unmount/disable/remove: editing a mount that holds an iSCSI fileio image yanks it. Premise (umount succeeds while LIO holds the image) needs the iscsi.6 GT run.
+- **MOUNTS-M3** DEFECT repro  parsers/fstab.ts:50/658 (FIELD_SPLIT=/\s+/, .trim()), :65 vs shared/formats/fstab.ts:47 — reader splits on ALL Unicode whitespace, libmount on ASCII blanks, writer escapes only space/tab/newline/backslash: a CIFS share with U+3000 or a mountpoint with NBSP is written but cannot be read back -> Remove leaves the line (job says removed), Edit 404, second create duplicates the line and overwrites the first mount's credentials file. Probe p1.
+- **MOUNTS-M4** DEFECT repro  routes/mounts.ts:342-387, 1344-1372 — editing a DISABLED line mounts it (no disabled gate on update; panel gate bypassed by row double-click 2930-2934). Probe p2.
+- **MOUNTS-M5** DEFECT repro  parsers/fstab.ts:741/794/1163, routes/mounts.ts:917-919 — credential rotation on an `smb3` fstype line "completes" but the line keeps the old credentials file; new file orphaned; detail says credentials not set. Same orphan for credentials sent on an NFS entry. Probe p3.
+- **MOUNTS-M6** DEFECT repro  routes/mounts.ts:1326-1332 doMount, parsers/fstab.ts:1110-1121 — Mount verb on a hand-written CIFS line with an inline password drops the password (lifted, never re-emitted) -> mount.cifs prompts on an open stdin pipe -> hang to deadline. Regression from cr.52r D3. Probe p7.
+- **MOUNTS-M7** POSSIBLE  services/mounts.ts:1113-1132 — Test probe dir removed with rm recursive+force in finally; umount result ignored, no umount on timeout 124: if the share is still mounted Node's rm walks into the LIVE remote share and deletes what the credentials allow. Fix: rmdir only, never recurse. (HIGH consequence; treat as must-fix regardless of proof.)
+- **MOUNTS-L8** DEFECT repro  shared/mount-target.ts:62-76, services/mounts.ts:1117 — NFS server beginning with `-` reaches `mount -t nfs4 -o … <spec>` with no `--` in probeMountSpec (Sys.Modify). Probe p4.
+- **MOUNTS-L9** DEFECT repro  67-mounts.js:1592-1601, 2535-2537 — Test from Edit of a credentialed CIFS mount always fails unless password retyped (credentials:{username} refused). Probe p6.
+- **MOUNTS-L10** DEFECT repro  findmnt.ts:312-317, routes/mounts.ts:279-286 — fuse.sshfs/glusterfs/davfs classed nfs; mutation verbs act on them. Probe p5.
+- **MOUNTS-L11** NOTICED  routes/mounts.ts:415-418, 737-740 — non-persistent CIFS create writes a credentials file Remove never deletes.
+- **MOUNTS-L12** NOTICED  parsers/fstab.ts:162-175 — untouched save of a hand-written line rewrites it canonically (p8).
+- **MOUNTS-L13** NOTICED  67-mounts.js:666-675 vs routes/mounts.ts:382-383 — armed automount row offers Unmount -> 404.
+- **MOUNTS-L14** NOTICED  routes/mounts.ts:1207-1215 — removeMountpointDir rmdirs the textual path with no mountTargetRefusal (/home, /srv on a hand-written line).
+- **MOUNTS-L15** NOTICED  shared/schemas/mounts.ts:486-511 — extraOptions accepts x-systemd.required-by=local-fs.target etc. (defeats nofail -> emergency mode on a dead server).
+- **MOUNTS-L16** NOTICED  routes/mounts.ts:1081-1083, 1182-1184 — failed `umount -l` ignored: reports disabled/removed while still mounted; Remove already deleted the credentials file.
+- **MOUNTS-L17** NOTICED  67-mounts.js:712 lunTip unencoded tooltip; :2624 submitMount trims the mountpoint used in the PUT path.
+
+Other doors: executor/prod.ts:422 stdin is an open pipe by default (any prompting tool waits for the deadline); SingleLine/AbsolutePath refuse only C0/DEL (check smb.conf/exports parsers for the same \s mismatch).
+Could not verify: armed automount Edit; `guest` added to sec=krb5 lines; H2 premise; systemd mount argv; mount.cifs without a TTY.
