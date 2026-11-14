@@ -396,6 +396,7 @@ phase0_preflight() {
   release_need app/packages/daemon/dist/recycle-purge.js         # recycle purge runner
   release_need app/packages/daemon/dist/backup-task.js           # backup runner
   release_need app/packages/daemon/dist/cloud-task.js            # cloud sync runner
+  release_need app/packages/daemon/dist/services/anas-acl-walk.pl # recursive permission walk
   for tpl in "${NOTIFY_TEMPLATES[@]}"; do
     release_need "templates/${tpl}"
   done

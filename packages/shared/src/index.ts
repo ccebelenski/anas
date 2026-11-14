@@ -72,8 +72,11 @@ export {
 // smb.conf (cr.13, review H3(a)): the value and list-entry validators that
 // gate every request field written into Samba's config.
 export {
+  isSmbSharePath,
+  SMB_SHARE_PATH_MSG,
   SmbConfListEntry,
   SmbConfValue,
+  SmbSharePath,
 } from './formats/smb-conf.js'
 
 // Mount target normalisation (Epic 18): the pure server/share normaliser the
@@ -100,6 +103,9 @@ export {
 export {
   AccessEntry,
   AccessLevel,
+  AccessWalkBoundary,
+  AccessWalkNote,
+  AccessWalkReport,
   DatasetAccess,
   SetAccessRequest,
   ShareAccessGrantResult,

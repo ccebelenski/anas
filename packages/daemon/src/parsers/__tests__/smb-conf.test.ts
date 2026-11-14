@@ -23,6 +23,7 @@ import {
   removeShare,
   serializeDoc,
   shadowFormatFor,
+  smbSectionKey,
   updateGlobal,
   updateShare,
 } from '../smb-conf.js'
@@ -89,7 +90,10 @@ describe('parseSmbConf typed model', () => {
   it('extracts the global config, including a space-separated interfaces list', () => {
     const { global } = parseSmbConf(FIXTURE)
     assert.equal(global.workgroup, 'WORKGROUP')
-    assert.equal(global.serverString, 'Odd   Whitespace   Server')
+    // cr3.shares H1: Samba's reader collapses a whitespace run to its first
+    // character — testparm 4.25 prints `server string = Odd Whitespace Server`
+    // for this line, so the read model says what Samba serves.
+    assert.equal(global.serverString, 'Odd Whitespace Server')
     assert.deepEqual(global.interfaces, ['lo', 'eth0', '10.0.0.0/24'])
     assert.equal(global.bindInterfacesOnly, true)
   })
@@ -1382,5 +1386,290 @@ describe('identity references (cr.30)', () => {
     }
     // The sigil makes the entry a GROUP — a user of that name is nobody's ref.
     assert.deepEqual(findIdentityReferences(text, 'crab', false), [])
+  })
+})
+
+// --- cr3.shares H1 — section headers the way Samba reads them --------------
+// The oracle is Samba itself: smb-section-headers.testparm is testparm 4.25's
+// own reading of smb-section-headers.conf. The same parser must read the hand
+// file and testparm's canonical rewrite of it to the same shares.
+describe('section headers as Samba reads them (cr3.shares H1)', () => {
+  const dir = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/samba')
+  const conf = readFileSync(join(dir, 'smb-section-headers.conf'), 'utf8')
+  const testparm = readFileSync(join(dir, 'smb-section-headers.testparm'), 'utf8')
+
+  it('the header fixture round-trips byte-identically', () => {
+    assert.equal(serializeDoc(parseDoc(conf)), conf)
+  })
+
+  it('reads every share and the global config exactly as testparm does', () => {
+    assert.deepEqual(parseSmbConf(conf), parseSmbConf(testparm))
+  })
+
+  it('names each header by the text up to its first `]`', () => {
+    assert.deepEqual(parseSmbConf(conf).shares.map(s => [s.name, s.path]), [
+      ['public', '/srv/public'],
+      ['private', '/srv/private'],
+      ['odd', '/srv/odd'],
+      ['a', '/srv/ab'],
+      ['indented', '/srv/indented'],
+      ['tabbed', '/srv/tabbed'],
+      ['continued', '/srv/continued'],
+      ['My Space', '/srv/My Space'],
+      ['valuecont', '/srv/value [not-a-header]'],
+      ['merged', '/srv/merged-one'],
+    ])
+  })
+
+  const PROBE = [
+    '[global]',
+    '\tworkgroup = WG',
+    '',
+    '[public]',
+    '\tpath = /srv/public',
+    '\tread only = yes',
+    '',
+    '[private] ; staff only',
+    '\tpath = /srv/private',
+    '\tvalid users = alice',
+    '',
+    '[odd]x',
+    '\tpath = /srv/odd',
+    '',
+  ].join('\n')
+
+  it('a header with trailing text is its own share (the review probe)', () => {
+    assert.deepEqual(parseSmbConf(PROBE).shares.map(s => [s.name, s.path, s.validUsers]), [
+      ['public', '/srv/public', []],
+      ['private', '/srv/private', ['alice']],
+      ['odd', '/srv/odd', []],
+    ])
+    assert.equal(hasShare(PROBE, 'private'), true)
+    assert.equal(hasShare(PROBE, 'odd'), true)
+  })
+
+  it('removing one share removes only its stanza', () => {
+    assert.equal(removeShare(PROBE, 'public'), PROBE.replace('[public]\n\tpath = /srv/public\n\tread only = yes\n\n', ''))
+  })
+
+  it('editing one share never touches the stanza after it', () => {
+    const next = updateShare(PROBE, 'public', { readOnly: false, validUsers: ['bob'] })
+    assert.equal(getShare(next, 'private')?.validUsers.join(','), 'alice')
+    assert.equal(getShare(next, 'public')?.validUsers.join(','), 'bob')
+    assert.ok(next.includes('[private] ; staff only\n\tpath = /srv/private\n\tvalid users = alice\n'))
+  })
+
+  it('identity references land on the share that names the account', () => {
+    assert.deepEqual(findIdentityReferences(PROBE, 'alice', false), [{ share: 'private', parameter: 'valid users' }])
+  })
+
+  it('a `[global] # comment` header is the global section — no second [global] is prepended', () => {
+    const text = '[global] # server\n\tworkgroup = WG\n'
+    assert.equal(updateGlobal(text, { workgroup: 'NEW' }), '[global] # server\n\tworkgroup = NEW\n')
+  })
+
+  it('the recycle purge reads each stanza\'s own bin and age (the review probe)', () => {
+    const text = [
+      '[global]',
+      '\tworkgroup = WG',
+      '',
+      '[scratch]',
+      '\tpath = /tank/scratch',
+      '\tvfs objects = recycle',
+      '\trecycle:repository = #recycle',
+      '\t# anas:recycle-purge-days = 7',
+      '',
+      '[finance] ; keep deleted files forever',
+      '\tpath = /tank/finance',
+      '\tvfs objects = recycle',
+      '\trecycle:repository = #recycle',
+      '',
+    ].join('\n')
+    assert.deepEqual(recyclePurgeTargets(text), [
+      { share: 'scratch', path: '/tank/scratch', repository: '#recycle', days: 7 },
+      { share: 'finance', path: '/tank/finance', repository: '#recycle', days: null },
+    ])
+  })
+
+  it('a marker-looking line that continues a value is not a purge marker', () => {
+    const text = '[s]\n\tpath = /tank/s\n\trecycle:repository = #recycle\n\tcomment = x \\\n# anas:recycle-purge-days = 7\n'
+    assert.equal(recyclePurgeTargets(text)[0].days, null)
+  })
+
+  it('a leading no-break space or a BOM does not make a header (Samba whitespace is ASCII)', () => {
+    const text = '[a]\n\tpath = /srv/a\n [b]\n\tcomment = belongs to a\n'
+    assert.deepEqual(parseSmbConf(text).shares.map(s => [s.name, s.comment]), [['a', 'belongs to a']])
+    assert.deepEqual(parseSmbConf('﻿[bom]\n\tpath = /srv/bom\n').shares, [])
+  })
+
+  it('a no-break space is not trimmed from a value, and `;` separates list entries', () => {
+    const text = '[a]\n\tpath = /srv/a \n\tvalid users = alice;bob\n'
+    assert.equal(getShare(text, 'a')?.path, '/srv/a ')
+    assert.deepEqual(getShare(text, 'a')?.validUsers, ['alice', 'bob'])
+    assert.deepEqual(findIdentityReferences(text, 'bob', false), [{ share: 'a', parameter: 'valid users' }])
+  })
+
+  it('a continued value joins without an inserted space, as Samba does', () => {
+    assert.equal(getShare('[a]\n\tpath = /srv/x\\\ny\n', 'a')?.path, '/srv/xy')
+  })
+
+  // cr3.shares (review): testparm 4.25 serves `[pub lic]`, `[public]` and
+  // `[ public]` as THREE shares (each with its own path); only the case and a
+  // whitespace run's length are folded. (Was: whitespace-blind, from a
+  // testparm reading whose second section had no path — "available = No"
+  // came from the missing path, not from a name clash.)
+  it('a share name is found case-blind, whitespace kept (runs collapsed)', () => {
+    const text = '[My   Space]\n\tpath = /srv/m\n'
+    assert.equal(getShare(text, 'MY SPACE')?.path, '/srv/m')
+    assert.equal(hasShare(text, 'myspace'), false)
+  })
+
+  it('[pub lic], [public] and [ public] are three shares, as testparm serves them', () => {
+    const text = '[pub lic]\n\tpath = /srv/one\n[public]\n\tpath = /srv/two\n[ public]\n\tpath = /srv/three\n[PUB  LIC]\n\tcomment = merged\n'
+    assert.deepEqual(parseSmbConf(text).shares.map(s => [s.name, s.path, s.comment]), [
+      ['pub lic', '/srv/one', 'merged'],
+      ['public', '/srv/two', null],
+      [' public', '/srv/three', null],
+    ])
+  })
+
+  it('sections Samba merges read, edit and remove as one share', () => {
+    const text = '[merged]\n\tpath = /srv/one\n\tcomment = first\n\n[MERGED]\n\tcomment = second\n\n[after]\n\tpath = /srv/after\n'
+    assert.equal(getShare(text, 'merged')?.comment, 'second')
+    const edited = updateShare(text, 'merged', { comment: 'third' })
+    assert.equal(edited, text.replace('comment = second', 'comment = third'))
+    assert.equal(removeShare(text, 'merged'), '[after]\n\tpath = /srv/after\n')
+  })
+
+  it('editing or removing [public] never touches [ public] (another share)', () => {
+    const text = '[public]\n\tpath = /srv/one\n\n[ public]\n\tpath = /srv/two\n'
+    assert.equal(getShare(text, 'public')?.path, '/srv/one')
+    assert.equal(updateShare(text, 'public', { comment: 'x' }), '[public]\n\tpath = /srv/one\n\tcomment = x\n\n[ public]\n\tpath = /srv/two\n')
+    assert.equal(removeShare(text, 'public'), '[ public]\n\tpath = /srv/two\n')
+  })
+
+  it('an unloadable header (no `]`) ends the stanza before it', () => {
+    const text = '[a]\n\tpath = /srv/a\n[broken\n\tcomment = not a\n'
+    assert.equal(getShare(text, 'a')?.comment, null)
+  })
+})
+
+// --- cr3.shares (review) — parameters before the first header are [global] ---
+// testparm 4.25: a file that starts `workgroup = PRE` serves that workgroup;
+// a UTF-8 BOM before `[global]` hides the header, and the lines under it are
+// read as global parameters the same way.
+describe('the preamble is the global section (cr3.shares, review)', () => {
+  const BOM = '﻿[global]\n\tworkgroup = BOM\n[a]\n\tpath = /srv/a\n'
+
+  it('reads parameters before the first header (and under a BOM-hidden header) as global', () => {
+    assert.equal(parseSmbConf(BOM).global.workgroup, 'BOM')
+    assert.equal(parseSmbConf('workgroup = PRE\n[share]\n\tpath = /srv/s\n').global.workgroup, 'PRE')
+  })
+
+  it('a global edit on a BOM file writes in place: the BOM kept byte for byte, no second [global], no line lost', () => {
+    const out = updateGlobal(BOM, { workgroup: 'BOM', serverString: 'NAS', interfaces: [], bindInterfacesOnly: false })
+    assert.equal(out, '﻿[global]\n\tworkgroup = BOM\n\tserver string = NAS\n[a]\n\tpath = /srv/a\n')
+  })
+
+  it('a global edit on a preamble rewrites the preamble line in place', () => {
+    const pre = 'workgroup = PRE\n\tserver string = S\n[share]\n\tpath = /srv/s\n'
+    assert.equal(updateGlobal(pre, { serverString: 'NAS' }), 'workgroup = PRE\n\tserver string = NAS\n[share]\n\tpath = /srv/s\n')
+  })
+
+  it('a file that starts with a share header still gains a [global] for a new parameter', () => {
+    assert.equal(updateGlobal('[a]\n\tpath = /srv/a\n', { workgroup: 'WG' }), '[global]\n\tworkgroup = WG\n\n[a]\n\tpath = /srv/a\n')
+  })
+})
+
+// --- cr3.shares (second review) — the case fold is Samba's, per character ---
+describe('service names fold the way Samba folds them (cr3.shares, second review)', () => {
+  it('[kelvin] and [Kelvin] (Kelvin sign) are two shares, as testparm serves them; removing one keeps the other', () => {
+    const text = '[kelvin]\n\tpath = /srv/k1\n\n[Kelvin]\n\tpath = /srv/k2\n'
+    assert.deepEqual(parseSmbConf(text).shares.map(s => [s.name, s.path]), [['kelvin', '/srv/k1'], ['Kelvin', '/srv/k2']])
+    assert.equal(getShare(text, 'kelvin')?.path, '/srv/k1')
+    assert.equal(removeShare(text, 'kelvin'), '[Kelvin]\n\tpath = /srv/k2\n')
+  })
+
+  it('straße and STRASSE stay two shares; ordinary case still merges', () => {
+    const text = '[straße]\n\tpath = /srv/a\n[STRASSE]\n\tpath = /srv/b\n[Media]\n\tpath = /srv/m\n[MEDIA]\n\tcomment = merged\n'
+    assert.deepEqual(parseSmbConf(text).shares.map(s => [s.name, s.path, s.comment]), [['straße', '/srv/a', null], ['STRASSE', '/srv/b', null], ['Media', '/srv/m', 'merged']])
+  })
+})
+
+// --- cr3.shares (third review D4) — every pair of the review's table, against testparm
+describe('the fold agrees with testparm on every case-folding pair (cr3.shares, third review)', () => {
+  const dir = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/samba')
+  const conf = readFileSync(join(dir, 'smb-unicode-fold.conf'), 'utf8')
+  const testparm = readFileSync(join(dir, 'smb-unicode-fold.testparm'), 'utf8')
+
+  it('reads the same shares, merged and apart, as testparm 4.25 serves them', () => {
+    assert.deepEqual(parseSmbConf(conf), parseSmbConf(testparm))
+  })
+
+  it('kelvin/Kelvin-sign, long s, micro/mu, final sigma, dotless i and the dz digraph stay apart; ÿy/ŸY, Ärger/äRGER and Media/MEDIA merge', () => {
+    const names = parseSmbConf(conf).shares.map(s => s.name)
+    for (const apart of [['kelvin', 'Kelvin'], ['kelvın', 'kelvin'], ['STRASSE', 'ſtrasse'], ['µu', 'μu'], ['σς', 'ΣΣ'], ['ǅdz', 'ǄDZ'], ['ﬀx', 'FFX']]) {
+      for (const n of apart)
+        assert.ok(names.includes(n), `${n} is its own share`)
+    }
+    assert.equal(names.filter(n => n.toLowerCase() === 'media').length, 1)
+    assert.ok(!names.includes('ŸY') && names.includes('ÿy'), 'ÿy and ŸY merge')
+  })
+})
+
+// --- cr3.shares (fourth review D-F) — Samba's fold table, every pair, both directions
+/** One `[first, count, step, delta]` row of SAMBA_FOLD_RUNS in smb-conf.ts. */
+const FOLD_ROW_RE = /\[(\d+), (\d+), (\d+), (-?\d+)\]/g
+describe('the fold is Samba\'s table: every case pair testparm was asked, both directions (cr3.shares, fourth review D-F)', () => {
+  const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/samba/smb-case-fold.json'), 'utf8')) as {
+    verdicts: [number, number, boolean][]
+    runs: [number, number, number, number][]
+  }
+  const name = (cp: number): string => `q${String.fromCodePoint(cp)}`
+
+  it('every pair Samba MERGES has one key', () => {
+    const wrong = fixture.verdicts.filter(([a, b, merged]) => merged && smbSectionKey(name(a)) !== smbSectionKey(name(b)))
+    assert.deepEqual(wrong.map(([a, b]) => `U+${a.toString(16)}/U+${b.toString(16)}`), [])
+  })
+
+  it('every pair Samba keeps APART has two keys (the 836 pairs the third review\'s fold merged included)', () => {
+    const wrong = fixture.verdicts.filter(([a, b, merged]) => !merged && smbSectionKey(name(a)) === smbSectionKey(name(b)))
+    assert.deepEqual(wrong.map(([a, b]) => `U+${a.toString(16)}/U+${b.toString(16)}`), [])
+    assert.ok(fixture.verdicts.filter(v => !v[2]).length > 900, 'the apart side is the bulk of the table')
+  })
+
+  it('every code point folds to the lowest of the class Samba merged it into, and is kept otherwise', () => {
+    // The verdicts' merged pairs, closed into classes (testparm's answers are an equivalence).
+    const low = new Map<number, number>()
+    const root = (x: number): number => low.has(x) && low.get(x) !== x ? root(low.get(x)!) : x
+    for (const [a, b, merged] of fixture.verdicts) {
+      if (!merged)
+        continue
+      const [ra, rb] = [root(a), root(b)]
+      low.set(Math.max(ra, rb), Math.min(ra, rb))
+      low.set(Math.min(ra, rb), Math.min(ra, rb))
+    }
+    const wrong: string[] = []
+    for (let cp = 0; cp <= 0x10FFFF; cp++) {
+      if (cp >= 0xD800 && cp <= 0xDFFF)
+        continue
+      const want = String.fromCodePoint(root(cp))
+      if (smbSectionKey(`x${String.fromCodePoint(cp)}`).slice(1) !== want && !(cp <= 0x20 && smbSectionKey(`x${String.fromCodePoint(cp)}`) === 'X'))
+        wrong.push(`U+${cp.toString(16)}`)
+    }
+    assert.deepEqual(wrong.slice(0, 20), [])
+  })
+
+  it('the table in smb-conf.ts is the fixture\'s, row for row (regenerate both together)', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../smb-conf.ts'), 'utf8')
+    const block = src.slice(src.indexOf('const SAMBA_FOLD_RUNS'), src.indexOf('\n]\n', src.indexOf('const SAMBA_FOLD_RUNS')))
+    const rows = Array.from(block.matchAll(FOLD_ROW_RE), m => m.slice(1).map(Number))
+    assert.deepEqual(rows, fixture.runs)
+  })
+
+  it('[global] is still found under any case Samba folds, and ASCII still merges', () => {
+    assert.equal(smbSectionKey(' GloBal '), 'global')
+    assert.equal(smbSectionKey('Media'), smbSectionKey('MEDIA'))
+    assert.notEqual(smbSectionKey('qș'), smbSectionKey('qȘ'))
   })
 })

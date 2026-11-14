@@ -2028,7 +2028,7 @@ export async function datasetRoutes(
       { ...identity, params: access.jobParams(plan) },
       // Ruling (j): the gates again, and the plan only while the state it was
       // computed from is unchanged (STATE_CHANGED otherwise, nothing written).
-      guarded(spec, pre, async (_o, ctx) => access.runSetAccess(plan, ctx.updateProgress)),
+      guarded(spec, pre, async (_o, ctx) => access.runSetAccess(plan, ctx.updateProgress, ctx)),
       { locks: pre.locks },
     )
 

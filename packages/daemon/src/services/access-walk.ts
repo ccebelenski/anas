@@ -3,82 +3,49 @@ import { isPathWithin } from '@anas/shared'
 import { normalizePath } from './nested-filesystems.js'
 
 // ============================================================================
-// The recursive permission walk's boundary (story nf.1, wave-3 node pass D2).
+// The recursive permission walk's scope (story nf.1, wave-3 node pass D2).
 //
 // A recursive apply (`applyToExisting`) used to run `chown -R`, `setfacl -R`
 // and `chmod -R` on the target's directory. None of the three stops at a
 // mount: on the node the walk entered an NFS mount below a dataset and
 // rewrote ownership on the NFS SERVER's export, while the confirm had named
-// only the child datasets. The rule now: a recursive apply never crosses a
-// mount boundary it did not name.
+// only the child datasets. The rule: a recursive apply never crosses a mount
+// boundary it did not name.
 //
-// The tools' own boundary options (man pages of the versions the node runs —
-// GNU findutils 4.10, coreutils 9, acl 2.3):
-//   - find(1) `-xdev`: "Don't descend directories on other filesystems."
-//     It still EVALUATES the boundary directory itself (the root of the other
-//     filesystem), so an action would reach the NFS export's top directory;
-//     every mount below a walk root is therefore also `-prune`d by path
-//     ("-prune True; if the file is a directory, do not descend into it.").
-// Every action runs as `-execdir … {} +`, never `-exec` (review H2,
-// 2026-10-16). `-exec` runs the batch on the full paths collected when find
-// LISTED them; between a listing and the batch a write-capable user can swap
-// a listed DIRECTORY for a symlink (`d -> /etc`), the kernel traverses it
-// when the tool resolves the absolute operand, and the action lands outside
-// the tree — the review's simulation put a named recursive grant on a victim
-// file through exactly that swap. `-execdir` closes the swap at its root:
-// find(1) runs each batch "in the subdirectory that contains the files",
-// reaching that directory through the handle it OPENED during the descent (a
-// renamed or swapped name cannot move an open fd), and every member arrives
-// as `./name` relative to that handle — never as an absolute path, so
-// nothing outside the opened directory is addressable at all. Batches never
-// mix directories ("the set of files passed is always restricted such that
-// they all live under the same directory"), and the `+` form's exit-status
-// rule is unchanged: a failing invocation fails find.
+// THE WRITE PATH (cr3.shares, fourth review) no longer runs find(1) at all.
+// find names each entry as `./name` and every tool resolved that name again
+// when it ran; a share user who swapped the name for a symbolic link in
+// between redirected the write — acl 2.3.2 `setfacl -P` followed the link,
+// coreutils 9.7 `chmod -h` raced, and GNU find's `-fstype btrfs` matched
+// nothing on btrfs, so a recursive AHR apply changed nothing and said it
+// had. The walk is now services/anas-acl-walk.pl: every entry is opened
+// O_PATH|O_NOFOLLOW where it was listed and proven by fstat, every tool
+// names that descriptor, and the boundary is the device number. What this
+// module still decides for the writer is the SCOPE: the roots (the target,
+// each named child dataset, each nested btrfs subvolume — `btrfs subvolume
+// list`, read with the plan, each pinned like every root), the mounts left
+// alone (named in the confirm and the result) and the child datasets
+// crossed.
 //
-// The final component gets its no-follow too — each tool in its own way:
-//   - chown(1) `-h, --no-dereference`: "affect … the symbolic link itself
-//     rather than the file to which the link refers" — what `chown -R`'s
-//     default `-P` did to a link it met, and never the referent;
-//   - setfacl(1) `-P, --physical`: do not follow symbolic-link operands.
-//     What happens to the operand itself is the acl version's: acl 2.3.2
-//     (Debian 13 / PVE 9) skips it silently with exit 0, acl 2.4.0 refuses
-//     it with exit 1 (both captured 2026-10-18). Either way the referent is
-//     never touched, which is the property the walk needs; "a swapped-in
-//     link fails the job loudly" held only on the 2.4.0 dev box;
-//   - chmod has no operand no-follow option on Linux (GNU chmod's `-h`
-//     affects only the `-R` traversal — and there is no lchmod here anyway),
-//     so a chmod batch's members are filtered by find's OWN type test,
-//     evaluated per entry ahead of `-execdir`: `! -type l` for the mode and
-//     `g-s` steps, `-type d` for setgid (which under find's `-P` already
-//     excludes links). No chmod invocation can receive a member find typed
-//     as anything but the kind it selects.
-//   - chown(1), chmod(1) and setfacl(1) `-R` have no one-filesystem option,
-//     so all three stay find-driven with `-xdev` and the prunes; none is
-//     ever run with `-R` (that is what crossed mounts).
-//
-// Exit status is unchanged from `-exec … {} +`: "If any invocation with the
-// `+' form returns a non-zero value as exit status, then find returns a
-// non-zero exit status" — a failing action still fails the job.
-//
-// Child ZFS datasets the confirm names are still included: each is a walk
-// root of its own (`-xdev` keeps every root inside its own dataset). Every
-// other mount under the target is excluded and named in the confirm.
-//
-// btrfs is the one exception to `-xdev`: a btrfs subvolume carries its own
-// `st_dev` and has NO mount line (BACKUP-RESTORE-GROUND-TRUTH GT-52/53, the
-// reason `services/nested-filesystems.ts` walks by st_dev), so `-xdev` would
-// stop at every subvolume of an AHR pool's `@data` — which the walk has always
-// swept as one tree. A root on btrfs is bounded by the pruned mount paths
-// alone.
+// {@link walkArgs} below is the find(1) argv of the identity scan
+// (identity-ids.ts), a READ of uids, gids and ACL entries — `-P`, `-xdev`,
+// every mount below a root `-prune`d by path, each action `-execdir ... {} +`
+// (find(1): runs "in the subdirectory that contains the files", every member
+// as `./name`). Nothing it runs writes.
 // ============================================================================
 
 /** One directory a walk starts from, and how it is bounded. */
 export interface WalkRoot {
   path: string
-  /** `-xdev` — false only on btrfs (subvolumes are not mounts). */
+  /** The identity scan's `-xdev` (identity-ids.ts sets it per filesystem). */
   xdev: boolean
-  /** Paths `-prune`d: every mount directly below this root, plus a ZFS root's `.zfs`. */
+  /** The identity scan's `-prune`d paths: every mount directly below this root, plus a ZFS root's `.zfs`. */
   prune: string[]
+  /**
+   * The root is a ZFS dataset's mountpoint: the permission walk skips the
+   * `.zfs` control directory at its top (cr3.shares, fourth review).
+   */
+  zfsRoot?: boolean
 }
 
 /** A mount under the target that the walk does not enter. */
@@ -93,6 +60,9 @@ export interface WalkScope {
   /** The named child datasets the walk crosses (not hidden under an excluded mount). */
   crossed: { name: string, mountpoint: string }[]
 }
+
+/** Leading slashes of a subvolume path. */
+const LEADING_SLASHES_RE = /^\/+/
 
 /** `find -path` takes a glob: a mountpoint's `*`, `?`, `[`, `]` and `\` must match themselves. */
 const GLOB_META_RE = /[*?[\]\\]/g
@@ -129,6 +99,7 @@ export function walkScopeFrom(
   dir: string,
   mounts: Map<string, FindmntNode>,
   children: { name: string, mountpoint: string }[],
+  subvolumes: string[] = [],
 ): WalkScope {
   const base = normalizePath(dir)
   const under = [...mounts.keys()].filter(t => t !== base && isPathWithin(base, t))
@@ -140,15 +111,22 @@ export function walkScopeFrom(
     .map(c => c.mountpoint))
   const excludedTargets = outermost(under.filter(t => !namedMounted.has(t)))
   const hidden = (path: string): boolean => excludedTargets.some(e => isPathWithin(e, path))
-  const rootPaths = [base, ...[...namedMounted].filter(p => !hidden(p)).sort()]
+  // Nested btrfs subvolumes of the walked tree are roots of their own (each
+  // has its own device number, where the walk stops), unless an excluded
+  // mount hides them.
+  const subvolRoots = subvolumes
+    .map(normalizePath)
+    .filter(p => p !== base && isPathWithin(base, p) && !hidden(p) && !namedMounted.has(p))
+  const rootPaths = [base, ...[...namedMounted, ...subvolRoots].filter(p => !hidden(p)).sort()]
   const roots = rootPaths.map((path): WalkRoot => {
     const own = mountOf(path, mounts)
     const below = outermost(under.filter(t => t !== path && isPathWithin(path, t)))
     const zfsRoot = own !== undefined && own.target === path && own.fstype === 'zfs'
     return {
       path,
-      xdev: own?.fstype !== 'btrfs',
+      xdev: true,
       prune: [...(zfsRoot ? [`${path === '/' ? '' : path}/.zfs`] : []), ...below],
+      ...(zfsRoot ? { zfsRoot: true } : {}),
     }
   })
   return {
@@ -159,13 +137,10 @@ export function walkScopeFrom(
 }
 
 /**
- * The `find` argv for one walk root: `-P` (never follow a link), the start,
- * `-xdev` (a global option, so ahead of every test), the pruned paths, then
- * the selection and the action. `select` filters what the action sees
- * (`! -type l`, `-type d`) and is what keeps a chmod batch — the one tool
- * with no operand no-follow — free of every member find did not type in;
- * `action` is the command and its options, run as `-execdir … {} +` so each
- * batch executes relative to the directory find opened (H2 — see the header).
+ * The identity scan's `find` argv for one walk root (identity-ids.ts — a
+ * READ): `-P` (never follow a link), the start, `-xdev` when the root has it
+ * (a global option, so ahead of every test), the pruned paths, then the
+ * selection and the action, run as `-execdir ... {} +`.
  */
 export function walkArgs(root: WalkRoot, select: string[], action: string[]): string[] {
   const args = ['-P', root.path]
@@ -177,6 +152,49 @@ export function walkArgs(root: WalkRoot, select: string[], action: string[]): st
   }
   args.push(...select, '-execdir', ...action, '{}', '+')
   return args
+}
+
+/**
+ * The nested btrfs subvolumes under `dir`, as absolute paths (third review
+ * D2 — each is a root of the permission walk): `btrfs subvolume list <mountpoint>` names every subvolume of the
+ * filesystem relative to its top level; the mount's own `subvol=` option says
+ * which of them is mounted at `own.target`, so a subvolume below it maps onto
+ * the mounted tree. Subvolumes outside the mounted one (`@snapshots`) are not
+ * under `dir` and drop out.
+ */
+export function nestedSubvolumes(paths: string[], own: FindmntNode, dir: string): string[] {
+  const mounted = mountedSubvolume(own)
+  const base = normalizePath(dir)
+  const out: string[] = []
+  for (const p of paths) {
+    const rel = p.replace(LEADING_SLASHES_RE, '')
+    if (mounted !== '' && !rel.startsWith(`${mounted}/`))
+      continue
+    const abs = normalizePath(`${own.target}/${mounted === '' ? rel : rel.slice(mounted.length + 1)}`)
+    if (abs !== base && isPathWithin(base, abs))
+      out.push(abs)
+  }
+  return out
+}
+
+/**
+ * The subvolume a btrfs mount shows, relative to the top level, without a
+ * leading slash (`@data`; `''` for the top level itself) — from the mount's
+ * `subvol=` option.
+ */
+export function mountedSubvolume(own: FindmntNode): string {
+  const opt = own.options.split(',').find(o => o.startsWith('subvol='))
+  return (opt ? opt.slice('subvol='.length) : '/').replace(LEADING_SLASHES_RE, '')
+}
+
+/** A subvolume path as `btrfs subvolume list` prints it, without a leading slash. */
+export function subvolumeRelPath(path: string): string {
+  return path.replace(LEADING_SLASHES_RE, '')
+}
+
+/** The mount row of the filesystem `path` sits on (exported for the plan's subvolume read). */
+export function mountRowOf(path: string, mounts: Map<string, FindmntNode>): FindmntNode | undefined {
+  return mountOf(path, mounts)
 }
 
 /** `/w3s7/a/nfs (nfs4), /w3s7/a/tmp (tmpfs)` — the confirm's and the result's list. */

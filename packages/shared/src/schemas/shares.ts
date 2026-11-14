@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { EXPORT_PATH_MSG, ExportClientSpec, ExportOption, isExportPath } from '../formats/exports.js'
-import { SmbConfListEntry, SmbConfValue } from '../formats/smb-conf.js'
+import { SmbConfListEntry, SmbConfValue, SmbSharePath } from '../formats/smb-conf.js'
 import { AbsolutePath, NewShareName, ShareName, SingleLine } from './common.js'
 
 // ============================================================================
@@ -125,6 +125,20 @@ export const SmbShare = z.object({
   /** The read-time path check, all four outcomes (cr.35). Absent from an old daemon. */
   pathState: SharePathState.optional(),
   /**
+   * cr3.shares (INVENTED-STATE-M6): the share's live client connections, from
+   * ONE `smbstatus` read for the whole list. `null` = smbstatus could not be
+   * read — unknown, never 0. Absent from an old daemon (render unknown).
+   */
+  activeConnections: z.number().int().nonnegative().nullable().optional(),
+  /**
+   * cr3.shares (review): true when the section's name holds characters ANAS
+   * does not use in a share name (`ShareName`: letters, digits, `_`, `-`) —
+   * `[My Space]`, `[ public]`. Such a share is LISTED (Samba serves it) but
+   * not managed by ANAS: its name cannot address the detail, edit, remove or
+   * permissions doors, and the panel offers no action on it. Absent = managed.
+   */
+  unmanagedName: z.boolean().optional(),
+  /**
    * The share's `vfs objects` module list, parsed from the stanza — absent
    * when the stanza carries no such line. Read-only information (what the
    * config says), and the input {@link hasCustomVfsObjects} answers from.
@@ -155,6 +169,12 @@ export type ShareCapacity = z.infer<typeof ShareCapacity>
 /** SMB share detail = the share plus its live connections. */
 export const SmbShareDetail = SmbShare.extend({
   connections: z.array(SmbConnection),
+  /**
+   * cr3.shares (SHARES-L8): true when smbstatus could not be read — then
+   * `connections` is empty because nothing could be seen, not because nobody
+   * is connected. Absent when the read answered.
+   */
+  connectionsUnknown: z.boolean().optional(),
   /** Free space under the share path, when it resolves onto ZFS or AHR. */
   capacity: ShareCapacity.optional(),
 })
@@ -213,7 +233,9 @@ export const CreateSmbShareRequest = z.object({
   // sections — `global` would append a second `[global]` Samba merges into
   // the first, and ANAS could neither show nor delete the stanza it wrote.
   name: NewShareName,
-  path: AbsolutePath.and(SmbConfValue),
+  // cr3.shares L6: and exactly the path Samba serves (no edge or doubled
+  // whitespace, no `%` macro) — the gates judge the string they are given.
+  path: AbsolutePath.and(SmbConfValue).and(SmbSharePath),
   comment: SmbConfValue.optional(),
   browseable: z.boolean().optional(),
   readOnly: z.boolean().optional(),
@@ -238,6 +260,11 @@ export type CreateSmbShareRequest = z.infer<typeof CreateSmbShareRequest>
 export const UpdateSmbShareRequest = CreateSmbShareRequest
   .partial()
   .omit({ name: true })
+  // cr3.shares L6 (review): an edit carries the stanza's own path back
+  // whatever it holds (a hand-written `/srv/profiles/%U` included — the panel
+  // always sends `path`), so the request stays lenient here; the daemon holds
+  // a path that CHANGES to SmbSharePath (exactly what Samba serves).
+  .extend({ path: AbsolutePath.and(SmbConfValue).optional() })
 export type UpdateSmbShareRequest = z.infer<typeof UpdateSmbShareRequest>
 
 /**

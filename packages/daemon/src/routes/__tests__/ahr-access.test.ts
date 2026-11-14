@@ -1,6 +1,7 @@
 import type { AccessEntry, DatasetAccess, Job, JobAccepted } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
+import type { WalkRun } from './real-path-echo.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -11,8 +12,13 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { mockFixtures } from '../../fixtures/loader.js'
-import { createServer } from '../../server.js'
+import { createServer as createDevServer } from '../../server.js'
+import { PINNED_DIR } from '../../services/access.js'
 import { AHR_FINDMNT_ARGS } from '../../services/ahr-topology.js'
+import { echoRealPaths, pinnedPaths, walkRuns } from './real-path-echo.js'
+
+/** cr3.shares H2: the dev server, with `realpath -e` naming each plain test directory as itself. */
+const createServer = (...a: Parameters<typeof createDevServer>): ReturnType<typeof createDevServer> => echoRealPaths(createDevServer(...a))
 
 /**
  * access.2 — the AHR permissions editor runs the SAME writer as the ZFS editor
@@ -39,28 +45,22 @@ const POOL = 'ahr0'
 const MP = '/mnt/anas-ahr/ahr0'
 const URL = `/v1/ahr/${POOL}/access`
 
-/** The AHR pool sits on btrfs (`ahr/findmnt-ahr0.json`): its walk has no `-xdev` — subvolumes are not mounts. */
-const WALK_XDEV: string[] = []
-
-const FIND = '/usr/bin/find'
-
 /**
- * Story nf.1 (wave-3 D2): every recursive step is a bounded `find` walk —
- * `find -P <root> [-xdev] [( -path … ) -prune -o] <select> -exec <action> {} +` —
- * never `-R`, which crosses every mount under the directory. WALK_XDEV is
- * `-xdev` unless the root sits on btrfs (an AHR pool, whose subvolumes carry
- * their own st_dev and no mount line).
+ * cr3.shares, fourth review: a recursive apply is ONE run of the walk helper
+ * (anas-acl-walk) over the pinned roots — the dev mock answers it and these
+ * tests read the job the writer sent. On btrfs the helper stops at every
+ * nested subvolume's own device number; each nested subvolume of `@data`
+ * that `btrfs subvolume list` names is a pinned root of its own.
  */
-function walkOf(root: string, select: string[], action: string[]): string[] {
-  return ['-P', root, ...WALK_XDEV, ...select, '-execdir', ...action, '{}', '+']
+function walkJob(): WalkRun['job'] {
+  const runs = walkRuns()
+  assert.equal(runs.length, 1, `one walk: ${JSON.stringify(runs)}`)
+  return runs[0].job
 }
 
-/** The walk whose action is `tool` (and whose action arguments pass `pred`). */
-function walkCall(calls: Call[], tool: string, pred: (action: string[]) => boolean = () => true): string[] | undefined {
-  return calls.find((c) => {
-    const at = c.args.indexOf('-execdir')
-    return c.command === FIND && at >= 0 && c.args[at + 1] === tool && pred(c.args.slice(at + 2, -2))
-  })?.args
+/** The steps a walk job asks for, by name. */
+function walkSteps(job: WalkRun['job']): string[] {
+  return Object.keys(job).filter(k => k !== 'roots' && k !== 'tools').sort()
 }
 
 /** A live ACL on the pool's mount with one named user (alice rwx) and a default ACL. */
@@ -97,7 +97,7 @@ function installExecutor(server: ReturnType<typeof createServer>, stubs: Stub[] 
   const mock = (server as any).executor as MockExecutor
   const calls: Call[] = []
   const orig = mock.exec.bind(mock)
-  mock.exec = async (command: string, args: string[]): Promise<ExecResult> => {
+  mock.exec = async (command: string, args: string[], opts?: Parameters<MockExecutor['exec']>[2]): Promise<ExecResult> => {
     calls.push({ command, args })
     // nf.1: the recursive walk reads `findmnt --json`; the AHR pool's mount
     // is the captured `ahr/findmnt-ahr0.json` (`/` ext4, the pool btrfs).
@@ -110,7 +110,7 @@ function installExecutor(server: ReturnType<typeof createServer>, stubs: Stub[] 
     )
     if (stub)
       return stub.result
-    return orig(command, args)
+    return orig(command, args, opts)
   }
   return calls
 }
@@ -253,7 +253,8 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       assert.equal((res.json() as JobAccepted).job.operation, 'fs.setAccess')
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
-      assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['750', '--', MP])
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
+      assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['750', '--', PINNED_DIR])
       assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
       assert.deepEqual((job.result as { pool: string, mountpoint: string }).pool, POOL)
       assertNoAcltypeStep(calls)
@@ -272,7 +273,9 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(walkCall(calls, '/usr/bin/chmod'), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX', '--']))
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
+      assert.deepEqual(walkSteps(walkJob()), ['mode'])
+      assert.equal(walkJob().mode, 'u=rwX,g=rX,o=rX')
       assertNoAcltypeStep(calls)
     })
 
@@ -289,7 +292,8 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       ] })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', '--', MP])
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', '--', PINNED_DIR])
     })
   })
 
@@ -306,12 +310,14 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       ] })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
       // Native ACLs: nothing to auto-enable.
       assert.equal((job.result as { aclAutoEnabled: boolean }).aclAutoEnabled, false)
       const spec = 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx'
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', spec, '--', MP])
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '--set', spec, '--', MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['g+s', '--', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', spec, '--', PINNED_DIR])
+      // cr3.shares M3: the default ACL gains only the principal granted.
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '-m', 'u:alice:rwx,m::rwx', '--', PINNED_DIR])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['g+s', '--', PINNED_DIR])
       assertNoAcltypeStep(calls)
     })
 
@@ -338,10 +344,12 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       ] })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
       assert.equal((job.result as { clearedNamed: boolean }).clearedNamed, true)
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-b', '-k', '--', MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g-s')), ['g-s', '--', MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('755')), ['755', '--', MP])
+      // cr3.shares M3: base three alone (7,5,5), only alice leaves the default.
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x', '--', PINNED_DIR])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-x')), ['-n', '-d', '-x', 'u:alice', '--', PINNED_DIR])
+      assert.equal(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), undefined)
     })
 
     it('ahr recursive clear folds the setgid drop into a single chmod walk', async () => {
@@ -354,24 +362,28 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       ] })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-P', '-b', '-k', '--']))
-      const chmodWalks = calls.filter(c => c.command === FIND && c.args.includes('/usr/bin/chmod'))
-      assert.equal(chmodWalks.length, 1)
-      assert.deepEqual(chmodWalks[0].args, walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/chmod', 'u=rwX,g=rX,o=rX,g-s', '--']))
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
+      // The clear and the mode in ONE walk; cr3.shares N3: no g-s (was `u=rwX,g=rX,o=rX,g-s`).
+      assert.deepEqual(walkSteps(walkJob()), ['clear', 'mode'])
+      assert.equal(walkJob().mode, 'u=rwX,g=rX,o=rX')
+      assert.equal(calls.some(c => c.args.some(a => a.includes('g-s'))), false)
     })
 
     it('ahr base-only update with no named entries LEAVES existing named ACLs alone (#37)', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server, [{ command: '/usr/bin/getfacl', args: ['-pcE', MP], result: ok(GETFACL_WITH_ALICE) }])
+      // One base level actually moved (everyone --- -> read): cr3.shares M3
+      // runs no command for an edit that moves nothing.
       const res = await put({ entries: [
         { kind: 'owner', level: 'read-write' },
         { kind: 'owning-group', level: 'read' },
-        { kind: 'everyone', level: 'none' },
+        { kind: 'everyone', level: 'read' },
       ] })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
       assert.equal(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), undefined)
-      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', '--', MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', 'u::rwx,g::r-x,o::r-x,u:alice:rwx,m::rwx', '--', PINNED_DIR])
       assert.equal((job.result as { namedCount: number }).namedCount, 1)
     })
 
@@ -381,7 +393,8 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       const res = await put({ owner: 'media' })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['media', '--', MP])
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
+      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['media', '--', PINNED_DIR])
       assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
       assert.equal(find(calls, '/usr/bin/chmod', () => true), undefined)
     })
@@ -389,7 +402,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
 
   // --- PUT: applyToExisting -------------------------------------------------------
   describe('PUT — applyToExisting', () => {
-    it('ahr applyToExisting walks chown and setfacl (access + default) and directories for g+s with find — the whole @data tree, no -xdev', async () => {
+    it('ahr applyToExisting walks chown and setfacl (access + default) and directories for g+s in one helper run over @data', async () => {
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server)
       const res = await putConfirmed({
@@ -404,13 +417,20 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       })
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media', '--']))
-      const spec = 'u::rwX,g::r-X,o::r-X,u:alice:r-X,m::rwX'
-      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-b')), walkOf(MP, ['!', '-type', 'l'], ['/usr/bin/setfacl', '-P', '-b', '-m', spec, '--']))
-      assert.deepEqual(walkCall(calls, '/usr/bin/setfacl', a => a.includes('-d')), walkOf(MP, ['-type', 'd'], ['/usr/bin/setfacl', '-P', '-d', '--set', 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx', '--']))
-      assert.deepEqual(walkCall(calls, '/usr/bin/chmod', a => a[0] === 'g+s'), walkOf(MP, ['-type', 'd'], ['/usr/bin/chmod', 'g+s', '--']))
-      // btrfs: no -xdev, so every subvolume under @data is still swept (nf.1).
-      assert.equal(calls.some(c => c.command === FIND && c.args.includes('-xdev')), false)
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
+      const walked = walkJob()
+      assert.deepEqual(walkSteps(walked), ['acl', 'chown', 'defaultAcl', 'setgid'])
+      assert.equal(walked.chown, 'media')
+      assert.equal(walked.acl, 'u::rwX,g::r-X,o::r-X,u:alice:r-X,m::rwX')
+      assert.equal(walked.defaultAcl, 'u::rwx,g::r-x,o::r-x,u:alice:r-x,m::rwx')
+      assert.equal(walked.setgid, true)
+      // cr3.shares D2 (third review), fourth review: the walk stops at every
+      // device boundary, btrfs too — each nested subvolume of @data is a
+      // pinned root of its own (this fixture's list has none under @data). Not
+      // a ZFS root: no `.zfs` skip. (Was: `-xdev` + `-fstype btrfs`, which
+      // matched nothing on btrfs — the review's D-A.)
+      assert.deepEqual(walked.roots.map(r => [r.fd, r.path, r.zfs]), [[3, MP, false]])
+      assert.equal(calls.some(c => c.command === '/usr/bin/find'), false, 'no find')
       assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), undefined, 'no chmod g+s over the whole tree')
       // The walk starts at the mount (@data); @snapshots is a sibling subvolume
       // outside it, so no command ever names a snapshot path.
@@ -430,7 +450,7 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       assert.ok(err.warnings.some(w => /sweeps every subvolume under the pool's data as one tree; the pool's snapshots are not touched/.test(w)), JSON.stringify(err.warnings))
       assert.ok(err.warnings.some(w => /cannot be undone/.test(w)), JSON.stringify(err.warnings))
       assert.equal(err.warnings.some(w => /iSCSI/.test(w)), false, 'no LUN on this pool, no LUN sentence')
-      assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl', '/usr/bin/find'].includes(c.command)), false, 'nothing ran')
+      assert.equal(calls.some(c => ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl', '/usr/bin/find', '/usr/bin/perl'].includes(c.command)), false, 'nothing ran')
       assertNoAcltypeStep(calls)
       // A wrong code is a fresh challenge, never a pass.
       const wrong = await server.inject({ method: 'PUT', url: URL, headers: { ...JSON_HEADERS, 'x-anas-confirm': 'nope' }, payload: JSON.stringify({ owner: 'media', applyToExisting: true }) })
@@ -439,7 +459,9 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       assert.equal(ok2.statusCode, 202)
       const job = await waitForJob(server, (ok2.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
-      assert.deepEqual(walkCall(calls, '/usr/bin/chown'), walkOf(MP, [], ['/usr/bin/chown', '-h', 'media', '--']))
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
+      assert.deepEqual(walkSteps(walkJob()), ['chown'])
+      assert.equal(walkJob().chown, 'media')
     })
 
     it('ahr applyToExisting is refused when a PVE storage path sits inside the tree; the flat change is not', async () => {
@@ -502,10 +524,13 @@ describe('access.2 — AHR permissions editor (GET/PUT /v1/ahr/:name/access)', (
       await lunOnAhr0()
       server = createServer({ mock: true, logger: false })
       const calls = installExecutor(server)
-      const res = await put({ entries: [{ kind: 'everyone', level: 'read' }] })
+      // everyone r-x -> none: a real change (cr3.shares M3 runs nothing for
+      // a level left as read, and the pool reads everyone = read).
+      const res = await put({ entries: [{ kind: 'everyone', level: 'none' }] })
       assert.equal(res.statusCode, 202, res.body)
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.deepEqual(pinnedPaths(), [MP], 'cr3: the writer pinned exactly the planned directory')
       assert.ok(find(calls, '/usr/bin/chmod', () => true), 'the mode change ran')
       // The read is never gated — the editor opens and shows the state.
       const read = await server.inject({ method: 'GET', url: URL, headers: IDENTITY_HEADERS })

@@ -1,9 +1,13 @@
 import type { Stats } from 'node:fs'
 import type { FileHandle } from 'node:fs/promises'
+import type { CommandExecutor } from './executor/types.js'
+import type { SharePathProbe } from './services/share-path.js'
 import { constants } from 'node:fs'
 import { lstat, open, readdir, readFile, rmdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
+import { ProdExecutor } from './executor/prod.js'
 import { recyclePurgeTargets } from './parsers/smb-conf.js'
+import { probeSharePath } from './services/share-path.js'
 
 /**
  * Recycle-bin PURGE RUNNER (smbsvc.2) — the entrypoint the static
@@ -88,6 +92,20 @@ export interface RecyclePurgeOptions {
    */
   ageOf?: (stats: Stats) => number
   log?: PurgeLog
+  /**
+   * cr3.shares L9: the share-path liveness check run before a share is
+   * touched — the daemon's own `timeout 2 stat -f` probe (cr.35) in a child
+   * process, so a share on a dead hard NFS mount is reported and passed over
+   * instead of hanging the run in the kernel. Injectable (tests).
+   */
+  probe?: (path: string) => Promise<SharePathProbe>
+}
+
+/** The runner's own executor, made only when a probe actually runs. */
+let runnerExecutor: CommandExecutor | null = null
+function defaultProbe(path: string): Promise<SharePathProbe> {
+  runnerExecutor ??= new ProdExecutor()
+  return probeSharePath(runnerExecutor, path)
 }
 
 /** `find`'s `-ctime +N` semantics: whole days only, strictly more than N. */
@@ -320,6 +338,23 @@ export async function runRecyclePurge(opts: RecyclePurgeOptions = {}): Promise<R
       result.skipped++
       continue
     }
+    // cr3.shares L9: a share whose path does not answer (a dead hard NFS or
+    // CIFS mount) is never lstat-ed in this process — that lstat would sleep
+    // in the kernel for ever and every later share would wait behind it. It
+    // is reported as FAILED (the run exits 1: systemd's last-result says so)
+    // and the sweep moves on; the unit's TimeoutStartSec bounds a mount that
+    // dies mid-walk.
+    const live = await (opts.probe ?? defaultProbe)(target.path)
+    if (live.state === 'missing') {
+      log(`anas-recycle: share=${target.share} skipped (path ${target.path} does not exist)`)
+      result.skipped++
+      continue
+    }
+    if (live.state !== 'exists') {
+      log(`anas-recycle: share=${target.share} failed (path ${target.path} ${live.state === 'not-answering' ? 'is not answering' : 'could not be checked'}: ${live.detail ?? 'no detail'} - not swept)`)
+      result.failed++
+      continue
+    }
     const bin = join(target.path, target.repository)
     const fs: PurgeFs = { ...NODE_FS, ...opts.fs }
     try {
@@ -334,11 +369,18 @@ export async function runRecyclePurge(opts: RecyclePurgeOptions = {}): Promise<R
         continue
       }
     }
-    catch {
+    catch (err) {
       // No bin on disk yet — nothing has been deleted on this share, so there
-      // is nothing to purge. Not an error (DESIGN smbsvc.2).
-      log(`anas-recycle: share=${target.share} skipped (${target.repository} does not exist)`)
-      result.skipped++
+      // is nothing to purge. Not an error (DESIGN smbsvc.2). Any OTHER failure
+      // (EACCES, EIO) is a read that failed, never "no bin" (cr3).
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        log(`anas-recycle: share=${target.share} skipped (${target.repository} does not exist)`)
+        result.skipped++
+      }
+      else {
+        log(`anas-recycle: share=${target.share} failed (${target.repository} could not be read: ${err instanceof Error ? err.message : String(err)})`)
+        result.failed++
+      }
       continue
     }
     try {

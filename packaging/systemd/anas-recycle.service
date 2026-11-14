@@ -3,4 +3,8 @@ Description=ANAS recycle bin purge (vfs_recycle, age-based)
 
 [Service]
 Type=oneshot
+# cr3.shares L9: the run ends. A share on a mount that dies mid-sweep must
+# not hold the unit active for ever (a running oneshot swallows every later
+# timer fire); the runner probes each share's path first, this bounds the rest.
+TimeoutStartSec=12h
 ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/recycle-purge.js

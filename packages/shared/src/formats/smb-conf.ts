@@ -45,7 +45,7 @@ export const SMB_CONF_VALUE_MSG
 
 /** The refusal sentence for one ENTRY of a joined list (adds the separator rule). */
 export const SMB_CONF_LIST_ENTRY_MSG
-  = `${SMB_CONF_VALUE_MSG}, and it must not contain a space, comma or tab (Samba list separators — the writer joins entries with spaces)`
+  = `${SMB_CONF_VALUE_MSG}, and it must not contain a space, comma, semicolon or tab (Samba list separators — the writer joins entries with spaces)`
 
 /** Is `s` a safe single smb.conf value? (see the file head for why). */
 export function isSmbConfValue(s: string): boolean {
@@ -67,8 +67,10 @@ export function isSmbConfValue(s: string): boolean {
 export const SmbConfValue = z.string().refine(isSmbConfValue, SMB_CONF_VALUE_MSG)
 
 // Samba joins list-style parameters (valid users, hosts allow, interfaces)
-// on whitespace and/or commas and reads them back the same way.
-const SMB_LIST_SEPARATOR_RE = /[,\s]/
+// on whitespace and/or commas and reads them back on its `LIST_SEP` set —
+// space, tab, comma, SEMICOLON, CR, LF (testparm 4.25 reads `alice;bob` as
+// two entries; cr3.shares H1).
+const SMB_LIST_SEPARATOR_RE = /[,;\s]/
 
 /**
  * One ENTRY of a whitespace/comma-joined smb.conf list. The entry must be a
@@ -88,3 +90,28 @@ export function isSmbConfListEntry(s: string): boolean {
 
 /** One smb.conf list entry (see {@link isSmbConfListEntry}). */
 export const SmbConfListEntry = z.string().refine(isSmbConfListEntry, SMB_CONF_LIST_ENTRY_MSG)
+
+// ── Share paths (cr3.shares L6) ──────────────────────────────────────────────
+
+/** Samba's whitespace (C `isspace`): a run of two, or one at either end. */
+const SMB_PATH_WS_RUN_RE = /[\t\n\v\f\r ]{2}/
+const SMB_PATH_WS_EDGE_RE = /^[\t\n\v\f\r ]|[\t\n\v\f\r ]$/
+
+/** The refusal sentence for a share path Samba would read differently. */
+export const SMB_SHARE_PATH_MSG
+  = 'a share path must be exactly the path Samba serves: no leading or trailing space, no run of two spaces (Samba trims and collapses them) and no `%` (Samba substitutes `%` macros such as %U per connection)'
+
+/**
+ * Is `p` a path Samba reads back exactly as written? Samba's reader trims a
+ * value and collapses each whitespace run to one character (testparm 4.25:
+ * `path = /srv/My  Data` serves `/srv/My Data`), and substitutes `%` macros
+ * in `path` per connection — so the PVE territory gate, the path check and
+ * the permissions grant, which judge the string ANAS was given, would judge a
+ * different directory from the one Samba serves.
+ */
+export function isSmbSharePath(p: string): boolean {
+  return !p.includes('%') && !SMB_PATH_WS_RUN_RE.test(p) && !SMB_PATH_WS_EDGE_RE.test(p)
+}
+
+/** A share path Samba serves verbatim (see {@link isSmbSharePath}). */
+export const SmbSharePath = z.string().refine(isSmbSharePath, SMB_SHARE_PATH_MSG)

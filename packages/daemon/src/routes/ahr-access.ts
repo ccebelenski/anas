@@ -130,7 +130,7 @@ export async function ahrAccessRoutes(
     const job = jobQueue.submit(
       'fs.setAccess',
       { ...identity, params: access.jobParams(plan) },
-      guarded(spec, pre, async (_o, ctx) => access.runSetAccess(plan, ctx.updateProgress)),
+      guarded(spec, pre, async (_o, ctx) => access.runSetAccess(plan, ctx.updateProgress, ctx)),
       { locks: pre.locks },
     )
     reply.code(202)

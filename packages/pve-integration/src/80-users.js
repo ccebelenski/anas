@@ -79,6 +79,18 @@
         return ANAS.enc(s);
     }
 
+    // cr3: the default ExtJS BoundList (and a tagfield's tag label) renders
+    // its display field as raw HTML. Rows that carry names from the node —
+    // accounts and groups from getent, interfaces and addresses — go through
+    // these encoded templates instead.
+    function encodedListConfig(field) {
+        return { tpl: '<tpl for="."><div class="x-boundlist-item">{' + field + ':htmlEncode}</div></tpl>' };
+    }
+
+    function encodedLabelTpl(field) {
+        return '{' + field + ':htmlEncode}';
+    }
+
     function trim(v) {
         return ('' + (v == null ? '' : v)).replace(/^\s+|\s+$/g, '');
     }
@@ -197,7 +209,7 @@
         }
         return enc(v)
             + ' <span class="anas-badge-private-group" title="'
-            + enc(t('User-private group — the primary group of user') + ' ' + enc(priv))
+            + enc(t('User-private group — the primary group of user') + ' ' + priv)
             + '" style="color:#888;font-size:0.85em;">'
             + enc(t('private group of') + ' ') + enc(priv) + '</span>';
     }
@@ -539,6 +551,8 @@
                             fieldLabel: t('Groups'),
                             store: groupStore,
                             displayField: 'name',
+                            listConfig: encodedListConfig('name'),
+                            labelTpl: encodedLabelTpl('name'),
                             valueField: 'name',
                             queryMode: 'local',
                             filterPickList: true,
@@ -579,6 +593,7 @@
                                 fieldLabel: t('Primary group'),
                                 store: primaryStore,
                                 displayField: 'name',
+                                listConfig: encodedListConfig('name'),
                                 valueField: 'name',
                                 queryMode: 'local',
                                 forceSelection: true,
@@ -715,7 +730,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-smb-password',
-                title: t('Set SMB Password') + ': ' + userName,
+                title: t('Set SMB Password') + ': ' + enc(userName),
                 modal: true,
                 width: 460,
                 resizable: false,
@@ -956,7 +971,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-user-groups',
-                title: t('Edit Groups') + ': ' + userName,
+                title: t('Edit Groups') + ': ' + enc(userName),
                 modal: true,
                 width: 520,
                 resizable: false,
@@ -975,6 +990,8 @@
                             fieldLabel: t('Groups'),
                             store: groupStore,
                             displayField: 'name',
+                            listConfig: encodedListConfig('name'),
+                            labelTpl: encodedLabelTpl('name'),
                             valueField: 'name',
                             queryMode: 'local',
                             filterPickList: true,
@@ -1258,7 +1275,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-group-members',
-                title: t('Group Members') + ': ' + groupName,
+                title: t('Group Members') + ': ' + enc(groupName),
                 modal: true,
                 width: 520,
                 height: 460,
@@ -1277,6 +1294,8 @@
                                 flex: 1,
                                 store: userStore,
                                 displayField: 'name',
+                                listConfig: encodedListConfig('name'),
+                                labelTpl: encodedLabelTpl('name'),
                                 valueField: 'name',
                                 queryMode: 'local',
                                 filterPickList: true,

@@ -221,8 +221,14 @@ function walkRootsWhere(paths: string[], mounts: Map<string, FindmntNode>, walka
     if (!own || isUnwalkableKind(kindOfMount(own)))
       continue
     const scope = walkScopeFrom(path, mounts, [])
-    if (walkable(own))
-      roots.push(scope.roots[0])
+    // A READ (the uid/gid accounting), not a write: on btrfs it still sweeps
+    // the nested subvolumes as one tree (no `-xdev`) — the
+    // permission writer's filesystem boundary (cr3.shares D2) is about what
+    // a write may reach; this scan must SEE every id in use.
+    if (walkable(own)) {
+      const { zfsRoot: _zfsRoot, ...root } = scope.roots[0]
+      roots.push({ ...root, xdev: own.fstype !== 'btrfs' })
+    }
     // cr.59: a local filesystem below is looked at even when this one is not
     // walked (a ZFS share left to the accounting, a ZFS filesystem with POSIX
     // ACLs off): an ext4 or btrfs mount under it still holds share files.

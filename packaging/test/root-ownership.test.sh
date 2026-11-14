@@ -126,6 +126,8 @@ cp "${PKG}"/templates/anas-*.txt.hbs "${REL}/templates/"
 for t in recycle-purge.js backup-task.js cloud-task.js; do
   : > "${REL}/app/packages/daemon/dist/${t}"
 done
+mkdir -p "${REL}/app/packages/daemon/dist/services"
+: > "${REL}/app/packages/daemon/dist/services/anas-acl-walk.pl"
 cat > "${REL}/app/packages/pve-integration/install.sh" <<'EOF'
 #!/usr/bin/env bash
 mkdir -p "${PVE_JS_DIR}"

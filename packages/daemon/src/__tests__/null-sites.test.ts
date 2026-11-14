@@ -26,7 +26,7 @@ const NULL_SITES: { file: string, reason: string }[] = [
   // rrep.1b: the recursive run's per-dataset pipeline — a second site in the
   // same file, the same data mover.
   { file: 'routes/replication.ts', reason: 'zfs send | zfs recv: a data mover, hours for a large send' },
-  { file: 'services/access.ts', reason: 'recursive chown/setfacl/chmod/find over a whole tree: hours on a large dataset' },
+  { file: 'services/access.ts', reason: 'recursive chown/setfacl/chmod walk over a whole tree: hours on a large dataset' },
   { file: 'services/ahr-scrub.ts', reason: 'btrfs scrub: a verify pass over the whole filesystem, hours to days on a large pool' },
   { file: 'services/backup-restore-files.ts', reason: 'proxmox-backup-client file restore: a data mover, hours for a large tree' },
   { file: 'services/backup-restore.ts', reason: 'proxmox-backup-client image restore in place: a data mover, hours for a large image' },

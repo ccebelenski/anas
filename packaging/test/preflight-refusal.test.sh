@@ -60,6 +60,8 @@ stage_release() {
   for t in recycle-purge.js backup-task.js cloud-task.js; do
     : > "${rel}/app/packages/daemon/dist/${t}"
   done
+  mkdir -p "${rel}/app/packages/daemon/dist/services"
+  : > "${rel}/app/packages/daemon/dist/services/anas-acl-walk.pl"
 }
 
 # Run ONLY the read-only preflight from the staged release; output -> $LOG.
@@ -144,6 +146,7 @@ for need in VERSION systemd/anasd.service systemd/anas.service anas-md-event.sh 
             app/packages/daemon/dist/recycle-purge.js \
             app/packages/daemon/dist/backup-task.js \
             app/packages/daemon/dist/cloud-task.js \
+            app/packages/daemon/dist/services/anas-acl-walk.pl \
             templates/anas-ahr-subject.txt.hbs templates/anas-cloud-body.txt.hbs \
             templates/anas-integration-subject.txt.hbs; do
   stage_release "${REL}"

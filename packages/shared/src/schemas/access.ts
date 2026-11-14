@@ -44,6 +44,18 @@ export const AccessEntry = z.object({
    * surfaces it as "unknown (uid N)" so it can be recognised and removed.
    */
   unresolved: z.boolean().optional(),
+  /**
+   * cr3.shares (second review): the entry's live permission bits as the
+   * directory reads them (`rwx`, `r-x`, `-w-`, `r--` ... — for a group-class
+   * entry, what the mask lets it do). Set by the daemon on a read; when they
+   * are not exactly the level's own bits (none `---`, read `r-x`,
+   * read-write `rwx`) the row is CUSTOM and the panel shows the bits. In a
+   * request (third review D3) the panel echoes them for a named row whose
+   * level the operator did not change: bits equal to the live ones keep the
+   * row exactly as it is; a row sent without them, or at a level other than
+   * the one read, is restated at its level. Absent from an older daemon.
+   */
+  perms: z.string().regex(/^[r-][w-][x-]$/).optional(),
 })
   .refine(
     e => (e.kind === 'user' || e.kind === 'group') ? !!e.name : e.name === undefined,
@@ -79,6 +91,13 @@ export const DatasetAccess = z.object({
   /** Raw `getfacl` text for the Advanced panel, or null when no/unsupported ACLs */
   aclText: z.string().nullable(),
   /**
+   * cr3.shares (second review, coordinator ruling): the revision of what this
+   * read saw — the same hash the route-to-job binding computes. Sent back as
+   * `expectedRevision`, it refuses an Apply made from a stale read (409
+   * STATE_CHANGED, "reload"). Absent from an older daemon.
+   */
+  revision: z.string().optional(),
+  /**
    * Which filesystem family the directory sits on (access.1/access.2) — the
    * one input the shared Permissions dialog needs to state where the targets
    * differ: `zfs` has the `acltype` switch and a recursive apply walks into
@@ -91,6 +110,90 @@ export const DatasetAccess = z.object({
   backing: z.enum(['zfs', 'ahr', 'other']).optional(),
 })
 export type DatasetAccess = z.infer<typeof DatasetAccess>
+
+/**
+ * The recursive permission walk's report (cr3.shares, fourth review): the
+ * counts anas-acl-walk answers, carried on an `fs.setAccess` job's result as
+ * `walk` (and the share grant's). `notes` is a bounded list (50) of what was
+ * left out, each with the path under its root and the inode.
+ */
+export const AccessWalkNote = z.object({
+  kind: z.enum(['swapped', 'boundary', 'tooDeep', 'error', 'notEntered', 'changing', 'overrun', 'vanished']),
+  name: z.string(),
+  ino: z.number().optional(),
+  op: z.string().optional(),
+  message: z.string().optional(),
+})
+export type AccessWalkNote = z.infer<typeof AccessWalkNote>
+
+/**
+ * A filesystem boundary the walk met and did not enter (fifth review D6):
+ * its path as seen (bounded), where it was met (the directory's inode and the
+ * entry's name), device, inode and mount id — the daemon matches the mount
+ * id and the place against what the confirmation named (a mount id is reused
+ * once its mount is gone).
+ */
+export const AccessWalkBoundary = z.object({
+  name: z.string(),
+  /** The entry's own name in the directory it was met in. */
+  leaf: z.string(),
+  /** The inode of that directory. */
+  parent: z.number(),
+  dev: z.number(),
+  ino: z.number(),
+  mnt: z.number().nullable(),
+})
+export type AccessWalkBoundary = z.infer<typeof AccessWalkBoundary>
+
+export const AccessWalkReport = z.object({
+  /** Present (true) when the walk completed. */
+  done: z.boolean().optional(),
+  /** Why the helper refused before changing anything. */
+  refused: z.string().optional(),
+  /** Why the walk stopped part-way. */
+  aborted: z.string().optional(),
+  visited: z.object({ files: z.number(), dirs: z.number() }).default({ files: 0, dirs: 0 }),
+  /** Per step: how many entries the tool changed (operands it did not refuse). */
+  changed: z.record(z.string(), z.number()).default({}),
+  /** Per step: how many entries it failed on (fifth review D3: each one counted). */
+  failed: z.record(z.string(), z.number()).default({}),
+  skipped: z.object({ links: z.number(), other: z.number() }).default({ links: 0, other: 0 }),
+  /** Entries that changed between their listing and their opening: never touched. */
+  swapped: z.number().default(0),
+  /**
+   * Entries whose name was gone when the walk looked at or opened it (sixth
+   * review): deleted, or moved where the walk may not have met them again —
+   * the walk cannot tell which. Any makes the job INCOMPLETE.
+   */
+  vanished: z.number().default(0),
+  /** Entries whose open found them gone and that were met again under another name in the same folder, and acted on there. */
+  returned: z.number().default(0),
+  /** Entries on another mount or device that is not a root of the walk: never entered or touched. */
+  boundary: z.number().default(0),
+  /** Those boundaries, with their identity (bounded; the rest counted in `boundariesDropped`). */
+  boundaries: z.array(AccessWalkBoundary).default([]),
+  boundariesDropped: z.number().default(0),
+  /** Directories that are roots of their own (a child dataset, a nested subvolume). */
+  nestedRoots: z.number().default(0),
+  /** `.zfs` control directories skipped at a ZFS root. */
+  zfsControl: z.number().default(0),
+  /** Directories acted on but not entered (deeper than the walk's descriptor budget). */
+  tooDeep: z.number().default(0),
+  /** Directories acted on but not entered (the reopen failed). */
+  notEntered: z.number().default(0),
+  /** Directories that changed while they were walked (fifth review (a)). */
+  changing: z.number().default(0),
+  /** Directories whose reads were stopped at their bound (fifth review (b)). */
+  overrun: z.number().default(0),
+  errors: z.number().default(0),
+  maxDepth: z.number().optional(),
+  notes: z.array(AccessWalkNote).default([]),
+  notesDropped: z.number().default(0),
+  /** The helper checked that its counts add up (fifth review D3). */
+  accounted: z.boolean().default(false),
+  accountingError: z.string().optional(),
+})
+export type AccessWalkReport = z.infer<typeof AccessWalkReport>
 
 /**
  * What the share-path grant did (access.1) — the `grant` field of an SMB
@@ -126,6 +229,12 @@ export const ShareAccessGrantResult = z.object({
   childAclEnabled: z.array(z.string()).optional(),
   /** Present when the share has guest access and a valid-users list: Samba admits no guest on such a share, so Everyone was not granted. */
   guestNote: z.string().optional(),
+  /**
+   * cr3.shares (fourth review): an applied recursive grant whose walk had to
+   * leave something out (a swapped entry, an error, a filesystem nobody
+   * named); `message` says what.
+   */
+  incomplete: z.boolean().optional(),
 })
 export type ShareAccessGrantResult = z.infer<typeof ShareAccessGrantResult>
 
@@ -158,6 +267,13 @@ export const SetAccessRequest = z.object({
   /** Remove every named (user/group) ACL entry — the only way to clear them. */
   clearNamed: z.boolean().optional(),
   applyToExisting: z.boolean().optional(),
+  /**
+   * cr3.shares (second review, coordinator ruling): the `revision` of the
+   * GET this edit was made from. When present and the directory no longer
+   * reads the same, the PUT is refused 409 STATE_CHANGED (another edit
+   * happened in between — reload). Absent = today's behaviour.
+   */
+  expectedRevision: z.string().max(128).optional(),
 })
   .refine(
     b => b.owner !== undefined || b.group !== undefined || b.entries !== undefined || b.clearNamed === true,
@@ -166,5 +282,22 @@ export const SetAccessRequest = z.object({
   .refine(
     b => !(b.clearNamed === true && (b.entries ?? []).some(e => e.kind === 'user' || e.kind === 'group')),
     'clearNamed cannot be combined with named user/group entries',
+  )
+  // cr3.shares (second review): one principal, one row — a body naming the
+  // same user (or group) twice is refused, never resolved by "last wins".
+  .refine(
+    (b) => {
+      const named = (b.entries ?? []).filter(e => e.kind === 'user' || e.kind === 'group').map(e => `${e.kind}:${e.name}`)
+      return new Set(named).size === named.length
+    },
+    'a principal may appear only once in entries',
+  )
+  // Third review N4: one row per base principal too (two `everyone` rows).
+  .refine(
+    (b) => {
+      const base = (b.entries ?? []).filter(e => e.kind === 'owner' || e.kind === 'owning-group' || e.kind === 'everyone').map(e => e.kind)
+      return new Set(base).size === base.length
+    },
+    'owner, owning group and everyone may each appear only once in entries',
   )
 export type SetAccessRequest = z.infer<typeof SetAccessRequest>

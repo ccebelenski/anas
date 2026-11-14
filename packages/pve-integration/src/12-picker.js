@@ -91,7 +91,7 @@
     function nodeLocalTimeTip() {
         return t(
             'Node local time \u2014 the backup client prints this timestamp with no timezone, '
-            + 'in the timezone of the node that read the archive. It is not converted, and it is not UTC.',
+            + 'in the timezone of the node that read the archive. It is not converted, and it is not UTC.'
         );
     }
 
@@ -1032,7 +1032,7 @@
                                         return '';
                                     }
                                     if (rec && rec.get('mtimeZone') === 'node-local') {
-                                        return '<span data-qtip="' + enc(nodeLocalTimeTip()) + '">'
+                                        return '<span data-qtip="' + enc(enc(nodeLocalTimeTip())) + '">'
                                             + enc(v)
                                             + ' <span style="color:var(--anas-muted,gray);font-size:0.85em;">'
                                             + enc(t('node local time')) + '</span></span>';
@@ -1238,7 +1238,9 @@
                                 renderer: function (v, meta, rec) {
                                     // The full composed id is the tooltip — ids
                                     // are never truncated, on screen or in a hint.
-                                    meta.tdAttr = 'data-qtip="' + enc(rec.get('snapshot')) + '"';
+                                    // The id comes from the PBS server: encoded for
+                                    // the attribute AND for the tip (cr3).
+                                    meta.tdAttr = 'data-qtip="' + enc(enc(rec.get('snapshot'))) + '"';
                                     return enc(v);
                                 },
                             },
@@ -1248,6 +1250,11 @@
                                 width: 100,
                                 sortable: false,
                                 menuDisabled: true,
+                                // A count the panel computed; anything else is
+                                // never rendered raw (cr3).
+                                renderer: function (v) {
+                                    return typeof v === 'number' ? ('' + v) : '';
+                                },
                             },
                             {
                                 text: t('Size'),

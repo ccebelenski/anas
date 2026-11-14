@@ -169,3 +169,87 @@ describe('serializeExportLine', () => {
     assert.deepEqual(parseExports('/data host\n')[0].clients, [{ spec: 'host', options: [] }])
   })
 })
+
+// --- cr3.shares M5 — read the way exportfs reads (exports(5)) ---------------
+describe('exports(5) syntax the reader honours (cr3.shares M5)', () => {
+  // The review's probe: a hand-written entry wrapped with backslashes.
+  const WRAPPED = '# hand-written\n/srv/media \\\n    10.0.0.0/24(rw,sync,no_subtree_check) \\\n    192.168.1.5(ro)\n/srv/other 10.0.0.9(rw)\n'
+
+  it('an entry continued with a backslash is one export with every client', () => {
+    assert.deepEqual(parseExports(WRAPPED), [
+      { path: '/srv/media', clients: [
+        { spec: '10.0.0.0/24', options: ['rw', 'sync', 'no_subtree_check'] },
+        { spec: '192.168.1.5', options: ['ro'] },
+      ] },
+      { path: '/srv/other', clients: [{ spec: '10.0.0.9', options: ['rw'] }] },
+    ])
+    assert.equal(serializeExportsDoc(parseExportsDoc(WRAPPED)), WRAPPED)
+  })
+
+  it('removing a wrapped entry removes every line of it — no orphaned continuation', () => {
+    assert.equal(removeExport(WRAPPED, '/srv/media'), '# hand-written\n/srv/other 10.0.0.9(rw)\n')
+  })
+
+  it('replacing a wrapped entry replaces every line of it', () => {
+    assert.equal(
+      replaceExport(WRAPPED, '/srv/media', { path: '/srv/media', clients: [{ spec: '10.0.0.7', options: ['rw'] }] }),
+      '# hand-written\n/srv/media 10.0.0.7(rw)\n/srv/other 10.0.0.9(rw)\n',
+    )
+  })
+
+  it('a `#` after the clients is a comment, not a client', () => {
+    assert.deepEqual(parseExports('/srv/a 10.0.0.1(rw) # old: 10.0.0.2(rw)\n')[0].clients, [{ spec: '10.0.0.1', options: ['rw'] }])
+  })
+
+  it('an octal escape in the export name is the byte it names', () => {
+    assert.equal(parseExports('/srv/My\\040Data 10.0.0.1(ro)\n')[0].path, '/srv/My Data')
+    assert.equal(parseExports('/srv/caf\\303\\251 *(ro)\n')[0].path, '/srv/café')
+    assert.equal(hasExport('/srv/My\\040Data 10.0.0.1(ro)\n', '/srv/My Data'), true)
+  })
+
+  it('a quote toggles anywhere in the name', () => {
+    assert.equal(parseExports('/mnt/"My Data" host(rw)\n')[0].path, '/mnt/My Data')
+  })
+
+  it('`-opts` after the path are the defaults every later client starts from', () => {
+    assert.deepEqual(parseExports('/srv/d -rw,sync hostA hostB(no_root_squash)\n')[0].clients, [
+      { spec: 'hostA', options: ['rw', 'sync'] },
+      { spec: 'hostB', options: ['rw', 'sync', 'no_root_squash'] },
+    ])
+  })
+
+  it('a no-break space is not a separator (exportfs splits on ASCII blanks only)', () => {
+    assert.deepEqual(parseExports('/srv/a b host(rw)\n')[0].path, '/srv/a b')
+  })
+
+  it('a backslash before CRLF does not continue the entry', () => {
+    const text = '/srv/a host(rw)\\\r\n/srv/b host(ro)\n'
+    assert.deepEqual(parseExports(text).map(e => e.path), ['/srv/a', '/srv/b'])
+  })
+})
+
+// --- cr3.shares (review) — comments never hide an entry; an untouched edit keeps bytes
+describe('comments and untouched edits (cr3.shares, review)', () => {
+  it('a comment line ending in a backslash continues nothing: the export after it is read', () => {
+    const text = '# disabled for now \\\n/srv/hidden host1(rw)\n/srv/shown host2(ro)\n'
+    assert.deepEqual(parseExports(text).map(e => e.path), ['/srv/hidden', '/srv/shown'])
+  })
+
+  it('a backslash inside a trailing comment continues nothing either', () => {
+    const text = '/srv/a host1(rw) # note \\\n/srv/b host2(ro)\n'
+    assert.deepEqual(parseExports(text).map(e => e.path), ['/srv/a', '/srv/b'])
+  })
+
+  it('replacing an entry with the clients it already has is byte-identical (continuations and comments kept)', () => {
+    const text = '/srv/a host1(rw,sync) \\\n    host2(ro) # two hosts\n/srv/b *(ro)\n'
+    assert.equal(replaceExport(text, '/srv/a', getExport(text, '/srv/a')!), text)
+  })
+
+  it('a real edit keeps the entry\'s trailing comment', () => {
+    const text = '/srv/a host1(rw) # trailing note\n/srv/b host2(ro)\n'
+    assert.equal(
+      replaceExport(text, '/srv/a', { path: '/srv/a', clients: [{ spec: 'host9', options: ['ro'] }] }),
+      '/srv/a host9(ro) # trailing note\n/srv/b host2(ro)\n',
+    )
+  })
+})

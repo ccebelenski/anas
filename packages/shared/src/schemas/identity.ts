@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { SingleLine } from './common.js'
+import { hasControlChars, SingleLine } from './common.js'
 
 // ============================================================================
 // Identity — system users & groups for SHARE ACCESS ONLY (Epic 8).
@@ -155,6 +155,17 @@ export const LookupName = z.string()
 export type LookupName = z.infer<typeof LookupName>
 
 /**
+ * cr3.shares L10: an SMB password. `smbpasswd -s` reads it line by line from
+ * stdin (the new password, then the retype), so a newline inside one ends it
+ * early — `a\na` would set the password `a` — and other control characters
+ * are not what anyone types. Refused, never written.
+ */
+export const SmbPassword = z
+  .string()
+  .min(1)
+  .refine(s => !hasControlChars(s), 'an SMB password must not contain control characters (smbpasswd reads it line by line: a newline would end it early)')
+
+/**
  * Create a local share user (POST /v1/identity/users). Made with no login
  * shell and no Unix password; if `smbPassword` is given, an SMB passdb entry is
  * created so they can authenticate to SMB shares.
@@ -174,7 +185,7 @@ export const CreateShareUserRequest = z.object({
    */
   groups: z.array(IdentityName).optional(),
   /** If set, also create the SMB passdb entry with this password */
-  smbPassword: z.string().min(1).optional(),
+  smbPassword: SmbPassword.optional(),
   /**
    * The uid to create the account with (cr.29). Absent: ANAS picks the next
    * free uid in the share band that owns nothing under the paths it manages.
@@ -193,7 +204,7 @@ export type CreateShareUserRequest = z.infer<typeof CreateShareUserRequest>
 
 /** Set (or replace) a user's SMB password (POST /v1/identity/users/:name/smb-password). */
 export const SetSmbPasswordRequest = z.object({
-  password: z.string().min(1),
+  password: SmbPassword,
 })
 export type SetSmbPasswordRequest = z.infer<typeof SetSmbPasswordRequest>
 

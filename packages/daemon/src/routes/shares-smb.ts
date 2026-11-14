@@ -1,22 +1,21 @@
-import type { ShareAccessGrantRequest, ShareAccessGrantResult, SmbConnection, SmbShare, SmbShareDetail } from '@anas/shared'
+import type { ShareAccessGrantRequest, ShareAccessGrantResult, SmbConnection, SmbGlobalConfig, SmbShare, SmbShareDetail } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
-import type { JobQueue } from '../jobs/queue.js'
+import type { JobContext, JobQueue } from '../jobs/queue.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { GuardPass, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { AccessObject, AccessService, GrantShare } from '../services/access.js'
 import { createHash } from 'node:crypto'
 import { rm, writeFile } from 'node:fs/promises'
-import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
-import { addMissingGrantParams, addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseDoc, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
+import { CreateSmbShareRequest, isSmbSharePath, ShareName, SMB_SHARE_PATH_MSG, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
+import { addMissingGrantParams, addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, serviceLineRanges, smbSectionKey, updateGlobal, updateShare } from '../parsers/smb-conf.js'
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
-import { confirmGate } from '../safety/gate.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, reverify, sendRefusal, smbShareClaim } from '../safety/guard.js'
 import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
-import { loadPveFootprint, ownershipRefusal, pveManagedRefusal } from '../services/pve-footprint.js'
-import { probeSharePath, probeSharePaths, sharePathFields } from '../services/share-path.js'
+import { loadPveFootprint } from '../services/pve-footprint.js'
+import { isSambaTemplatedPath, probeSharePath, probeSharePaths, sharePathFields, sharePathVerdictRefusal } from '../services/share-path.js'
 import { enablingSelfService, ensureAhrSnapshotsMount, resolveSelfService, shareAvailableBytes, touchesSelfService } from '../services/share-selfservice.js'
 import { requireIdentity } from './identity.js'
 import { shareAccessHandlers } from './share-access.js'
@@ -84,8 +83,8 @@ export async function smbShareRoutes(
    * write, so defaults are what smb.conf says, not what the request omitted).
    * Never fails the job — the outcome rides on the result.
    */
-  async function grantFor(share: SmbShare, grant: ShareAccessGrantRequest, updateProgress: (msg: string) => void, recursiveConfirmed: boolean): Promise<ShareAccessGrantResult> {
-    return access.grantOnSharePath(share.path, share, grant.applyToExisting === true, updateProgress, { recursiveConfirmed })
+  async function grantFor(share: SmbShare, grant: ShareAccessGrantRequest, updateProgress: (msg: string) => void, recursiveConfirmed: boolean, ctx?: JobContext): Promise<ShareAccessGrantResult> {
+    return access.grantOnSharePath(share.path, share, grant.applyToExisting === true, updateProgress, { recursiveConfirmed, ctx })
   }
 
   /**
@@ -175,13 +174,17 @@ export async function smbShareRoutes(
   const shareNotFound = (name: string): Refusal =>
     ({ status: 404, code: 'NOT_FOUND', message: `SMB share '${name}' not found` })
 
-  /** sha256 of the stanza's own lines (header through one-before-next), or null when gone. */
+  /**
+   * sha256 of the stanza's own lines (header through one-before-next) — every
+   * section Samba reads under the name, merged or left unavailable (H1) — or
+   * null when gone.
+   */
   function stanzaRevision(text: string, name: string): string | null {
-    const doc = parseDoc(text)
-    const span = doc.sections.find(s => s.key === name.toLowerCase() && s.key !== 'global')
-    if (!span)
+    const ranges = name.toLowerCase() === 'global' ? null : serviceLineRanges(text, name)
+    if (!ranges)
       return null
-    return createHash('sha256').update(doc.lines.slice(span.start, span.end).join('\n')).digest('hex')
+    const lines = text.split('\n')
+    return createHash('sha256').update(ranges.map(r => lines.slice(r.start, r.end).join('\n')).join('\n')).digest('hex')
   }
 
   function smbShareView(name: string): ObjectView<SmbShareObject> {
@@ -195,7 +198,14 @@ export async function smbShareRoutes(
     }
   }
 
-  function smbUpdateGuardSpec(name: string): GuardSpec<SmbShareObject> {
+  /**
+   * cr3.shares L7 (ruling (j)): the PVE share-path claim as a guard gate, so
+   * the job asks it again before it writes — a storage that came to claim
+   * the path while the job waited refuses there, not only at the route.
+   */
+  const sharePathGate = (path: string) => async (): Promise<Refusal | null> => sharePathRefusal(path)
+
+  function smbUpdateGuardSpec(name: string, movedPath?: string): GuardSpec<SmbShareObject> {
     return {
       operation: 'smb.config.set',
       object: {
@@ -210,7 +220,14 @@ export async function smbShareRoutes(
           return revision
         },
       },
-      gates: [async o => (hasShare(o.text, name) ? null : shareNotFound(name))],
+      gates: [
+        async o => (hasShare(o.text, name) ? null : shareNotFound(name)),
+        // An edit that MOVES the path re-asks the claim on the new one; the
+        // stanza's own path sent back unchanged is no move (cr3.shares L6).
+        ...(movedPath !== undefined
+          ? [async (o: SmbShareObject) => (getShare(o.text, name)?.path === movedPath ? null : sharePathRefusal(movedPath))]
+          : []),
+      ],
       locks: async () => [smbShareClaim(name)],
     }
   }
@@ -229,7 +246,7 @@ export async function smbShareRoutes(
   const shareExists = (name: string): Refusal =>
     ({ status: 409, code: 'CONFLICT', message: `SMB share '${name}' already exists` })
 
-  function smbCreateGuardSpec(name: string): GuardSpec<SmbShareObject> {
+  function smbCreateGuardSpec(name: string, path: string): GuardSpec<SmbShareObject> {
     return {
       operation: 'smb.share.add',
       // The object is the share-name SLOT (the mounts create precedent): a
@@ -238,7 +255,7 @@ export async function smbShareRoutes(
       // while the create waits refuses there, so no duplicate stanza is ever
       // written. The job's transform carries the last-moment backstop.
       object: smbShareView(name),
-      gates: [async o => (hasShare(o.text, name) ? shareExists(name) : null)],
+      gates: [async o => (hasShare(o.text, name) ? shareExists(name) : null), sharePathGate(path)],
       locks: async () => [smbShareClaim(name)],
     }
   }
@@ -276,43 +293,56 @@ export async function smbShareRoutes(
   }
 
   /**
-   * Live connections keyed by share (service), from smbstatus (JSON first).
+   * Live connections keyed by share (service), from smbstatus (JSON first),
+   * keyed the way Samba names a service (case- and whitespace-blind).
    *
-   * FAIL-OPEN, never throws: smbstatus ships in the `samba` package, and
-   * execFile REJECTS (rather than returning an exit code) when the binary is
-   * missing, so on a node without samba this would otherwise 500 the share
-   * detail view (issue #6). No smbstatus means no reportable connections.
+   * Never throws. smbstatus ships in the `samba` package and execFile
+   * REJECTS with ENOENT when the binary is missing — a node without samba
+   * runs no smbd, so nothing is connected (issue #6: never a 500). Every
+   * other failure — a non-zero exit, output neither parser reads, a timeout —
+   * is UNKNOWN (cr3.shares L8 / INVENTED-STATE-M6): `null`, never "no
+   * connections", so a binding change still confirms and a count reads
+   * unknown, not 0.
    */
-  async function connectionsByShare(): Promise<Record<string, SmbConnection[]>> {
+  async function connectionsByShare(): Promise<Map<string, SmbConnection[]> | null> {
+    const keyed = (byService: Record<string, SmbConnection[]>): Map<string, SmbConnection[]> => {
+      const out = new Map<string, SmbConnection[]>()
+      for (const [service, conns] of Object.entries(byService)) {
+        const key = smbSectionKey(service)
+        out.set(key, [...(out.get(key) ?? []), ...conns])
+      }
+      return out
+    }
     try {
       const json = await executor.exec(SMBSTATUS, ['--json'])
       if (json.exitCode === 0 && json.stdout.trim().startsWith('{')) {
         try {
-          return parseSmbStatusJson(json.stdout)
+          return keyed(parseSmbStatusJson(json.stdout))
         }
         catch {
           // Fall through to the text parser below.
         }
       }
       const text = await executor.exec(SMBSTATUS, ['-S'])
-      if (text.exitCode === 0 && text.stdout.trim())
-        return parseSmbStatusText(text.stdout)
-      return {}
+      if (text.exitCode === 0)
+        return keyed(parseSmbStatusText(text.stdout))
+      return null
     }
-    catch {
-      return {}
+    catch (err) {
+      return (err as NodeJS.ErrnoException)?.code === 'ENOENT' ? new Map() : null
     }
   }
 
-  /** Live connections for a given share, from smbstatus (JSON preferred). */
-  async function connectionsFor(shareName: string): Promise<SmbConnection[]> {
-    return (await connectionsByShare())[shareName] ?? []
-  }
-
-  /** Every live connection across all shares (for global-change impact). */
-  async function allConnections(): Promise<SmbConnection[]> {
+  /** Live connections for a given share, or null when smbstatus could not be read. */
+  async function connectionsFor(shareName: string): Promise<SmbConnection[] | null> {
     const byShare = await connectionsByShare()
-    return Object.values(byShare).flat()
+    return byShare === null ? null : byShare.get(smbSectionKey(shareName)) ?? []
+  }
+
+  /** Every live connection across all shares, or null when unreadable. */
+  async function allConnections(): Promise<SmbConnection[] | null> {
+    const byShare = await connectionsByShare()
+    return byShare === null ? null : [...byShare.values()].flat()
   }
 
   /** Reload smbd so the config change takes effect (side effect of the job). */
@@ -328,6 +358,48 @@ export async function smbShareRoutes(
       return false
     const setB = new Set(b)
     return a.every(v => setB.has(v))
+  }
+
+  /** Does the edit change which interfaces smbd binds to (a reorder is not a change)? */
+  function bindingChanges(current: SmbGlobalConfig, req: UpdateSmbGlobalConfigRequest): boolean {
+    const interfacesChanged = req.interfaces !== undefined && !sameStringList(req.interfaces, current.interfaces)
+    const bindChanged = req.bindInterfacesOnly !== undefined && req.bindInterfacesOnly !== current.bindInterfacesOnly
+    return interfacesChanged || bindChanged
+  }
+
+  /** The binding confirm's warnings: the clients it may drop, or that nobody could see. */
+  function bindingWarnings(conns: SmbConnection[] | null): string[] {
+    if (conns === null)
+      return ['Active SMB connections could not be read (smbstatus failed) — any connected client may be dropped when smbd rebinds to the new interface list.']
+    const warnings = [`${conns.length} active SMB connection(s) may be dropped when smbd rebinds to the new interface list.`]
+    const machines = [...new Set(conns.map(c => c.machine).filter(Boolean))]
+    if (machines.length > 0)
+      warnings.push(`Connected clients: ${machines.join(', ')}.`)
+    return warnings
+  }
+
+  /**
+   * The `[global]` guard spec (the last legacy confirmGate door, moved onto
+   * the guard — EPICS §3 rider): the object is the `[global]` stanza (every
+   * section Samba merges into it), its revision binds the confirm and the
+   * job, and the job holds the section's lock.
+   */
+  function smbGlobalGuardSpec(): GuardSpec<SmbShareObject> {
+    return {
+      operation: 'smb.config.set',
+      object: {
+        ...smbShareView('global'),
+        what: 'SMB global configuration',
+        revision: async (o) => {
+          const ranges = serviceLineRanges(o.text, 'global')
+          const lines = o.text.split('\n')
+          const body = ranges ? ranges.map(r => lines.slice(r.start, r.end).join('\n')).join('\n') : '<no [global]>'
+          return createHash('sha256').update(body).digest('hex')
+        },
+      },
+      gates: [],
+      locks: async () => [smbShareClaim('global')],
+    }
   }
 
   /** Map a ConfigConflictError raised in a job into a clear job error. */
@@ -411,18 +483,22 @@ export async function smbShareRoutes(
    * storage and passes untouched.
    */
   async function refuseOwnedSharePath(path: string, reply: FastifyReply): Promise<boolean> {
-    const pve = await loadPveFootprint(executor)
-    const claim = pve.sharePathClaim(path)
-    if (!claim)
+    const refusal = await sharePathRefusal(path)
+    if (!refusal)
       return false
-    // cr.47b: the ownership fact is the ONE answer — 409 PVE_MANAGED, reason
-    // `pve-managed` — at every dataset, snapshot, access and share door; the
-    // config-unreadable verdict is a different fact and keeps its 400.
-    const refusal = claim.kind === 'dataset'
-      ? ownershipRefusal(claim.ownership, `Share path '${path}' is on '${claim.dataset}', which is PVE-owned — ${claim.ownership.reason}`)
-      : pveManagedRefusal(`Share path '${path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — shares cannot serve PVE territory`)
     reply.send(sendRefusal(reply, refusal))
     return true
+  }
+
+  /**
+   * The footprint's answer for a share path as a refusal, or null for a
+   * positive "no claim" only (cr.47b: the ownership fact is 409
+   * PVE_MANAGED, the config-unreadable verdict keeps its 400; cr3.shares
+   * M4: a footprint that could not see refuses, never reads as no claim).
+   */
+  async function sharePathRefusal(path: string): Promise<Refusal | null> {
+    const pve = await loadPveFootprint(executor)
+    return sharePathVerdictRefusal(pve.sharePathVerdict(path), 'Share path', path)
   }
 
   // --- GET /shares/smb — ALL shares (incl. admin-created, Principle 11) -----
@@ -433,10 +509,20 @@ export async function smbShareRoutes(
     // hung mount under the share (cr.35: through the executor, never a stat
     // on the event loop). Each share gets its own verdict.
     const parsed = parseSmbConf(text).shares
-    const probes = await probeSharePaths(executor, parsed.map(s => s.path))
+    // cr3.shares L6: a path with a Samba `%` macro names no one directory —
+    // never probed, no path state (unknown), never "missing".
+    const [probes, byShare] = await Promise.all([
+      probeSharePaths(executor, parsed.map(s => s.path).filter(p => !isSambaTemplatedPath(p))),
+      // INVENTED-STATE-M6: ONE smbstatus read for the whole list; a failed
+      // read is null for every row (unknown), never 0.
+      connectionsByShare(),
+    ])
     const shares = parsed.map(share => ({
       ...share,
-      ...sharePathFields(probes.get(share.path)!),
+      ...(isSambaTemplatedPath(share.path) ? {} : sharePathFields(probes.get(share.path)!)),
+      activeConnections: byShare === null ? null : (byShare.get(smbSectionKey(share.name)) ?? []).length,
+      // cr3.shares (review): a name ANAS cannot address is listed, not managed.
+      ...(ShareName.safeParse(share.name).success ? {} : { unmanagedName: true }),
     }))
     return { data: shares }
   })
@@ -464,41 +550,52 @@ export async function smbShareRoutes(
     // Guard only the disruptive change: retargeting which interfaces/addresses
     // smbd binds to can cut off clients when smbd rebinds on reload. Cosmetic
     // edits (workgroup, server string) reload without dropping sessions, so they
-    // stay unguarded. Gate only when the binding actually changes AND there are
-    // live connections that could be dropped.
-    const current = parseSmbConf(await readSmbConf()).global
-    const interfacesChanged = req.interfaces !== undefined
-      && !sameStringList(req.interfaces, current.interfaces)
-    const bindChanged = req.bindInterfacesOnly !== undefined
-      && req.bindInterfacesOnly !== current.bindInterfacesOnly
-
-    if (interfacesChanged || bindChanged) {
+    // stay unguarded. Gate when the binding actually changes AND clients are
+    // connected — or when nobody can tell (cr3.shares L8: a failed smbstatus
+    // read is unknown, and unknown confirms).
+    const spec = smbGlobalGuardSpec()
+    const pre = await guardCheck(spec)
+    if ('refusal' in pre)
+      return sendRefusal(reply, pre.refusal)
+    let confirmed = false
+    if (bindingChanges(parseSmbConf(pre.object.text).global, req)) {
       const conns = await allConnections()
-      if (conns.length > 0) {
-        const warnings = [
-          `${conns.length} active SMB connection(s) may be dropped when smbd rebinds to the new interface list.`,
-        ]
-        const machines = [...new Set(conns.map(c => c.machine).filter(Boolean))]
-        if (machines.length > 0)
-          warnings.push(`Connected clients: ${machines.join(', ')}.`)
-
-        // Signature is the resource identity only (section: 'global') — never
-        // the changed values, so the confirm code stays valid on resend.
-        if (!confirmGate(confirmStore, request, reply, {
-          operation: 'smb.config.set',
-          params: { section: 'global' },
+      if (conns === null || conns.length > 0) {
+        // The confirm signs every field the edit writes, values included
+        // (EPICS §2, ruling 2026-10-17; none is secret): a code minted for
+        // one interface list never confirms another (core review handoff).
+        if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+          validated: { section: 'global', ...req },
+          address: ['section'],
           message: `Changing the SMB interface binding reloads smbd and may disconnect active clients`,
-          warnings,
+          warnings: bindingWarnings(conns),
         })) {
           return reply
         }
+        confirmed = true
       }
     }
 
     const job = jobQueue.submit(
       'smb.config.set',
       { ...identity, params: { section: 'global', config: req } },
-      async () => {
+      // Ruling (j): the [global] stanza's revision is re-read here, and a
+      // binding change that went unconfirmed at the route asks the clients
+      // gate again — clients that connected while the job waited (or a
+      // smbstatus that no longer answers) refuse it rather than drop them.
+      guarded(spec, pre, async (o) => {
+        if (!confirmed && bindingChanges(parseSmbConf(o.text).global, req)) {
+          const conns = await allConnections()
+          if (conns === null || conns.length > 0) {
+            throw new GuardRefusalError({
+              status: 409,
+              code: 'STATE_CHANGED',
+              message: conns === null
+                ? 'Active SMB connections could not be read when the job ran — the interface binding change was not applied; send it again to confirm it'
+                : `${conns.length} SMB client connection(s) appeared after the request was accepted — the interface binding change was not applied; send it again to confirm it`,
+            })
+          }
+        }
         try {
           await editSmbConf(current => updateGlobal(current, req))
         }
@@ -507,7 +604,8 @@ export async function smbShareRoutes(
         }
         await reloadSmbd()
         return { updated: 'global' }
-      },
+      }),
+      { locks: pre.locks },
     )
 
     reply.code(202)
@@ -530,10 +628,13 @@ export async function smbShareRoutes(
       return { error: { code: 'NOT_FOUND', message: `SMB share '${name}' not found` } }
     }
 
+    const connections = await connectionsFor(share.name)
     const detail: SmbShareDetail = {
       ...share,
-      ...sharePathFields(await probeSharePath(executor, share.path)),
-      connections: await connectionsFor(share.name),
+      ...(isSambaTemplatedPath(share.path) ? {} : sharePathFields(await probeSharePath(executor, share.path))),
+      connections: connections ?? [],
+      ...(connections === null ? { connectionsUnknown: true } : {}),
+      activeConnections: connections === null ? null : connections.length,
     }
     // The storage's free space (smbsvc.3, additive, fail-open): the input for
     // the Time Machine cap suggestion — present when the path resolves onto a
@@ -601,7 +702,7 @@ export async function smbShareRoutes(
     // the same gate runs again in the job under the share's lock — a stanza
     // that appears while the create waits refuses there, so no duplicate
     // stanza is ever written.
-    const spec = smbCreateGuardSpec(req.name)
+    const spec = smbCreateGuardSpec(req.name, req.path)
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
@@ -624,7 +725,8 @@ export async function smbShareRoutes(
       // Ruling (j): the slot gate runs again here and the whole job holds the
       // share's lock — a stanza that appeared while the create waited arrives
       // as CONFLICT, before a line of smb.conf moves.
-      guarded(spec, pre, async (_share, { updateProgress }) => {
+      guarded(spec, pre, async (_share, ctx) => {
+        const { updateProgress } = ctx
         // cr.43 step 5: the grant's revision is re-verified FIRST — an ACL
         // that moved while this job waited fails STATE_CHANGED before a line
         // of smb.conf is written and before any setfacl, chown or chmod argv
@@ -656,7 +758,7 @@ export async function smbShareRoutes(
         if (req.grantAccess) {
           const created = getShare(await readSmbConf(), req.name)
           const grant = created
-            ? await grantFor(created, req.grantAccess, updateProgress, grantBinding?.recursive === true)
+            ? await grantFor(created, req.grantAccess, updateProgress, grantBinding?.recursive === true, ctx)
             : { status: 'failed' as const, message: `SMB share '${req.name}' could not be read back after the write`, path: req.path, granted: [], skipped: [], applyToExisting: req.grantAccess.applyToExisting === true }
           return { created: req.name, grant }
         }
@@ -695,7 +797,7 @@ export async function smbShareRoutes(
     // route's edit is bound to the stanza's revision — the job writes a merge
     // of THIS stanza or refuses (NOT_FOUND when it vanished, STATE_CHANGED
     // when a hand edit moved it under the request).
-    const spec = smbUpdateGuardSpec(name)
+    const spec = smbUpdateGuardSpec(name, req.path)
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
@@ -703,8 +805,16 @@ export async function smbShareRoutes(
 
     // The edit CAN move the path (UpdateSmbShareRequest carries an optional
     // one) — the same backstop as create applies when it does (pvepool.1
-    // review fixes). An edit that leaves the path alone is untouched.
-    if (req.path !== undefined && await refuseOwnedSharePath(req.path, reply))
+    // review fixes). An edit that leaves the path alone is untouched: the
+    // stanza's own path sent back (the panel always sends it) is no move, and
+    // is kept verbatim whatever it holds (cr3.shares L6, review). A path that
+    // DOES move must be exactly what Samba serves.
+    const pathMoves = req.path !== undefined && req.path !== getShare(text, name)?.path
+    if (pathMoves && !isSmbSharePath(req.path!)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid update share request: ${SMB_SHARE_PATH_MSG}` } }
+    }
+    if (pathMoves && await refuseOwnedSharePath(req.path!, reply))
       return reply
 
     // The self-service fast path (smbsvc.1) judges the EFFECTIVE path — the
@@ -735,7 +845,8 @@ export async function smbShareRoutes(
       // Ruling (j): id, the stanza's revision and the existence gate run again
       // here, and the whole job holds the share's lock — a hand edit while the
       // job waited arrives as STATE_CHANGED, a vanished stanza as NOT_FOUND.
-      guarded(spec, pre, async (_share, { updateProgress }) => {
+      guarded(spec, pre, async (_share, ctx) => {
+        const { updateProgress } = ctx
         // cr.43 step 5: the grant's revision is re-verified FIRST — an ACL
         // that moved while this job waited fails STATE_CHANGED before a line
         // of smb.conf is written and before any setfacl, chown or chmod argv
@@ -780,7 +891,7 @@ export async function smbShareRoutes(
           // An explicit "apply to existing files" is its own reason to run.
           if (!editRunsGrant(req.grantAccess, before, after))
             return { updated: name, grant: { status: 'nothing' as const, path: after.path, granted: [], skipped: [], applyToExisting: false } }
-          return { updated: name, grant: await grantFor(after, req.grantAccess, updateProgress, grantBinding?.recursive === true) }
+          return { updated: name, grant: await grantFor(after, req.grantAccess, updateProgress, grantBinding?.recursive === true, ctx) }
         }
         return { updated: name }
       }),
@@ -825,7 +936,9 @@ export async function smbShareRoutes(
       `Removing SMB share '${name}' makes the shared path '${share.path}' inaccessible over SMB.`,
       ...pre.advisories.map(a => a.warning),
     ]
-    if (connections.length > 0)
+    if (connections === null)
+      warnings.push(`Active connections to '${name}' could not be read (smbstatus failed) — any client connected now will be disconnected on reload.`)
+    else if (connections.length > 0)
       warnings.push(`${connections.length} active connection(s) to '${name}' will be terminated on reload.`)
 
     if (!guardConfirm(confirmStore, request, reply, spec, pre, {

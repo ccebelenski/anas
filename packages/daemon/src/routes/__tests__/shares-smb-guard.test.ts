@@ -11,7 +11,11 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { CreateSmbShareRequest } from '@anas/shared'
 import { addShare, removeShare } from '../../parsers/smb-conf.js'
-import { createServer } from '../../server.js'
+import { createServer as createDevServer } from '../../server.js'
+import { echoRealPaths } from './real-path-echo.js'
+
+/** cr3.shares H2: the dev server, with `realpath -e` naming each plain test directory as itself. */
+const createServer = (...a: Parameters<typeof createDevServer>): ReturnType<typeof createDevServer> => echoRealPaths(createDevServer(...a))
 
 /**
  * Story cr.43 — the SMB share verbs on the guard (docs/WAVE3-DESIGN.md §2.5,

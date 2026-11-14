@@ -4,9 +4,9 @@
  * `getfacl -pcE <path>` prints one ACL entry per line, no comment header (`-c`)
  * and no `#effective` rights comments (`-E`). We still parse defensively: if an
  * effective-rights comment IS present (tab-separated `\t#effective:r--`), it is
- * stripped and the entry's GRANTED perms are kept — the layered UI reports the
- * level a principal was granted, not what the mask currently clamps it to (the
- * mask is managed to `rwx` so the two agree anyway).
+ * stripped and the entry's GRANTED perms are kept here. The editor reports
+ * what the mask lets each group-class principal do ({@link effectivePerms},
+ * cr3.shares M3): an ACL written by hand can clamp a grant below its text.
  *
  * Entry forms:
  *   user::rwx            → owner (mode bits)
@@ -130,6 +130,22 @@ export function parseGetfacl(text: string): ParsedAcl {
 // no `r` → none. We deliberately ignore `x` on read: a directory needs execute
 // (search) to be usable at all, and the granted `r-x`/`rwx` shapes carry it.
 // ============================================================================
+
+/**
+ * cr3.shares M3: what a group-class entry (`group::` and every named entry)
+ * can actually do — its granted perms with every bit the ACL mask clears
+ * cleared (`rwx` under `mask::r-x` is `r-x`; `-w-` under `r-x` is `---`).
+ * No mask (a minimal ACL) clamps nothing. `user::` and `other::` are never
+ * masked; the caller does not pass them here.
+ */
+export function effectivePerms(perms: string, mask: string | undefined): string {
+  if (mask === undefined)
+    return perms
+  let out = ''
+  for (let i = 0; i < perms.length; i++)
+    out += mask[i] === undefined || mask[i] === '-' ? '-' : perms[i]
+  return out
+}
 
 /** Granted perms string (e.g. `rwx`, `r-x`, `---`) → plain-language level. */
 export function permsToLevel(perms: string): AccessLevel {

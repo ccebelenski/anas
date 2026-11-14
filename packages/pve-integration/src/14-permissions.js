@@ -99,6 +99,18 @@
         return ANAS.enc(s);
     }
 
+    // cr3: the default ExtJS BoundList (and a tagfield's tag label) renders
+    // its display field as raw HTML. Rows that carry names from the node —
+    // accounts and groups from getent, interfaces and addresses — go through
+    // these encoded templates instead.
+    function encodedListConfig(field) {
+        return { tpl: '<tpl for="."><div class="x-boundlist-item">{' + field + ':htmlEncode}</div></tpl>' };
+    }
+
+    function encodedLabelTpl(field) {
+        return '{' + field + ':htmlEncode}';
+    }
+
     // The filesystem family, normalised: anything unknown reads as ZFS — the
     // datasets payload carries no `backing` at all (absent = zfs).
     function normBacking(b) {
@@ -157,6 +169,10 @@
         }
         return false;
     }
+
+    // The bits each level writes (DESIGN "Layered access"): a row whose live
+    // bits differ is custom.
+    var LEVEL_BITS = { 'none': '---', 'read': 'r-x', 'read-write': 'rwx' };
 
     // Display label for a named/base principal, flagging orphans clearly so a
     // bare numeric id reads as "unknown (uid N)" / "unknown (gid N)" rather than
@@ -259,6 +275,7 @@
                             store: userStore,
                             valueField: 'name',
                             displayField: 'name',
+                            listConfig: encodedListConfig('name'),
                             queryMode: 'local',
                             editable: true,
                             forceSelection: false,
@@ -311,7 +328,10 @@
                                     return r.get('kind') === kind && r.get('name') === name;
                                 });
                                 if (dup !== -1) {
-                                    namedStore.getAt(dup).set('level', level);
+                                    // Adding a principal already listed is an explicit
+                                    // choice of its level (fourth review D-E): the row
+                                    // is written at that level, never at its old bits.
+                                    namedStore.getAt(dup).set({ level: level, readLevel: null });
                                 } else {
                                     namedStore.add({ kind: kind, name: name, level: level });
                                 }
@@ -353,7 +373,7 @@
         var userStore = identityStore();
         var groupStore = identityStore();
         var namedStore = Ext.create('Ext.data.Store', {
-            fields: ['kind', 'name', 'level', 'unresolved'],
+            fields: ['kind', 'name', 'level', 'unresolved', 'perms', 'readLevel'],
             data: [],
         });
         var backing = normBacking(opts.backing);
@@ -362,7 +382,9 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-dataset-access',
-                title: t('Permissions') + ': ' + title,
+                // Encoded here, once: the AHR, datasets and shares callers pass
+                // raw pool, dataset and share names (window titles are HTML).
+                title: t('Permissions') + ': ' + enc(title),
                 modal: true,
                 width: 560,
                 height: 620,
@@ -396,6 +418,7 @@
                                         store: userStore,
                                         valueField: 'name',
                                         displayField: 'name',
+                                        listConfig: encodedListConfig('name'),
                                         queryMode: 'local',
                                         editable: true,
                                         forceSelection: false,
@@ -439,6 +462,7 @@
                                         store: groupStore,
                                         valueField: 'name',
                                         displayField: 'name',
+                                        listConfig: encodedListConfig('name'),
                                         queryMode: 'local',
                                         editable: true,
                                         forceSelection: false,
@@ -500,7 +524,23 @@
                         border: true,
                         store: namedStore,
                         selModel: { mode: 'SINGLE' },
-                        plugins: [{ ptype: 'cellediting', clicksToEdit: 1 }],
+                        plugins: [{
+                            ptype: 'cellediting',
+                            clicksToEdit: 1,
+                            listeners: {
+                                // Choosing a DIFFERENT level is an edit: the row is
+                                // then written at that level (D3). Opening and
+                                // closing the editor on the level shown changes
+                                // nothing (fourth review D-E): a custom row keeps
+                                // its bits.
+                                edit: function (editor, ctx) {
+                                    if (ctx && ctx.field === 'level' && ctx.record
+                                        && ctx.value !== ctx.originalValue) {
+                                        ctx.record.set('readLevel', null);
+                                    }
+                                },
+                            },
+                        }],
                         emptyText: t('No named users or groups.'),
                         columns: [
                             {
@@ -520,8 +560,9 @@
                                     var orphan = rec && rec.get('unresolved');
                                     if (orphan) {
                                         meta.tdCls = 'anas-cell-orphan';
+                                        // data-qtip: encoded for the attribute AND for the tip.
                                         meta.tdAttr = 'data-qtip="'
-                                            + enc(t('This id no longer resolves to a user/group — removed outside ANAS. Remove this entry to clean it up.'))
+                                            + enc(enc(t('This id no longer resolves to a user/group — removed outside ANAS. Remove this entry to clean it up.')))
                                             + '"';
                                         return '<span style="color:#b35900;">'
                                             + principalLabel(v, true, isGroup) + '</span>';
@@ -533,7 +574,19 @@
                                 text: t('Access'),
                                 dataIndex: 'level',
                                 width: 150,
-                                renderer: function (v) {
+                                renderer: function (v, meta, rec) {
+                                    // cr3.shares (second review): live bits that are not
+                                    // exactly the level's own are CUSTOM — say so, with the
+                                    // bits; an Apply restates the row at the level shown.
+                                    // Untouched, a custom row stays exactly as it is
+                                    // (third review D3); choosing a level writes it.
+                                    var bits = rec ? rec.get('perms') : null;
+                                    var untouched = rec && rec.get('readLevel') === v;
+                                    if (bits && untouched && bits !== LEVEL_BITS[v]) {
+                                        meta.tdAttr = 'data-qtip="' + enc(enc(t('Custom permissions on disk') + ': ' + bits + '. '
+                                            + t('They stay as they are unless you choose a level for this entry.'))) + '"';
+                                        return enc(t('custom') + ' (' + bits + ')');
+                                    }
                                     return enc(accessLevelLabel(v));
                                 },
                                 editor: {
@@ -762,7 +815,7 @@
         for (var i = 0; i < entries.length; i++) {
             var e = entries[i];
             if (e && (e.kind === 'user' || e.kind === 'group')) {
-                named.push({ kind: e.kind, name: e.name || '', level: e.level || 'none', unresolved: !!e.unresolved });
+                named.push({ kind: e.kind, name: e.name || '', level: e.level || 'none', unresolved: !!e.unresolved, perms: e.perms || null, readLevel: e.level || 'none' });
             }
         }
         namedStore.loadData(named);
@@ -771,6 +824,10 @@
         // daemon never infers a clear from an empty list (#37), so the UI has to
         // say so explicitly — and can only say it because the pre-fill worked.
         win._loadedNamedCount = named.length;
+        // cr3.shares (second review): the revision of what this read saw —
+        // sent back so an Apply made from a stale read is refused, never
+        // silently undoing an edit made in between.
+        win._readRevision = acc.revision || null;
 
         // Surface an orphaned owner/group (uid/gid deleted outside ANAS) next to
         // the pickers so a bare number isn't mistaken for a real account.
@@ -857,14 +914,23 @@
             var name = (r.get('name') || '').trim();
             if (!name) { return; }
             namedCount++;
-            entries.push({
+            var entry = {
                 kind: r.get('kind') === 'group' ? 'group' : 'user',
                 name: name,
                 level: r.get('level') || 'none',
-            });
+            };
+            // cr3.shares (third review D3): a row whose level the operator did
+            // not change carries back the bits the read gave it, so the daemon
+            // keeps them exactly (a custom `--x` or `-wx` row included); an
+            // edited or added row carries none and is written at its level.
+            if (r.get('perms') && r.get('readLevel') && r.get('level') === r.get('readLevel')) {
+                entry.perms = r.get('perms');
+            }
+            entries.push(entry);
         });
 
         var body = { entries: entries, applyToExisting: applyToExisting };
+        if (win._readRevision) { body.expectedRevision = win._readRevision; }
         if (owner) { body.owner = owner; }
         if (group) { body.group = group; }
         // Removing the last named grant is a real gesture — say it out loud.
@@ -890,10 +956,23 @@
             confirmTitle: t('Apply to existing files'),
             confirmHeadline: true,
             failTitle: 'Set permissions failed',
-            successMsg: t('Permissions updated') + ': ' + title,
+            // The toast says what the job did (cr3.shares M3): an Apply that
+            // changed nothing ran no command and says so.
             onComplete: function (job) {
                 if (!win.destroyed && !win.destroying) {
                     win.close();
+                }
+                if (job && job.result && job.result.nothingChanged) {
+                    ANAS.toast(t('Nothing to change: the permissions already say this') + ': ' + title);
+                } else if (job && job.result && job.result.incomplete) {
+                    // cr3.shares (fourth review): the walk finished but had to
+                    // leave something out (an entry swapped while it was read,
+                    // a failed change, a filesystem nobody named) — never a
+                    // plain "updated".
+                    ANAS.alertMsg('Permissions updated with exceptions',
+                        String(job.result.message || ''));
+                } else {
+                    ANAS.toast(t('Permissions updated') + ': ' + title);
                 }
                 // ZFS: the child datasets whose POSIX ACLs the walk switched on.
                 var kids = job && job.result && job.result.childAclEnabled;

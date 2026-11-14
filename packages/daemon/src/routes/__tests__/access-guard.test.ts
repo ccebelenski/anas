@@ -10,8 +10,12 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { currentLane } from '../../executor/deadline.js'
-import { createServer } from '../../server.js'
+import { createServer as createDevServer } from '../../server.js'
 import { SET_ACCESS_PRESENTATION_ONLY } from '../../services/access.js'
+import { echoRealPaths } from './real-path-echo.js'
+
+/** cr3.shares H2: the dev server, with `realpath -e` naming each plain test directory as itself. */
+const createServer = (...a: Parameters<typeof createDevServer>): ReturnType<typeof createDevServer> => echoRealPaths(createDevServer(...a))
 
 /**
  * Story cr.37 — `fs.setAccess` on the guard, at all three doors (the datasets

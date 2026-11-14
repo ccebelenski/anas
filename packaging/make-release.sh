@@ -142,6 +142,12 @@ for p in "${WORKSPACES[@]}"; do
   cp "${src}/package.json" "${dst}/package.json"
 done
 
+# The recursive permission walk (cr3.shares) is a Perl script the daemon runs
+# from beside its compiled services (services/access.ts, ANAS_ACL_WALK). tsc
+# copies no .pl file, so it is staged here; install.sh's preflight requires it.
+install -m 0644 "${REPO_ROOT}/packages/daemon/src/services/anas-acl-walk.pl" \
+  "${APP}/packages/daemon/dist/services/anas-acl-walk.pl"
+
 # Dev/test-only build output never ships (2026-10-14 review W3, closed by
 # cr.61). The package tsconfigs compile every src/**/__tests__ into dist, and
 # daemon/dist/bin/selfheal-*.js are the self-heal loop-device suite's entry

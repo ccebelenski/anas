@@ -1,0 +1,78 @@
+# Global parameters
+[global]
+	workgroup = W
+	idmap config * : backend = tdb
+
+
+[kelvin]
+	path = /srv/k1
+
+
+[Kelvin]
+	path = /srv/k2
+
+
+[KELVİN]
+	path = /srv/k3
+
+
+[kelvın]
+	path = /srv/k4
+
+
+[straße]
+	path = /srv/s1
+
+
+[STRASSE]
+	path = /srv/s2
+
+
+[ſtrasse]
+	path = /srv/s3
+
+
+[µu]
+	path = /srv/m1
+
+
+[μu]
+	path = /srv/m2
+
+
+[σς]
+	path = /srv/g1
+
+
+[ΣΣ]
+	path = /srv/g2
+
+
+[ÿy]
+	path = /srv/y2
+
+
+[ǅdz]
+	path = /srv/t1
+
+
+[ǄDZ]
+	path = /srv/t2
+
+
+[ﬀx]
+	path = /srv/f1
+
+
+[FFX]
+	path = /srv/f2
+
+
+[Ärger]
+	comment = merged-umlaut
+	path = /srv/a1
+
+
+[Media]
+	comment = merged
+	path = /srv/media

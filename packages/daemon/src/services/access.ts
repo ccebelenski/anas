@@ -1,24 +1,34 @@
-import type { AccessEntry, AccessLevel, DatasetAccess, ErrorCode, MountpointPermissions, SetAccessRequest, ShareAccessGrantResult } from '@anas/shared'
-import type { CommandExecutor, ExecOptions } from '../executor/types.js'
+import type { AccessEntry, AccessLevel, AccessWalkReport, DatasetAccess, ErrorCode, MountpointPermissions, SetAccessRequest, ShareAccessGrantResult } from '@anas/shared'
+import type { FileHandle } from 'node:fs/promises'
+import type { CommandExecutor, ExecOptions, ExecResult } from '../executor/types.js'
 import type { LockClaim } from '../jobs/locks.js'
-import type { ParsedAcl } from '../parsers/getfacl.js'
+import type { JobContext } from '../jobs/queue.js'
+import type { ParsedAcl, ParsedAclSet } from '../parsers/getfacl.js'
 import type { Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
 import type { WalkScope } from './access-walk.js'
 import type { IscsiPaths } from './iscsi.js'
 import { createHash } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
-import { DatasetPath, isPathWithin } from '@anas/shared'
+import { constants as FS_CONSTANTS } from 'node:fs'
+import { access, lstat, open, readFile, readlink } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { AccessWalkReport as AccessWalkReportSchema, DatasetPath, isPathWithin } from '@anas/shared'
+import { ChildCancel } from '../jobs/child-cancel.js'
+import { JobCancelledError } from '../jobs/queue.js'
+import { parseBtrfsSubvolList } from '../parsers/btrfs-subvol-list.js'
 import { isFindmntTable } from '../parsers/findmnt.js'
-import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
+import { parseGroups, parsePasswd } from '../parsers/getent.js'
+import { effectivePerms, levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
 import { parsePveMountPaths, PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseDatasetGet, parseZfsList, zfsListArgs } from '../parsers/zfs-list.js'
 import { ahrPoolClaims, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
-import { notChangedList, walkArgs, walkScopeFrom } from './access-walk.js'
+import { mountedSubvolume, mountRowOf, nestedSubvolumes, notChangedList, subvolumeRelPath, walkScopeFrom } from './access-walk.js'
 import { heldByLunOnce } from './iscsi-held.js'
 import { probeMount } from './mounts.js'
 import { isProbeableKind, kindOfMount, mountIndex, normalizePath } from './nested-filesystems.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from './pve-footprint.js'
+import { cannotSeeMessage, probeSharePath } from './share-path.js'
 import { resolveSelfServiceTarget } from './share-selfservice.js'
 
 // ============================================================================
@@ -35,13 +45,13 @@ import { resolveSelfServiceTarget } from './share-selfservice.js'
 //   - the ACL switch: ZFS has `acltype` (auto-enabled with `zfs set` on the
 //     first named grant); btrfs (AHR) and other Linux filesystems carry POSIX
 //     ACLs natively, so there is no switch and never a `zfs set`;
-//   - the recursive walk: `setfacl -R`/`chown -R`/`chmod -R` (and
-//     `find -type d` for the directories' setgid) walk the directory
-//     tree. On ZFS that includes child datasets mounted beneath (the
-//     PVE-descendant refusal guards it, and a named grant switches their
-//     ACLs on first — {@link enableChildAcls}); on AHR it sweeps every subvolume
-//     under `@data` as one tree, and `@snapshots` is a sibling OUTSIDE the
-//     mountpoint (AHR-DESIGN §12), so it is never entered;
+//   - the recursive walk (anas-acl-walk, cr3.shares fourth review) walks
+//     the directory tree and stops at every other device. On ZFS each
+//     child dataset mounted beneath that the confirm names is a root of its
+//     own (the PVE-descendant refusal guards it, and a named grant switches
+//     their ACLs on first — {@link enableChildAcls}); on AHR each nested
+//     subvolume under `@data` is a root of its own, and `@snapshots` is a
+//     sibling OUTSIDE the mountpoint (AHR-DESIGN §12), so it is never entered;
 //   - PVE territory: a ZFS dataset asks the footprint service; a non-ZFS
 //     directory asks storage.cfg's `path`/`mountpoint` keys directly.
 // ============================================================================
@@ -55,23 +65,37 @@ const SETFACL = '/usr/bin/setfacl'
 
 /**
  * cr.34: a RECURSIVE apply walks the whole tree — hours on a large dataset —
- * so its commands run with no deadline (the job lane's 300 s would stop a
- * legitimate walk half-way). The non-recursive forms keep the lane default.
+ * so the walk runs with no deadline (the job lane's 300 s would stop a
+ * legitimate walk half-way); the job's cancel stops it instead (cr3.shares,
+ * fourth review: the helper's whole process group). The non-recursive forms
+ * keep the lane default.
  *
  * Story nf.1 (wave-3 D2) keeps that and bounds the one way a walk could hang
- * that has nothing to do with the tree's size: since the walk no longer
- * enters other filesystems, the only foreign entry it still reads is the
- * MOUNTPOINT of a mount below the target (find lstats an entry before the
- * prune that skips it, GT amendment 16) — and a dead NFS/CIFS server hangs
+ * that has nothing to do with the tree's size: the walk never enters another
+ * filesystem, but it still lstats the MOUNTPOINT of a mount below the target
+ * (that is how it sees the other device) — and a dead NFS/CIFS server hangs
  * that lstat for ever. The job probes every such remote mount first and
  * refuses before changing anything ({@link refuseDeadRemotes}).
  */
+// The reason literal is pinned by __tests__/null-sites.test.ts.
 const TREE_WALK: ExecOptions = {
   timeoutMs: null,
-  longRunning: 'recursive chown/setfacl/chmod/find over a whole tree: hours on a large dataset',
+  longRunning: 'recursive chown/setfacl/chmod walk over a whole tree: hours on a large dataset',
 }
-const FIND = '/usr/bin/find'
 const FINDMNT = '/usr/bin/findmnt'
+const BTRFS = '/usr/bin/btrfs'
+/** `btrfs subvolume list` reads metadata only; a minute is far beyond any pool. */
+const BTRFS_LIST_TIMEOUT_MS = 60_000
+const PERL = '/usr/bin/perl'
+/** perl's answer when it cannot open the script it was given (it ran nothing of it). */
+const PERL_CANNOT_OPEN_RE = /^Can't open perl script/
+/**
+ * The recursive permission walk (cr3.shares, fourth review). It ships beside
+ * this module: the release build copies services/anas-acl-walk.pl next to the
+ * compiled services (root-owned, under the install prefix), and a dev run
+ * reads it from the source tree, so there is one path rule for both.
+ */
+export const ANAS_ACL_WALK = join(dirname(fileURLToPath(import.meta.url)), 'anas-acl-walk.pl')
 const GETENT = '/usr/bin/getent'
 
 /** The base-three access kinds (mode bits), in owner/group/everyone order. */
@@ -84,8 +108,181 @@ interface BaseLevels {
   'everyone': AccessEntry['level']
 }
 
+/** The base principals, in spec order. */
+const BASE_KINDS = ['owner', 'owning-group', 'everyone'] as const
+
 /** Whitespace splitter for `stat` output (owner group mode). */
 const WHITESPACE_RE = /\s+/
+
+/** What every pinned single-directory write names: the directory the daemon opened (fd 3 in the child). */
+export const PINNED_DIR = '/proc/self/fd/3'
+
+/** One opened directory a write job acts through (cr3.shares H2). */
+export interface PinnedDir {
+  fd: number
+  close: () => Promise<void>
+}
+
+/**
+ * The pin's filesystem calls — a seam so a unit test standing on a path that
+ * does not exist on the test host can stand in an opened directory. Production
+ * never replaces it.
+ */
+export const accessDirIo = {
+  /** Open a directory without following a final symlink. */
+  open: (path: string) => open(path, FS_CONSTANTS.O_RDONLY | FS_CONSTANTS.O_DIRECTORY | FS_CONSTANTS.O_NOFOLLOW),
+  /** The kernel's name for an opened descriptor (`/proc/self/fd/N`). */
+  readlink: (path: string) => readlink(path),
+  /** lstat a path component (the share-path symlink rule). */
+  lstat: (path: string) => lstat(path),
+  /** The opened descriptor's own identity (N1). */
+  fstat: (handle: FileHandle) => handle.stat(),
+  /** Resolves when the walk helper's script can be read (fifth review D1). */
+  readable: (path: string) => access(path, FS_CONSTANTS.R_OK),
+  /** The mount table with its mount ids (fifth review D6). */
+  mountinfo: () => readFile('/proc/self/mountinfo', 'utf8'),
+}
+
+/** A mountinfo field's octal escapes (`\040` for a space). */
+const MOUNTINFO_ESCAPE_RE = /\\([0-7]{3})/g
+
+/**
+ * The mount id of the mount VISIBLE at each target (fifth review D6), from
+ * /proc/self/mountinfo (proc(5): field 1 the mount id, 2 its parent's, 5 the
+ * mount point, octal-escaped): of the mounts at one target, the one no other
+ * mount there stacks on. Null for a target the table does not show.
+ */
+export function mountIdsAt(mountinfo: string, targets: string[]): (number | null)[] {
+  const at = new Map<string, { id: number, parent: number }[]>()
+  for (const line of mountinfo.split('\n')) {
+    const f = line.split(' ')
+    if (f.length < 5)
+      continue
+    const target = f[4].replace(MOUNTINFO_ESCAPE_RE, (_m, o: string) => String.fromCharCode(Number.parseInt(o, 8)))
+    at.set(target, [...(at.get(target) ?? []), { id: Number(f[0]), parent: Number(f[1]) }])
+  }
+  return targets.map((t) => {
+    const here = at.get(t) ?? []
+    const top = here.filter(m => !here.some(o => o.parent === m.id))
+    return top.length === 1 ? top[0].id : null
+  })
+}
+
+/**
+ * cr3.shares H2: open the planned directory ONCE — `O_DIRECTORY|O_NOFOLLOW`,
+ * so a final component that is a symlink fails the open — and prove that the
+ * descriptor is the planned real path: the kernel's name for it must equal
+ * the path itself (an earlier component swapped for a link between the check
+ * and the open lands the descriptor elsewhere, and its name says so; the
+ * mounts pin, services/mounts.ts openMountTarget, proves a mountpoint the
+ * same way). Every tool then names `/proc/self/fd/3`, which the kernel
+ * resolves to exactly this directory whatever the path names afterwards.
+ */
+async function pinDir(dir: string, expected?: DirId): Promise<PinnedDir> {
+  const want = normalizePath(dir)
+  let handle: Awaited<ReturnType<typeof accessDirIo.open>>
+  try {
+    handle = await accessDirIo.open(want)
+  }
+  catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? 'error'
+    throw new Error(`No permissions were changed: '${want}' could not be opened as a plain directory (${code}) — a symbolic link in its place is refused`)
+  }
+  let name: string | null
+  try {
+    name = await accessDirIo.readlink(`/proc/self/fd/${handle.fd}`)
+  }
+  catch {
+    name = null
+  }
+  if (name !== want) {
+    await handle.close()
+    throw new Error(`No permissions were changed: the directory opened for '${want}' is ${name === null ? 'unnamed' : `'${name}'`} — a component of the path was swapped for a symbolic link after the check`)
+  }
+  // N1 (third review): the readlink proves a PATH; the device and inode
+  // prove the OBJECT is the one the plan read (a directory replaced by
+  // another of the same name since refuses here).
+  if (expected) {
+    const st = await accessDirIo.fstat(handle).catch(() => null)
+    if (!st || st.dev !== expected.dev || st.ino !== expected.ino) {
+      await handle.close()
+      throw new Error(`No permissions were changed: '${want}' is no longer the directory the change was planned for (it was replaced since) — reload and apply again`)
+    }
+  }
+  return { fd: handle.fd, close: () => handle.close() }
+}
+
+/** How many symbolic links one resolution follows before it gives up (the kernel's own bound). */
+const MAX_LINKS = 40
+
+/**
+ * cr3.shares H2 (second review): the ONE resolution of a configured path,
+ * walked component by component by the daemon itself — the OpenSSH
+ * "safe path" rule. `.`, `..` and repeated `/` are normalised as the walk
+ * goes; every component is `lstat`-ed, and a symbolic link is followed
+ * (readlink) ONLY when the link itself is owned by root AND every directory
+ * from `/` down to the one holding it is root-owned and writable by neither
+ * group nor others (a sticky bit does not make a writable directory safe):
+ * only then can no share user have planted or swapped it. Any other link
+ * refuses, naming the link and why. The result R is the real path: the PVE
+ * gates judge it, and the writes act on it through a descriptor proven to
+ * BE it ({@link pinDir}) — the pin covers the non-link components, the only
+ * ones a share user can still swap. No second resolution, no mount table.
+ */
+export async function safeResolve(configured: string): Promise<{ real: string } | { refusal: string }> {
+  const queue = configured.split('/').filter(Boolean)
+  const real: string[] = []
+  const safeDirs = new Map<string, string | null>()
+  /** Why the directory `dir` (a real path) may not hold a trusted link, or null. */
+  const unsafeDir = async (dir: string): Promise<string | null> => {
+    if (safeDirs.has(dir))
+      return safeDirs.get(dir)!
+    const st = await accessDirIo.lstat(dir).catch(() => null)
+    const why = !st
+      ? `'${dir}' could not be read`
+      : st.uid !== 0
+        ? `'${dir}' is owned by uid ${st.uid}, not root`
+        : (st.mode & 0o022) !== 0
+            ? `'${dir}' is writable by its group or by everyone`
+            : null
+    safeDirs.set(dir, why)
+    return why
+  }
+  let links = 0
+  while (queue.length > 0) {
+    const comp = queue.shift()!
+    if (comp === '.')
+      continue
+    if (comp === '..') {
+      real.pop()
+      continue
+    }
+    const here = `/${[...real, comp].join('/')}`
+    const st = await accessDirIo.lstat(here).catch((err: NodeJS.ErrnoException) => err)
+    if (st instanceof Error)
+      return { refusal: `'${configured}' could not be resolved: '${here}' ${st.code === 'ENOENT' ? 'does not exist' : `could not be read (${st.code ?? st.message})`}` }
+    if (!st.isSymbolicLink()) {
+      real.push(comp)
+      continue
+    }
+    if (++links > MAX_LINKS)
+      return { refusal: `'${configured}' could not be resolved: more than ${MAX_LINKS} symbolic links` }
+    let why: string | null = st.uid !== 0 ? `it is owned by uid ${st.uid}, not root` : null
+    if (why === null) {
+      for (let i = 0; i <= real.length && why === null; i++)
+        why = await unsafeDir(`/${real.slice(0, i).join('/')}`)
+    }
+    if (why !== null)
+      return { refusal: `'${configured}' runs through the symbolic link '${here}', which a share user could have planted or swapped (${why}) — ANAS follows a link only when root owns it and every directory above it is root's and writable by no one else; point the share at the real directory instead` }
+    const target = await accessDirIo.readlink(here).catch(() => null)
+    if (target === null)
+      return { refusal: `'${configured}' could not be resolved: the link '${here}' could not be read` }
+    if (target.startsWith('/'))
+      real.length = 0
+    queue.unshift(...target.split('/').filter(Boolean))
+  }
+  return { real: `/${real.join('/')}` }
+}
 
 // ============================================================================
 // Targets
@@ -109,7 +306,13 @@ export interface AhrAccessTarget {
   vgUuid?: string
 }
 /** A share's path, resolved onto its home (ZFS dataset, AHR pool, or neither). */
-export interface ShareAccessTarget { kind: 'share', path: string, home: ShareHome }
+/**
+ * A share path's target. `path` is the REAL path (cr3.shares H2: `realpath -e`
+ * of the configured one — the gates judge it and the writes pin it);
+ * `configuredPath` is the path as smb.conf / exports names it, present when
+ * it differs, so the symlink rule can be asked of it.
+ */
+export interface ShareAccessTarget { kind: 'share', path: string, home: ShareHome, configuredPath?: string, /** The safe-path walk's refusal, when it refused. */ pathRefusal?: string }
 
 export type AccessTarget = ZfsAccessTarget | AhrAccessTarget | ShareAccessTarget
 
@@ -123,7 +326,36 @@ interface ChildDataset { name: string, mountpoint: string, acltype: string }
  */
 export interface PlanWalk extends WalkScope {
   children: ChildDataset[]
+  /**
+   * cr3.shares N1 (third review): each root's device and inode as the plan
+   * saw them, index for index with `roots` — the pin compares its descriptor
+   * with them, so a root replaced by another directory of the same name
+   * refuses before any write.
+   */
+  rootIds: DirId[]
+  /**
+   * Fifth review D6: the identity of each excluded mount, index for index
+   * with `excluded`, as the plan read it (null when it could not be read) —
+   * the walk's boundaries are matched against these, never against a count.
+   */
+  excludedIds: (ExcludedIdentity | null)[]
 }
+
+/**
+ * An excluded mount as the plan saw it (fifth review D6): its mount id
+ * (mountinfo), and WHERE it sits — the inode of the directory holding its
+ * mountpoint and the mountpoint's name. A mount id is reused once its mount
+ * is gone (the re-run of the review's probe: a tmpfs mounted at another name
+ * after the excluded one was unmounted got the same id AND the same anonymous
+ * device number), and a mountpoint cannot be renamed while mounted, so the
+ * three together name this mount at this place. The device is not part of
+ * it: on btrfs, stat(2) reports a subvolume's own anonymous device, never the
+ * mount table's major:minor.
+ */
+export interface ExcludedIdentity { mnt: number, parent: number, leaf: string }
+
+/** A directory's identity: its device and inode. */
+export interface DirId { dev: number, ino: number }
 
 /** The directory the writer acts on. */
 export function targetDir(t: AccessTarget): string {
@@ -161,7 +393,10 @@ function identityFields(t: AccessTarget): Record<string, string> {
     return { dataset: t.dataset, mountpoint: t.mountpoint }
   if (t.kind === 'ahr')
     return { pool: t.pool, mountpoint: t.mountpoint }
-  return { path: t.path }
+  // cr3.shares (second review): `path` is what the operator named (the
+  // share's configured path); the real path the writer stood on rides beside
+  // it, additively, when the two differ.
+  return t.configuredPath !== undefined ? { path: t.configuredPath, resolvedPath: t.path } : { path: t.path }
 }
 
 /** "Mountpoint '<x>'" or "Share path '<x>'" — the 404 when the directory cannot be stat'ed. */
@@ -202,16 +437,31 @@ function orphanFlag(entry: AccessEntry, orphan: boolean): AccessEntry {
 /** The base-three AccessEntry list derived from mode bits (mode-only datasets). */
 function baseEntriesFromMode(mode: string, ownerOrphan = false, groupOrphan = false): AccessEntry[] {
   const levels = baseLevelsFromMode(mode)
+  const digits = mode.slice(-3).padStart(3, '0')
+  const bits = (i: number): string => {
+    const d = Number.parseInt(digits[i], 8) || 0
+    return `${d & 4 ? 'r' : '-'}${d & 2 ? 'w' : '-'}${d & 1 ? 'x' : '-'}`
+  }
   return [
-    orphanFlag({ kind: 'owner', level: levels.owner }, ownerOrphan),
-    orphanFlag({ kind: 'owning-group', level: levels['owning-group'] }, groupOrphan),
-    { kind: 'everyone', level: levels.everyone },
+    orphanFlag({ kind: 'owner', level: levels.owner, perms: bits(0) }, ownerOrphan),
+    orphanFlag({ kind: 'owning-group', level: levels['owning-group'], perms: bits(1) }, groupOrphan),
+    { kind: 'everyone', level: levels.everyone, perms: bits(2) },
   ]
 }
 
-/** Base three levels → 3-digit octal mode string (e.g. `750`). */
-function levelsToMode(levels: BaseLevels): string {
-  return `${levelToOctalDigit(levels.owner)}${levelToOctalDigit(levels['owning-group'])}${levelToOctalDigit(levels.everyone)}`
+/** Does a `stat %a` mode carry the setgid bit (`2775`)? */
+function hasSetgid(mode: string): boolean {
+  return mode.length >= 4 && (Number.parseInt(mode[mode.length - 4], 8) & 2) !== 0
+}
+
+/**
+ * cr3.shares M3: the 3-digit mode for a base-level edit, every digit the
+ * request did not move keeping its LIVE value (`0751`, others moved to none
+ * → `750`; owner moved → `751` keeps others' traverse bit).
+ */
+function levelsToModeKeeping(levels: BaseLevels, moved: readonly BaseKind[], liveMode: string): string {
+  const live = liveMode.slice(-3).padStart(3, '0')
+  return BASE_KINDS.map((kind, i) => moved.includes(kind) ? String(levelToOctalDigit(levels[kind])) : live[i]).join('')
 }
 
 /**
@@ -234,8 +484,28 @@ function levelsToSymbolic(levels: BaseLevels): string {
   return `u=${levelToSymbolicPerms(levels.owner)},g=${levelToSymbolicPerms(levels['owning-group'])},o=${levelToSymbolicPerms(levels.everyone)}`
 }
 
-/** A named (user/group) AccessEntry — kind narrowed, name guaranteed present. */
-type NamedEntry = AccessEntry & { kind: 'user' | 'group', name: string }
+/**
+ * A named (user/group) AccessEntry — kind narrowed, name guaranteed present.
+ * `perms` (cr3.shares M3) is the exact perms field to write instead of the
+ * level's canonical one: the principal's LIVE effective perms, carried when
+ * the request leaves its level as it reads (a preserved entry, or a requested
+ * one at the level the editor showed), so an Apply never rewrites what the
+ * operator did not touch (`-w-`, `r--`, `--x`, a mask-clamped grant).
+ */
+type NamedEntry = AccessEntry & { kind: 'user' | 'group', name: string, perms?: string }
+
+/** The same override for the base three (cr3.shares M3). */
+type BasePerms = Partial<Record<BaseKind, string>>
+
+/** What a request does to the named principals, against what was read (cr3.shares M3). */
+interface NamedDelta {
+  added: NamedEntry[]
+  changed: NamedEntry[]
+  removed: NamedEntry[]
+}
+
+/** Every execute bit as `X` — a recursive spec carries no literal `x` (see buildAclSpec). */
+const EXEC_BIT_RE = /x/g
 
 function isNamed(e: AccessEntry): e is NamedEntry {
   return (e.kind === 'user' || e.kind === 'group') && e.name !== undefined
@@ -260,17 +530,42 @@ function isNamed(e: AccessEntry): e is NamedEntry {
  * not inherit execute from it: the kernel masks the inherited entries with
  * the creating call's mode (0666 for an ordinary file).
  */
-function buildAclSpec(base: BaseLevels, named: NamedEntry[], recursive: boolean): string {
-  const p = (level: AccessEntry['level']) => levelToAclPerms(level, recursive)
+function buildAclSpec(base: BaseLevels, named: NamedEntry[], recursive: boolean, basePerms: BasePerms = {}, liveMask?: string | null): string {
+  const p = (level: AccessEntry['level'], kept?: string) => kept !== undefined
+    ? (recursive ? kept.replace(EXEC_BIT_RE, 'X') : kept)
+    : levelToAclPerms(level, recursive)
   const specs = [
-    `u::${p(base.owner)}`,
-    `g::${p(base['owning-group'])}`,
-    `o::${p(base.everyone)}`,
+    `u::${p(base.owner, basePerms.owner)}`,
+    `g::${p(base['owning-group'], basePerms['owning-group'])}`,
+    `o::${p(base.everyone, basePerms.everyone)}`,
   ]
   for (const n of named)
-    specs.push(`${n.kind === 'user' ? 'u' : 'g'}:${n.name}:${p(n.level)}`)
-  specs.push(recursive ? 'm::rwX' : 'm::rwx')
+    specs.push(`${n.kind === 'user' ? 'u' : 'g'}:${n.name}:${p(n.level, n.perms)}`)
+  if (liveMask === undefined || liveMask === null) {
+    specs.push(recursive ? 'm::rwX' : 'm::rwx')
+    return specs.join(',')
+  }
+  // cr3.shares M3: one directory's LIVE mask as found — kept when every
+  // group-class entry fits inside it, else the narrowest that fits them all
+  // (their union). Either way no principal's effective access moves except
+  // the ones the request moved, and the reported levels stay truthful. (No
+  // live mask — a first grant — is the managed `m::rwx`.)
+  const groupClass = [specs[1], ...specs.slice(3)].map(e => e.slice(e.lastIndexOf(':') + 1))
+  const union = ['r', 'w', 'x'].map((bit, i) => groupClass.some(g => g[i] === bit) ? bit : '-').join('')
+  const fits = liveMask !== null && [...union].every((c, i) => c === '-' || liveMask[i] === c)
+  specs.push(`m::${fits ? liveMask : union}`)
   return specs.join(',')
+}
+
+/**
+ * cr3.shares M3: a MINIMAL access ACL spec — the base three alone, no named
+ * entry and no mask — for the explicit clear of one directory. A principal
+ * whose level the request leaves keeps its live bits (`group::` at what the
+ * mask let it do, so dropping the mask never widens it).
+ */
+function buildBaseSpec(base: BaseLevels, basePerms: BasePerms): string {
+  const p = (kind: BaseKind) => basePerms[kind] ?? levelToAclPerms(base[kind], false)
+  return `u::${p('owner')},g::${p('owning-group')},o::${p('everyone')}`
 }
 
 /** True when the dataset has POSIX ACLs in effect (ZFS may print `posix`). */
@@ -349,6 +644,22 @@ export interface SetAccessPlan {
   base: BaseLevels
   named: NamedEntry[]
   preservedNamedCount: number
+  /**
+   * cr3.shares M3: the live perms each base principal keeps — present for a
+   * principal whose level the request leaves as it reads, so its exact bits
+   * are restated rather than the level's canonical ones.
+   */
+  basePerms: BasePerms
+  /** cr3.shares M3: the base principals whose level the request moves. */
+  baseDelta: BaseKind[]
+  /** cr3.shares M3: the named principals the request adds, moves or removes. */
+  delta: NamedDelta
+  /** The directory's mode as read (`stat %a`, a leading special digit included). */
+  liveMode: string
+  /** The live default ACL, or null when the directory has none (or ACLs are off). */
+  liveDefault: ParsedAclSet | null
+  /** The live access ACL's mask, or null when it has none (or ACLs are off). */
+  liveMask: string | null
   hasNamed: boolean
   aclAutoEnabled: boolean
   clearAcls: boolean
@@ -366,6 +677,22 @@ export interface SetAccessPlan {
    * an ACL entry added since would silently delete that entry (F4).
    */
   revision: string
+  /** cr3.shares: the revision a GET of the editor reports for the same state (no walk facts). */
+  readRevision: string
+  /** cr3.shares N1: the directory's device and inode when planned (the pin must match). */
+  dirId: DirId
+}
+
+/**
+ * The editor's read revision (cr3.shares, second review): a hash of the
+ * facts a GET shows and a plan is computed from — the directory, its owner,
+ * group and mode, the ACL switch and the live `getfacl -pcE` answer — the
+ * same facts the plan's route-to-job revision binds, without the walk.
+ */
+function accessReadRevision(dir: string, perm: MountpointPermissions, supported: boolean, enabled: boolean, aclRead: { exitCode: number, stdout: string } | null): string {
+  return createHash('sha256')
+    .update(JSON.stringify({ dir, perm: [perm.owner, perm.group, perm.mode], supported, enabled, acl: aclRead }))
+    .digest('hex')
 }
 
 /**
@@ -428,6 +755,12 @@ export interface AccessServiceOptions {
   iscsiPaths?: IscsiPaths
   /** storage.cfg override; defaults to ANAS_STORAGE_CFG, then the real path. */
   pveStorageCfg?: string
+  /**
+   * The walk helper run for "apply to existing files" (default
+   * {@link ANAS_ACL_WALK}, the copy beside this module); a test may name
+   * another script.
+   */
+  aclWalkScript?: string
 }
 
 export type AccessService = ReturnType<typeof createAccessService>
@@ -435,6 +768,7 @@ export type AccessService = ReturnType<typeof createAccessService>
 export function createAccessService(opts: AccessServiceOptions) {
   const { executor } = opts
   const iscsiPaths = opts.iscsiPaths ?? {}
+  const aclWalkScript = opts.aclWalkScript ?? ANAS_ACL_WALK
 
   /** Stat a directory for owner/group/mode, or null if it can't be read. */
   async function statMountpoint(mountpoint: string): Promise<MountpointPermissions | null> {
@@ -523,15 +857,32 @@ export function createAccessService(opts: AccessServiceOptions) {
   }
 
   /** A share path → its home (the ONE path resolver the self-service decisions use). */
-  async function resolveShareTarget(path: string): Promise<ShareAccessTarget> {
+  async function resolveShareTarget(configured: string): Promise<ShareAccessTarget> {
+    // cr3.shares H2: the target is the REAL path from the one safe-path walk
+    // ({@link safeResolve}); the configured one rides along. A path the walk
+    // refuses stays as configured and carries the refusal — the plan answers it.
+    // N7 (third review): the component walk runs lstat/readlink in this
+    // process, and a dead hard mount on the path would block a libuv thread
+    // for ever — so the path first gets the share-path family's bounded child
+    // probe (`timeout 2 stat -f`); one that does not answer is refused.
+    const probe = await probeSharePath(executor, configured)
+    const walked = probe.state === 'not-answering'
+      ? { refusal: `'${configured}' is not answering (${probe.detail ?? 'no answer'}) — the storage under it, usually a network mount, is hung; nothing was read or changed` }
+      : await safeResolve(configured)
+    const real = 'real' in walked ? walked.real : null
+    const path = real ?? configured
+    const extra = {
+      ...(real !== null && real !== normalizePath(configured) ? { configuredPath: configured } : {}),
+      ...('refusal' in walked ? { pathRefusal: walked.refusal } : {}),
+    }
     const home = await resolveSelfServiceTarget(executor, path)
     if (home?.kind === 'zfs')
-      return { kind: 'share', path, home: { kind: 'zfs', dataset: home.dataset } }
+      return { kind: 'share', path, home: { kind: 'zfs', dataset: home.dataset }, ...extra }
     if (home?.kind === 'ahr') {
       const r = home.poolRecord
-      return { kind: 'share', path, home: { kind: 'ahr', pool: home.pool, record: { name: r.name, mountpoint: r.mountpoint, mounted: r.mounted }, ...(r.vg.uuid ? { vgUuid: r.vg.uuid } : {}) } }
+      return { kind: 'share', path, home: { kind: 'ahr', pool: home.pool, record: { name: r.name, mountpoint: r.mountpoint, mounted: r.mounted }, ...(r.vg.uuid ? { vgUuid: r.vg.uuid } : {}) }, ...extra }
     }
-    return { kind: 'share', path, home: null }
+    return { kind: 'share', path, home: null, ...extra }
   }
 
   // --- PVE territory ----------------------------------------------------------
@@ -628,18 +979,27 @@ export function createAccessService(opts: AccessServiceOptions) {
     const bad = (message: string): AccessFailure => ({ status: 400, body: { error: { code: 'VALIDATION_ERROR', message } } })
     const fail = (r: TerritoryRefusal): AccessFailure => (r.pveOwned ? pveFail(r.message) : bad(r.message))
 
-    if (t.kind === 'share' && t.home?.kind === 'zfs') {
+    if (t.kind === 'share') {
       // The share backstop's own answer (pvepool.1): a path on an owned
       // dataset, or inside a dir storage's path on ZFS. The config-unreadable
-      // verdict is the cannot-see fact (cr.47b) and keeps its 400.
-      const claim = (await loadPveFootprint(executor)).sharePathClaim(dir)
-      if (claim) {
+      // verdict is the cannot-see fact (cr.47b) and keeps its 400. cr3.shares
+      // M4: asked whatever home the path resolved onto — a failed `zfs list`
+      // resolves a path on an owned dataset onto NO home — and any answer
+      // other than a claim or a positive "no claim" is the footprint saying
+      // it could not see, refused 400.
+      const verdict = (await loadPveFootprint(executor)).sharePathVerdict(dir)
+      if (verdict.kind === 'claim') {
+        const claim = verdict.claim
         if (claim.kind === 'dataset')
           return claim.ownership.kind === 'config-unreadable' ? bad(claim.ownership.reason) : pveFail(claim.ownership.reason)
         return pveFail(`'${dir}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims`)
       }
+      if (verdict.kind !== 'no-claim') {
+        const reason = (verdict as { reason?: unknown }).reason
+        return bad(cannotSeeMessage('Share path', dir, typeof reason === 'string' && reason ? reason : 'the footprint could not be read'))
+      }
     }
-    else {
+    if (t.kind !== 'share' || t.home?.kind !== 'zfs') {
       const owned = await pathOwnershipRefusal(dir)
       if (owned)
         return fail(owned)
@@ -700,9 +1060,53 @@ export function createAccessService(opts: AccessServiceOptions) {
     const r = await executor.exec(FINDMNT, ['--json'])
     if (r.exitCode !== 0 || !isFindmntTable(r.stdout))
       return { unreadable: `the mount table could not be read (findmnt ${r.exitCode !== 0 ? `exited ${r.exitCode}` : 'answered in an unknown shape'})` }
-    const scope = walkScopeFrom(dir, mountIndex(r.stdout), children)
+    const mounts = mountIndex(r.stdout)
+    // D2 (third review): the nested btrfs subvolumes of the tree are walk
+    // roots of their own (each has its own device number, where the walk
+    // stops) — read with the plan. Fourth review: a list that answered
+    // nothing usable is a FAILED read, never "no subvolumes" (the walk would
+    // then leave every nested subvolume unchanged): bounded by a deadline,
+    // every line must parse, and a mount of a subvolume must find that
+    // subvolume itself in the list.
+    let subvolumes: string[] = []
+    const own = mountRowOf(dir, mounts)
+    if (own?.fstype === 'btrfs') {
+      const cannot = (why: string): { unreadable: string } => ({ unreadable: `the btrfs subvolumes under '${dir}' could not be listed (btrfs subvolume list ${why})` })
+      const list = await executor.exec(BTRFS, ['subvolume', 'list', own.target], { timeoutMs: BTRFS_LIST_TIMEOUT_MS }).catch((err: unknown) => err instanceof Error ? err : new Error(String(err)))
+      if (list instanceof Error)
+        return cannot(`did not answer: ${list.message}`)
+      if (list.exitCode !== 0)
+        return cannot(`exited ${list.exitCode}`)
+      const parsed = parseBtrfsSubvolList(list.stdout)
+      if (parsed.length !== list.stdout.split('\n').filter(l => l.trim() !== '').length)
+        return cannot('answered lines it could not read')
+      const mounted = mountedSubvolume(own)
+      if (mounted !== '' && !parsed.some(v => subvolumeRelPath(v.path) === mounted))
+        return cannot(`did not list the mounted subvolume '${mounted}' itself`)
+      subvolumes = nestedSubvolumes(parsed.map(v => v.path), own, dir)
+    }
+    const scope = walkScopeFrom(dir, mounts, children, subvolumes)
     const crossed = new Set(scope.crossed.map(c => c.name))
-    return { walk: { ...scope, children: children.filter(c => crossed.has(c.name)) } }
+    // N1: every root's identity, as the plan sees it now.
+    const rootIds: DirId[] = []
+    for (const root of scope.roots) {
+      const st = await accessDirIo.lstat(root.path).catch(() => null)
+      if (!st || !st.isDirectory())
+        return { unreadable: `the walk root '${root.path}' could not be read` }
+      rootIds.push({ dev: st.dev, ino: st.ino })
+    }
+    // Fifth review D6: each excluded mount's identity, as the plan sees it —
+    // its mount id from the mount table, the directory holding its
+    // mountpoint by lstat (inside the walked tree: never the mount).
+    const table = await accessDirIo.mountinfo().catch(() => '')
+    const ids = mountIdsAt(table, scope.excluded.map(e => e.target))
+    const excludedIds: (ExcludedIdentity | null)[] = []
+    for (const [i, e] of scope.excluded.entries()) {
+      const id = ids[i]
+      const parent = id !== null ? await accessDirIo.lstat(dirname(e.target)).catch(() => null) : null
+      excludedIds.push(id !== null && parent ? { mnt: id, parent: parent.ino, leaf: basename(e.target) } : null)
+    }
+    return { walk: { ...scope, children: children.filter(c => crossed.has(c.name)), rootIds, excludedIds } }
   }
 
   /**
@@ -817,6 +1221,8 @@ export function createAccessService(opts: AccessServiceOptions) {
     let aclText: string | null = null
     /** acltype says posixacl, but the ACL itself could not be read (#37). */
     let aclDegraded = false
+    /** The `getfacl -pcE` answer, exactly as a plan reads it (the read revision). */
+    let aclRead: { exitCode: number, stdout: string } | null = null
 
     // A principal whose uid/gid no longer resolves shows as a bare number
     // (getfacl/stat print the numeric id) — an orphan from a delete outside
@@ -827,15 +1233,23 @@ export function createAccessService(opts: AccessServiceOptions) {
     if (enabled && supported) {
       // ACLs are live: read the full ACL and map it to entries.
       const r = await executor.exec(GETFACL, ['-pcE', dir])
+      aclRead = { exitCode: r.exitCode, stdout: r.stdout }
       if (r.exitCode === 0 && r.stdout.trim()) {
         const acl = parseGetfacl(r.stdout)
+        // cr3.shares M3: a group-class entry reads as what the mask lets it
+        // do — a hand-written mask can clamp a grant below its text. Each row
+        // carries its live bits (`perms`, second review) so a CUSTOM row
+        // (`-w-`, `r--`) is shown as such, never as a level it is not.
+        const g = effectivePerms(acl.owningGroup, acl.mask)
         entries = [
-          orphanFlag({ kind: 'owner', level: permsToLevel(acl.owner) }, ownerOrphan),
-          orphanFlag({ kind: 'owning-group', level: permsToLevel(acl.owningGroup) }, groupOrphan),
-          { kind: 'everyone', level: permsToLevel(acl.everyone) },
+          orphanFlag({ kind: 'owner', level: permsToLevel(acl.owner), perms: acl.owner }, ownerOrphan),
+          orphanFlag({ kind: 'owning-group', level: permsToLevel(g), perms: g }, groupOrphan),
+          { kind: 'everyone', level: permsToLevel(acl.everyone), perms: acl.everyone },
           // Named entries; mask + default entries are managed, not shown.
-          ...acl.named.map((n): AccessEntry =>
-            orphanFlag({ kind: n.type, name: n.name, level: permsToLevel(n.perms) }, isNumericId(n.name))),
+          ...acl.named.map((n): AccessEntry => {
+            const eff = effectivePerms(n.perms, acl.mask)
+            return orphanFlag({ kind: n.type, name: n.name, level: permsToLevel(eff), perms: eff }, isNumericId(n.name))
+          }),
         ]
       }
       else {
@@ -863,6 +1277,8 @@ export function createAccessService(opts: AccessServiceOptions) {
       aclEnabled: enabled && !aclDegraded,
       entries,
       aclText,
+      // cr3.shares (second review): what this read saw, for `expectedRevision`.
+      revision: accessReadRevision(dir, perm, supported, enabled, aclRead),
     }
     if (aclDegraded)
       data.aclDegraded = true
@@ -883,10 +1299,44 @@ export function createAccessService(opts: AccessServiceOptions) {
     const perm = await statMountpoint(dir)
     if (!perm)
       return fail(404, 'NOT_FOUND', unreadableMessage(t))
+    // cr3.shares H2: a share path is resolved ONCE, by the safe-path walk
+    // (resolveShareTarget); a dataset or pool mountpoint must already be its
+    // own real path. The writes then pin R.
+    if (t.kind === 'share' && t.pathRefusal)
+      return fail(409, 'CONFLICT', t.pathRefusal)
+    if (t.kind !== 'share') {
+      const walked = await safeResolve(dir)
+      if ('refusal' in walked)
+        return fail(409, 'CONFLICT', walked.refusal)
+      if (walked.real !== normalizePath(dir))
+        return fail(409, 'CONFLICT', `'${dir}' resolves to '${walked.real}' — a mountpoint must be its own real path; nothing was changed`)
+    }
+    // N1 (third review): the directory's identity, which the pin must match.
+    const dirStat = await accessDirIo.lstat(normalizePath(dir)).catch(() => null)
+    if (!dirStat || !dirStat.isDirectory())
+      return fail(404, 'NOT_FOUND', unreadableMessage(t))
+    const dirId: DirId = { dev: dirStat.dev, ino: dirStat.ino }
 
     const recursive = req.applyToExisting === true
 
     const requestedNamed = (req.entries ?? []).filter(isNamed)
+    // N4 (third review): one principal, one row — two rows naming the same
+    // user (or group) two ways, a name and its numeric id, are refused. The
+    // ids come from the same nsswitch lookup the share grant uses (getent);
+    // a name that does not resolve is not a duplicate of anything.
+    if (requestedNamed.length >= 2) {
+      const seen = new Map<string, string>()
+      for (const e of requestedNamed) {
+        const id = await principalId(e.kind, e.name)
+        if (id === null)
+          continue
+        const key = `${e.kind}:${id}`
+        const first = seen.get(key)
+        if (first !== undefined)
+          return fail(400, 'VALIDATION_ERROR', `'${first}' and '${e.name}' name the same ${e.kind} (${e.kind === 'user' ? 'uid' : 'gid'} ${id}) — a principal may appear only once`)
+        seen.set(key, e.name)
+      }
+    }
     const baseChanged = req.entries !== undefined
     /** Named grants are stripped ONLY on an explicit request (#37). */
     const clearNamed = req.clearNamed === true
@@ -936,11 +1386,14 @@ export function createAccessService(opts: AccessServiceOptions) {
     // appears under the target after the confirm moves the revision and the
     // job refuses STATE_CHANGED instead of walking what nobody confirmed.
     const walkFacts = walk
-      ? { roots: walk.roots, excluded: walk.excluded, children: walk.children.map(c => [c.name, c.mountpoint, c.acltype]) }
+      ? { roots: walk.roots, rootIds: walk.rootIds, excluded: walk.excluded, excludedIds: walk.excludedIds, children: walk.children.map(c => [c.name, c.mountpoint, c.acltype]) }
       : null
     const revision = createHash('sha256')
-      .update(JSON.stringify({ dir, perm: [perm.owner, perm.group, perm.mode], supported, enabled, acl: aclRead, ...(walkFacts ? { walk: walkFacts } : {}) }))
+      .update(JSON.stringify({ dir, dirId, perm: [perm.owner, perm.group, perm.mode], supported, enabled, acl: aclRead, ...(walkFacts ? { walk: walkFacts } : {}) }))
       .digest('hex')
+    // cr3.shares (second review): the same facts without the walk — what a
+    // GET of the editor saw (its `revision`), compared to `expectedRevision`.
+    const readRevision = accessReadRevision(dir, perm, supported, enabled, aclRead)
 
     // Desired base three: a supplied entry overrides the current level, so a
     // partial request never silently drops an unmentioned base principal. The
@@ -949,11 +1402,19 @@ export function createAccessService(opts: AccessServiceOptions) {
     // digit is the ACL MASK (rwx), not the owning-group level, so reading it as
     // the group level would silently escalate an omitted owning-group to
     // read-write. With no ACLs, the mode bits ARE the truth.
-    const current: BaseLevels = liveAcl
+    //
+    // cr3.shares M3: and the real level is the EFFECTIVE one — `group::` and
+    // every named entry as the live mask lets them act, so an Apply that
+    // restates them with the managed `m::rwx` never hands a clamped principal
+    // a bit it could not use.
+    const livePerms: Record<BaseKind, string> | null = liveAcl
+      ? { 'owner': liveAcl.owner, 'owning-group': effectivePerms(liveAcl.owningGroup, liveAcl.mask), 'everyone': liveAcl.everyone }
+      : null
+    const current: BaseLevels = livePerms
       ? {
-          'owner': permsToLevel(liveAcl.owner),
-          'owning-group': permsToLevel(liveAcl.owningGroup),
-          'everyone': permsToLevel(liveAcl.everyone),
+          'owner': permsToLevel(livePerms.owner),
+          'owning-group': permsToLevel(livePerms['owning-group']),
+          'everyone': permsToLevel(livePerms.everyone),
         }
       : baseLevelsFromMode(perm.mode)
     const levelOf = (kind: BaseKind) => req.entries?.find(e => e.kind === kind)?.level ?? current[kind]
@@ -969,10 +1430,60 @@ export function createAccessService(opts: AccessServiceOptions) {
     // a plain chmod would write the ACL MASK, not `group::`. When there is
     // nothing to preserve (no live ACL, or the caller asked to clear) this list
     // is empty and the mode-bit path below runs as before.
+    //
+    // cr3.shares M3: restated at their EFFECTIVE perms, verbatim — never
+    // through the three-level abstraction, which turned `-w-` into `rwx`,
+    // `r--` into `r-x` and `--x` (traverse) into `---`.
+    const liveNamed: NamedEntry[] = (liveAcl?.named ?? []).map((n) => {
+      const eff = effectivePerms(n.perms, liveAcl?.mask)
+      return { kind: n.type, name: n.name, level: permsToLevel(eff), perms: eff }
+    })
     const preservedNamed: NamedEntry[] = (baseChanged && requestedNamed.length === 0 && !clearNamed)
-      ? (liveAcl?.named ?? []).map(n => ({ kind: n.type, name: n.name, level: permsToLevel(n.perms) }))
+      ? liveNamed
       : []
-    const named = requestedNamed.length > 0 ? requestedNamed : preservedNamed
+    // A requested entry left at the level the editor showed for it keeps its
+    // live perms too: adding one principal changes nobody else's bits.
+    //
+    // cr3.shares (third review D3): nothing the edit did not name moves —
+    // custom rows (`--x` traverse, a `-wx` drop box) included. The panel
+    // echoes the bits the GET gave for every row whose level control the
+    // operator did not change; a row whose echoed bits ARE the live ones
+    // keeps them. A row is restated at its level only when the body carries
+    // no bits for it (an older panel, the API) or a level that differs from
+    // what the read showed.
+    const keptNamed = requestedNamed.map((e): NamedEntry => {
+      const { perms: sent, ...entry } = e
+      const live = liveNamed.find(n => n.kind === e.kind && n.name === e.name)
+      if (live && ((sent !== undefined && sent === live.perms && permsToLevel(live.perms) === e.level) || live.perms === levelToAclPerms(e.level, false)))
+        return { ...entry, perms: live.perms }
+      return entry
+    })
+    const named = keptNamed.length > 0 ? keptNamed : preservedNamed
+    // A base principal whose level the request leaves as it reads keeps its
+    // live perms in the ACL spec.
+    const basePerms: BasePerms = {}
+    if (livePerms) {
+      for (const kind of BASE_KINDS) {
+        if (base[kind] === current[kind])
+          basePerms[kind] = livePerms[kind]
+      }
+    }
+    // cr3.shares M3 (review): the write is decided from the DIFFERENCE between
+    // what the editor read and what it sent — the panel always sends every
+    // row, so the mere presence of a row says nothing. A level left as read
+    // is no change; a named row absent from a request that names any is a
+    // removal (a request with none keeps them, #37).
+    const namedKey = (n: { kind: string, name: string }): string => `${n.kind}:${n.name}`
+    const liveByKey = new Map(liveNamed.map(n => [namedKey(n), n]))
+    const sentKeys = new Set(keptNamed.map(namedKey))
+    const delta: NamedDelta = {
+      added: keptNamed.filter(n => !liveByKey.has(namedKey(n))),
+      changed: keptNamed.filter(n => liveByKey.has(namedKey(n)) && liveByKey.get(namedKey(n))!.perms !== (n.perms ?? levelToAclPerms(n.level, false))),
+      // An explicit clear removes every named principal; a request that names
+      // some removes the ones it no longer names; one that names none keeps them.
+      removed: clearNamed ? liveNamed : keptNamed.length > 0 ? liveNamed.filter(n => !sentKeys.has(namedKey(n))) : [],
+    }
+    const baseDelta = BASE_KINDS.filter(kind => base[kind] !== current[kind])
     const hasNamed = named.length > 0
     // Only a ZFS target has a switch to flip (never `zfs set` on anything else).
     const aclAutoEnabled = hasNamed && supported && !enabled
@@ -998,11 +1509,19 @@ export function createAccessService(opts: AccessServiceOptions) {
         base,
         named,
         preservedNamedCount: preservedNamed.length,
+        basePerms,
+        baseDelta,
+        delta,
+        liveMode: perm.mode,
+        liveDefault: liveAcl?.default ?? null,
+        liveMask: liveAcl?.mask ?? null,
         hasNamed,
         aclAutoEnabled,
         clearAcls,
         walk,
+        dirId,
         revision,
+        readRevision,
       },
     }
   }
@@ -1022,9 +1541,49 @@ export function createAccessService(opts: AccessServiceOptions) {
     }
   }
 
-  /** Execute a plan — the body of every `fs.setAccess` job (and of the share grant). */
-  async function runSetAccess(plan: SetAccessPlan, updateProgress: (msg: string) => void): Promise<Record<string, unknown>> {
-    const { req, dir: mountpoint, recursive, hasNamed, supported, enabled, base, named, clearAcls, baseChanged, aclAutoEnabled } = plan
+  /**
+   * Execute a plan — the body of every `fs.setAccess` job (and of the share
+   * grant). `ctx` is the job's cancel seam: a recursive walk registers its
+   * cancel there (cr3.shares, fourth review).
+   */
+  async function runSetAccess(plan: SetAccessPlan, updateProgress: (msg: string) => void, ctx?: JobContext): Promise<Record<string, unknown>> {
+    // cr3.shares H2: every single-directory write (chown, setfacl, chmod)
+    // acts on ONE descriptor of the directory, opened no-follow and proven to
+    // be the planned real path, handed to each tool as /proc/self/fd/3 — a
+    // name swapped for a symlink after the check can no longer redirect a
+    // root write (chmod has no no-follow form of its own).
+    // Pinned BEFORE the first write, so a swapped path refuses with nothing
+    // done (the zfs acltype switch included): the one directory, or EVERY
+    // root a recursive walk starts from (second review: an unpinned walk lost
+    // 481 of 537 races). Every write of ownership, mode or ACL reaches the
+    // filesystem only through one of these descriptors.
+    const pins: PinnedDir[] = []
+    try {
+      if (plan.recursive) {
+        for (const [i, root] of (plan.walk?.roots ?? []).entries())
+          pins.push(await pinDir(root.path, plan.walk?.rootIds[i]))
+      }
+      else {
+        pins.push(await pinDir(plan.dir, plan.dirId))
+      }
+      const pinnedExec = async (cmd: string, args: string[]): Promise<ExecResult> =>
+        executor.exec(cmd, [...args.slice(0, -1), PINNED_DIR], { inheritedFds: [pins[0].fd] })
+      return await runSetAccessWrites(plan, updateProgress, pinnedExec, pins, ctx)
+    }
+    finally {
+      for (const pin of pins)
+        await pin.close()
+    }
+  }
+
+  async function runSetAccessWrites(
+    plan: SetAccessPlan,
+    updateProgress: (msg: string) => void,
+    pinnedExec: (cmd: string, args: string[]) => Promise<ExecResult>,
+    pins: PinnedDir[],
+    ctx?: JobContext,
+  ): Promise<Record<string, unknown>> {
+    const { req, dir: mountpoint, recursive, hasNamed, supported, base, named, clearAcls, baseChanged, aclAutoEnabled, basePerms } = plan
     const ident = identityFields(plan.target)
 
     // Named grants need the acl package. Gate BEFORE any mutation so a
@@ -1033,205 +1592,390 @@ export function createAccessService(opts: AccessServiceOptions) {
     if (hasNamed && !supported)
       throw new Error('The acl package (setfacl) is not installed; named user/group grants require it. Install it (apt install acl), or grant owner/group/everyone only.')
 
-    // Story nf.1 (wave-3 D2): a recursive plan carries the walk it confirmed.
-    // Every recursive command below is a `find` over its roots, bounded by
-    // `-xdev` and the pruned mounts (see access-walk.ts) — never `-R`, which
-    // crosses every mount below the directory. A dead remote mount among the
-    // ones left alone refuses here, before anything is touched.
-    const walk = recursive ? plan.walk : null
-    if (recursive && !walk)
+    // cr3.shares M3: the one directory is written from the DIFFERENCE the
+    // plan measured (runSingleDir); below is the recursive walk — the
+    // explicit tree rewrite "apply to existing files" asked for.
+    if (!recursive)
+      return runSingleDir(plan, updateProgress, pinnedExec)
+
+    // Story nf.1 (wave-3 D2): a recursive plan carries the walk it confirmed:
+    // its roots (the target, each named child dataset, each nested btrfs
+    // subvolume — every one pinned above) and the mounts it leaves alone. A
+    // dead remote mount among those refuses here, before anything is touched.
+    const walk = plan.walk
+    if (!walk)
       throw new Error(`No permissions were changed: the plan for '${mountpoint}' carries no walk scope — refusing a recursive change that could cross other filesystems`)
-    if (walk)
-      await refuseDeadRemotes(walk, mountpoint)
-    /** Run one recursive step over every walk root; `label` names it in a failure. */
-    const walkStep = async (label: string, select: string[], action: string[]): Promise<void> => {
-      for (const root of walk!.roots) {
-        const args = walkArgs(root, select, action)
-        updateProgress(`find ${args.join(' ')}`)
-        const r = await executor.exec(FIND, args, TREE_WALK)
-        if (r.exitCode !== 0)
-          throw new Error(r.stderr.trim() || `${label} over '${root.path}' exited with code ${r.exitCode}`)
-      }
-    }
-    const notChanged = walk && walk.excluded.length > 0 ? { notChanged: notChangedList(walk.excluded) } : {}
+    await refuseDeadRemotes(walk, mountpoint)
+    // Fifth review D1: a helper that is not there (or cannot be read) is said
+    // as such, before anything — the ACL switches included — has changed.
+    const unreadable = await accessDirIo.readable(aclWalkScript).then(() => null, (err: NodeJS.ErrnoException) => err.code ?? 'error')
+    if (unreadable !== null)
+      throw new Error(`The permission walk could not be started: '${aclWalkScript}' cannot be read (${unreadable}) — no permission was changed`)
+    const notChanged = walk.excluded.length > 0 ? { notChanged: notChangedList(walk.excluded) } : {}
 
     // 0) A recursive named grant on ZFS crosses every child dataset mounted
-    // under the directory; one with ACLs off would fail the walk's `setfacl`
-    // part-way. Switch them on first, before any permission changes (ruling
-    // 2026-10-11).
+    // under the directory; one with ACLs off would refuse the walk's
+    // `setfacl` there. Switch them on first, then the target's own, before
+    // any permission changes (ruling 2026-10-11).
     const aclDataset = aclDatasetOf(plan.target)
-    const childAclEnabled = walk && hasNamed && aclDataset !== null
+    const childAclEnabled = hasNamed && aclDataset !== null
       ? await enableChildAcls(walk.children, updateProgress)
       : null
-
-    // 1) Ownership.
-    if (plan.ownerChanged || plan.groupChanged) {
-      const spec = plan.ownerChanged && plan.groupChanged
-        ? `${req.owner}:${req.group}`
-        : plan.ownerChanged
-          ? `${req.owner}`
-          : `:${req.group}`
-      if (walk) {
-        // `-h`: a link's own owner, as `chown -R` (-P) changes it — never
-        // the file it points at, which may sit outside the tree. `-execdir`
-        // addresses every member relative to the directory find opened (H2).
-        await walkStep('chown', [], [CHOWN, '-h', spec, '--'])
-      }
-      else {
-        // cr.53 (L16): `--` ends option parsing — a name that somehow
-        // reached here still cannot become a chown option.
-        const args = [spec, '--', mountpoint]
-        updateProgress(`chown ${args.join(' ')}`)
-        const r = await executor.exec(CHOWN, args)
-        if (r.exitCode !== 0)
-          throw new Error(r.stderr.trim() || `chown exited with code ${r.exitCode}`)
-      }
+    // The datasets switched so far, in order: a walk that then cannot start
+    // says they were (sixth review (d)).
+    const switched = [...(childAclEnabled ?? [])]
+    if (hasNamed && !plan.enabled && aclDataset !== null) {
+      // Enable POSIX ACLs on the dataset if not already (side effect). ZFS
+      // only: a filesystem with native ACLs is always `enabled`.
+      updateProgress(`zfs set acltype=posixacl xattr=sa ${aclDataset}`)
+      const r = await executor.exec(ZFS, ['set', '--', 'acltype=posixacl', 'xattr=sa', aclDataset])
+      if (r.exitCode !== 0)
+        throw new Error(r.stderr.trim() || `zfs set acltype=posixacl exited with code ${r.exitCode}`)
+      switched.push(aclDataset)
     }
 
+    // THE WALK (cr3.shares, fourth review): one run of anas-acl-walk over
+    // every pinned root. It never resolves a name twice and never follows a
+    // link: each entry is opened O_PATH|O_NOFOLLOW where it was listed,
+    // proven by fstat, and every tool names its descriptor (see the helper's
+    // header). Each entry gets these steps, in this order, through the same
+    // tools and specs as before:
+    //
+    //   step          entries                 tool
+    //   chown         files + directories     chown <owner[:group]>
+    //   acl           files + directories     setfacl -b -m <spec, capital X>
+    //   defaultAcl    directories             setfacl -d --set <spec>
+    //   setgid        directories             chmod g+s
+    //   clear         files + directories     setfacl -b -k
+    //   mode          files + directories     chmod <u=..,g=..,o=.. with X>
+    //
+    // Only regular files and directories are touched (third review N2); no
+    // step removes setgid (N3). An entry on another device is never entered
+    // or touched — the boundary is the device, never a name (third review
+    // D2, fourth review D-A).
+    const ownerSpec = plan.ownerChanged || plan.groupChanged
+      ? (plan.ownerChanged && plan.groupChanged ? `${req.owner}:${req.group}` : plan.ownerChanged ? `${req.owner}` : `:${req.group}`)
+      : null
+    const steps = hasNamed
+      // `-b -m` resolves the spec's `X` against each file's own permissions,
+      // so a file that already carries execute keeps it and a plain file
+      // gets none; the DEFAULT ACL takes the lowercase spec (buildAclSpec).
+      ? { acl: buildAclSpec(base, named, recursive, basePerms), defaultAcl: buildAclSpec(base, named, false), setgid: true }
+      // No named entries → an EXPLICIT ACL clear (`clearNamed: true`, never
+      // inferred) and the mode bits, symbolic with capital `X` so execute
+      // lands only on directories (and already-executable files).
+      : { ...(clearAcls ? { clear: true } : {}), ...(baseChanged ? { mode: levelsToSymbolic(base) } : {}) }
+    const ran = ownerSpec !== null || Object.keys(steps).length > 0
+      ? await runAclWalk(walk, pins, { ...(ownerSpec !== null ? { chown: ownerSpec } : {}), ...steps }, updateProgress, switched, ctx)
+      : null
+    const walked = ran ? { walk: ran.report, ...ran.verdict } : {}
+
     if (hasNamed) {
-      // 2) Enable POSIX ACLs on the dataset if not already (side effect). ZFS
-      // only: a filesystem with native ACLs is always `enabled`.
-      if (!enabled && aclDataset !== null) {
-        updateProgress(`zfs set acltype=posixacl xattr=sa ${aclDataset}`)
-        const r = await executor.exec(ZFS, ['set', '--', 'acltype=posixacl', 'xattr=sa', aclDataset])
-        if (r.exitCode !== 0)
-          throw new Error(r.stderr.trim() || `zfs set acltype=posixacl exited with code ${r.exitCode}`)
-      }
-
-      // 3) Set the access ACL DECLARATIVELY so dropped principals disappear.
-      // The mountpoint alone: `--set` replaces the whole ACL. The recursive
-      // walk: `-b -m` is the same replacement (`-b` drops every extended
-      // entry, `-m` writes the spec), but setfacl resolves the spec's `X`
-      // against each file's own permissions after `-b` instead of against an
-      // empty ACL — so a file that already carries execute keeps it and a
-      // plain file gets none. `--set` with an all-`X` spec would strip
-      // execute from every file in the tree.
-      const spec = buildAclSpec(base, named, recursive)
-      if (walk) {
-        // Links filtered out at the listing (`! -type l`) AND never followed
-        // at the operand (`-P`, --physical): a link swapped in between the
-        // two is skipped (acl 2.3.2, PVE 9) or refused (acl 2.4.0) — never
-        // followed (H2; see access-walk.ts for the captured behaviours).
-        await walkStep('setfacl -b -m', ['!', '-type', 'l'], [SETFACL, '-P', '-b', '-m', spec, '--'])
-      }
-      else {
-        const setArgs = ['--set', spec, '--', mountpoint]
-        updateProgress(`setfacl ${setArgs.join(' ')}`)
-        const setR = await executor.exec(SETFACL, setArgs)
-        if (setR.exitCode !== 0)
-          throw new Error(setR.stderr.trim() || `setfacl --set exited with code ${setR.exitCode}`)
-      }
-
-      // 4) Matching DEFAULT ACL so new files inherit the grants. `setfacl -R
-      // -d --set` writes the default entries on directories only and passes
-      // over regular files with exit 0 (0.4.3 live proof §3: the files carry
-      // no `default:` lines and the job completed). The spec is always the
-      // lowercase form — see {@link buildAclSpec}.
-      const defSpec = buildAclSpec(base, named, false)
-      if (walk) {
-        // Directories only — what `setfacl -R -d` wrote anyway (above); `-P`
-        // so a directory swapped for a link is refused, not followed (H2).
-        await walkStep('setfacl -d --set', ['-type', 'd'], [SETFACL, '-P', '-d', '--set', defSpec, '--'])
-      }
-      else {
-        const defArgs = ['-d', '--set', defSpec, '--', mountpoint]
-        updateProgress(`setfacl ${defArgs.join(' ')}`)
-        const defR = await executor.exec(SETFACL, defArgs)
-        if (defR.exitCode !== 0)
-          throw new Error(defR.stderr.trim() || `setfacl -d --set exited with code ${defR.exitCode}`)
-      }
-
-      // 5) setgid on directories so new files take the directory's group,
-      // completing inheritance. Directories ONLY: `chmod -R g+s` marks every
-      // regular file setgid as well (0.4.3 live proof §3: a root-owned 0755
-      // binary ended `-rwxrwsr-x`, a setgid-root executable). The recursive
-      // form is the same bounded walk as every step, `-type d` only.
-      if (walk) {
-        // find's own `-type d` decides the members (chmod has no operand
-        // no-follow on Linux); `-execdir` runs the batch relative to the
-        // directory find opened (H2).
-        await walkStep('find -type d -execdir chmod g+s', ['-type', 'd'], [CHMOD, 'g+s', '--'])
-      }
-      else {
-        const gidArgs = ['g+s', '--', mountpoint]
-        updateProgress(`chmod ${gidArgs.join(' ')}`)
-        const gidR = await executor.exec(CHMOD, gidArgs)
-        if (gidR.exitCode !== 0)
-          throw new Error(gidR.stderr.trim() || `chmod g+s exited with code ${gidR.exitCode}`)
-      }
-
-      const result: Record<string, unknown> = { ...ident, aclEnabled: true, aclAutoEnabled, namedCount: named.length, ...notChanged }
+      const result: Record<string, unknown> = { ...ident, aclEnabled: true, aclAutoEnabled, namedCount: named.length, ...notChanged, ...walked }
       // The child datasets whose ACLs were switched on (present whenever the
       // walk was checked for them — an empty list says none needed it).
       if (childAclEnabled)
         result.childAclEnabled = childAclEnabled
       return result
     }
+    return { ...ident, aclEnabled: plan.enabled, aclAutoEnabled: false, namedCount: 0, clearedNamed: clearAcls, ...notChanged, ...walked }
+  }
 
-    // No named entries to apply → mode bits, plus an EXPLICIT ACL clear.
-    // Strip the requested-away ACLs first so the mode bits are the whole
-    // truth. This runs only for `clearNamed: true` — never inferred.
+  /**
+   * Run anas-acl-walk over the pinned roots (cr3.shares, fourth review). The
+   * job goes in on stdin, the roots as inherited descriptors 3, 4, ... in
+   * plan order; the helper answers one JSON line of counts. A refusal
+   * (exit 2) changed nothing; a walk that stopped part-way (exit 3, a
+   * signal, an unreadable answer) is a failure that says how far it got; a
+   * completed walk that skipped a swapped entry, met an error, did not enter
+   * a directory for depth, found an entry gone before it could open it
+   * (sixth review) or met a filesystem the plan did not name is
+   * INCOMPLETE — the job completes and says so, with the counts. A cancel
+   * stops the helper's whole process group. `switched` names the datasets
+   * whose POSIX ACLs were switched on before the walk: a walk that cannot
+   * start says so instead of "no permission was changed".
+   */
+  async function runAclWalk(
+    walk: PlanWalk,
+    pins: PinnedDir[],
+    ops: { chown?: string, acl?: string, defaultAcl?: string, setgid?: boolean, clear?: boolean, mode?: string },
+    updateProgress: (msg: string) => void,
+    switched: string[],
+    ctx?: JobContext,
+  ): Promise<{ report: AccessWalkReport, verdict: { incomplete?: true, message?: string } }> {
+    const unchanged = switched.length === 0
+      ? 'no permission was changed'
+      : `the walk changed no file or folder; POSIX ACLs were already switched on for ${switched.join(', ')}`
+    const job = {
+      roots: walk.roots.map((root, i) => ({ fd: 3 + i, path: root.path, dev: walk.rootIds[i].dev, ino: walk.rootIds[i].ino, zfs: root.zfsRoot === true })),
+      tools: { chown: CHOWN, chmod: CHMOD, setfacl: SETFACL },
+      ...ops,
+    }
+    updateProgress(`anas-acl-walk over ${walk.roots.map(r => r.path).join(', ')}: ${Object.keys(ops).join(', ')}`)
+    const cancel = new ChildCancel(ctx, 'the permission walk', {
+      subject: `The permission walk over '${walk.roots[0]?.path ?? ''}'`,
+      consequence: 'The files and folders the walk already reached keep their new permissions; the rest keep their old ones.',
+    }, { ladder: 'read' })
+    let r: ExecResult
+    try {
+      r = await executor.exec(PERL, [aclWalkScript], { ...TREE_WALK, stdin: JSON.stringify(job), inheritedFds: pins.map(p => p.fd), onSpawn: cancel.onSpawn })
+    }
+    catch (err) {
+      // Nothing ran: the interpreter could not be started (ENOENT, EACCES).
+      const code = (err as NodeJS.ErrnoException).code
+      if (code !== undefined)
+        throw new Error(`The permission walk could not be started: '${PERL}' could not be run (${code}) — ${unchanged}`)
+      throw err
+    }
+    // Fifth review D1: a cancel is a cancel only when one was ASKED for and
+    // the hook stopped the child — never any non-zero exit (the executor
+    // announces every child it spawns, so `stoppedOnPurpose()` alone is true
+    // for a refusal, a crash or an OOM kill too).
+    if (r.exitCode !== 0 && cancel.requested() && cancel.stoppedOnPurpose()) {
+      const by = cancel.cancellation()
+      throw new JobCancelledError(`the permission walk was stopped${by ? ` by ${by.user} at ${by.at}` : ''}: the files and folders it already reached keep their new permissions`)
+    }
+    const line = r.stdout.trim().split('\n').at(-1) ?? ''
+    let parsed: unknown = null
+    try {
+      parsed = JSON.parse(line)
+    }
+    catch {}
+    const report = AccessWalkReportSchema.safeParse(parsed)
+    if (!report.success) {
+      const said = r.stderr.trim().split('\n')[0] ?? ''
+      // perl's own refusal to load the script: it ran nothing of it.
+      if (r.exitCode !== 0 && PERL_CANNOT_OPEN_RE.test(said))
+        throw new Error(`The permission walk could not be started: '${aclWalkScript}' could not be opened (${said}) — ${unchanged}`)
+      if (r.signal)
+        throw new Error(`The permission walk was killed (${r.signal}) before it finished — some files may already have been changed; apply again to finish`)
+      throw new Error(`The permission walk ended without a readable report (exit ${r.exitCode}) — some files may already have been changed. ${said}`.trim())
+    }
+    const rep = report.data
+    if (rep.refused !== undefined) {
+      throw new Error(switched.length === 0
+        ? `No permissions were changed: ${rep.refused}`
+        : `The walk changed no file or folder (POSIX ACLs were already switched on for ${switched.join(', ')}): ${rep.refused}`)
+    }
+    if (r.exitCode !== 0 || rep.aborted !== undefined || rep.done !== true)
+      throw new Error(`The permission walk stopped part-way: ${rep.aborted ?? `exit ${r.exitCode}`} — ${walkSummary(rep)}`)
+    return { report: rep, verdict: walkVerdict(rep, walk) }
+  }
+
+  /** The counts a person reads: what was reached. */
+  function walkSummary(rep: AccessWalkReport): string {
+    return `${rep.visited.files} file(s) and ${rep.visited.dirs} folder(s) reached`
+  }
+
+  /**
+   * INCOMPLETE (cr3.shares, fourth and fifth reviews): anything the walk had
+   * to leave out that the confirmation did not name. Boundaries are matched
+   * by IDENTITY (fifth review D6): a boundary whose mount id is one the plan
+   * excluded is expected; any other boundary — a filesystem nobody named, a
+   * nested subvolume nobody listed, one the report could not carry — is
+   * reported, and so is an excluded mount the walk never met (unmounted,
+   * replaced, or hidden). Every sentence is derived from counts that add up
+   * (fifth review D3); when the helper could not check that they do, the
+   * message says so instead of "everything else was changed".
+   */
+  function walkVerdict(rep: AccessWalkReport, walk: PlanWalk): { incomplete?: true, message?: string } {
+    const why: string[] = []
+    const list = (names: string[]): string => names.length > 0 ? ` (${names.slice(0, 5).join(', ')}${names.length > 5 ? ', and more' : ''})` : ''
+    const named = (...kinds: string[]): string => list(rep.notes.filter(n => kinds.includes(n.kind)).map(n => n.name))
+    const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`
+    if (rep.swapped > 0)
+      why.push(`${plural(rep.swapped, 'entry', 'entries')} changed while the walk read ${rep.swapped === 1 ? 'it and was' : 'them and were'} not touched${named('swapped')}`)
+    const failedSteps = Object.entries(rep.failed).filter(([, n]) => n > 0)
+    const failedTotal = failedSteps.reduce((t, [, n]) => t + n, 0)
+    if (failedTotal > 0)
+      why.push(`${failedTotal} change(s) failed (${failedSteps.map(([step, n]) => `${step}: ${n} of ${(rep.changed[step] ?? 0) + n}`).join(', ')})${list(rep.notes.filter(n => n.kind === 'error' && n.op !== undefined && n.op in rep.failed).map(n => n.name))}`)
+    const unreadable = rep.errors - failedTotal - rep.notEntered
+    if (unreadable > 0)
+      why.push(`${plural(unreadable, 'entry', 'entries')} could not be read and ${unreadable === 1 ? 'was' : 'were'} not touched${list(rep.notes.filter(n => n.kind === 'error' && !(n.op !== undefined && n.op in rep.failed)).map(n => n.name))}`)
+    if (rep.tooDeep > 0)
+      why.push(`${plural(rep.tooDeep, 'folder', 'folders')} nested deeper than ${rep.maxDepth} levels ${rep.tooDeep === 1 ? 'was' : 'were'} not entered${named('tooDeep')}`)
+    if (rep.notEntered > 0)
+      why.push(`${plural(rep.notEntered, 'folder', 'folders')} could not be entered${named('notEntered')}`)
+    if (rep.changing > 0)
+      why.push(`${plural(rep.changing, 'folder', 'folders')} changed while ${rep.changing === 1 ? 'it was' : 'they were'} walked, so entries added or renamed there may have been missed${named('changing')}`)
+    if (rep.overrun > 0)
+      why.push(`${plural(rep.overrun, 'folder', 'folders')} kept changing and ${rep.overrun === 1 ? 'was' : 'were'} not finished${named('overrun')}`)
+    // Sixth review: a name gone before the walk could open it is a delete or
+    // a move, and a move into a folder the walk had finished is never met.
+    if (rep.vanished > 0) {
+      why.push(rep.vanished === 1
+        ? `1 entry disappeared while the walk read it${named('vanished')}; if it was moved rather than deleted it may not have been changed`
+        : `${rep.vanished} entries disappeared while the walk read them${named('vanished')}; any that were moved rather than deleted may not have been changed`)
+    }
+    // Boundaries, by identity: the mount id and the place.
+    const met = new Set<number>()
+    const unnamed: string[] = []
+    for (const b of rep.boundaries) {
+      const i = walk.excludedIds.findIndex(id => id !== null && id !== undefined
+        && id.mnt === b.mnt && id.parent === b.parent && id.leaf === b.leaf)
+      if (i >= 0)
+        met.add(i)
+      else
+        unnamed.push(b.name)
+    }
+    const unnamedCount = unnamed.length + rep.boundariesDropped
+    if (unnamedCount > 0)
+      why.push(`${plural(unnamedCount, 'folder', 'folders')} on another filesystem that the confirmation did not name ${unnamedCount === 1 ? 'was' : 'were'} not entered${list(unnamed)}`)
+    const notMet = walk.excluded.filter((_e, i) => !met.has(i)).map(e => e.target)
+    if (notMet.length > 0)
+      why.push(`${plural(notMet.length, 'filesystem', 'filesystems')} the confirmation named as left alone ${notMet.length === 1 ? 'was' : 'were'} not where the walk looked (unmounted or replaced since), so what is there now was walked as part of the tree or left out${list(notMet)}`)
+    if (!rep.accounted)
+      why.push(`its counts do not add up${rep.accountingError ? ` (${rep.accountingError})` : ''}, so some entries may not have been changed`)
+    if (why.length === 0)
+      return {}
+    // What WAS done, per step, from counts the helper checked add up.
+    const done = Object.keys(rep.changed).filter(step => (rep.changed[step] ?? 0) + (rep.failed[step] ?? 0) > 0).map(step => `${step} ${rep.changed[step] ?? 0} of ${(rep.changed[step] ?? 0) + (rep.failed[step] ?? 0)}`)
+    const rest = rep.accounted
+      ? `Changed: ${done.length > 0 ? done.join(', ') : 'nothing'} (${walkSummary(rep)})`
+      : `It reached ${rep.visited.files} file(s) and ${rep.visited.dirs} folder(s)`
+    return { incomplete: true, message: `INCOMPLETE: the walk finished, but ${why.join('; ')}. ${rest}; apply again to retry the rest.` }
+  }
+
+  /**
+   * cr3.shares M3 (review): one directory, written from the DIFFERENCE
+   * between what the editor read and what it sent (the plan's `baseDelta`
+   * and `delta`), never from which rows the request happens to carry:
+   *
+   *  - a principal whose level is unchanged keeps its live bits (the ACL
+   *    spec restates them verbatim, at what the mask let them do);
+   *  - the access ACL is rewritten only when a base level or a named
+   *    principal moved; the mode bits only when a base level moved, a digit
+   *    left as read keeping its live value (`0751` keeps others' traverse);
+   *  - the DEFAULT ACL (see writeDefault) follows only what moved; the
+   *    implied moves, the complete list: (i) a grant on a directory with NO
+   *    default ACL establishes one (base entries + that principal) and sets
+   *    setgid; (ii) the "other" digit of the mode when Everyone changes;
+   *    (iii) the group digit falling back from the mask to `g::` when the
+   *    last named principal is cleared; (iv) the base entries of an existing
+   *    default ACL follow a base change. A clear never removes setgid (N3);
+   *  - an Apply that changes nothing runs NO command and says so
+   *    (`nothingChanged: true`).
+   *
+   * Every write names the pinned descriptor (H2).
+   */
+  async function runSingleDir(
+    plan: SetAccessPlan,
+    updateProgress: (msg: string) => void,
+    pinnedExec: (cmd: string, args: string[]) => Promise<ExecResult>,
+  ): Promise<Record<string, unknown>> {
+    const { req, dir, base, named, hasNamed, enabled, clearAcls, basePerms, baseDelta, delta, liveMode, liveDefault, aclAutoEnabled } = plan
+    const ident = identityFields(plan.target)
+    let writes = 0
+    const run = async (cmd: string, args: string[], label: string): Promise<void> => {
+      updateProgress(`${label} ${args.join(' ')}`)
+      const r = await pinnedExec(cmd, args)
+      if (r.exitCode !== 0)
+        throw new Error(r.stderr.trim() || `${label} ${args[0]} exited with code ${r.exitCode}`)
+      writes++
+    }
+    const said = (result: Record<string, unknown>): Record<string, unknown> =>
+      // N6 (third review): the path the operator named, not the resolved one.
+      writes === 0 ? { ...result, nothingChanged: true, message: `Nothing to change: '${plan.target.kind === 'share' ? plan.target.configuredPath ?? dir : dir}' already has these permissions` } : result
+
+    // 1) Ownership. cr.53 (L16): `--` ends option parsing.
+    if (plan.ownerChanged || plan.groupChanged) {
+      const spec = plan.ownerChanged && plan.groupChanged
+        ? `${req.owner}:${req.group}`
+        : plan.ownerChanged ? `${req.owner}` : `:${req.group}`
+      await run(CHOWN, [spec, '--', dir], 'chown')
+    }
+
+    const tag = (n: NamedEntry): string => `${n.kind === 'user' ? 'u' : 'g'}:${n.name}`
+    const namedMoved = delta.added.length + delta.changed.length + delta.removed.length > 0
+    const inDefault = new Set((liveDefault?.named ?? []).map(n => `${n.type === 'user' ? 'u' : 'g'}:${n.name}`))
+    const BASE_TAG: Record<BaseKind, string> = { 'owner': 'u:', 'owning-group': 'g:', 'everyone': 'o:' }
+
+    /**
+     * The DEFAULT ACL (second review): only what moved, and only where the
+     * directory has a default ACL — except a grant on a directory without
+     * one, which establishes it (its base entries + that principal) and
+     * sets setgid. A base level that moved restates the SAME base entry of an
+     * existing default, so files created afterwards get what the editor
+     * shows. A changed principal touches its default entry only when it has
+     * one; a removed one is dropped (`-n`: the default mask as found). Each
+     * `-m` recalculates the default mask, so every OTHER default entry the
+     * old mask clamped is restated at what it could do — it gains nothing.
+     */
+    const writeDefault = async (): Promise<void> => {
+      const mods: string[] = []
+      if (liveDefault) {
+        for (const kind of baseDelta)
+          mods.push(`${BASE_TAG[kind]}:${levelToAclPerms(base[kind], false)}`)
+        for (const n of [...delta.added, ...delta.changed.filter(c => inDefault.has(tag(c)))])
+          mods.push(`${tag(n)}:${n.perms ?? levelToAclPerms(n.level, false)}`)
+      }
+      else {
+        for (const n of delta.added)
+          mods.push(`${tag(n)}:${n.perms ?? levelToAclPerms(n.level, false)}`)
+      }
+      if (mods.length > 0) {
+        const touched = new Set(mods.map(m => m.slice(0, m.lastIndexOf(':'))))
+        const clampFix: string[] = []
+        if (liveDefault?.mask !== undefined) {
+          for (const n of liveDefault.named) {
+            const t = `${n.type === 'user' ? 'u' : 'g'}:${n.name}`
+            const eff = effectivePerms(n.perms, liveDefault.mask)
+            if (eff !== n.perms && !touched.has(t))
+              clampFix.push(`${t}:${eff}`)
+          }
+          const g = effectivePerms(liveDefault.owningGroup, liveDefault.mask)
+          if (g !== liveDefault.owningGroup && !touched.has('g:'))
+            clampFix.push(`g::${g}`)
+        }
+        // A default ACL established here carries the managed `m::rwx`, as a
+        // first grant always wrote it (SMB inheritance, RF1).
+        await run(SETFACL, ['-d', '-m', [...mods, ...clampFix, ...(liveDefault ? [] : ['m::rwx'])].join(','), '--', dir], 'setfacl')
+      }
+      const drops = delta.removed.map(tag).filter(t => inDefault.has(t))
+      if (drops.length > 0)
+        await run(SETFACL, ['-n', '-d', '-x', drops.join(','), '--', dir], 'setfacl')
+      // setgid: only when THIS edit established the default ACL.
+      if (!liveDefault && delta.added.length > 0 && !hasSetgid(liveMode))
+        await run(CHMOD, ['g+s', '--', dir], 'chmod')
+    }
+
+    if (hasNamed) {
+      if (baseDelta.length > 0 || namedMoved) {
+        // 2) POSIX ACLs on (ZFS only), then the access ACL, declaratively:
+        // the spec restates everyone the request left alone at their live bits.
+        const aclDataset = aclDatasetOf(plan.target)
+        if (!enabled && aclDataset !== null) {
+          updateProgress(`zfs set acltype=posixacl xattr=sa ${aclDataset}`)
+          const r = await executor.exec(ZFS, ['set', '--', 'acltype=posixacl', 'xattr=sa', aclDataset])
+          if (r.exitCode !== 0)
+            throw new Error(r.stderr.trim() || `zfs set acltype=posixacl exited with code ${r.exitCode}`)
+          writes++
+        }
+        await run(SETFACL, ['--set', buildAclSpec(base, named, false, basePerms, plan.liveMask), '--', dir], 'setfacl')
+        // 3) The default ACL and setgid (see writeDefault).
+        await writeDefault()
+      }
+      return said({ ...ident, aclEnabled: true, aclAutoEnabled: aclAutoEnabled && writes > 0, namedCount: named.length })
+    }
+
+    // No named entries left: an EXPLICIT clear (clearNamed) replaces the
+    // access ACL with its base three alone (no named entry, no mask — each
+    // base principal at what it could do, or at its new level), and drops
+    // ONLY the removed principals from the default ACL: anything else the
+    // default holds stays as found. The setgid bit is left as found.
     if (clearAcls) {
-      if (walk) {
-        await walkStep('setfacl -b -k', ['!', '-type', 'l'], [SETFACL, '-P', '-b', '-k', '--'])
-      }
-      else {
-        const clearArgs = ['-b', '-k', '--', mountpoint]
-        updateProgress(`setfacl ${clearArgs.join(' ')}`)
-        const clearR = await executor.exec(SETFACL, clearArgs)
-        if (clearR.exitCode !== 0)
-          throw new Error(clearR.stderr.trim() || `setfacl -b -k exited with code ${clearR.exitCode}`)
-      }
-      // Also drop the setgid bit we set for ACL inheritance — with the
-      // named grants gone there is nothing to inherit, and a leftover
-      // setgid would make the reported mode (e.g. 2775 vs 775) misleading.
-      // A recursive clear that ALSO sets the base levels folds `g-s` into
-      // that one mode chmod below (one `-R` walk instead of two); every
-      // other shape needs its own call. The recursive `g-s` reaches regular
-      // files on purpose: it repairs trees an earlier recursive grant marked
-      // setgid file by file (before 0.4.3 that step ran `chmod -R g+s`).
-      if (walk && !baseChanged) {
-        await walkStep('chmod g-s', ['!', '-type', 'l'], [CHMOD, 'g-s', '--'])
-      }
-      else if (!walk) {
-        const gsArgs = ['g-s', '--', mountpoint]
-        updateProgress(`chmod ${gsArgs.join(' ')}`)
-        const unsetR = await executor.exec(CHMOD, gsArgs)
-        if (unsetR.exitCode !== 0)
-          throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
-      }
+      // N3 (third review): a clear never removes setgid — ANAS cannot tell
+      // the bit it set from one an administrator set, and a leftover setgid
+      // on a directory is harmless.
+      await run(SETFACL, ['--set', buildBaseSpec(base, basePerms), '--', dir], 'setfacl')
+      await writeDefault()
+      return said({ ...ident, aclEnabled: enabled, aclAutoEnabled: false, namedCount: 0, clearedNamed: true })
     }
-    if (baseChanged) {
-      // Recursive: symbolic perms with capital `X` so execute is applied only
-      // to directories (and already-executable files), never sprinkled onto
-      // plain data files. When we cleared ACLs, append `,g-s` so the setgid
-      // bit is removed in the SAME recursive walk (the `=` clauses set the
-      // base perms, `g-s` strips setgid). Non-recursive: numeric octal is
-      // correct — the mountpoint is always a directory — and the setgid-clear
-      // above stays its own cheap call. GNU chmod takes the comma-separated
-      // clauses mixing `=` and `-` (`u=rwX,g=rX,o=,g-s`), and its `X` is
-      // decided by each file's mode BEFORE the change, so an executable keeps
-      // execute and a plain file gets none (checked on scratch files with
-      // coreutils 9.10; the 0.4.3 live proof did not run this shape).
-      const mode = recursive
-        ? (clearAcls ? `${levelsToSymbolic(base)},g-s` : levelsToSymbolic(base))
-        : levelsToMode(base)
-      if (walk) {
-        // Links filtered out by find's own `! -type l` (chmod has no operand
-        // no-follow on Linux) and addressed relative to the directory find
-        // opened (`-execdir`, H2).
-        await walkStep(`chmod ${mode}`, ['!', '-type', 'l'], [CHMOD, mode, '--'])
-      }
-      else {
-        const modeArgs = [mode, '--', mountpoint]
-        updateProgress(`chmod ${modeArgs.join(' ')}`)
-        const modeR = await executor.exec(CHMOD, modeArgs)
-        if (modeR.exitCode !== 0)
-          throw new Error(modeR.stderr.trim() || `chmod ${mode} exited with code ${modeR.exitCode}`)
-      }
+    if (baseDelta.length > 0) {
+      await run(CHMOD, [levelsToModeKeeping(base, baseDelta, liveMode), '--', dir], 'chmod')
+      await writeDefault()
     }
-
-    return { ...ident, aclEnabled: enabled, aclAutoEnabled: false, namedCount: 0, clearedNamed: clearAcls, ...notChanged }
+    return said({ ...ident, aclEnabled: enabled, aclAutoEnabled: false, namedCount: 0, clearedNamed: clearAcls })
   }
 
   // --- The guard (story cr.37) ---------------------------------------------------
@@ -1241,6 +1985,19 @@ export function createAccessService(opts: AccessServiceOptions) {
 
   /** The plan could not read the directory (404). */
   const plannedGate: Gate<AccessObject> = async o => o.planFailure ? failureRefusal(o.planFailure) : null
+
+  /**
+   * cr3.shares (second review, coordinator ruling): an Apply made from a
+   * stale read. The editor's GET reports the revision of what it saw; a PUT
+   * that sends it back is refused when the directory no longer reads the
+   * same — another edit in between (a `u:nobody` added) would otherwise be
+   * undone by a body that never showed it. A PUT without one behaves as before.
+   */
+  function staleReadGate(req: SetAccessRequest): Gate<AccessObject> {
+    return async o => req.expectedRevision !== undefined && o.plan && o.plan.readRevision !== req.expectedRevision
+      ? { status: 409, code: 'STATE_CHANGED', message: 'The permissions changed since the editor read them — nothing was changed; reload and apply again' }
+      : null
+  }
 
   /** An AHR or share target's PVE gates ({@link guardPathTarget}); a ZFS target brings its own. */
   function pathGate(req: SetAccessRequest): Gate<AccessObject> {
@@ -1332,12 +2089,29 @@ export function createAccessService(opts: AccessServiceOptions) {
         revision: async o => o.plan?.revision ?? null,
         unbound: () => `Could not read the permissions of ${what} — refusing a change that cannot be bound to them`,
       },
-      gates: [...(opts.before ?? []), resolvedGate, pathGate(req), plannedGate],
+      gates: [...(opts.before ?? []), resolvedGate, pathGate(req), plannedGate, staleReadGate(req)],
       locks: (o, _bound, reads) => accessClaims(o.target, reads),
     }
   }
 
   // --- The share grant (access.1) ------------------------------------------------
+
+  /**
+   * A user's uid or a group's gid through nsswitch (`getent passwd|group
+   * <name or id>`), or null when it does not resolve or cannot be read.
+   */
+  async function principalId(kind: 'user' | 'group', name: string): Promise<number | null> {
+    const r = await executor.exec(GETENT, [kind === 'user' ? 'passwd' : 'group', name]).catch(() => null)
+    if (!r || r.exitCode !== 0)
+      return null
+    const numeric = NUMERIC_ID_RE.test(name) ? Number(name) : null
+    if (kind === 'user') {
+      const hit = parsePasswd(r.stdout).find(u => u.name === name || u.uid === numeric)
+      return hit ? hit.uid : null
+    }
+    const hit = parseGroups(r.stdout).find(g => g.name === name || g.gid === numeric)
+    return hit ? hit.gid : null
+  }
 
   /** Does a user/group name resolve through nsswitch (`getent`; exit 0 = yes)? */
   async function principalResolves(kind: 'user' | 'group', name: string): Promise<boolean> {
@@ -1380,10 +2154,18 @@ export function createAccessService(opts: AccessServiceOptions) {
         skipped.push(`${p.kind === 'group' ? '@' : ''}${p.name}`)
     }
 
-    const liveNamed: NamedEntry[] = acc.entries.filter(isNamed).map(e => ({ kind: e.kind, name: e.name, level: e.level }))
+    // cr3.shares (fourth review D-D): every row the grant does not RAISE keeps
+    // the live bits the read gave it (`perms`), exactly as the editor echoes
+    // an untouched row (third review D3) — a custom `u:4242:--x` traverse
+    // entry stays `--x`; it is never restated at its level (`---`). A row
+    // the grant raises is written at its new level.
+    const liveNamed: NamedEntry[] = acc.entries.filter(isNamed).map(e => ({ kind: e.kind, name: e.name, level: e.level, ...(e.perms !== undefined ? { perms: e.perms } : {}) }))
     const merged: NamedEntry[] = liveNamed.map((e) => {
       const w = wanted.find(x => x.kind === e.kind && x.name === e.name)
-      return w ? { ...e, level: maxLevel(e.level, w.level) } : e
+      if (!w || maxLevel(e.level, w.level) === e.level)
+        return e
+      const { perms: _kept, ...raised } = e
+      return { ...raised, level: w.level }
     })
     for (const w of wanted) {
       if (!merged.some(e => e.kind === w.kind && e.name === w.name))
@@ -1405,7 +2187,7 @@ export function createAccessService(opts: AccessServiceOptions) {
     }
     if (wanted.length === 0 && !guest)
       return { ok: true, request: null, granted: [], skipped }
-    entries.push(...merged.map(e => ({ kind: e.kind, name: e.name, level: e.level })))
+    entries.push(...merged.map(e => ({ kind: e.kind, name: e.name, level: e.level, ...(e.perms !== undefined ? { perms: e.perms } : {}) })))
     const request: SetAccessRequest = { entries }
     if (applyToExisting)
       request.applyToExisting = true
@@ -1475,9 +2257,12 @@ export function createAccessService(opts: AccessServiceOptions) {
   /**
    * Run the share-path grant inside a share job (access.1): prepare it (see
    * {@link prepareShareGrant}) and execute the plan exactly as the editor's job
-   * would. Never throws — the share is created or updated whatever happens
-   * here, and the outcome (with the gate's or the command's own sentence) rides
-   * on the job result.
+   * would. The share is created or updated whatever happens here, and the
+   * outcome (with the gate's or the command's own sentence) rides on the job
+   * result. It throws one thing only: the {@link JobCancelledError} of a
+   * cancel asked for while the grant ran (fifth review D1), so the job ends
+   * cancelled with the share saved; every other failure is the 'failed'
+   * outcome.
    *
    * `recursiveConfirmed` says whether the request took the recursive confirm.
    * The route skips the confirm when the grant would be refused or would do
@@ -1489,7 +2274,7 @@ export function createAccessService(opts: AccessServiceOptions) {
     share: GrantShare,
     applyToExisting: boolean,
     updateProgress: (msg: string) => void,
-    opts: { recursiveConfirmed: boolean },
+    opts: { recursiveConfirmed: boolean, ctx?: JobContext },
   ): Promise<ShareAccessGrantResult> {
     const prepared = await prepareShareGrant(path, share, applyToExisting)
     if ('done' in prepared)
@@ -1502,11 +2287,17 @@ export function createAccessService(opts: AccessServiceOptions) {
       return outcome('refused', { message: `Applying to existing files under '${path}' was not confirmed: when the request was checked, the grant would not have run. Nothing was granted; use Permissions on the share to apply it` })
     try {
       updateProgress(`granting access on ${path}`)
-      const ran = await runSetAccess(plan, updateProgress)
+      const ran = await runSetAccess(plan, updateProgress, opts.ctx)
       const children = Array.isArray(ran.childAclEnabled) ? { childAclEnabled: ran.childAclEnabled as string[] } : {}
-      return outcome('applied', { granted, ...children })
+      // cr3.shares (fourth review): a walk that had to leave something out says so.
+      const incomplete = ran.incomplete === true ? { incomplete: true, message: String(ran.message) } : {}
+      return outcome('applied', { granted, ...children, ...incomplete })
     }
     catch (err) {
+      // Fifth review D1: a cancel stays a cancel (the share is saved; the job
+      // ends cancelled, not "failed").
+      if (err instanceof JobCancelledError)
+        throw err
       return outcome('failed', { message: err instanceof Error ? err.message : String(err) })
     }
   }

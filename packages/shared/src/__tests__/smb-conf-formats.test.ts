@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { SmbConfListEntry, SmbConfValue } from '../formats/smb-conf.js'
+import { SmbConfListEntry, SmbConfValue, SmbSharePath } from '../formats/smb-conf.js'
 import { CreateSmbShareRequest, UpdateSmbGlobalConfigRequest } from '../schemas/shares.js'
 
 /**
@@ -114,5 +114,34 @@ describe('the request schemas gate the smb.conf writer', () => {
     for (const v of ['Media library', 'Nightly backups', '/tank/media', 'ANAS Storage'])
       assert.equal(SmbConfValue.safeParse(v).success, true, v)
     assert.ok(fixture.includes('valid users = media @smbusers'))
+  })
+})
+
+// --- cr3.shares L6 / H1 — what Samba reads is what ANAS wrote ---------------
+describe('SmbSharePath and the list separators (cr3.shares L6, H1)', () => {
+  it('refuses a share path Samba would trim, collapse or substitute', () => {
+    for (const path of ['/rpool/data ', '/srv/My  Data', '/srv/%U', '/srv/a\t b']) {
+      assert.equal(CreateSmbShareRequest.safeParse({ name: 'x', path }).success, false, JSON.stringify(path))
+      assert.equal(SmbSharePath.safeParse(path).success, false, JSON.stringify(path))
+    }
+  })
+
+  it('keeps a path with single spaces legal', () => {
+    assert.equal(CreateSmbShareRequest.safeParse({ name: 'x', path: '/mnt/My Data' }).success, true)
+  })
+
+  // cr3.shares L6 (review): the panel always sends the stanza's own path back,
+  // so an EDIT's path stays lenient in the schema (a hand-written `%U` path
+  // must not block editing a comment); the daemon holds a path that CHANGES
+  // to SmbSharePath (routes/__tests__/shares-cr3.test.ts "L6").
+  it('an edit carries the stanza\'s own path back whatever it holds', async () => {
+    const { UpdateSmbShareRequest } = await import('../schemas/shares.js')
+    assert.equal(UpdateSmbShareRequest.safeParse({ path: '/srv/profiles/%U' }).success, true)
+    assert.equal(UpdateSmbShareRequest.safeParse({ path: '/srv/x\\' }).success, false, 'the smb.conf value rule still holds')
+  })
+
+  it('a list entry may not carry `;` — Samba splits on it (testparm 4.25)', () => {
+    assert.equal(SmbConfListEntry.safeParse('alice;bob').success, false)
+    assert.equal(CreateSmbShareRequest.safeParse({ name: 'x', path: '/srv/x', validUsers: ['alice;bob'] }).success, false)
   })
 })

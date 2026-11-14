@@ -1,0 +1,54 @@
+# Global parameters
+[global]
+	server string = Late Global
+	workgroup = WG
+	idmap config * : backend = tdb
+
+
+[public]
+	path = /srv/public
+
+
+[private]
+	path = /srv/private
+	valid users = alice bob
+
+
+[odd]
+	path = /srv/odd
+
+
+[a]
+	path = /srv/ab
+
+
+[indented]
+	path = /srv/indented
+
+
+[tabbed]
+	path = /srv/tabbed
+
+
+[continued]
+	path = /srv/continued
+
+
+[My Space]
+	path = /srv/My Space
+
+
+[swallow]
+	available = No
+	comment = no path here
+
+
+[valuecont]
+	comment = after a continued value
+	path = /srv/value [not-a-header]
+
+
+[merged]
+	browseable = No
+	comment = second
+	path = /srv/merged-one

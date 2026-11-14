@@ -9,7 +9,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
-import { createServer } from '../../server.js'
+import { createServer as createDevServer } from '../../server.js'
+import { echoRealPaths } from './real-path-echo.js'
+
+/** cr3.shares H2: the dev server, with `realpath -e` naming each plain test directory as itself. */
+const createServer = (...a: Parameters<typeof createDevServer>): ReturnType<typeof createDevServer> => echoRealPaths(createDevServer(...a))
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',

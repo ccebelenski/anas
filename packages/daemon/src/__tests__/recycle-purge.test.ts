@@ -1,11 +1,12 @@
 import type { Stats } from 'node:fs'
 import type { FileHandle } from 'node:fs/promises'
 import assert from 'node:assert/strict'
-import { chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { lstat, open } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { isPurgeable, isSingleSegment, main, parseRunnerArgs, purgeBin, runRecyclePurge } from '../recycle-purge.js'
 
 const DAY = 86_400_000
@@ -14,6 +15,7 @@ const DAY = 86_400_000
  * are aged RELATIVE to it, so the actual value never matters).
  */
 const NOW = Date.now()
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 /**
  * The age seam uses mtime: ctime cannot be set from userspace (any utimes
@@ -160,13 +162,16 @@ describe('runRecyclePurge — the sweep over smb.conf', () => {
   })
 
   it('a share whose path is missing from the stanza, or whose bin does not exist, is skipped without error', async () => {
-    setup([
+    // cr3.shares L9: the stanza names THIS run's directory (the function form
+    // of setup's `extra`) — the literal evaluated `dir` before setup made it,
+    // so the share path itself was missing and the bin check never ran.
+    setup(({ root }: { root: string }) => [
       '[no-path]',
       '\trecycle:repository = #recycle',
       '\t# anas:recycle-purge-days = 30',
       '',
       '[no-bin]',
-      `\tpath = ${join(dir, 'srv/empty-share')}`,
+      `\tpath = ${join(root, 'srv/empty-share')}`,
       '\trecycle:repository = #recycle',
       '\t# anas:recycle-purge-days = 30',
     ].join('\n'))
@@ -377,5 +382,80 @@ describe('purge runner argv', () => {
     assert.throws(() => parseRunnerArgs(['--bogus']), /Missing value|--bogus/)
     assert.throws(() => parseRunnerArgs(['--bogus', 'x']), /Unknown argument/)
     assert.throws(() => parseRunnerArgs(['--smbconf']), /Missing value/)
+  })
+})
+
+// --- cr3.shares L9 — a dead mount never hangs the purge ---------------------
+describe('a share on a dead mount never hangs the purge (cr3.shares L9)', () => {
+  let root = ''
+  afterEach(() => rmSync(root, { recursive: true, force: true }))
+
+  function conf(): { confPath: string, livePath: string, deadPath: string } {
+    root = mkdtempSync(join(tmpdir(), 'anas-recycle-l9-'))
+    const livePath = join(root, 'srv/live')
+    const deadPath = '/mnt/anas-nfs/dead'
+    mkdirSync(join(livePath, '#recycle'), { recursive: true })
+    const old = join(livePath, '#recycle/old.txt')
+    writeFileSync(old, 'x')
+    const past = (NOW - 40 * 86_400_000) / 1000
+    utimesSync(old, past, past)
+    const confPath = join(root, 'smb.conf')
+    writeFileSync(confPath, [
+      '[dead]',
+      `\tpath = ${deadPath}`,
+      '\trecycle:repository = #recycle',
+      '\t# anas:recycle-purge-days = 30',
+      '',
+      '[live]',
+      `\tpath = ${livePath}`,
+      '\trecycle:repository = #recycle',
+      '\t# anas:recycle-purge-days = 30',
+      '',
+    ].join('\n'))
+    return { confPath, livePath, deadPath }
+  }
+
+  it('a path that does not answer is reported failed without an lstat, and the next share still purges', async () => {
+    const { confPath, livePath, deadPath } = conf()
+    const lines: string[] = []
+    const lstatted: string[] = []
+    const result = await runRecyclePurge({
+      smbConfPath: confPath,
+      now: () => NOW,
+      ageOf: mtimeAge,
+      log: l => lines.push(l),
+      // The captured `timeout 2 stat -f` answer for a stopped hard NFS server (124).
+      probe: async p => p === deadPath ? { state: 'not-answering', detail: 'the stat did not return within 2 s' } : { state: 'exists' },
+      fs: { lstat: (p) => {
+        lstatted.push(p)
+        return lstat(p)
+      } },
+    })
+    assert.deepEqual(result, { purged: 1, skipped: 0, failed: 1 })
+    assert.ok(lines.some(l => l.startsWith('anas-recycle: share=dead failed (path /mnt/anas-nfs/dead is not answering')), lines.join('\n'))
+    assert.equal(lstatted.some(p => p.startsWith(deadPath)), false, 'nothing under the dead mount is ever lstat-ed')
+    assert.equal(existsSync(join(livePath, '#recycle/old.txt')), false)
+  })
+
+  it('a bin that cannot be read (EACCES) is a failure, never "does not exist"', async () => {
+    const { confPath } = conf()
+    const lines: string[] = []
+    const result = await runRecyclePurge({
+      smbConfPath: confPath,
+      now: () => NOW,
+      ageOf: mtimeAge,
+      log: l => lines.push(l),
+      probe: async () => ({ state: 'exists' }),
+      fs: { lstat: async () => {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+      } },
+    })
+    assert.equal(result.failed, 2)
+    assert.ok(lines.every(l => !l.includes('does not exist')), lines.join('\n'))
+  })
+
+  it('the unit bounds a run (TimeoutStartSec) so a running oneshot never swallows the next fire', () => {
+    const unit = readFileSync(join(__dirname, '../../../../packaging/systemd/anas-recycle.service'), 'utf8')
+    assert.match(unit, /^TimeoutStartSec=\d+h$/m)
   })
 })

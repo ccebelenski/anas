@@ -90,6 +90,18 @@
         return ANAS.enc(s);
     }
 
+    // cr3: the default ExtJS BoundList (and a tagfield's tag label) renders
+    // its display field as raw HTML. Rows that carry names from the node —
+    // accounts and groups from getent, interfaces and addresses — go through
+    // these encoded templates instead.
+    function encodedListConfig(field) {
+        return { tpl: '<tpl for="."><div class="x-boundlist-item">{' + field + ':htmlEncode}</div></tpl>' };
+    }
+
+    function encodedLabelTpl(field) {
+        return '{' + field + ':htmlEncode}';
+    }
+
     // Split a free-text list (comma / whitespace separated) into a trimmed,
     // empty-filtered array — used for hosts allow/deny and NFS export options.
     function splitList(str) {
@@ -249,8 +261,15 @@
             share = item || {};
             active = item ? item.activeConnections : undefined;
         }
-        if (active === undefined || active === null) {
-            active = (share && share.connections) ? share.connections.length : 0;
+        // cr3 (INVENTED-STATE-M6): the daemon sends the real count, or null
+        // when smbstatus could not be read. Absent or null is UNKNOWN — never
+        // a fallback 0 (a detail payload's connection list still counts).
+        if ((active === undefined || active === null) && share && share.connections
+            && !share.connectionsUnknown) {
+            active = share.connections.length;
+        }
+        if (active === undefined) {
+            active = null;
         }
         return {
             protocol: 'smb',
@@ -263,7 +282,7 @@
             // cr.35: which of the four outcomes the check had (exists /
             // missing / not-answering / unreadable); absent from an old daemon.
             pathState: share.pathState,
-            activeConnections: Number(active) || 0,
+            activeConnections: (active === null || isNaN(Number(active))) ? null : Number(active),
             raw: share,
         };
     }
@@ -286,6 +305,25 @@
             activeConnections: null,
             raw: exp,
         };
+    }
+
+    // cr3.shares (second review): the row standing in for a list that could
+    // not be read — it carries the reason and offers no action.
+    function readErrorRow(proto, message) {
+        return {
+            protocol: proto,
+            name: '',
+            path: '',
+            pathExists: undefined,
+            pathState: undefined,
+            activeConnections: null,
+            raw: { readError: '' + (message || '') },
+        };
+    }
+
+    function readErrorOf(rec) {
+        var raw = rec ? rec.get('raw') : null;
+        return raw && raw.readError !== undefined ? raw.readError : null;
     }
 
     // ---- Renderers ---------------------------------------------------------
@@ -351,6 +389,9 @@
     // Key attributes summary. SMB: read-only/guest/valid-users; NFS: client
     // count plus a preview of the client specs.
     function renderAttrs(v, meta, rec) {
+        if (readErrorOf(rec) !== null) {
+            return '';
+        }
         var proto = rec.get('protocol');
         var raw = rec.get('raw') || {};
         var parts = [];
@@ -385,12 +426,19 @@
     }
 
     // Active SMB connection count (from smbstatus, via activeConnections). NFS
-    // has no live per-export connection concept — show a dash.
+    // has no live per-export connection concept — show a dash. cr3
+    // (INVENTED-STATE-M6): an SMB count the daemon could not read (null, or
+    // absent from an older daemon) renders "unknown", never 0.
     function renderActive(v, meta, rec) {
-        if (rec.get('protocol') !== 'smb') {
+        if (rec.get('protocol') !== 'smb' || readErrorOf(rec) !== null) {
             return '<span style="color:#888;">&mdash;</span>';
         }
-        var n = Number(rec.get('activeConnections')) || 0;
+        var raw = rec.get('activeConnections');
+        if (raw === null || raw === undefined || isNaN(Number(raw))) {
+            meta.tdAttr = 'data-qtip="' + enc(enc(t('The live connections could not be read (smbstatus did not answer).'))) + '"';
+            return '<span class="anas-share-active-unknown" style="color:#888;">' + enc(t('unknown')) + '</span>';
+        }
+        var n = Number(raw);
         if (n > 0) {
             return '<b style="color:#21BF4B;">' + n + '</b>';
         }
@@ -411,8 +459,36 @@
         }
     }
 
+    // cr3.shares (review): a share whose name holds characters ANAS does not
+    // use is listed but not managed — no action is offered on it.
+    function isUnmanaged(rec) {
+        var raw = rec ? rec.get('raw') : null;
+        // A row standing in for a list that could not be read is no share.
+        return !!(raw && (raw.unmanagedName || raw.readError !== undefined));
+    }
+
+    var UNMANAGED_TIP = 'Not managed by ANAS: its name contains characters ANAS does not use '
+        + '(letters, digits, underscore and hyphen only). Samba serves it; change it in smb.conf.';
+
+    function renderShareName(v, meta, rec) {
+        var failed = readErrorOf(rec);
+        if (failed !== null) {
+            return '<span class="anas-share-read-failed" style="color:var(--anas-warn,#b06a12);">'
+                + enc(rec.get('protocol') === 'smb'
+                    ? t('The SMB shares could not be read')
+                    : t('The NFS exports could not be read'))
+                + (failed ? ': ' + enc(failed) : '') + '</span>';
+        }
+        var html = enc(v);
+        if (isUnmanaged(rec)) {
+            html += pathTag('anas-share-unmanaged', 'not managed by ANAS', UNMANAGED_TIP,
+                'var(--anas-muted,gray)');
+        }
+        return html;
+    }
+
     function updateShareButtons(grid) {
-        var has = !!selectedShare(grid);
+        var has = !!selectedShare(grid) && !isUnmanaged(selectedShare(grid));
         setDisabled(grid, 'shareDetails', !has);
         setDisabled(grid, 'shareEdit', !has);
         setDisabled(grid, 'shareRemove', !has);
@@ -430,17 +506,19 @@
         } catch (e) {
             // non-fatal
         }
+        // cr3.shares (second review): a list that could not be read is never
+        // an empty list — that half of the grid says it could not be read.
         var smbCall = ANAS.api.get(node, '/shares/smb').then(function (res) {
             return (res && res.data) || [];
         }, function (err) {
             ANAS.warn('smb shares load failed: ' + ANAS.errText(err));
-            return [];
+            return { readError: ANAS.errText(err) };
         });
         var nfsCall = ANAS.api.get(node, '/shares/nfs').then(function (res) {
             return (res && res.data) || [];
         }, function (err) {
             ANAS.warn('nfs exports load failed: ' + ANAS.errText(err));
-            return [];
+            return { readError: ANAS.errText(err) };
         });
         Promise.all([smbCall, nfsCall]).then(function (results) {
             if (grid.destroyed || grid.destroying) {
@@ -455,11 +533,19 @@
             var smb = results[0] || [];
             var nfs = results[1] || [];
             var i;
-            for (i = 0; i < smb.length; i++) {
-                rows.push(normSmb(smb[i]));
+            if (smb.readError !== undefined) {
+                rows.push(readErrorRow('smb', smb.readError));
+            } else {
+                for (i = 0; i < smb.length; i++) {
+                    rows.push(normSmb(smb[i]));
+                }
             }
-            for (i = 0; i < nfs.length; i++) {
-                rows.push(normNfs(nfs[i]));
+            if (nfs.readError !== undefined) {
+                rows.push(readErrorRow('nfs', nfs.readError));
+            } else {
+                for (i = 0; i < nfs.length; i++) {
+                    rows.push(normNfs(nfs[i]));
+                }
             }
             try {
                 grid.getStore().loadData(rows);
@@ -699,6 +785,15 @@
             } catch (e) {
                 ANAS.warn('grant: ' + (grant.message || ''));
             }
+        } else if (grant.incomplete) {
+            // cr3.shares (fourth review): the walk over the existing files had
+            // to leave something out — the daemon's sentence says what.
+            try {
+                Ext.Msg.alert(t('Share saved; access granted with exceptions'),
+                    enc((grant.message || '') + skipped + guestNote));
+            } catch (e) {
+                ANAS.warn('grant: ' + (grant.message || ''));
+            }
         } else {
             // A recursive grant on ZFS switches POSIX ACLs on for the child
             // datasets it crosses (ruling 2026-10-11) — say which.
@@ -750,7 +845,7 @@
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-smb-share',
                 title: isEdit
-                    ? t('Edit SMB Share') + ': ' + existing.name
+                    ? t('Edit SMB Share') + ': ' + enc(existing.name)
                     : t('Add SMB Share'),
                 modal: true,
                 width: 540,
@@ -818,6 +913,8 @@
                             fieldLabel: t('Valid users'),
                             store: userGroupStore,
                             displayField: 'name',
+                            listConfig: encodedListConfig('name'),
+                            labelTpl: encodedLabelTpl('name'),
                             valueField: 'name',
                             queryMode: 'local',
                             filterPickList: true,
@@ -1301,7 +1398,7 @@
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-nfs-export',
                 title: isEdit
-                    ? t('Edit NFS Export') + ': ' + existing.path
+                    ? t('Edit NFS Export') + ': ' + enc(existing.path)
                     : t('Add NFS Export'),
                 modal: true,
                 width: 620,
@@ -1519,6 +1616,8 @@
                     // allows arbitrary interface names or subnets.
                     store: Ext.create('Ext.data.Store', { fields: ['name'], data: [] }),
                     displayField: 'name',
+                    listConfig: encodedListConfig('name'),
+                    labelTpl: encodedLabelTpl('name'),
                     valueField: 'name',
                     queryMode: 'local',
                     forceSelection: false,
@@ -1814,6 +1913,7 @@
             width: 360,
             store: addrStore,
             displayField: 'name',
+            listConfig: encodedListConfig('name'),
             valueField: 'name',
             queryMode: 'local',
             forceSelection: true,
@@ -1879,7 +1979,7 @@
 
         var win = Ext.create('Ext.window.Window', {
             cls: 'anas-win-share-details',
-            title: t('Connect to') + ' ' + (proto === 'smb' ? (raw.name || '') : (raw.path || '')),
+            title: t('Connect to') + ' ' + enc(proto === 'smb' ? (raw.name || '') : (raw.path || '')),
             modal: true,
             width: 640,
             resizable: true,
@@ -1943,19 +2043,29 @@
                 }
                 var conns = (res && res.data && res.data.connections) || [];
                 var html;
-                if (!conns.length) {
+                if (res && res.data && res.data.connectionsUnknown) {
+                    // cr3 (SHARES-L8): an empty list the daemon could not read
+                    // is not "no connections".
+                    html = '<div class="anas-details-connections-unknown" style="color:#b06a12;">'
+                        + enc(t('Active connections could not be read (smbstatus did not answer).')) + '</div>';
+                } else if (!conns.length) {
                     html = '<div style="color:#888;">' + enc(t('No active connections.')) + '</div>';
                 } else {
                     var rowsHtml = [];
                     for (var i = 0; i < conns.length; i++) {
                         rowsHtml.push(enc(conns[i].user) + ' @ ' + enc(conns[i].machine));
                     }
-                    html = '<b>' + t('Active connections') + ' (' + conns.length + '):</b><br>'
+                    html = '<b>' + enc(t('Active connections')) + ' (' + conns.length + '):</b><br>'
                         + '<div style="line-height:1.5em;">' + rowsHtml.join('<br>') + '</div>';
                 }
                 connsCmp.setHtml(html);
             }, function () {
-                // Detail fetch failed — leave the block empty (non-fatal).
+                // Detail fetch failed: say so — never an empty block that
+                // reads as "nobody connected" (cr3).
+                if (!win.destroyed) {
+                    connsCmp.setHtml('<div class="anas-details-connections-unknown" style="color:#b06a12;">'
+                        + enc(t('Active connections could not be read.')) + '</div>');
+                }
             });
         }
     }
@@ -2003,7 +2113,7 @@
                         text: t('Name'),
                         dataIndex: 'name',
                         width: 180,
-                        renderer: Ext.String.htmlEncode,
+                        renderer: renderShareName,
                     },
                     {
                         text: t('Path'),
@@ -2121,6 +2231,9 @@
                         updateShareButtons(this);
                     },
                     itemdblclick: function (grid, rec) {
+                        if (isUnmanaged(rec)) {
+                            return;
+                        }
                         openEdit(node, grid, rec);
                     },
                 },

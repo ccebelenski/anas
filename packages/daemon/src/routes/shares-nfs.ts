@@ -11,8 +11,8 @@ import { guardCheck, guardConfirm, guarded, GuardRefusalError, nfsShareClaim, se
 import { createAccessService } from '../services/access.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
-import { loadPveFootprint, ownershipRefusal, pveManagedRefusal } from '../services/pve-footprint.js'
-import { probeSharePath, probeSharePaths, sharePathFields } from '../services/share-path.js'
+import { loadPveFootprint } from '../services/pve-footprint.js'
+import { probeSharePath, probeSharePaths, sharePathFields, sharePathVerdictRefusal } from '../services/share-path.js'
 import { requireIdentity } from './identity.js'
 import { shareAccessHandlers } from './share-access.js'
 
@@ -127,7 +127,11 @@ export async function nfsExportRoutes(
       // while the create waits refuses there, before its reload touches
       // `exportfs` at all (no baseline runs for a create that never writes).
       object: nfsExportView(path),
-      gates: [async o => (hasExport(o.text, path) ? exportExists(path) : null)],
+      gates: [
+        async o => (hasExport(o.text, path) ? exportExists(path) : null),
+        // cr3.shares L7 (ruling (j)): the PVE claim re-asked in the job too.
+        async () => sharePathVerdictRefusal((await loadPveFootprint(executor)).sharePathVerdict(path), 'Export path', path, 'exports'),
+      ],
       locks: async () => [nfsShareClaim(normalizeMountpointPath(path))],
     }
   }
@@ -253,15 +257,11 @@ export async function nfsExportRoutes(
     // sibling dataset's mountpoint, or on no PVE claim at all, passes. The PUT
     // below cannot move the path (it is the URL identity, only the client list
     // is replaced), so create is the one door to guard.
-    const pve = await loadPveFootprint(executor)
-    const claim = pve.sharePathClaim(exp.path)
-    if (claim) {
-      // The config-unreadable verdict is a different fact and keeps its 400.
-      const refusal = claim.kind === 'dataset'
-        ? ownershipRefusal(claim.ownership, `Export path '${exp.path}' is on '${claim.dataset}', which is PVE-owned — ${claim.ownership.reason}`)
-        : pveManagedRefusal(`Export path '${exp.path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — exports cannot serve PVE territory`)
-      return sendRefusal(reply, refusal)
-    }
+    // cr3.shares M4: only a positive "no claim" opens the door — a
+    // footprint that could not see refuses (sharePathVerdictRefusal).
+    const pathRefusal = sharePathVerdictRefusal((await loadPveFootprint(executor)).sharePathVerdict(exp.path), 'Export path', exp.path, 'exports')
+    if (pathRefusal)
+      return sendRefusal(reply, pathRefusal)
 
     // Story cr.43 item 2: existence answers 409 CONFLICT at the route, and
     // the same gate runs again in the job under the export's lock — a line

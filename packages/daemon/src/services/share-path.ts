@@ -1,6 +1,9 @@
 import type { SharePathState } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { Refusal } from '../safety/guard.js'
+import type { SharePathClaim } from './pve-footprint.js'
 import { CommandTimeoutError } from '../executor/deadline.js'
+import { ownershipRefusal, pveManagedRefusal } from './pve-footprint.js'
 
 /**
  * The read-time check of a share's backing path (cr.35, WAVE3-DESIGN §6.1
@@ -95,4 +98,57 @@ export async function probeSharePaths(executor: CommandExecutor, paths: readonly
   const unique = [...new Set(paths)]
   const results = await Promise.all(unique.map(p => probeSharePath(executor, p)))
   return new Map(unique.map((p, i) => [p, results[i]]))
+}
+
+/**
+ * cr3.shares L6: does an SMB `path` carry a Samba `%` macro (`%U`, `%S`, ...)?
+ * Samba substitutes it per connection, so the literal string names no
+ * directory to check: such a path is not probed and carries no path state
+ * (unknown, never "missing"). NFS has no macros; this is the SMB question.
+ */
+export function isSambaTemplatedPath(path: string): boolean {
+  return path.includes('%')
+}
+
+/**
+ * cr3.shares M4: the share-path backstop's THREE-valued answer — structurally
+ * the pools area's `SharePathVerdict` (cr3.pools-disks, `pve.sharePathVerdict`
+ * in services/pve-footprint.ts): `no-claim` is the ONLY answer that opens a
+ * share door; `claim` is PVE's claim; `cannot-see` is the daemon unable to
+ * judge the path (its `zfs list` mountpoint read failed, or storage.cfg is
+ * unreadable, and the mount table does not prove the path non-ZFS).
+ */
+export type ShareDoorVerdict
+  = | { kind: 'no-claim' }
+    | { kind: 'claim', claim: SharePathClaim }
+    | { kind: 'cannot-see', reason: string }
+
+/** The cannot-see refusal sentence (400 — not a PVE claim). */
+export function cannotSeeMessage(noun: string, path: string, reason: string): string {
+  return `Could not tell whether ${noun.toLowerCase()} '${path}' is PVE territory — ${reason}; refusing until it can be read`
+}
+
+/**
+ * cr3.shares M4: the ONE refusal the share doors (SMB create/edit, NFS create)
+ * give for the footprint's answer about a share path. Only a positive
+ * `no-claim` opens the door: a claim on an owned dataset or a dir storage's
+ * path is the territory fact (409 PVE_MANAGED; an unreadable storage.cfg's
+ * `config-unreadable` ownership keeps its 400), and `cannot-see` — or any
+ * verdict this code does not know — refuses 400 as the cannot-see fact.
+ */
+export function sharePathVerdictRefusal(verdict: ShareDoorVerdict, noun: string, path: string, plural = 'shares'): Refusal | null {
+  if (verdict.kind === 'no-claim')
+    return null
+  if (verdict.kind === 'claim') {
+    const claim = verdict.claim
+    if (claim.kind === 'dataset')
+      return ownershipRefusal(claim.ownership, `${noun} '${path}' is on '${claim.dataset}', which is PVE-owned — ${claim.ownership.reason}`)
+    return pveManagedRefusal(`${noun} '${path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — ${plural} cannot serve PVE territory`)
+  }
+  const reason = (verdict as { reason?: unknown }).reason
+  return {
+    status: 400,
+    code: 'VALIDATION_ERROR',
+    message: cannotSeeMessage(noun, path, typeof reason === 'string' && reason ? reason : 'the footprint could not be read'),
+  }
 }

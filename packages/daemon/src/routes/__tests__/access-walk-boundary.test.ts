@@ -2,16 +2,18 @@ import type { Job, JobAccepted } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { createServer } from '../../server.js'
+import { createServer as createDevServer } from '../../server.js'
 import { findPathPattern, walkArgs, walkScopeFrom } from '../../services/access-walk.js'
 import { mountIndex } from '../../services/nested-filesystems.js'
+import { echoRealPaths, pinnedPaths, walkRuns } from './real-path-echo.js'
+
+/** cr3.shares H2: the dev server, with `realpath -e` naming each plain test directory as itself. */
+const createServer = (...a: Parameters<typeof createDevServer>): ReturnType<typeof createDevServer> => echoRealPaths(createDevServer(...a))
 
 /**
  * Story nf.1 — the wave-3 node pass's D2 (docs/LIVE-PROOF-0.4.4-wave3.md):
@@ -19,8 +21,13 @@ import { mountIndex } from '../../services/nested-filesystems.js'
  * and chowned the NFS server's export, while the confirm named only the
  * child datasets. The rule now: a recursive apply never crosses a mount
  * boundary it did not name. Named child datasets are still walked (each from
- * its own mountpoint); every other mount is excluded from every argv and
- * named in the confirm as "not changed: <path> (<fstype>)".
+ * its own mountpoint); every other mount is excluded and named in the
+ * confirm as "not changed: <path> (<fstype>)".
+ *
+ * cr3.shares, fourth review: the walk is anas-acl-walk (one run over every
+ * pinned root; the boundary is the device number, proven for real in
+ * services/__tests__/access-boundary-ns.test.ts). Here the dev mock answers
+ * the helper and the tests read the JOB the writer sent (walkRuns()).
  *
  * FIXTURES (ruling (l): fakes print captured output; every rewrite spelled out):
  *  - the mount table: the dev mock's capture `mounts/findmnt-full.json`
@@ -52,9 +59,12 @@ const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }
 const MP = '/testpool/media'
 const NFS = `${MP}/nfs`
 const CHILD_A = `${MP}/a`
-const FIND = '/usr/bin/find'
 const FINDMNT = '/usr/bin/findmnt'
-const PERMISSION_COMMANDS = ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl', FIND]
+/** A command that changes a permission on the tree: a tool, or the walk helper (perl). */
+const PERMISSION_COMMANDS = ['/usr/bin/chown', '/usr/bin/chmod', '/usr/bin/setfacl', '/usr/bin/find', '/usr/bin/perl']
+function isPermissionWrite(c: { command: string, args: string[] }): boolean {
+  return PERMISSION_COMMANDS.includes(c.command)
+}
 const CHILDREN_ARGS = ['list', '-r', '-H', '-o', 'name,mountpoint,acltype', '--', 'testpool/media']
 const CHILDREN = [
   'testpool/media\t/testpool/media\toff',
@@ -145,8 +155,6 @@ describe('nf.1 — a recursive apply never crosses a mount it did not name (wave
     return { warnings, job: await waitForJob(server!, (res.json() as JobAccepted).job.id) }
   }
 
-  const walks = (): string[][] => calls.filter(c => c.command === FIND).map(c => c.args)
-
   const NAMED = {
     owner: 'nobody',
     entries: [
@@ -165,48 +173,21 @@ describe('nf.1 — a recursive apply never crosses a mount it did not name (wave
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.deepEqual((job.result as { notChanged?: string[] }).notChanged, [`${NFS} (nfs4)`])
 
-    // Four steps (chown, access ACL, default ACL, setgid; one root): every
-    // one a bounded find that prunes the NFS mount and stays on its device.
-    const all = walks()
-    assert.equal(all.length, 4)
-    for (const args of all) {
-      assert.deepEqual(args.slice(0, 8), ['-P', MP, '-xdev', '(', '-path', NFS, ')', '-prune'], args.join(' '))
-      // The mount appears ONLY as the pruned pattern — never as a start, never in an action.
-      assert.equal(args.filter(a => a.includes(NFS)).length, 1, args.join(' '))
-    }
-    // No tool walks on its own (`-R` crosses mounts), and none names the mount.
-    for (const c of calls.filter(c => PERMISSION_COMMANDS.includes(c.command) && c.command !== FIND))
-      assert.ok(!c.args.includes('-R') && !c.args.some(a => a.includes(NFS)), `${c.command} ${c.args.join(' ')}`)
-  })
-
-  it('the chown argv, run for real on a scratch tree, never reaches the excluded mount — its own top directory included', () => {
-    // The prune is a path pattern, so a directory stands in for the mount;
-    // `-xdev` cannot be exercised without a real mount and is pinned above.
-    const scope = walkScopeFrom(MP, mountIndex(FINDMNT_NFS_UNDER), [])
-    const [root] = scope.roots
-    const args = walkArgs(root, [], ['/usr/bin/chown', '-h', 'nobody', '--'])
-    const tree = mkdtempSync(join(tmpdir(), 'anas-nf1-'))
-    try {
-      for (const d of ['nfs/tree/d0', 'keep/sub'])
-        mkdirSync(join(tree, d), { recursive: true })
-      writeFileSync(join(tree, 'nfs/f0'), '')
-      writeFileSync(join(tree, 'nfs/tree/d0/f0'), '')
-      writeFileSync(join(tree, 'keep/sub/f'), '')
-      const at = args.indexOf('-execdir')
-      const real = [...args.slice(0, at + 1), '/usr/bin/echo', '{}', '+'].map(a => a === MP ? tree : a.replace(MP, findPathPattern(tree)))
-      const seen = execFileSync(FIND, real, { encoding: 'utf-8' }).trim().split(/\s+/)
-      // cr.53 (H2): under `-execdir` every operand is a bare `./name` inside
-      // the directory handle find opened — no absolute path ever reaches the
-      // tool, so a directory swapped between listing and batch cannot
-      // redirect a batch out of the tree.
-      for (const operand of seen)
-        assert.match(operand, /^\.\/[^/]+$/, `${operand} in ${seen.join(' ')}`)
-      assert.ok(seen.includes('./sub') && seen.includes('./f'), seen.join(' '))
-      assert.equal(seen.filter(p => p.includes('nfs') || p.includes('f0') || p.includes('d0')).length, 0, seen.join(' '))
-    }
-    finally {
-      rmSync(tree, { recursive: true, force: true })
-    }
+    // cr3.shares, fourth review: ONE walk over the one root (the dataset,
+    // pinned), every step in it; nothing in the job names the NFS mount —
+    // the helper stops at its device (access-boundary-ns.test.ts).
+    const [run, ...more] = walkRuns()
+    assert.equal(more.length, 0)
+    // (Not a ZFS dataset ROOT in this capture — no mount row of its own —
+    // so no `.zfs` skip; the child-dataset case below has one.)
+    assert.deepEqual(run.job.roots.map(r => [r.fd, r.path, r.zfs]), [[3, MP, false]])
+    assert.equal(run.inheritedFds, 1)
+    assert.deepEqual(Object.keys(run.job).filter(k => k !== 'roots' && k !== 'tools').sort(), ['acl', 'chown', 'defaultAcl', 'setgid'])
+    assert.equal(JSON.stringify(run.job).includes(NFS), false, 'the job never names the excluded mount')
+    assert.deepEqual(pinnedPaths(), [MP])
+    // No tool runs on its own outside the walk (`-R` crosses mounts).
+    assert.deepEqual(calls.filter(c => isPermissionWrite(c) && c.command !== '/usr/bin/perl'), [])
+    assert.equal((job.result as { walk?: { done?: boolean } }).walk?.done, true, 'the result carries the walk\'s report')
   })
 
   it('a named child dataset is still walked — from its own mountpoint — while the NFS mount stays out', async () => {
@@ -216,17 +197,18 @@ describe('nf.1 — a recursive apply never crosses a mount it did not name (wave
     assert.ok(warnings.some(w => w.includes(`not changed: ${NFS} (nfs4)`)), JSON.stringify(warnings))
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
 
-    const chown = walks().filter(a => a.includes('/usr/bin/chown'))
-    assert.deepEqual(chown, [
-      // The dataset: its own .zfs, the child (walked on its own) and the NFS mount pruned.
-      ['-P', MP, '-xdev', '(', '-path', `${MP}/.zfs`, '-o', '-path', CHILD_A, '-o', '-path', NFS, ')', '-prune', '-o', '-execdir', '/usr/bin/chown', '-h', 'nobody', '--', '{}', '+'],
-      // The child, from its own mountpoint, on its own device.
-      ['-P', CHILD_A, '-xdev', '(', '-path', `${CHILD_A}/.zfs`, ')', '-prune', '-o', '-execdir', '/usr/bin/chown', '-h', 'nobody', '--', '{}', '+'],
-    ])
-    // Every step covers both roots.
-    for (const tool of ['/usr/bin/chown', '/usr/bin/setfacl', '/usr/bin/chmod'])
-      assert.ok(walks().some(a => a[1] === CHILD_A && a.includes(tool)), `${tool} walks the child`)
-    assert.ok(!walks().some(a => a[1] === NFS), 'the NFS mount is never a walk root')
+    // ONE walk over both roots: the dataset first, then the child from its
+    // own mountpoint — both ZFS dataset roots (each skips its `.zfs`), each
+    // its own inherited descriptor; the NFS mount is in neither.
+    const runs = walkRuns()
+    assert.equal(runs.length, 1)
+    assert.deepEqual(runs[0].job.roots.map(r => [r.fd, r.path, r.zfs]), [[3, MP, true], [4, CHILD_A, true]])
+    assert.equal(runs[0].inheritedFds, 2)
+    assert.equal(runs[0].job.chown, 'nobody')
+    assert.equal(JSON.stringify(runs[0].job).includes(NFS), false)
+    // cr3.shares H2 (second review): both roots were pinned, the dataset
+    // first, then the child — and never the NFS mount.
+    assert.deepEqual(pinnedPaths(), [MP, CHILD_A])
     // The child's ACLs were switched on first (a has acltype=off).
     assert.deepEqual((job.result as { childAclEnabled?: string[] }).childAclEnabled, ['testpool/media/a'])
   })
@@ -239,7 +221,7 @@ describe('nf.1 — a recursive apply never crosses a mount it did not name (wave
     const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'failed')
     assert.match(job.error!.message, new RegExp(`^No permissions were changed: ${NFS} \\(nfs4\\), mounted under '${MP}', did not answer a 2 s liveness probe`))
-    assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false, 'no chown, chmod, setfacl or find ran')
+    assert.equal(calls.some(c => isPermissionWrite(c)), false, 'no chown, chmod, setfacl, find or walk ran')
     assert.equal(calls.some(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set'), false, 'no ACL switch flipped')
   })
 
@@ -253,7 +235,7 @@ describe('nf.1 — a recursive apply never crosses a mount it did not name (wave
     assert.equal(res.statusCode, 409, res.body)
     assert.equal(res.json().error.code, 'STATE_CHANGED')
     assert.ok((res.json().error.warnings as string[]).some(w => w.includes(`not changed: ${NFS} (nfs4)`)), res.body)
-    assert.equal(calls.some(c => PERMISSION_COMMANDS.includes(c.command)), false)
+    assert.equal(calls.some(c => isPermissionWrite(c)), false)
   })
 
   it('an unreadable mount table refuses the recursive change at the door', async () => {
@@ -267,7 +249,10 @@ describe('nf.1 — a recursive apply never crosses a mount it did not name (wave
 })
 
 describe('nf.1 — the walk scope (access-walk.ts)', () => {
-  it('a btrfs root has no -xdev (subvolumes are not mounts); a mount inside an excluded one is never listed', () => {
+  // cr3.shares D2 (third review): every root is bounded, btrfs included
+  // (each nested subvolume becomes a root of its own). Was: `xdev: false`.
+  // Fourth review: no `fstype` on a root (the walk's boundary is the device).
+  it('a btrfs root is bounded and is not a ZFS root; a mount inside an excluded one is never listed', () => {
     const table = JSON.stringify({ filesystems: [
       { target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' },
       { target: '/mnt/anas-ahr/ahr0', source: '/dev/mapper/ahr0-ahr0--vol', fstype: 'btrfs', options: 'rw', children: [
@@ -277,7 +262,7 @@ describe('nf.1 — the walk scope (access-walk.ts)', () => {
       ] },
     ] })
     const scope = walkScopeFrom('/mnt/anas-ahr/ahr0', mountIndex(table), [])
-    assert.deepEqual(scope.roots, [{ path: '/mnt/anas-ahr/ahr0', xdev: false, prune: ['/mnt/anas-ahr/ahr0/ext'] }])
+    assert.deepEqual(scope.roots, [{ path: '/mnt/anas-ahr/ahr0', xdev: true, prune: ['/mnt/anas-ahr/ahr0/ext'] }])
     assert.deepEqual(scope.excluded, [{ target: '/mnt/anas-ahr/ahr0/ext', fstype: 'nfs4' }])
   })
 
