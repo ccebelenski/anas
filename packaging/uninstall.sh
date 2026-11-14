@@ -20,9 +20,9 @@ err()  { printf 'ERROR: %s\n' "$*" >&2; }
 # months-old missed occurrence (review R10).
 TIMERS_STAMP_DIR="${TIMERS_STAMP_DIR:-/var/lib/systemd/timers}"
 
-# Remove the ANAS SCHEDULE units (review F2/F8). ONE rule for all five unit
+# Remove the ANAS SCHEDULE units (review F2/F8). ONE rule for all six unit
 # families — `anas-snap-*`, `anas-backup-*`, `anas-repl-*`, `anas-cloud-*`,
-# `anas-scrub.*` — and one reason for it: every family's runner lives in
+# `anas-replcheck.*`, `anas-scrub.*` — and one reason for it: every family's runner lives in
 # /opt/anas, which this
 # uninstall is deleting (a cloud task's ExecStart is
 # /opt/anas/packages/daemon/dist/cloud-task.js; the family was missing here
@@ -59,6 +59,16 @@ remove_schedule_units() {
       info "removed ${count} ANAS schedule unit pair(s) (${family}-*)"
     fi
   done
+
+  # The replication targets' daily check (repl.drift): ONE static pair the
+  # daemon writes with the first replication task. `anas-repl-*` does not
+  # match its name, and its runner lives in /opt/anas like the others.
+  if [ -f "${SYSTEMD_DIR}/anas-replcheck.timer" ] || [ -f "${SYSTEMD_DIR}/anas-replcheck.service" ]; then
+    systemctl disable --now anas-replcheck.timer >/dev/null 2>&1 || true
+    rm -f "${SYSTEMD_DIR}/anas-replcheck.timer" "${SYSTEMD_DIR}/anas-replcheck.service"
+    rm -f "${TIMERS_STAMP_DIR}/stamp-anas-replcheck.timer"
+    info "removed 1 ANAS schedule unit pair (anas-replcheck.*)"
+  fi
 
   if [ -f "${SYSTEMD_DIR}/anas-scrub.timer" ] || [ -f "${SYSTEMD_DIR}/anas-scrub.service" ]; then
     systemctl disable --now anas-scrub.timer >/dev/null 2>&1 || true

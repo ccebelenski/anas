@@ -344,7 +344,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.equal(result.target, 'testpool2/share1')
     assert.equal(result.bytesEstimated, 13424)
 
-    // Exact send|recv argv: readonly=on only on the create (full send).
+    // Exact send|recv argv: readonly=on on the create (full send) and, since repl.drift ruling 1, on every incremental.
     assert.equal(mock.pipelineCalls.length, 1)
     assert.deepEqual(mock.pipelineCalls[0], {
       cmd1: ZFS,
@@ -366,7 +366,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
   })
 
   // --- replicate: incremental happy path — exact send/recv argv ----------
-  it('replicate incremental → send -i @base, plain recv (no -o readonly)', async () => {
+  it('replicate incremental → send -i @base, recv re-asserts -o readonly=on (ruling 1, repl.drift)', async () => {
     server = createServer({ mock: true, logger: false })
     const mock = mockOf(server)
     mock.clearFixtures()
@@ -399,7 +399,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
       cmd1: ZFS,
       args1: ['send', '-i', '@repl-base', '--', 'testpool/share1@repl-next'],
       cmd2: ZFS,
-      args2: ['recv', '--', 'testpool2/share1'],
+      args2: ['recv', '-o', 'readonly=on', '--', 'testpool2/share1'],
     })
   })
 

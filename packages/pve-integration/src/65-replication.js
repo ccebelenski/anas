@@ -387,8 +387,45 @@
             + enc(s) + '</span>';
     }
 
-    // Lag: snapshotsBehind → 0 current (green), N behind (amber), null muted dash.
+    // repl.drift: the target's state against the snapshot its next incremental
+    // starts from (targetDrift on the task row, read by the daemon on every
+    // list). Clean adds nothing; the other three get their own pill with the
+    // daemon's sentence as the tip. A data-qtip value is encoded twice: once
+    // for the tip (QuickTip renders the decoded attribute as HTML), once for
+    // the attribute.
+    var DRIFT_PILLS = {
+        modified: { label: 'target changed', color: 'var(--anas-danger,#c23b2c)', fill: true },
+        exposed: { label: 'not read-only', color: 'var(--anas-warn,#b06a12)', fill: false },
+        unknown: { label: 'target unchecked', color: 'var(--anas-muted,gray)', fill: false },
+    };
+    function renderDrift(rec) {
+        var d = rec.get('targetDrift');
+        if (!d || typeof d !== 'object') {
+            return '';
+        }
+        // Review N8: an own key only — a state named after an Object.prototype
+        // member ('constructor', 'toString', '__proto__') is no pill.
+        if (typeof d.state !== 'string' || !Object.prototype.hasOwnProperty.call(DRIFT_PILLS, d.state)) {
+            return '';
+        }
+        var look = DRIFT_PILLS[d.state];
+        var tip = d.message ? String(d.message) : t(look.label);
+        var style = look.fill
+            ? 'color:#fff;background:' + look.color + ';'
+            : 'color:' + look.color + ';border:1px solid ' + look.color + ';';
+        return ' <span class="anas-repl-drift anas-repl-drift-' + enc(d.state) + '"'
+            + ' data-qtip="' + enc(enc(tip)) + '"'
+            + ' style="display:inline-block;padding:0 8px;border-radius:9px;font-size:0.85em;' + style + '">'
+            + enc(t(look.label)) + '</span>';
+    }
+
+    // Lag: snapshotsBehind → 0 current (green), N behind (amber), null muted
+    // dash; then the target's drift pill (repl.drift), when it has one.
     function renderLag(v, meta, rec) {
+        return renderLagOnly(rec) + renderDrift(rec);
+    }
+
+    function renderLagOnly(rec) {
         var behind = rec.get('snapshotsBehind');
         if (behind === undefined || behind === null || behind === '') {
             // cr3: null is UNKNOWN (a snapshot listing that could not be read,
@@ -626,6 +663,8 @@
             lastRunResult: entry.lastRunResult || 'unknown',
             lastRunNote: entry.lastRunNote || '',
             nextRunAt: entry.nextRunAt,
+            // repl.drift: absent from an older daemon — no pill, never "clean".
+            targetDrift: entry.targetDrift || null,
             raw: task,
         };
     }
@@ -652,6 +691,8 @@
     ANAS.replication.runTask = runTask;
     // cr3: exposed for cr3-replication.harness.mjs.
     ANAS.replication.renderLag = renderLag;
+    // repl.drift: exposed for repl-drift.harness.mjs.
+    ANAS.replication.renderDrift = renderDrift;
     ANAS.replication.encodedList = encodedList;
     ANAS.replication.locationComboCfg = locationComboCfg;
     ANAS.replication.reloadRemotes = reloadRemotes;
@@ -3402,6 +3443,7 @@
                 { name: 'exclude', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
                 { name: 'snapshotsBehind', type: 'auto' },
+                { name: 'targetDrift', type: 'auto' },
                 { name: 'raw', type: 'auto' },
             ],
             data: [],
@@ -3529,7 +3571,7 @@
                     {
                         text: t('Lag'),
                         dataIndex: 'snapshotsBehind',
-                        width: 100,
+                        width: 210,
                         align: 'center',
                         renderer: renderLag,
                     },

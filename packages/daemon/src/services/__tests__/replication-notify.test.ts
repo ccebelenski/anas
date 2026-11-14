@@ -212,6 +212,39 @@ describe('replication notifications — emission (9.4)', () => {
     assert.match(executor.calls[0].args[3], /completed with warnings$/)
   })
 
+  // repl.drift review P2 (operator: modified is critical, exposed informational).
+  it('a completed run that recorded its target CHANGED mails `error`, titled and resulted as what it is; exposed stays `warning`', async () => {
+    const changed = { mode: undefined, snapshot: 'anas-daily-b', upToDate: ['testpool/media'], warnings: ['Target \'backuppool/media\' has been changed since \'@anas-daily-b\': 12.00 KiB written'], targetDrift: [{ state: 'modified' as const }] }
+    const executor = mockPerl()
+    await notifyReplicationRun(executor, { ...LOCAL, result: changed })
+    assert.equal(executor.calls.length, 1)
+    assert.equal(executor.calls[0].args[2], 'error')
+    assert.equal(executor.calls[0].args[3], 'replication testpool/media -> backuppool/media completed, target changed')
+    assert.match(executor.calls[0].args[4], /^Result: {6}completed, target changed$/m)
+    const exposed = { ...changed, targetDrift: [{ state: 'exposed' as const }] }
+    const quiet = mockPerl()
+    await notifyReplicationRun(quiet, { ...LOCAL, result: exposed })
+    assert.equal(quiet.calls[0].args[2], 'warning')
+    assert.match(quiet.calls[0].args[3], /completed with warnings$/)
+  })
+
+  // repl.drift review 2 (note a): the daily check ran no replication, so its
+  // notice is never titled FAILED; it carries its own verdict at error.
+  it('the daily check\'s notice: its own verdict in the title and the Result line, at `error`, the sentence verbatim', async () => {
+    const error = 'The daily check of replication task \'media\' found its target changed; no replication ran: Target \'backuppool/media\' has been changed since \'@anas-daily-b\': 12.00 KiB written with no new snapshot'
+    const executor = mockPerl()
+    await notifyReplicationRun(executor, { ...LOCAL, dailyCheck: true, error })
+    assert.equal(executor.calls.length, 1)
+    assert.equal(executor.calls[0].args[2], 'error')
+    assert.equal(executor.calls[0].args[3], 'replication testpool/media -> backuppool/media daily check: target changed')
+    assert.match(executor.calls[0].args[4], /^Result: {6}daily check: target changed$/m)
+    assert.doesNotMatch(executor.calls[0].args[4], /FAILED/)
+    assert.ok(executor.calls[0].args[4].includes(`Error:\n  ${error}`))
+    const remote = mockPerl()
+    await notifyReplicationRun(remote, { ...LOCAL, location: { kind: 'remote', name: 'offsite' }, dailyCheck: true, error })
+    assert.equal(remote.calls[0].args[3], 'replication testpool/media -> backuppool/media (remote \'offsite\') daily check: target changed')
+  })
+
   it('a delivery failure is swallowed — best-effort by contract', async () => {
     const executor = mockPerl(255)
     await assert.doesNotReject(notifyReplicationRun(executor, { ...LOCAL, error: 'boom' }))

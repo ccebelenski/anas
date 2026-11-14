@@ -170,6 +170,20 @@ export interface SettleHoldsInput {
    * base may be the very snapshot the legacy hold pins).
    */
   releaseLegacyOnSource: boolean
+  /**
+   * repl.drift review D2: when given, the settle records what it CHANGED —
+   * every hold it placed (a `zfs hold` that exited 0; one answered "tag
+   * already exists" changed nothing) and every hold it released (a `zfs
+   * release` that exited 0), as full snapshot names — so a sentence about
+   * the run can say what happened to its holds.
+   */
+  done?: SettleActs
+}
+
+/** What a settle changed (review D2): full snapshot names, in command order. */
+export interface SettleActs {
+  placed: string[]
+  released: string[]
 }
 
 export interface HoldDeps {
@@ -207,7 +221,10 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
 
   // 1) The own holds — new base, both sides. cr.21: `--` before the hold-tag
   //    and snapshot operands (both derived).
+  const done = input.done
   const srcHold = await executor.exec('/usr/sbin/zfs', ['hold', '--', tag, srcSnapFull])
+  if (srcHold.exitCode === 0)
+    done?.placed.push(srcSnapFull)
   const srcHeld = srcHold.exitCode === 0 || (srcHold.exitCode !== SSH_OWN_FAILURE && alreadyHeld(srcHold.stderr, srcSnapFull))
   if (!srcHeld) {
     warnings.push(`Could not place ${tag} hold on ${srcSnapFull}: ${failText(srcHold)}`)
@@ -216,6 +233,8 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
   const tgtHold = remote
     ? await transport.remoteHold(remote, tgtSnapFull, tag)
     : await executor.exec('/usr/sbin/zfs', ['hold', '--', tag, tgtSnapFull])
+  if (tgtHold.exitCode === 0)
+    done?.placed.push(tgtSnapFull)
   const tgtHeld = tgtHold.exitCode === 0 || (tgtHold.exitCode !== SSH_OWN_FAILURE && alreadyHeld(tgtHold.stderr, tgtSnapFull))
   if (!tgtHeld) {
     warnings.push(`Could not place ${tag} hold on ${tgtSnapFull}: ${failText(tgtHold)}`)
@@ -232,9 +251,9 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
       const full = `${source.dataset}@${name}`
       const tags = srcHolds.get(full) ?? []
       if (name !== snapName && tags.includes(tag))
-        await releaseLocal(executor, tag, full, warnings)
+        await releaseLocal(executor, tag, full, warnings, done)
       if (input.releaseLegacyOnSource && ownBase.has(name) && tags.includes(LEGACY_REPLICATION_HOLD_TAG))
-        await releaseLocal(executor, LEGACY_REPLICATION_HOLD_TAG, full, warnings)
+        await releaseLocal(executor, LEGACY_REPLICATION_HOLD_TAG, full, warnings, done)
     }
   }
 
@@ -249,6 +268,8 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
         const rel = await transport.remoteRelease(remote, full, t)
         if (rel.exitCode !== 0)
           warnings.push(`Could not release ${t} hold on ${full}: ${failText(rel)}`)
+        else
+          done?.released.push(full)
       }
     }
   }
@@ -258,7 +279,7 @@ export async function settleReplicationHolds(deps: HoldDeps, input: SettleHoldsI
     for (const name of target.snapshotNames) {
       const full = `${target.dataset}@${name}`
       for (const t of releasableTargetTags(tgtHolds.get(full) ?? [], name, snapName, tag))
-        await releaseLocal(executor, t, full, warnings)
+        await releaseLocal(executor, t, full, warnings, done)
     }
   }
   return warnings
@@ -297,10 +318,12 @@ function alreadyHeld(stderr: string, snapshot: string): boolean {
   return false
 }
 
-async function releaseLocal(executor: CommandExecutor, tag: string, full: string, warnings: string[]): Promise<void> {
+async function releaseLocal(executor: CommandExecutor, tag: string, full: string, warnings: string[], done?: SettleActs): Promise<void> {
   const rel = await executor.exec('/usr/sbin/zfs', ['release', '--', tag, full])
   if (rel.exitCode !== 0)
     warnings.push(`Could not release ${tag} hold on ${full}: ${failText(rel)}`)
+  else
+    done?.released.push(full)
 }
 
 /** Whether the legacy hold may come off this source, and why not when it may not. */

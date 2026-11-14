@@ -3,7 +3,6 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { PoolExistence, Transport } from '../services/replication-transport.js'
-import type { TargetNamesResolver } from '../services/replication-units.js'
 import type { UnitTaskObject } from '../services/task-units.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -12,13 +11,14 @@ import { currentLane } from '../executor/deadline.js'
 import { parseTreeList } from '../parsers/zfs-tree.js'
 import { guardCheck, guarded, sendRefusal, taskClaim } from '../safety/guard.js'
 import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage } from '../services/pve-footprint.js'
-import { readRemoteSnapshotNames } from '../services/replication-snapshots.js'
+import { syncDriftCheckUnits } from '../services/replication-check-units.js'
 import { guardReplicationTarget, memoisePoolExists, readLocalPoolExistence } from '../services/replication-target.js'
 import { ownedMessage } from '../services/replication-tree-gate.js'
 import { treePlacementRefusals, treeTargetName, treeTargetNameRefusals } from '../services/replication-tree.js'
 import {
   collectTaskStatuses,
   readTask,
+  remoteTargetReaders,
   removeTaskUnits,
   resolveTaskDatasets,
   serviceUnitName,
@@ -94,20 +94,24 @@ export async function replicationTaskRoutes(
    * "everything is behind". cr3: so is a listing that FAILED — before, the
    * ssh listing answered `[]` on any failure (`remoteSnapshotNames`), and the
    * comment here was not true of it; a target ZFS says does not exist is an
-   * empty set (nothing replicated yet, the truth).
+   * empty set (nothing replicated yet, the truth). repl.drift: the names come
+   * newest first, and the drift read runs `zfs` over the same ssh argv
+   * (`remoteTargetReaders`, shared with the dashboard collector).
    */
-  const remoteTargetNames: TargetNamesResolver = async (task, targetFull) => {
+  const remoteReaders = remoteTargetReaders(transport)
+
+  /**
+   * repl.drift, ruling 3: the node-wide daily target check comes with the
+   * first task and goes with the last. Its failure never fails the task's own
+   * change: the job's result says what happened to it.
+   */
+  async function syncDailyCheck(): Promise<{ dailyCheck?: string, dailyCheckWarning?: string }> {
     try {
-      const res = await transport.resolveLocation(task.target.location!)
-      if (!res.ok)
-        return null
-      const read = await readRemoteSnapshotNames(cmd => transport.sshExec(res.resolved, cmd), targetFull)
-      if (!read.ok)
-        return null
-      return new Set(read.exists ? read.snapshots : [])
+      const r = await syncDriftCheckUnits(executor, systemdDir)
+      return r === 'unchanged' ? {} : { dailyCheck: r }
     }
-    catch {
-      return null
+    catch (err) {
+      return { dailyCheckWarning: `The daily replication target check timer could not be updated: ${err instanceof Error ? err.message : String(err)}` }
     }
   }
 
@@ -471,7 +475,7 @@ export async function replicationTaskRoutes(
 
   // --- GET /replication/tasks — derived statuses (read-only) ----------------
   server.get('/replication/tasks', async () => {
-    return { data: await collectTaskStatuses(executor, systemdDir, remoteTargetNames) }
+    return { data: await collectTaskStatuses(executor, systemdDir, remoteReaders.names, remoteReaders.zfs) }
   })
 
   // --- POST /replication/tasks — create -------------------------------------
@@ -503,7 +507,7 @@ export async function replicationTaskRoutes(
       { ...identity, params: { task: task.name } },
       guarded(spec, pre, async () => {
         await writeTaskUnits(executor, systemdDir, task)
-        return { created: task.name }
+        return { created: task.name, ...(await syncDailyCheck()) }
       }),
       { locks: pre.locks },
     )
@@ -635,7 +639,7 @@ export async function replicationTaskRoutes(
       guarded(spec, pre, async () => {
         // Rewrite both units and re-sync the timer to `enabled` (toggle support).
         await writeTaskUnits(executor, systemdDir, merged)
-        return { updated: name }
+        return { updated: name, ...(await syncDailyCheck()) }
       }),
       { locks: pre.locks },
     )
@@ -672,7 +676,7 @@ export async function replicationTaskRoutes(
       { ...identity, params: { task: name } },
       guarded(spec, pre, async () => {
         await removeTaskUnits(executor, systemdDir, name)
-        return { removed: name }
+        return { removed: name, ...(await syncDailyCheck()) }
       }),
       { locks: pre.locks },
     )

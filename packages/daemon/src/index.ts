@@ -12,6 +12,7 @@ import { CLOUD_UNIT_KIND } from './services/cloud-units.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
 import { sweepStaleMountProbes } from './services/mounts.js'
 import { PROBE_TMP_BASE, sweepStaleProbeDirs } from './services/rclone-probe.js'
+import { syncDriftCheckUnits } from './services/replication-check-units.js'
 import { REPLICATION_UNIT_PREFIX } from './services/replication-units.js'
 import { reconcileSelfhealState, reconcileWasQuiet } from './services/selfheal-reconcile.js'
 import { DEFAULT_SYSTEMD_DIR, readScheduleList, SNAPSHOT_UNIT_PREFIX } from './services/snapshot-schedule-units.js'
@@ -192,6 +193,17 @@ async function main() {
             server.log.warn(`schedule unit ${u.file} could not be read (${u.reason}); its timer may still fire — delete it from the Schedules view or by hand`)
         }).catch((err) => {
           server.log.warn(`schedule unit scan failed: ${err instanceof Error ? err.message : String(err)}`)
+        })
+
+        // repl.drift, ruling 3: a node that had replication tasks before the
+        // daily target check existed gets its timer here (and a node whose
+        // last task went while the daemon was down loses it). Non-blocking,
+        // fail-open.
+        void syncDriftCheckUnits(bootExecutor, DEFAULT_SYSTEMD_DIR).then((r) => {
+          if (r !== 'unchanged')
+            server.log.info(`replication daily check units: ${r}`)
+        }).catch((err) => {
+          server.log.warn(`replication daily check units could not be synced: ${err instanceof Error ? err.message : String(err)}`)
         })
 
         void sweepOrphanTaskStamps([

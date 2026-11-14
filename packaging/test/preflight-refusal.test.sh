@@ -57,7 +57,7 @@ stage_release() {
   cp "${PKG}/anas-md-event.sh" "${PKG}/anas-cache-event.sh" "${PKG}/anas-cache.rules" "${rel}/"
   cp -a "${PKG}/systemd/." "${rel}/systemd/"
   cp "${PKG}"/templates/anas-*.txt.hbs "${rel}/templates/"
-  for t in recycle-purge.js backup-task.js cloud-task.js; do
+  for t in recycle-purge.js backup-task.js cloud-task.js replicate-task.js repl-drift-check.js; do
     : > "${rel}/app/packages/daemon/dist/${t}"
   done
   mkdir -p "${rel}/app/packages/daemon/dist/services"
@@ -146,6 +146,8 @@ for need in VERSION systemd/anasd.service systemd/anas.service anas-md-event.sh 
             app/packages/daemon/dist/recycle-purge.js \
             app/packages/daemon/dist/backup-task.js \
             app/packages/daemon/dist/cloud-task.js \
+            app/packages/daemon/dist/replicate-task.js \
+            app/packages/daemon/dist/repl-drift-check.js \
             app/packages/daemon/dist/services/anas-acl-walk.pl \
             templates/anas-ahr-subject.txt.hbs templates/anas-cloud-body.txt.hbs \
             templates/anas-integration-subject.txt.hbs; do

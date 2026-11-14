@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { parseTreeList, parseTreeProps, parseTreeSnapshots } from '../../parsers/zfs-tree.js'
-import { planTreeReplication, treePlacementRefusals, treeTargetNameRefusals } from '../replication-tree.js'
+import { planTreeReplication, treeDriftChecks, treePlacementRefusals, treeTargetNameRefusals } from '../replication-tree.js'
 import { isAtOrUnder } from '../zfs-snapshot.js'
 
 /**
@@ -275,14 +275,21 @@ describe('rule 7: one snapshot name across the tree', () => {
 })
 
 describe('rule 8: per-dataset full, incremental, up to date, refused', () => {
-  it('a target modified since its last received snapshot refuses (written above 0)', () => {
-    assert.deepEqual(refusalsOf(baseFacts({
+  // repl.drift: the planner no longer refuses `written` > 0 (its sentence
+  // said "or remove it" while a common snapshot exists); it plans the
+  // incremental and hands the copy to the gate's drift judgement, which
+  // refuses with the drift sentence (replication-drift.test.ts pins it).
+  it('a target modified since its last received snapshot is handed to the drift gate with its base (written above 0)', () => {
+    const facts = baseFacts({
       sourceSnaps: new Map([['tank', [S2, S1]]]),
       targetTree: ['backup'],
       targetSnaps: new Map([['backup', [S1]]]),
-      targetProps: new Map([['backup', { written: '24576' }]]),
-    })), [
-      `Target 'backup' has been modified since its last replicated snapshot — a receive would fail; roll it back to that snapshot, or remove it`,
+      targetProps: new Map([['backup', { written: '24576', readonly: 'on' }]]),
+    })
+    const plan = planOf(facts)
+    assert.deepEqual(plan.datasets, [{ dataset: 'tank', target: 'backup', mode: 'incremental', baseSnapshot: S1 }])
+    assert.deepEqual(treeDriftChecks(facts, plan), [
+      { dataset: 'tank', target: 'backup', base: S1, targetSnaps: [S1], sends: true, known: { written: 24576, readonly: 'on' } },
     ])
   })
 

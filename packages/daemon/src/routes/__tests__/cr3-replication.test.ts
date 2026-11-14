@@ -81,6 +81,18 @@ interface World {
   zpoolList?: ExecResult
   /** ssh (remote) answers, keyed by the remote command joined with spaces. */
   remote?: Map<string, ExecResult>
+  /**
+   * repl.drift: the target's `zfs get written@<base>,readonly` answer (local
+   * or over ssh). Absent: a clean read-only replica (`0`, `on`), the state
+   * every world here models.
+   */
+  targetState?: ExecResult
+}
+
+/** A clean read-only replica's answer to the drift read (the captured rows' shape). */
+function cleanTargetState(args: string[]): ExecResult {
+  const props = args[args.indexOf('--') - 1].split(',')
+  return ok(`${props[0]}\t0\t-\nreadonly\ton\tlocal\n`)
 }
 
 function hold(world: World, snap: string, tag: string): void {
@@ -124,8 +136,13 @@ function fakeExecutor(world: World, log: string[]): CommandExecutor {
     }
     if (cmd === ZFS && args[0] === 'send')
       return ok('size\t1000\n')
+    if (cmd === ZFS && args[0] === 'get')
+      return world.targetState ?? cleanTargetState(args)
     if (cmd === '/usr/bin/ssh') {
-      const remoteCmd = args.slice(args.indexOf('--') + 2).join(' ')
+      const remoteArgs = args.slice(args.indexOf('--') + 2)
+      const remoteCmd = remoteArgs.join(' ')
+      if (remoteArgs[1] === 'get' && !world.remote?.has(remoteCmd))
+        return world.targetState ?? cleanTargetState(remoteArgs.slice(1))
       return world.remote?.get(remoteCmd) ?? { stdout: '', stderr: 'no fixture', exitCode: 127 }
     }
     return { stdout: '', stderr: 'no fixture', exitCode: 127 }
@@ -367,7 +384,7 @@ describe('cr3 — which snapshot a run sends when none is named', () => {
     ])))
     const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
     assert.equal(r.error, undefined, r.error?.message)
-    assert.deepEqual(r.log.filter(l => l.startsWith('PIPE')), ['PIPE send -i @Sbase -- tank/data@Sn | recv -- backup/data'])
+    assert.deepEqual(r.log.filter(l => l.startsWith('PIPE')), ['PIPE send -i @Sbase -- tank/data@Sn | recv -o readonly=on -- backup/data'])
     assert.equal(world.holds.get(`${SRC}@anas-backup-nightly-1794618281`), undefined, 'the transient carries no hold')
   })
 
@@ -383,7 +400,7 @@ describe('cr3 — which snapshot a run sends when none is named', () => {
     ])))
     const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
     assert.equal(r.error, undefined, r.error?.message)
-    assert.deepEqual(r.log.filter(l => l.startsWith('PIPE')), ['PIPE send -i @Sbase -- tank/data@late | recv -- backup/data'])
+    assert.deepEqual(r.log.filter(l => l.startsWith('PIPE')), ['PIPE send -i @Sbase -- tank/data@late | recv -o readonly=on -- backup/data'])
   })
 })
 
@@ -546,7 +563,7 @@ describe('review 2 of cr3 — a transient the TARGET ends on (an older build sen
     const world = oldBuildWorld(['S1', 'S2', 'S3', T, 'S4'], ['S1', 'S2', 'S3', T])
     const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
     assert.equal(r.error, undefined, r.error?.message)
-    assert.deepEqual(r.log.filter(l => l.startsWith('PIPE')), [`PIPE send -i @${T} -- tank/data@S4 | recv -- backup/data`])
+    assert.deepEqual(r.log.filter(l => l.startsWith('PIPE')), [`PIPE send -i @${T} -- tank/data@S4 | recv -o readonly=on -- backup/data`])
     // The fake receive changes nothing on the target listing, so the target
     // side holds S4 by name; what matters: no hold is left on the transient.
     assert.equal(world.holds.get(`${SRC}@${T}`)?.size ?? 0, 0, 'the source transient is released')
@@ -570,7 +587,7 @@ describe('review 2 of cr3 — a transient the TARGET ends on (an older build sen
       hold(world, `${TGT}@S3`, LOCAL_TAG)
       const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
       assert.equal(r.error, undefined, r.error?.message)
-      assert.deepEqual(r.log.filter(l => l.startsWith('PIPE')), ['PIPE send -i @S3 -- tank/data@S4 | recv -- backup/data'])
+      assert.deepEqual(r.log.filter(l => l.startsWith('PIPE')), ['PIPE send -i @S3 -- tank/data@S4 | recv -o readonly=on -- backup/data'])
       assert.deepEqual([...(world.holds.get(`${SRC}@S4`) ?? [])], [LOCAL_TAG])
       assert.equal(world.holds.get(`${SRC}@S3`)?.size ?? 0, 0)
     })

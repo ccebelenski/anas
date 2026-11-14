@@ -324,6 +324,43 @@ export const LenientReplicationTask = ReplicationTaskFields.extend({
 })
 export type LenientReplicationTask = z.infer<typeof LenientReplicationTask>
 
+/**
+ * repl.drift — whether the replica would still accept the next incremental,
+ * read from ZFS on every status read and every run (never remembered):
+ * `zfs get -Hp -o property,value,source written@<base>,readonly -- <target>`
+ * on the target (ground truth `fixtures/zfs/zfs-written-replica.zfs2.4.2.txt`).
+ *
+ * - `clean`: nothing written since `@base`, and the replica is read-only.
+ * - `exposed`: nothing written since `@base` yet, but `readonly` is not `on`:
+ *   any write, and any read while access-time updates are on, makes the next
+ *   send fail. A warning, not a failure.
+ * - `modified`: `writtenBytes` written since `@base`: ZFS refuses an
+ *   incremental based on it until the target is rolled back.
+ * - `unknown`: the read failed, timed out, or did not parse; never `clean`.
+ *
+ * `message` is the one sentence for the state (absent for `clean`).
+ * `dataset` names the target dataset the state is about (a recursive task's
+ * status row is its root's).
+ */
+export const ReplicationTargetDrift = z.object({
+  state: z.enum(['clean', 'exposed', 'modified', 'unknown']),
+  dataset: z.string(),
+  base: z.string(),
+  writtenBytes: z.number().int().nonnegative().optional(),
+  /** The target's snapshots newer than `@base`, newest first (a rollback to `@base` destroys them). */
+  newerSnapshots: z.array(z.string()).optional(),
+  /** `readonly` as read (`on`/`off`); absent when it was not read. */
+  readonly: z.string().optional(),
+  message: z.string().optional(),
+  /**
+   * Present when the state is the one the task's LAST RUN recorded at this
+   * time (the dashboard's answer for a peer or remote target, which it never
+   * reads over ssh); absent when the target was read just now.
+   */
+  asOf: ISODateTime.optional(),
+})
+export type ReplicationTargetDrift = z.infer<typeof ReplicationTargetDrift>
+
 /** Live status of a task — derived, never stored (ZFS + systemd truth). */
 export const ReplicationTaskStatus = z.object({
   task: ReplicationTask,
@@ -359,6 +396,13 @@ export const ReplicationTaskStatus = z.object({
    * use for the same fact. ADDITIVE/optional: absent when the read answered.
    */
   statusUnreadable: z.literal(true).optional(),
+  /**
+   * repl.drift: the target's state against the snapshot the next incremental
+   * starts from. Absent when there is no such snapshot to judge (no target
+   * yet, nothing in common, or the lag could not be read). ADDITIVE/optional:
+   * an older panel ignores it.
+   */
+  targetDrift: ReplicationTargetDrift.optional(),
 })
 export type ReplicationTaskStatus = z.infer<typeof ReplicationTaskStatus>
 

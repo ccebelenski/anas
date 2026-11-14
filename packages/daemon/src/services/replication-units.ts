@@ -1,15 +1,22 @@
-import type { DashboardWarning, ReplicationTask, ReplicationTaskStatus, Snapshot } from '@anas/shared'
-import type { CommandExecutor } from '../executor/types.js'
+import type { DashboardWarning, ReplicationTargetDrift, ReplicationTask, ReplicationTaskStatus, Snapshot } from '@anas/shared'
+import type { CommandExecutor, ExecResult } from '../executor/types.js'
+import type { TreeUnchecked } from './replication-drift.js'
+import type { Transport } from './replication-transport.js'
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { LenientReplicationTask as LenientReplicationTaskSchema, ReplicationTask as ReplicationTaskSchema } from '@anas/shared'
-import { readLocalSnapshots } from './replication-snapshots.js'
+import { DatasetPath, LenientReplicationTask as LenientReplicationTaskSchema, ReplicationTask as ReplicationTaskSchema, SnapshotName } from '@anas/shared'
+import { parseTreeSnapshots, zfsTreeSnapshotsArgs } from '../parsers/zfs-tree.js'
+import { checkTargetDrift, nextIncrementalBase, readBaseHeld, treeUncheckedClause, treeUncheckedSentence, worstTargetDrift, writeOrAtimeRead } from './replication-drift.js'
+import { replicationHoldTag } from './replication-holds.js'
+import { readLocalSnapshots, readRemoteSnapshotNames } from './replication-snapshots.js'
+import { judgeTreeTargets } from './replication-tree-gate.js'
+import { readFailureReason, readTreeFactsWith } from './replication-tree-read.js'
 import { isTransientRunSnapshot } from './snapshot-naming.js'
 // The unit-store plumbing (marker regex, unlink, systemctl, unit-dir listing)
 // is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
 // hand-copy and its last private leftovers (third pass).
 import { listServiceUnitsChecked, markerRegex, quoteExecArg, readUnitFile, refuseControlChars, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
-import { deriveUnitRunStatus, showReadFailed, toSystemdRunResult } from './unit-run-status.js'
+import { deriveUnitRunStatus, newestHelperResult, readOnce, readUnitJournal, showReadFailed, toSystemdRunResult, TRIGGER_SLACK_MS } from './unit-run-status.js'
 
 /**
  * Recurring replication TASKS (Epic 5.5.3) — the systemd units ARE the store.
@@ -30,6 +37,7 @@ import { deriveUnitRunStatus, showReadFailed, toSystemdRunResult } from './unit-
  */
 
 const SYSTEMCTL = '/usr/bin/systemctl'
+const ZFS = '/usr/sbin/zfs'
 const SYSTEMD_ANALYZE = '/usr/bin/systemd-analyze'
 /** The timer executes this compiled runner (ships in dist — see replicate-task.ts). */
 const RUNNER_NODE = '/usr/bin/node'
@@ -398,15 +406,77 @@ async function listSnapshots(executor: CommandExecutor, fullDataset: string): Pr
  * never a false "N behind").
  */
 export type TargetNamesResolver
-  = (task: ReplicationTask, targetFull: string) => Promise<Set<string> | null>
+  = (task: ReplicationTask, targetFull: string) => Promise<Set<string> | string[] | null>
 
-export async function deriveTaskStatus(
+/**
+ * repl.drift: run `zfs <args>` where a NON-local task's target lives (the
+ * transport's ssh argv). A resolver answers the names NEWEST FIRST (an
+ * array) for the drift read to judge the target; a Set carries no order,
+ * and the row then has no `targetDrift`.
+ */
+export type TargetZfsRunner = (task: ReplicationTask, args: string[]) => Promise<ExecResult>
+
+/**
+ * repl.drift: what the task's LAST RUN recorded about its target — the
+ * newest runner result line in the unit's journal, taken only when it is the
+ * last run's own line (its time within {@link TRIGGER_SLACK_MS} of the run's
+ * end), with a state and names the shared schemas accept. Changed (worst)
+ * first. Null when the last run recorded nothing.
+ */
+function recordedDrift(journal: string, lastRunAt: string | null): ReplicationTargetDrift | null {
+  const newest = newestHelperResult(journal)
+  if (!newest || newest.at === null || lastRunAt === null)
+    return null
+  if (Math.abs(Date.parse(lastRunAt) - Date.parse(newest.at)) > TRIGGER_SLACK_MS)
+    return null
+  const list = newest.result.targetDrift
+  if (!Array.isArray(list))
+    return null
+  const valid = list.filter((r): r is { state: 'modified' | 'exposed', dataset: string, base: string } =>
+    !!r && typeof r === 'object'
+    && ((r as { state?: unknown }).state === 'modified' || (r as { state?: unknown }).state === 'exposed')
+    && DatasetPath.safeParse((r as { dataset?: unknown }).dataset).success
+    && SnapshotName.safeParse((r as { base?: unknown }).base).success)
+  const pick = valid.find(r => r.state === 'modified') ?? valid[0]
+  return pick ? { state: pick.state, dataset: pick.dataset, base: pick.base, asOf: newest.at } : null
+}
+
+/** A task's lag and target state, read from ZFS (no systemd). */
+export interface TaskTargetRead {
+  lastReplicatedSnapshot: string | null
+  lastReplicatedAt: string | null
+  snapshotsBehind: number | null
+  targetDrift?: ReplicationTargetDrift
+  /**
+   * repl.drift review P4: re-reads the target's snapshot listing the verdict
+   * was judged against and answers whether it is UNCHANGED — false when it
+   * changed (a receive landed between the listing and the `written@` read)
+   * or could not be read. Set whenever `targetDrift` was read; the daily
+   * check alerts only on a `modified` verdict this confirms. Nothing is kept:
+   * the first listing lives only in this closure for the one check.
+   */
+  confirmUnchanged?: () => Promise<boolean>
+}
+
+/** A tree's per-dataset snapshot names as one comparable value. */
+function treeSnapshotsKey(snaps: Map<string, string[]>): string {
+  return JSON.stringify([...snaps])
+}
+
+/**
+ * The ZFS half of a task's status (repl.drift: shared by the status read and
+ * the daily drift check): the lag from the source and target listings, and
+ * the target's state against the snapshot its next incremental starts from.
+ * A peer/remote target is read only through the readers given (none: the lag
+ * and the drift stay unknown/absent, and nothing is opened).
+ */
+export async function readTaskTarget(
   executor: CommandExecutor,
   task: ReplicationTask,
   remoteTargetNames?: TargetNamesResolver,
-): Promise<ReplicationTaskStatus> {
+  remoteTargetZfs?: TargetZfsRunner,
+): Promise<TaskTargetRead> {
   const { sourceFull, targetFull } = resolveTaskDatasets(task)
-
   // newest-first. ⚠ Transient backup snapshots (`anas-backup-<task>-<ts>`) are
   // dropped here as well as in the base discovery (backup2.3): they are never
   // replicated by design, so counting them would report a healthy task as N
@@ -414,11 +484,13 @@ export async function deriveTaskStatus(
   // silently fix itself when the run's `finally` destroyed them.
   // A source listing that could not be read leaves all three unknown (null),
   // exactly as a source with no snapshots does: no lag is derived from it.
-  const sourceSnaps = ((await listSnapshots(executor, sourceFull)) ?? [])
-    .filter(s => !isTransientRunSnapshot(s.snapshotName))
+  const allSourceSnaps = (await listSnapshots(executor, sourceFull)) ?? []
+  const sourceSnaps = allSourceSnaps.filter(s => !isTransientRunSnapshot(s.snapshotName))
   let lastReplicatedSnapshot: string | null = null
   let lastReplicatedAt: string | null = null
   let snapshotsBehind: number | null = null
+  let targetDrift: ReplicationTargetDrift | undefined
+  let confirmUnchanged: (() => Promise<boolean>) | undefined
 
   if (sourceSnaps.length > 0) {
     // Local target → list locally. Non-local target → the injected resolver
@@ -426,18 +498,105 @@ export async function deriveTaskStatus(
     // remote is unreadable here, so the lag honestly stays unknown (nulls).
     const isLocalTarget = !task.target.location || task.target.location.kind === 'local'
     let targetNames: Set<string> | null
+    /** The same names newest first, when the read gave an order (repl.drift). */
+    let targetOrder: string[] | null = null
     if (isLocalTarget) {
       // cr3: a target listing that could not be read is UNKNOWN (null), never
       // "nothing replicated"; a target ZFS says does not exist is the truth
       // "nothing replicated yet" (an empty set).
       const listed = await listSnapshots(executor, targetFull)
-      targetNames = listed === null ? null : new Set(listed.map(s => s.snapshotName))
+      targetOrder = listed === null ? null : listed.map(s => s.snapshotName)
+      targetNames = targetOrder === null ? null : new Set(targetOrder)
     }
     else if (remoteTargetNames) {
-      targetNames = await remoteTargetNames(task, targetFull)
+      const read = await remoteTargetNames(task, targetFull)
+      targetOrder = Array.isArray(read) ? read : null
+      targetNames = read === null ? null : new Set(read)
     }
     else {
       targetNames = null
+    }
+
+    // repl.drift: the snapshot the next incremental starts from, and whether
+    // the target still matches it (`written@<base>`) and is read-only — ONE
+    // read where the target lives. A READ only: nothing here notifies (the
+    // alert comes from runs and the daily check). A recursive task's LAG is
+    // its root's; its target state is the worst of its copies' (P1, below).
+    const base = targetOrder === null ? undefined : nextIncrementalBase(allSourceSnaps.map(s => s.snapshotName), targetOrder)
+    if (base !== undefined && targetOrder !== null) {
+      const runTarget = isLocalTarget
+        ? (args: string[]) => executor.exec(ZFS, args)
+        : remoteTargetZfs ? (args: string[]) => remoteTargetZfs(task, args) : null
+      const where = isLocalTarget ? '' : ` on ${task.target.location!.kind} '${task.target.location!.name ?? ''}'`
+      if (runTarget === null) {
+        targetDrift = { state: 'unknown', dataset: targetFull, base, message: `Could not check whether target '${targetFull}'${where} was changed since '@${base}': the target is not reachable from this read` }
+      }
+      else {
+        const tag = replicationHoldTag(task.target.location, targetFull)
+        const runSource = (args: string[]) => executor.exec(ZFS, args)
+        const readHeld = (sourceDs: string, targetDs: string, at: string) => () => readBaseHeld(runSource, runTarget, `${sourceDs}@${at}`, `${targetDs}@${at}`, tag)
+        // repl.drift P1: a RECURSIVE task's target is every copy its run
+        // receives into or finds up to date — judged by the run's own
+        // per-copy judgement over the run's own tree read, so a changed
+        // child shows here and alerts at the daily check. Review 2, defect 1
+        // (a read that could not see never says clean): a tree that cannot
+        // be read or planned leaves the copies UNCHECKED — the task's state
+        // is `unknown` with what could not be read, unless the root's own
+        // read below finds the root itself `modified`.
+        let treeUnchecked: TreeUnchecked | undefined
+        if (task.recursive === true) {
+          const tree = await readTreeFactsWith({ source: runSource, target: runTarget }, { sourceRoot: sourceFull, targetRoot: targetFull, exclude: task.exclude ?? [], localTarget: isLocalTarget })
+          if (!tree.ok) {
+            treeUnchecked = { read: readFailureReason(tree.message) }
+          }
+          else {
+            const copies = await judgeTreeTargets({ runTarget, where, readHeld: (ds, tgt, at) => readHeld(ds, tgt, at)() }, tree.facts)
+            if (copies.ok)
+              targetDrift = worstTargetDrift(copies.drifts)
+            else
+              treeUnchecked = { refusals: copies.refusals }
+          }
+          if (tree.ok && targetDrift !== undefined) {
+            const first = treeSnapshotsKey(tree.facts.targetSnaps)
+            confirmUnchanged = async () => {
+              try {
+                const again = await runTarget(zfsTreeSnapshotsArgs(targetFull))
+                return again.exitCode === 0 && treeSnapshotsKey(parseTreeSnapshots(again.stdout)) === first
+              }
+              catch {
+                return false
+              }
+            }
+          }
+        }
+        if (targetDrift === undefined) {
+          const root = await checkTargetDrift(runTarget, {
+            target: targetFull,
+            where,
+            base,
+            targetSnaps: targetOrder,
+            readHeld: readHeld(sourceFull, targetFull, base),
+          })
+          if (treeUnchecked === undefined)
+            targetDrift = root
+          else if (root.state === 'modified')
+            targetDrift = { ...root, message: `${root.message} ${treeUncheckedClause({ target: targetFull, why: treeUnchecked })}` }
+          else
+            targetDrift = { state: 'unknown', dataset: targetFull, base, message: treeUncheckedSentence({ target: targetFull, where, why: treeUnchecked }) }
+          const first = targetOrder.join('\n')
+          confirmUnchanged = async () => {
+            try {
+              const again = isLocalTarget
+                ? (await listSnapshots(executor, targetFull))?.map(s => s.snapshotName) ?? null
+                : await remoteTargetNames!(task, targetFull)
+              return Array.isArray(again) && again.join('\n') === first
+            }
+            catch {
+              return false
+            }
+          }
+        }
+      }
     }
 
     if (targetNames !== null) {
@@ -455,15 +614,44 @@ export async function deriveTaskStatus(
     }
   }
 
+  return { lastReplicatedSnapshot, lastReplicatedAt, snapshotsBehind, ...(targetDrift ? { targetDrift } : {}), ...(confirmUnchanged ? { confirmUnchanged } : {}) }
+}
+
+export async function deriveTaskStatus(
+  executor: CommandExecutor,
+  task: ReplicationTask,
+  remoteTargetNames?: TargetNamesResolver,
+  remoteTargetZfs?: TargetZfsRunner,
+  opts: {
+    /**
+     * repl.drift, the dashboard: a peer or remote target is never read here
+     * (no ssh); its drift is what the task's last run recorded, as of then.
+     */
+    remoteDriftFromLastRun?: boolean
+  } = {},
+): Promise<ReplicationTaskStatus> {
+  const read = await readTaskTarget(executor, task, remoteTargetNames, remoteTargetZfs)
+  const { lastReplicatedSnapshot, lastReplicatedAt, snapshotsBehind } = read
+  let targetDrift = read.targetDrift
+
   // taskstatus.1: the shared run-status derivation (unit-run-status.ts) —
   // live service props, else the runner's journal result line, else the
   // timer's last trigger. Replication's row carries the verdict and the next
   // run; its "when" is the ZFS-derived lastReplicatedAt above, not the unit's.
+  const isRemote = !!task.target.location && task.target.location.kind !== 'local'
+  const fromLastRun = opts.remoteDriftFromLastRun === true && isRemote
+  const readJournal = readOnce(() => readUnitJournal(executor, serviceUnitName(task.name)))
   const run = await deriveUnitRunStatus(executor, {
     serviceUnit: serviceUnitName(task.name),
     timerUnit: timerUnitName(task.name),
     enabled: task.enabled,
+    ...(fromLastRun ? { readJournal } : {}),
   })
+  if (fromLastRun && targetDrift === undefined) {
+    const recorded = recordedDrift(await readJournal(), run.lastRunAt)
+    if (recorded)
+      targetDrift = recorded
+  }
 
   return {
     task,
@@ -476,7 +664,40 @@ export async function deriveTaskStatus(
     // cr3.followup: a `systemctl show` that could not answer is a failed
     // read, never the `unknown` result it derives to.
     ...(showReadFailed(run.serviceProps) ? { statusUnreadable: true as const } : {}),
+    ...(targetDrift ? { targetDrift } : {}),
   }
+}
+
+/**
+ * How a status read reaches a NON-local task's target (the task list route
+ * and the dashboard collector share it): the snapshot names over ssh, NEWEST
+ * FIRST (`readRemoteSnapshotNames`: a failed listing is null — unknown, never
+ * "nothing replicated"; a target ZFS says does not exist is `[]`), and
+ * `zfs <args>` there for the drift read (repl.drift). A location that does
+ * not resolve answers null / a failed read.
+ */
+export function remoteTargetReaders(transport: Transport): { names: TargetNamesResolver, zfs: TargetZfsRunner } {
+  const names: TargetNamesResolver = async (task, targetFull) => {
+    try {
+      const res = await transport.resolveLocation(task.target.location!)
+      if (!res.ok)
+        return null
+      const read = await readRemoteSnapshotNames(cmd => transport.sshExec(res.resolved, cmd), targetFull)
+      if (!read.ok)
+        return null
+      return read.exists ? read.snapshots : []
+    }
+    catch {
+      return null
+    }
+  }
+  const zfs: TargetZfsRunner = async (task, args) => {
+    const res = await transport.resolveLocation(task.target.location!)
+    if (!res.ok)
+      return { stdout: '', stderr: res.error, exitCode: 1 }
+    return transport.sshExec(res.resolved, ['zfs', ...args])
+  }
+  return { names, zfs }
 }
 
 /** Derive statuses for every task in the store (fail-open per task). */
@@ -484,9 +705,10 @@ export async function collectTaskStatuses(
   executor: CommandExecutor,
   dir: string,
   remoteTargetNames?: TargetNamesResolver,
+  remoteTargetZfs?: TargetZfsRunner,
 ): Promise<ReplicationTaskStatus[]> {
   const tasks = await readAllTasks(dir)
-  return Promise.all(tasks.map(t => deriveTaskStatus(executor, t, remoteTargetNames)))
+  return Promise.all(tasks.map(t => deriveTaskStatus(executor, t, remoteTargetNames, remoteTargetZfs)))
 }
 
 /**
@@ -495,12 +717,55 @@ export async function collectTaskStatuses(
  * deep-link into the Replication view.
  */
 export function buildReplicationWarnings(statuses: ReplicationTaskStatus[]): DashboardWarning[] {
-  return statuses
-    .filter(s => s.lastRunResult === 'failure')
-    .map(s => ({
-      level: 'warning',
-      category: 'replication',
-      message: `Replication task '${s.task.name}' last run failed — check the Replication view`,
-      ref: s.task.name,
-    }))
+  const out: DashboardWarning[] = []
+  for (const s of statuses) {
+    const drift = s.targetDrift
+    // repl.drift: a target changed since its base is said by name, and one
+    // that is not read-only gets its own card while its runs still succeed.
+    // A state a run recorded (a peer or remote target, which the dashboard
+    // never reads) names that run's time (review N5: the record is taken from
+    // the newest result line near the last run's end, which two runs a few
+    // seconds apart can blur, so the card names the time, never "the last
+    // run").
+    const runAt = drift?.asOf ? `its run at ${drift.asOf.slice(0, 16).replace('T', ' ')} UTC found ` : ''
+    if (drift?.state === 'modified') {
+      out.push({
+        level: 'warning',
+        category: 'replication',
+        message: runAt
+          ? `Replication task '${s.task.name}': ${runAt}its target '${drift.dataset}' changed since '@${drift.base}'; replication into it stops until those changes are discarded — check the Replication view`
+          : `Replication task '${s.task.name}': its target '${drift.dataset}' has been changed since '@${drift.base}'; replication into it stops until those changes are discarded — check the Replication view`,
+        ref: s.task.name,
+      })
+    }
+    // Review N5: the failed-run card is left out only when the failed run's
+    // own record says it was refused for the changed target (a recorded
+    // `modified`); a target read live says nothing about why the last run
+    // failed, so both cards stand.
+    const failedOnTheChange = drift?.state === 'modified' && drift.asOf !== undefined
+    if (s.lastRunResult === 'failure' && !failedOnTheChange) {
+      out.push({
+        level: 'warning',
+        category: 'replication',
+        message: `Replication task '${s.task.name}' last run failed — check the Replication view`,
+        ref: s.task.name,
+      })
+    }
+    if (drift?.state === 'exposed') {
+      out.push({
+        level: 'warning',
+        category: 'replication',
+        message: runAt
+          ? `Replication task '${s.task.name}': ${runAt}its target '${drift.dataset}' not read-only, and ${writeOrAtimeRead('stops the next send')} — check the Replication view`
+          : `Replication task '${s.task.name}': its target '${drift.dataset}' is not read-only, and ${writeOrAtimeRead('stops the next send')} — check the Replication view`,
+        ref: s.task.name,
+      })
+    }
+  }
+  return out
+}
+
+/** repl.drift: the rows whose target state could not be read (the dashboard reports them incomplete). */
+export function driftUnreadTasks(statuses: ReplicationTaskStatus[]): string[] {
+  return statuses.filter(s => s.targetDrift?.state === 'unknown').map(s => s.task.name)
 }

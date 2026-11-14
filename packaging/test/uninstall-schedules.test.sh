@@ -66,6 +66,9 @@ make_units() {
   printf '[Service]\n' > "${SYSTEMD_DIR}/anas-scrub.service"
   printf '[Timer]\n'   > "${SYSTEMD_DIR}/anas-scrub.timer"
   : > "${STAMPS}/stamp-anas-scrub.timer"
+  printf '[Service]\n' > "${SYSTEMD_DIR}/anas-replcheck.service"
+  printf '[Timer]\n'   > "${SYSTEMD_DIR}/anas-replcheck.timer"
+  : > "${STAMPS}/stamp-anas-replcheck.timer"
   for n in nightly hourly; do
     for fam in snap backup repl; do
       printf '[Service]\n' > "${SYSTEMD_DIR}/anas-${fam}-${n}.service"
@@ -105,6 +108,10 @@ check "both scrub unit files removed" \
   bash -c "! test -e '${SYSTEMD_DIR}/anas-scrub.timer' && ! test -e '${SYSTEMD_DIR}/anas-scrub.service'"
 check "the scrub timer's Persistent stamp removed" \
   bash -c "! test -e '${STAMPS}/stamp-anas-scrub.timer'"
+check "anas-replcheck.timer disabled before removal" \
+  grep -q 'disable --now anas-replcheck.timer' "${WORK}/systemctl.log"
+check "the replication daily-check pair and its stamp removed" \
+  bash -c "! test -e '${SYSTEMD_DIR}/anas-replcheck.timer' && ! test -e '${SYSTEMD_DIR}/anas-replcheck.service' && ! test -e '${STAMPS}/stamp-anas-replcheck.timer'"
 for fam in snap backup repl; do
   check "${fam} unit pairs + stamps removed" \
     bash -c "! test -e '${SYSTEMD_DIR}/anas-${fam}-nightly.timer' && ! test -e '${SYSTEMD_DIR}/anas-${fam}-nightly.service' && ! test -e '${STAMPS}/stamp-anas-${fam}-nightly.timer'"
@@ -134,6 +141,8 @@ PATH="$(dirname "${SYSTEMCTL}"):$PATH" SYSTEMD_DIR="${SYSTEMD_DIR}" TIMERS_STAMP
   ANAS_UNINSTALL_LIB_ONLY=1 bash -c "source '${UNINSTALL}'; remove_schedule_units" > "${WORK}/out.log" 2>&1
 check "scrub removal line names the family and count" \
   grep -F 'removed 1 ANAS schedule unit pair (anas-scrub.*)' "${WORK}/out.log"
+check "the daily-check removal line names the family" \
+  grep -F 'removed 1 ANAS schedule unit pair (anas-replcheck.*)' "${WORK}/out.log"
 check "the restore is stated, and named as the distro default" \
   bash -c "grep -q 'has been RESTORED' '${WORK}/out.log' && grep -q 'distro default' '${WORK}/out.log'"
 check "no stale NOT-been-re-enabled admission" \
@@ -200,7 +209,7 @@ source_uninstall >/dev/null 2>&1
 : > "${WORK}/systemctl.log"
 source_uninstall >/dev/null 2>&1
 check "second run issues no mdcheck or anas-scrub systemctl calls" \
-  bash -c "! grep -q mdcheck '${WORK}/systemctl.log' && ! grep -q anas-scrub '${WORK}/systemctl.log'"
+  bash -c "! grep -q mdcheck '${WORK}/systemctl.log' && ! grep -q anas-scrub '${WORK}/systemctl.log' && ! grep -q anas-replcheck '${WORK}/systemctl.log'"
 check "second run leaves no units" \
   bash -c "! test -e '${SYSTEMD_DIR}/anas-scrub.timer' && ! test -e '${SYSTEMD_DIR}/anas-snap-nightly.service'"
 

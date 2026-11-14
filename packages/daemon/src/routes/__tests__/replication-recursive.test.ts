@@ -208,13 +208,13 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
     if (local) {
       mock.addFixture({ command: ZFS, args: zfsTreeListArgs(TARGET_POOL), result: ok(targetPoolListing()) })
       mock.addFixture({ command: ZFS, args: zfsTreeSnapshotsArgs(TARGET_ROOT), result: ok(fixture('dst-snaps-p.txt')) })
-      mock.addFixture({ command: ZFS, args: zfsTreeGetArgs(TARGET_ROOT, ['written']), result: ok(fixture('dst-written.txt')) })
+      mock.addFixture({ command: ZFS, args: zfsTreeGetArgs(TARGET_ROOT, ['written', 'readonly']), result: ok(fixture('dst-written.txt')) })
     }
     else {
       sshFix(['zpool', 'list', '-H', '-o', 'name'], ok('datapool\n'))
       sshFix(['zfs', ...zfsTreeListArgs(TARGET_POOL)], ok(targetPoolListing()))
       sshFix(['zfs', ...zfsTreeSnapshotsArgs(TARGET_ROOT)], ok(fixture('dst-snaps-p.txt')))
-      sshFix(['zfs', ...zfsTreeGetArgs(TARGET_ROOT, ['written'])], ok(fixture('dst-written.txt')))
+      sshFix(['zfs', ...zfsTreeGetArgs(TARGET_ROOT, ['written', 'readonly'])], ok(fixture('dst-written.txt')))
       // The post-receive target read (fail-open; nothing held there yet).
       sshFix(['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', '-s', 'createtxg', '--', TARGET_ROOT], ok(''))
     }
@@ -256,12 +256,12 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
     assert.equal(job?.status, 'completed', JSON.stringify(job?.error))
 
     assert.deepEqual(mock.pipelineCalls, [
-      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `${SOURCE}@${S2}`], cmd2: ZFS, args2: ['recv', '--', TARGET_ROOT] },
-      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/a@${S2}`], cmd2: ZFS, args2: ['recv', '--', 'datapool/rrdst/a'] },
-      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/a/deep@${S2}`], cmd2: ZFS, args2: ['recv', '--', 'datapool/rrdst/a/deep'] },
-      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/enc@${S2}`], cmd2: ZFS, args2: ['recv', '--', 'datapool/rrdst/enc'] },
+      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `${SOURCE}@${S2}`], cmd2: ZFS, args2: ['recv', '-o', 'readonly=on', '--', TARGET_ROOT] },
+      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/a@${S2}`], cmd2: ZFS, args2: ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/a'] },
+      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/a/deep@${S2}`], cmd2: ZFS, args2: ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/a/deep'] },
+      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/enc@${S2}`], cmd2: ZFS, args2: ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/enc'] },
       { cmd1: ZFS, args1: ['send', '--', `rpool/rrsrc/new@${S2}`], cmd2: ZFS, args2: ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/new'] },
-      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/vol@${S2}`], cmd2: ZFS, args2: ['recv', '--', 'datapool/rrdst/vol'] },
+      { cmd1: ZFS, args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/vol@${S2}`], cmd2: ZFS, args2: ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/vol'] },
     ])
 
     const result = job!.result as {
@@ -340,12 +340,12 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
     assert.equal(mock.pipelineCalls.length, PLANNED.length)
     const remoteTag = replicationHoldTag({ kind: 'remote', name: 'nas1' }, TARGET_ROOT)
     const expected = [
-      ['recv', '--', TARGET_ROOT],
-      ['recv', '--', 'datapool/rrdst/a'],
-      ['recv', '--', 'datapool/rrdst/a/deep'],
-      ['recv', '--', 'datapool/rrdst/enc'],
+      ['recv', '-o', 'readonly=on', '--', TARGET_ROOT],
+      ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/a'],
+      ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/a/deep'],
+      ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/enc'],
       ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/new'],
-      ['recv', '--', 'datapool/rrdst/vol'],
+      ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/vol'],
     ]
     mock.pipelineCalls.forEach((call, i) => {
       assert.equal(call.cmd1, ZFS)
@@ -371,7 +371,7 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
       cmd1: ZFS,
       args1: ['send', '-i', `@${S1}`, '--', `rpool/rrsrc/a/deep@${S2}`],
       cmd2: ZFS,
-      args2: ['recv', '--', 'datapool/rrdst/a/deep'],
+      args2: ['recv', '-o', 'readonly=on', '--', 'datapool/rrdst/a/deep'],
       result: { leftExitCode: 0, rightExitCode: 1, leftStderr: '', rightStderr: 'cannot receive incremental stream: destination datapool/rrdst/a/deep has been modified since most recent snapshot', stdout: '' },
     })
     const { job } = await run()
@@ -432,7 +432,7 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
     const written = `${fixture('dst-written.txt').trimEnd()}\ndatapool/rrdst/new\twritten\t0\ndatapool/rrdst/new\treadonly\ton\n`
     mock.prependFixture({ command: ZFS, args: zfsTreeListArgs(TARGET_POOL), result: ok(tree) })
     mock.prependFixture({ command: ZFS, args: zfsTreeSnapshotsArgs(TARGET_ROOT), result: ok(snaps) })
-    mock.prependFixture({ command: ZFS, args: zfsTreeGetArgs(TARGET_ROOT, ['written']), result: ok(written) })
+    mock.prependFixture({ command: ZFS, args: zfsTreeGetArgs(TARGET_ROOT, ['written', 'readonly']), result: ok(written) })
     const { job } = await run()
     assert.equal(job?.status, 'completed', JSON.stringify(job?.error))
     const result = job!.result as Record<string, unknown>
@@ -471,7 +471,7 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
     const written = `${fixture('dst-written.txt').trimEnd()}\ndatapool/rrdst/new\twritten\t0\ndatapool/rrdst/new\treadonly\ton\n`
     mock.prependFixture({ command: ZFS, args: zfsTreeListArgs(TARGET_POOL), result: ok(tree) })
     mock.prependFixture({ command: ZFS, args: zfsTreeSnapshotsArgs(TARGET_ROOT), result: ok(snaps) })
-    mock.prependFixture({ command: ZFS, args: zfsTreeGetArgs(TARGET_ROOT, ['written']), result: ok(written) })
+    mock.prependFixture({ command: ZFS, args: zfsTreeGetArgs(TARGET_ROOT, ['written', 'readonly']), result: ok(written) })
     mock.prependFixture({ command: ZFS, argsMatch: a => a[0] === 'hold', throws: new Error('spawn EAGAIN') })
     const { job } = await run()
     assert.equal(job?.status, 'completed', JSON.stringify(job?.error))
@@ -508,7 +508,7 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
     { args: zfsTreeGetArgs(SOURCE, ['keystatus']), okContent: fixture('src-keystatus.txt'), sentence: `Could not read the encryption state under '${SOURCE}' — refusing the recursive replication` },
     { args: zfsTreeListArgs(TARGET_POOL), okContent: targetPoolListing(), sentence: `Could not list the datasets of pool '${TARGET_POOL}' on the target — refusing the recursive replication` },
     { args: zfsTreeSnapshotsArgs(TARGET_ROOT), okContent: fixture('dst-snaps-p.txt'), sentence: `Could not list the snapshots under '${TARGET_ROOT}' on the target — refusing the recursive replication` },
-    { args: zfsTreeGetArgs(TARGET_ROOT, ['written']), okContent: fixture('dst-written.txt'), sentence: `Could not read the modification state under '${TARGET_ROOT}' on the target — refusing the recursive replication` },
+    { args: zfsTreeGetArgs(TARGET_ROOT, ['written', 'readonly']), okContent: fixture('dst-written.txt'), sentence: `Could not read the modification state under '${TARGET_ROOT}' on the target — refusing the recursive replication` },
   ]
 
   for (const read of READS) {

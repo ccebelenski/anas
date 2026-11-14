@@ -73,6 +73,13 @@ export interface ReplicationNotifyResult {
   upToDate?: string[]
   /** One sentence a run that sent nothing adds about why (cr3). */
   note?: string
+  /**
+   * repl.drift: what the run recorded about a target it found changed or
+   * not read-only. A completed run that found one `modified` (an up-to-date
+   * run: nothing to send, the NEXT send is refused) is mailed at ERROR
+   * severity (review P2).
+   */
+  targetDrift?: { state: 'modified' | 'exposed' }[]
 }
 
 export interface ReplicationNotifyContext extends UnattendedNotifyBase {
@@ -88,7 +95,19 @@ export interface ReplicationNotifyContext extends UnattendedNotifyBase {
   snapshot?: string
   /** The finished run result — absent when the run threw. */
   result?: ReplicationNotifyResult
+  /**
+   * repl.drift review 2 (note a): the DAILY CHECK found the target changed
+   * (repl-drift-check.ts). No replication ran, so the title and the Result
+   * line say what it is, never "FAILED"; `error` carries the sentence.
+   */
+  dailyCheck?: true
 }
+
+/** The verdict of a completed run that found its target changed (review P2). */
+const CHANGED_TARGET_VERDICT = 'completed, target changed'
+
+/** The verdict of the daily check that found a target changed (review 2, note a). */
+const DAILY_CHECK_VERDICT = 'daily check: target changed'
 
 /** Every C0 control character (the newline included) and DEL. */
 // eslint-disable-next-line no-control-regex
@@ -107,6 +126,18 @@ const SINGLE_LINE_MAX = 2000
 export function singleLine(text: string): string {
   const flat = text.replace(CONTROL_RE, ' ').trim()
   return flat.length > SINGLE_LINE_MAX ? `${flat.slice(0, SINGLE_LINE_MAX)}...` : flat
+}
+
+/**
+ * repl.drift review P2 (operator: modified is critical, exposed is
+ * informational): a run that COMPLETED and recorded its target `modified` —
+ * replication into it has stopped — reaches PVE at ERROR severity, as the
+ * failed runs and the daily check that report the same condition do. Its
+ * title and Result line say what it is: it completed, and the target was
+ * changed.
+ */
+function completedWithChangedTarget(ctx: ReplicationNotifyContext): boolean {
+  return ctx.error === undefined && (ctx.result?.targetDrift ?? []).some(r => r.state === 'modified')
 }
 
 /** Classify a finished replication into the shared four-outcome vocabulary. */
@@ -133,9 +164,13 @@ export function replicationRouteLine(ctx: ReplicationNotifyContext): string {
 
 /** The subject line's title (the template renders `ANAS: <title>`). */
 export function replicationNotifyTitle(ctx: ReplicationNotifyContext, outcome: NotifyOutcome): string {
-  const verdict = outcome === 'failure'
-    ? 'FAILED'
-    : outcome === 'warning' ? 'completed with warnings' : 'succeeded'
+  const verdict = ctx.dailyCheck === true
+    ? DAILY_CHECK_VERDICT
+    : outcome === 'failure'
+      ? 'FAILED'
+      : completedWithChangedTarget(ctx)
+        ? CHANGED_TARGET_VERDICT
+        : outcome === 'warning' ? 'completed with warnings' : 'succeeded'
   return `replication ${replicationRouteLine(ctx)} ${verdict}`
 }
 
@@ -144,9 +179,13 @@ export function buildReplicationNotifyBody(ctx: ReplicationNotifyContext): strin
   const outcome = replicationNotifyOutcome(ctx)
   const lines: string[] = []
 
-  const status = outcome === 'failure'
-    ? 'FAILED'
-    : outcome === 'warning' ? 'completed with warnings' : 'success'
+  const status = ctx.dailyCheck === true
+    ? DAILY_CHECK_VERDICT
+    : outcome === 'failure'
+      ? 'FAILED'
+      : completedWithChangedTarget(ctx)
+        ? CHANGED_TARGET_VERDICT
+        : outcome === 'warning' ? 'completed with warnings' : 'success'
 
   lines.push(`Source:      ${ctx.source}`)
   lines.push(`Target:      ${ctx.target}`)
@@ -218,7 +257,7 @@ export async function notifyReplicationRun(
     return
   await pveNotify(
     executor,
-    notifySeverity(outcome),
+    ctx.dailyCheck === true || completedWithChangedTarget(ctx) ? 'error' : notifySeverity(outcome),
     replicationNotifyTitle(ctx, outcome),
     buildReplicationNotifyBody(ctx),
     ANAS_REPLICATION_NOTIFY_TEMPLATE,

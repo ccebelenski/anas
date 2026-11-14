@@ -94,7 +94,7 @@ describe('cr3 REPLICATION-L4 — the job sweeps only what the route claimed', ()
     mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '', stderr: '', exitCode: 1 } })
     mock.addFixture({ command: ZFS, args: zfsTreeListArgs(TARGET_POOL), result: ok(`datapool\n${fixture('dst-tree.txt')}`) })
     mock.addFixture({ command: ZFS, args: zfsTreeSnapshotsArgs(TARGET_ROOT), result: ok(fixture('dst-snaps-p.txt')) })
-    mock.addFixture({ command: ZFS, args: zfsTreeGetArgs(TARGET_ROOT, ['written']), result: ok(fixture('dst-written.txt')) })
+    mock.addFixture({ command: ZFS, args: zfsTreeGetArgs(TARGET_ROOT, ['written', 'readonly']), result: ok(fixture('dst-written.txt')) })
     for (const dataset of PLANNED) {
       const args = dataset !== 'rpool/rrsrc/new'
         ? ['send', '-nvP', '-i', `@${S1}`, '--', `${dataset}@${S2}`]

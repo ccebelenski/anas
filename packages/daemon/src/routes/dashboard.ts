@@ -49,7 +49,7 @@ import { collectCloudWarnings } from '../services/cloud-units.js'
 import { readConfig } from '../services/config-writer.js'
 import { collectIscsiWarnings } from '../services/iscsi-warnings.js'
 import { collectMountWarnings } from '../services/mounts.js'
-import { buildReplicationWarnings, deriveTaskStatus, readAllTasksChecked } from '../services/replication-units.js'
+import { buildReplicationWarnings, deriveTaskStatus, driftUnreadTasks, readAllTasksChecked } from '../services/replication-units.js'
 import { probeSharePaths } from '../services/share-path.js'
 import { collectScheduleWarnings } from '../services/snapshot-schedule-units.js'
 import { collectDiskInventory } from './disks.js'
@@ -260,7 +260,11 @@ export async function dashboardRoutes(
     const { tasks, complete } = await readAllTasksChecked(systemdDir)
     if (!complete)
       incomplete(`the replication task units in ${systemdDir} could not all be read`)
-    const statuses = await Promise.all(tasks.map(t => deriveTaskStatus(exec, t)))
+    // repl.drift (coordinator's decision): the dashboard opens no ssh. A
+    // target on this node is read live (a local `zfs get`); a peer or remote
+    // target's drift is what its last run recorded, as of that run. A READ
+    // only — nothing here notifies.
+    const statuses = await Promise.all(tasks.map(t => deriveTaskStatus(exec, t, undefined, undefined, { remoteDriftFromLastRun: true })))
     // cr3.followup: a row whose status systemd could not answer derives
     // `unknown`, which warns about nothing — as the task stores' collector
     // does, it is reported incomplete, and with no readable row the section
@@ -273,6 +277,11 @@ export async function dashboardRoutes(
         throw new Error(reason)
       incomplete(reason)
     }
+    // repl.drift: a target whose state could not be read is never "fine":
+    // the section says which rows it could not judge.
+    const driftUnread = driftUnreadTasks(readable)
+    if (driftUnread.length)
+      incomplete(`the target state of replication task${driftUnread.length === 1 ? '' : 's'} ${driftUnread.map(n => `'${n}'`).join(', ')} could not be read`)
     return buildReplicationWarnings(readable)
   }
 

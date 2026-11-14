@@ -284,6 +284,16 @@ export function parseHelperResult<H extends TaskHelperResult = TaskHelperResult>
   return newest.done ? null : newest.value.result as H
 }
 
+/**
+ * The newest runner result line in a journal tail as printed — its `result`
+ * object and the line's own timestamp — or null (repl.drift: the dashboard
+ * reads what a replication run recorded about its target from it).
+ */
+export function newestHelperResult(journal: string): { result: Record<string, unknown>, at: string | null } | null {
+  const newest = resultLinesNewestFirst(journal).next()
+  return newest.done ? null : { result: newest.value.result as Record<string, unknown>, at: newest.value.at }
+}
+
 /** The newest runner result line in a journal tail: its run result, reason and timestamp. */
 export interface JournalRunResult {
   status: UnitRunResult

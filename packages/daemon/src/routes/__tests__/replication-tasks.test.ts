@@ -990,7 +990,9 @@ describe('replication task routes — RECURSIVE tasks (rrep.2, #84)', () => {
       '/usr/bin/systemctl daemon-reload',
       '/usr/bin/systemctl enable --now anas-repl-nightly-media.timer',
     ]
-    assert.deepEqual(createCalls, ['/usr/bin/systemd-analyze calendar daily', ...footprintAndWrite])
+    // repl.drift ruling 3: the node's FIRST task also installs the node-wide
+    // daily target check (`anas-replcheck.*`); the PUT finds it in place.
+    assert.deepEqual(createCalls, ['/usr/bin/systemd-analyze calendar daily', ...footprintAndWrite, '/usr/bin/systemctl daemon-reload', '/usr/bin/systemctl enable --now anas-replcheck.timer'])
     assert.deepEqual(putCalls, ['/usr/bin/systemd-analyze calendar weekly', ...footprintAndWrite])
   })
 })

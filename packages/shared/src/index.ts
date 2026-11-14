@@ -581,6 +581,7 @@ export {
   ReplicationLocation,
   ReplicationRemote,
   ReplicationTarget,
+  ReplicationTargetDrift,
   ReplicationTask,
   ReplicationTaskFields,
   ReplicationTaskName,

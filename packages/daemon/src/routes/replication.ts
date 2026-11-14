@@ -1,8 +1,10 @@
 import type { ReplicatePlan, ReplicateRequest as ReplicateRequestBody, Snapshot } from '@anas/shared'
 import type { FastifyReply, FastifyRequest } from 'fastify'
-import type { CommandExecutor, PipelineResult } from '../executor/types.js'
+import type { CommandExecutor, ExecResult, PipelineResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
+import type { BaseHeld, ZfsRunner } from '../services/replication-drift.js'
+import type { SettleActs } from '../services/replication-holds.js'
 import type { ReplicationNotifyContext } from '../services/replication-notify.js'
 import type { TargetPlacement } from '../services/replication-target.js'
 import type { PoolExistence, Transport } from '../services/replication-transport.js'
@@ -11,6 +13,7 @@ import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
 import { GuardRefusalError, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { ownershipRefusal } from '../services/pve-footprint.js'
+import { checkTargetDrift, nextIncrementalBase, readBaseHeld, recordOf } from '../services/replication-drift.js'
 import { legacyReleasableOnSource, readLocalHoldsChecked, replicationHoldTag, settleReplicationHolds } from '../services/replication-holds.js'
 import { notifyReplicationRun, singleLine } from '../services/replication-notify.js'
 import { newestReplicable, readLocalSnapshots, readRemoteSnapshotNames } from '../services/replication-snapshots.js'
@@ -35,7 +38,8 @@ import { requireIdentity } from './identity.js'
  *
  * Stateless (Principle): the incremental base is DISCOVERED at run time as the
  * newest snapshot common to source and target (never bookkept). The destination
- * is created `readonly=on`. A `zfs hold` pins the replicated base on BOTH sides
+ * is created `readonly=on`, and every later receive re-asserts it (repl.drift
+ * ruling 1). A `zfs hold` pins the replicated base on BOTH sides
  * so cleanup cannot sever the chain; the tag is per chain
  * (`anas-repl-<hash(location, target)>`, story ident.4) and a run releases only
  * its own tag on older snapshots, so exactly this chain's newest base stays
@@ -246,6 +250,13 @@ function pipelineFailureDetail(pipe: PipelineResult): string {
 
 const ISO_PUNCT_RE = /[:.]/g
 
+/** Two notes of one run as one sentence pair (either may be absent). */
+function joinNotes(a: string | undefined, b: string | undefined): string | undefined {
+  if (a === undefined)
+    return b
+  return b === undefined ? a : `${a}. ${b}`
+}
+
 /** Sortable, ZFS-legal default snapshot name for the snapshot-first convenience. */
 function defaultSnapName(): string {
   return `snapshot-${new Date().toISOString().replace(ISO_PUNCT_RE, '-')}`
@@ -272,6 +283,24 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
   function whereLabel(target: { location?: { kind: string, name?: string } }): string {
     const loc = target.location
     return loc && loc.kind !== 'local' ? ` on ${loc.kind} '${loc.name ?? ''}'` : ''
+  }
+
+  /**
+   * repl.drift: `zfs <args>` where the target lives — a second local `zfs`, or
+   * the SAME ssh argv every other target read uses (`ZFS_REMOTE` unqualified,
+   * the transport's `buildSshArgv`, `--` before the destination).
+   */
+  function targetZfs(loc: TargetPlacement): ZfsRunner {
+    if (loc.isRemote) {
+      const resolved = loc.resolved
+      return (args: string[]): Promise<ExecResult> => transport.sshExec(resolved, [ZFS_REMOTE, ...args])
+    }
+    return (args: string[]): Promise<ExecResult> => executor.exec(ZFS, args)
+  }
+
+  /** repl.drift: does `@base` carry this chain's hold, on each side (asked only for a `modified` target). */
+  function baseHeld(loc: TargetPlacement, sourceDs: string, targetDs: string, base: string, tag: string): () => Promise<BaseHeld> {
+    return () => readBaseHeld(args => executor.exec(ZFS, args), targetZfs(loc), `${sourceDs}@${base}`, `${targetDs}@${base}`, tag)
   }
 
   /**
@@ -569,7 +598,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     const job = jobQueue.submit(
       'zfs.replicate',
       { ...identity, params: { source, target: targetFull, ...(loc.isRemote ? { location: target.location } : {}) } },
-      async (updateProgress) => {
+      async (updateProgress, ctx) => {
         // 9.4: this job is the ONE place every replication converges (a task
         // timer's runner and a UI replicate both submit it), so it is also the
         // one place a run notification is emitted — success, warning or failure,
@@ -595,8 +624,17 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           if (!guardNow.ok)
             throw new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message: guardNow.message })
 
-          // 1) Optional snapshot-first — create a fresh, sortable snapshot to send up to.
+          // 1) Optional snapshot-first — a fresh, sortable snapshot to send up
+          //    to. repl.drift review D1 (rule: no precondition that can refuse
+          //    runs after the first act): its NAME is chosen here and the
+          //    snapshot is TAKEN only after every refusal below (the plan's
+          //    own, the drift gate's), so a refused run leaves no snapshot
+          //    behind. The plan is reasoned over the source listing with the
+          //    new name in front: it is the newest by createtxg once taken,
+          //    and decideBase picks the base among the snapshots OLDER than
+          //    S, so the base does not depend on it.
           let snapName = snapshot
+          let pendingSnapshot: string | undefined
           if (snapshotFirst) {
             // pvepool.1 review fix 4: the ownership gate moves WITH the
             // mutation. The snapshot is taken HERE, so the source is judged
@@ -610,12 +648,8 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             const owned = pveNow!.ownershipOf(source)
             if (owned)
               throw new GuardRefusalError(ownershipRefusal(owned, `Snapshot-first replication refused: '${source}' is PVE-owned — ${owned.reason}`))
-            const name = defaultSnapName()
-            updateProgress(`zfs snapshot ${source}@${name}`)
-            // The ONE zfs-snapshot verb (backup2.3's extraction) — same argv,
-            // same error text, one definition.
-            await createZfsSnapshot(executor, { dataset: source, name })
-            snapName = name
+            pendingSnapshot = defaultSnapName()
+            snapName = pendingSnapshot
           }
 
           // 2) Recompute the plan INSIDE the job — state may have changed since
@@ -624,7 +658,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           const src = await sourceSnapshots(source)
           if (!src.ok)
             throw new Error(src.message)
-          const sourceSnaps = src.snaps
+          const sourceSnaps = pendingSnapshot === undefined
+            ? src.snaps
+            : [{ snapshotName: pendingSnapshot } as Snapshot, ...src.snaps]
           if (!snapName) {
             // The newest snapshot that is not a backup/cloud run's transient
             // (cr3; the recursive run's S has always been filtered, R4).
@@ -636,7 +672,10 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           else if (!sourceSnaps.some(s => s.snapshotName === snapName)) {
             throw new Error(`Snapshot '${source}@${snapName}' does not exist on source`)
           }
-          notify.snapshot = snapName
+          // A snapshot-first run names its snapshot in the notification only
+          // once it exists (below): a refused run took none.
+          if (pendingSnapshot === undefined)
+            notify.snapshot = snapName
           // The chain's hold is never settled onto a transient: S here is
           // never one (the request refused a named one, the default skips
           // them, snapshot-first names its own) — said again where the hold
@@ -654,9 +693,36 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             throw new Error(divergedMessage(targetFull))
           if (d.refusal !== undefined)
             throw new Error(d.refusal)
+          // The new name already on the target (a millisecond-resolution
+          // name, so only by hand): the run would have nothing to send from a
+          // snapshot it has not taken. Refused before anything is taken.
+          if (pendingSnapshot !== undefined && d.upToDate)
+            throw new Error(`Target '${targetFull}'${whereLabel(target)} already has a snapshot named '@${pendingSnapshot}', the name this run gives its new snapshot of '${source}': no snapshot was taken and nothing was sent; run it again`)
 
           const holdTag = replicationHoldTag(target.location, targetFull)
           const sourceNames = sourceSnaps.map(s => s.snapshotName)
+          const targetNamesBefore = (tgt.snaps ?? []).map(s => s.snapshotName)
+
+          // repl.drift: has the target been changed since the snapshot the
+          // receive starts from (`written@<base>`), and is it still
+          // read-only? ONE read, before anything is sent. The base is the one
+          // decideBase picked (for an up-to-date target, the one the next
+          // incremental starts from) — a transient base included, so the
+          // rule-2 exception is judged against what ZFS will actually check.
+          const driftBase = d.upToDate
+            ? nextIncrementalBase(sourceNames, targetNamesBefore)
+            : d.mode === 'incremental' ? d.baseSnapshot : undefined
+          const checkDrift = driftBase === undefined
+            ? undefined
+            : (holdActs?: SettleActs) => checkTargetDrift(targetZfs(loc), {
+                target: targetFull,
+                where: whereLabel(target),
+                base: driftBase,
+                targetSnaps: targetNamesBefore,
+                sends: !d.upToDate,
+                readHeld: baseHeld(loc, source, targetFull, driftBase, holdTag),
+                ...(holdActs ? { holdActs } : {}),
+              })
 
           // cr3 REPLICATION-M1: the target already has S — nothing is sent.
           // When S is the newest snapshot the two sides share, its holds are
@@ -667,6 +733,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           if (d.upToDate) {
             const warnings: string[] = []
             let note: string | undefined
+            // Review D2: what the settle below changes, so a drift sentence
+            // read after it says what this run did to the holds.
+            const holdActs: SettleActs = { placed: [], released: [] }
             if (d.keepHoldsOn !== undefined) {
               // review of cr3 (decideBase rule 1): the target's newest
               // snapshot is a transient the source still has; the next new
@@ -691,6 +760,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
                   target: { dataset: targetFull, snapshotNames: (tgt.snaps ?? []).map(s => s.snapshotName) },
                   ...(loc.isRemote ? { remote: loc.resolved } : {}),
                   releaseLegacyOnSource: false,
+                  done: holdActs,
                 }))
               }
               catch (err) {
@@ -700,6 +770,18 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             else {
               note = `The target already has '@${d.newerCommon}', which is newer than '@${snapName}': nothing was sent and no hold was moved`
             }
+            // repl.drift, the proactive case: nothing to send today, but the
+            // NEXT send would be refused (`modified`) or is one touch away
+            // from it (`exposed`): said now, as a warning, so the run's
+            // notification carries it. Asked after the settle above, so the
+            // sentence states the holds as they now are, and (review D2) its
+            // first clause says what the settle moved, when it moved any.
+            const drift = checkDrift ? await checkDrift(holdActs) : undefined
+            if (drift && (drift.state === 'modified' || drift.state === 'exposed'))
+              warnings.push(drift.message!)
+            if (drift?.state === 'unknown')
+              note = joinNotes(note, drift.message)
+            const upRecord = drift ? recordOf(drift) : null
             const result = {
               snapshot: snapName,
               bytesEstimated: 0,
@@ -708,10 +790,40 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
               upToDate: [source],
               ...(note ? { note } : {}),
               ...(warnings.length ? { warnings } : {}),
+              // repl.drift: recorded for the dashboard (the runner's result line).
+              ...(upRecord ? { targetDrift: [upRecord] } : {}),
             }
             await notifyReplicationRun(executor, { ...notify, result, elapsedMs: Date.now() - startedAt })
             return result
           }
+
+          // repl.drift: a target changed since the base is refused by ZFS —
+          // the run does not send; it fails with the drift sentence (the
+          // catch below notifies once). Nothing is held or released. An
+          // `exposed` target is sent to (ZFS accepts: nothing changed) and
+          // the run warns; `unknown` goes ahead and ZFS decides.
+          const drift = checkDrift ? await checkDrift() : undefined
+          if (drift?.state === 'modified') {
+            // Recorded on the job (its detail), so the runner's journal line
+            // carries it for the dashboard, which never reads a remote.
+            ctx?.updateDetail({ targetDrift: [recordOf(drift)] })
+            throw new Error(drift.message)
+          }
+
+          // D1: every refusal is behind us — the snapshot-first snapshot is
+          // taken now, the run's first act. The ONE zfs-snapshot verb
+          // (backup2.3's extraction) — same argv, same error text.
+          if (pendingSnapshot !== undefined) {
+            updateProgress(`zfs snapshot ${source}@${pendingSnapshot}`)
+            await createZfsSnapshot(executor, { dataset: source, name: pendingSnapshot })
+            notify.snapshot = pendingSnapshot
+          }
+          // An exposed target is sealed by this run's receive (ruling 1): not recorded.
+          const sentRecord = drift ? recordOf(drift, { sealed: true }) : null
+          const driftWarning = drift?.state === 'exposed' ? drift.message : undefined
+          const driftNote = drift?.state === 'unknown'
+            ? `${drift.message}; the send went ahead, and ZFS refuses it if the target was changed`
+            : undefined
 
           const srcSnapFull = `${source}@${snapName}`
 
@@ -723,9 +835,16 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           const dry = await executor.exec(ZFS, dryArgs)
           const bytesEstimated = parseSendDryRun(dry.stdout)
 
-          // 4) Run the send|recv pipeline. readonly=on only on CREATE (full send);
-          //    an incremental recv into the existing (already-readonly) target
-          //    must not re-set the property, which -o would reject. For a remote/
+          // 4) Run the send|recv pipeline. EVERY receive, full or incremental,
+          //    passes `-o readonly=on` (ruling 1, operator 2026-11-15: a
+          //    replication task keeps its target read-only; to use the copy as
+          //    a live dataset, remove the task). Ground truth 2026-11-15 (ZFS
+          //    2.4.2, fixtures/zfs/zfs-written-replica.zfs2.4.2.txt, third
+          //    capture B and C): `zfs recv -o readonly=on` on an incremental
+          //    stream exits 0 and sets the property `local`, so a replica made
+          //    writable by hand (repl.drift's `exposed`) is sealed by the next
+          //    send. A ZFS that refuses `-o` there fails the run with its own
+          //    line (`pipelineFailureDetail`). For a remote/
           //    peer target the recv side runs over ssh (`… | ssh <host> zfs recv`);
           //    for a local target it is a second local `zfs` process.
           // cr.21: `--` ends zfs option parsing so srcSnapFull (derived) is
@@ -736,9 +855,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           // `--` ends zfs option parsing so `targetFull` is always the positional
           // filesystem, never mistaken for a flag (defence in depth; the schema
           // already restricts the dataset charset).
-          const recvArgs = d.mode === 'full'
-            ? ['recv', '-o', 'readonly=on', '--', targetFull]
-            : ['recv', '--', targetFull]
+          const recvArgs = ['recv', '-o', 'readonly=on', '--', targetFull]
 
           let recvCmd = ZFS
           let recvArgv = recvArgs
@@ -788,6 +905,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             releaseLegacyOnSource: legacy.releasable,
           })
           const warnings = [
+            ...(driftWarning ? [driftWarning] : []),
             ...holdWarnings,
             ...(legacy.warning ? [legacy.warning] : []),
             ...(reReadWarning ? [reReadWarning] : []),
@@ -800,7 +918,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             bytesEstimated,
             target: targetFull,
             holdTag,
+            ...(driftNote ? { note: driftNote } : {}),
             ...(warnings.length ? { warnings } : {}),
+            ...(sentRecord ? { targetDrift: [sentRecord] } : {}),
           }
           await notifyReplicationRun(executor, { ...notify, result, elapsedMs: Date.now() - startedAt })
           return result
@@ -817,6 +937,20 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
 
     reply.code(202)
     return { job }
+  }
+
+  /**
+   * repl.drift: the recursive gate's access to the target — the same runner
+   * as the single run, and the holds of a copy's base under the run's ONE tag
+   * (R7: derived from the target root).
+   */
+  function treeDriftDeps(loc: TargetPlacement, target: ReplicateRequestBody['target'], targetRoot: string) {
+    const tag = replicationHoldTag(target.location, targetRoot)
+    return {
+      runTarget: targetZfs(loc),
+      where: whereLabel(target),
+      readHeld: (dataset: string, targetDs: string, base: string) => baseHeld(loc, dataset, targetDs, base, tag)(),
+    }
   }
 
   /**
@@ -918,6 +1052,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: read.message } }
     }
+    // repl.drift: the drift is judged in the JOB only (a changed copy fails
+    // the job, which records it for the dashboard); the request's pass skips
+    // those reads.
     const gate = await gateTreeRun({ pve, guard: guardDeps }, { facts: read.facts, target })
     if (!gate.ok) {
       await notifyRefusal(gate.refusals.map(r => r.message).join('; '))
@@ -943,7 +1080,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     const job = jobQueue.submit(
       'zfs.replicate',
       { ...identity, params: { source, target: targetRoot, recursive: true, ...(loc.isRemote ? { location: target.location } : {}) } },
-      async (updateProgress) => {
+      async (updateProgress, ctx) => {
         const startedAt = Date.now()
         // R7: ONE tag for the whole run, derived from the ROOT's target name —
         // so a refused destroy of any child names the task that owns the tree.
@@ -964,9 +1101,17 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           const factsNow = await readTreeFacts({ executor, transport }, { sourceRoot: source, targetRoot, exclude, placement: jobLoc })
           if (!factsNow.ok)
             throw new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message: factsNow.message })
-          const gateNow = await gateTreeRun({ pve: pveNow, guard: guardDeps }, { facts: factsNow.facts, target })
-          if (!gateNow.ok)
-            throw new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message: gateNow.refusals.map(r => r.message).join('; ') })
+          const gateNow = await gateTreeRun({ pve: pveNow, guard: guardDeps, drift: treeDriftDeps(jobLoc, target, targetRoot) }, { facts: factsNow.facts, target })
+          if (!gateNow.ok) {
+            const message = gateNow.refusals.map(r => r.message).join('; ')
+            // repl.drift: a changed copy is a failed run (recorded on the
+            // job for the dashboard), not a state that changed under it.
+            if (gateNow.driftRecords?.length) {
+              ctx?.updateDetail({ targetDrift: gateNow.driftRecords })
+              throw new Error(message)
+            }
+            throw new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message })
+          }
           // cr3 REPLICATION-L4 (R9): the claims were taken on the ROUTE's
           // sweep. A dataset the job's fresh sweep finds that the route's did
           // not (a child created while the run waited) is not claimed by this
@@ -1057,9 +1202,8 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             const sendArgs = planned.mode === 'incremental' && planned.baseSnapshot
               ? ['send', '-i', `@${planned.baseSnapshot}`, '--', srcSnapFull]
               : ['send', '--', srcSnapFull]
-            const recvArgs = planned.mode === 'full'
-              ? ['recv', '-o', 'readonly=on', '--', planned.target]
-              : ['recv', '--', planned.target]
+            // Ruling 1: every receive, full or incremental, re-asserts read-only.
+            const recvArgs = ['recv', '-o', 'readonly=on', '--', planned.target]
             let recvCmd = ZFS
             let recvArgv = recvArgs
             if (jobLoc.isRemote) {
@@ -1146,6 +1290,11 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           //    left out), never a refusal — R5d's "no entry, no plan" case.
           for (const skipped of plan.skipped)
             warnings.push(skipped.message)
+          // repl.drift: a copy that is not read-only was sent to (ZFS
+          // accepted it: nothing had changed) and the run warns, every run
+          // while it lasts; a copy whose state could not be read is noted.
+          warnings.push(...gateNow.driftWarnings)
+          const driftNote = gateNow.driftNotes.length > 0 ? gateNow.driftNotes.join('; ') : undefined
 
           const result = {
             recursive: true as const,
@@ -1167,6 +1316,8 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             // only when there is one.
             ...(gateNow.excludeMissing.length > 0 ? { excludeMissing: gateNow.excludeMissing } : {}),
             bytesEstimated,
+            ...(driftNote ? { note: driftNote } : {}),
+            ...(gateNow.driftRecords.length > 0 ? { targetDrift: gateNow.driftRecords } : {}),
             ...(warnings.length ? { warnings } : {}),
           }
           await notifyReplicationRun(executor, { ...notify, result, elapsedMs: Date.now() - startedAt })

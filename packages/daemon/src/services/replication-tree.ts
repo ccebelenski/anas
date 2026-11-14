@@ -1,4 +1,5 @@
 import { DatasetPath } from '@anas/shared'
+import { chainRemedy, namedSnapshots, nextIncrementalBase, snapshotsNewerThan } from './replication-drift.js'
 import { isTransientRunSnapshot } from './snapshot-naming.js'
 import { isAtOrUnder, sweepSet } from './zfs-snapshot.js'
 
@@ -34,8 +35,26 @@ export interface TreeFacts {
   /** [] when the target root does not exist. */
   targetTree: string[]
   targetSnaps: Map<string, string[]>
-  /** the planner reads `written` (R5g). */
+  /** the planner reads `written` and `readonly` (R5g, repl.drift). */
   targetProps: Map<string, Record<string, string>>
+}
+
+/**
+ * repl.drift: one existing copy whose state against its base the run must
+ * know before the first send. `known` is set when the target's newest
+ * snapshot IS the base: the tree read's `written` (bytes since the newest
+ * snapshot) is then `written@<base>`, and no further read is needed. Without
+ * it, the gate reads `written@<base>,readonly` for this dataset.
+ */
+export interface TreeDriftCheck {
+  dataset: string
+  target: string
+  base: string
+  /** The copy's snapshots, newest first. */
+  targetSnaps: string[]
+  /** This run receives into the copy (a planned incremental): its receive re-asserts read-only. */
+  sends: boolean
+  known?: { written: number, readonly: string }
 }
 
 export interface PlannedDataset {
@@ -141,13 +160,10 @@ const TARGET_MODIFIED_RE = /has been modified\s+since most recent snapshot/
 export function modifiedTargetHint(stderr: string, target: string, base: string | undefined, targetSnaps: string[]): string {
   if (base === undefined || !TARGET_MODIFIED_RE.test(stderr))
     return ''
-  const i = targetSnaps.indexOf(base)
-  const newer = i <= 0 ? [] : targetSnaps.slice(0, i)
-  const named = newer.slice(0, 5).map(n => `'@${n}'`).join(', ') + (newer.length > 5 ? ', ...' : '')
-  const holds = newer.length > 0
-    ? `release any hold on ${newer.length === 1 ? 'that snapshot' : 'those snapshots'} ('zfs holds ${target}@${newer[0]}' lists them; 'zfs release <tag> <snapshot>' for each), then `
-    : ''
-  return `the target was written to after '@${base}'${newer.length > 0 ? ` and has newer snapshot(s) ${named}` : ''}; to continue the chain, on the target ${holds}roll it back to '@${base}' ('zfs rollback -r ${target}@${base}', which destroys the snapshots newer than it there and anything written since)`
+  // repl.drift: the remedy is ONE wording (`chainRemedy`), shared with the
+  // drift sentence a run or a status read gives before ZFS is ever asked.
+  const newer = snapshotsNewerThan(targetSnaps, base)
+  return `the target was written to after '@${base}'${newer.length > 0 ? ` and has newer snapshot(s) ${namedSnapshots(newer)}` : ''}; ${chainRemedy(target, base, newer)}`
 }
 
 /** The sentence of the one diverged case: nothing in common at all. */
@@ -370,16 +386,13 @@ export function planTreeReplication(facts: TreeFacts): TreePlan {
       plannedFull.add(t)
       continue
     }
-    const written = facts.targetProps.get(t)?.written
+    const props = facts.targetProps.get(t)
+    const written = props?.written
     // `''`/`'-'`/junk parse to NaN: unreadable, never a silent 0 (Number('')
     // IS 0 — hence the length guard).
-    const modified = written === undefined || written.length === 0 ? Number.NaN : Number(written)
-    if (!Number.isFinite(modified)) {
+    const writtenBytes = written === undefined || written.length === 0 ? Number.NaN : Number(written)
+    if (!Number.isFinite(writtenBytes)) {
       refusals.push(unreadableRow('written', t))
-      continue
-    }
-    if (modified > 0) {
-      refusals.push(`Target '${t}' has been modified since its last replicated snapshot — a receive would fail; roll it back to that snapshot, or remove it`)
       continue
     }
     // A copy that already holds S has nothing to send — asked BEFORE the base
@@ -389,6 +402,10 @@ export function planTreeReplication(facts: TreeFacts): TreePlan {
     // OpenZFS 2.4 — ground truth 2026-11-14 — so it was waste, not breakage,
     // but R6's "continues from each dataset's own base" means: skip these).
     // (review of cr3) The ONE base rule, shared with the single-dataset run.
+    // repl.drift: `written` > 0 no longer refuses here (its sentence told the
+    // operator to remove the copy, and `written` since the newest snapshot
+    // misses a change snapshotted on the target afterwards): the gate judges
+    // every copy against its own base ({@link treeDriftChecks}).
     const decision = decideBase(facts.sourceSnaps.get(dataset) ?? [], facts.targetSnaps.get(t) ?? [], S, { target: t })
     if (decision.kind === 'upToDate') {
       upToDate.push(dataset)
@@ -412,4 +429,40 @@ export function planTreeReplication(facts: TreeFacts): TreePlan {
   const targetOnly = facts.targetTree.filter(name => isAtOrUnder(name, targetRoot) && !covered.has(name))
 
   return { ok: true, snapshot: S, datasets, skipped, targetOnly, upToDate, ...(holdsKept.length > 0 ? { holdsKept } : {}) }
+}
+
+/**
+ * repl.drift: every existing copy a passed plan receives into or finds up to
+ * date, with the base its next receive starts from (the planned incremental's
+ * base; for an up-to-date copy, {@link nextIncrementalBase}), in sweep order.
+ * Pure: the tree read's `written` (bytes since the newest snapshot) answers
+ * for a copy whose newest snapshot IS its base (`known`); the gate reads the
+ * others.
+ */
+export function treeDriftChecks(facts: TreeFacts, plan: Extract<TreePlan, { ok: true }>): TreeDriftCheck[] {
+  const bases = new Map<string, { target: string, base: string, sends: boolean }>()
+  for (const d of plan.datasets) {
+    if (d.mode === 'incremental' && d.baseSnapshot !== undefined)
+      bases.set(d.dataset, { target: d.target, base: d.baseSnapshot, sends: true })
+  }
+  for (const dataset of plan.upToDate) {
+    const target = treeTargetName(facts.sourceRoot, facts.targetRoot, dataset)
+    const base = nextIncrementalBase(facts.sourceSnaps.get(dataset) ?? [], facts.targetSnaps.get(target) ?? [])
+    if (base !== undefined)
+      bases.set(dataset, { target, base, sends: false })
+  }
+  const checks: TreeDriftCheck[] = []
+  for (const dataset of facts.sourceTree) {
+    const entry = bases.get(dataset)
+    if (entry === undefined)
+      continue
+    const targetSnaps = facts.targetSnaps.get(entry.target) ?? []
+    const props = facts.targetProps.get(entry.target)
+    const written = props?.written
+    const readonly = props?.readonly
+    const bytes = written === undefined || written.length === 0 ? Number.NaN : Number(written)
+    const known = targetSnaps[0] === entry.base && Number.isSafeInteger(bytes) && bytes >= 0 && readonly !== undefined && readonly.length > 0
+    checks.push({ dataset, ...entry, targetSnaps, ...(known ? { known: { written: bytes, readonly: readonly! } } : {}) })
+  }
+  return checks
 }

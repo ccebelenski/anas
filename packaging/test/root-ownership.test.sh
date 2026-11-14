@@ -123,7 +123,7 @@ printf '9.9.9\n' > "${REL}/VERSION"
 cp "${PKG}/anas-md-event.sh" "${PKG}/anas-cache-event.sh" "${PKG}/anas-cache.rules" "${REL}/"
 cp -a "${PKG}/systemd/." "${REL}/systemd/"
 cp "${PKG}"/templates/anas-*.txt.hbs "${REL}/templates/"
-for t in recycle-purge.js backup-task.js cloud-task.js; do
+for t in recycle-purge.js backup-task.js cloud-task.js replicate-task.js repl-drift-check.js; do
   : > "${REL}/app/packages/daemon/dist/${t}"
 done
 mkdir -p "${REL}/app/packages/daemon/dist/services"

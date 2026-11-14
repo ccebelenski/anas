@@ -185,6 +185,26 @@ export async function runReplication(
   return pollJobToTerminal(requester, jobRef, 'replicate', loop)
 }
 
+/**
+ * What the runner prints for a finished job (journald keeps it): a completed
+ * job's `{task, result}` line on stdout, as always; a failed job's error on
+ * stderr, as always — and, repl.drift, when the failed job recorded the
+ * target it found changed (`detail.targetDrift`), a result line on stdout
+ * too, `{task, result: {status: 'failure', targetDrift}}`, so the dashboard
+ * can say so for a peer or remote target without reading it over ssh.
+ */
+export function runnerOutput(job: Job, opts: Pick<RunnerOptions, 'pool' | 'dataset'>): { stdout?: string, stderr?: string } {
+  const task = `${opts.pool}/${opts.dataset}`
+  if (job.status === 'completed')
+    return { stdout: `${JSON.stringify({ task, result: job.result })}\n` }
+  const detail = job.detail as { targetDrift?: unknown } | null | undefined
+  const drift = detail && Array.isArray(detail.targetDrift) && detail.targetDrift.length > 0 ? detail.targetDrift : undefined
+  return {
+    ...(drift ? { stdout: `${JSON.stringify({ task, result: { status: 'failure', targetDrift: drift } })}\n` } : {}),
+    stderr: `${job.error?.message ?? 'replication job failed'}\n`,
+  }
+}
+
 /** CLI entrypoint. Exits 0 on completed, 1 on job failure, 2 on bad args/transport. */
 export async function main(argv: string[]): Promise<number> {
   let opts: RunnerOptions
@@ -198,12 +218,12 @@ export async function main(argv: string[]): Promise<number> {
 
   try {
     const job = await runReplication(socketRequester(opts.socket), opts)
-    if (job.status === 'completed') {
-      process.stdout.write(`${JSON.stringify({ task: `${opts.pool}/${opts.dataset}`, result: job.result })}\n`)
-      return 0
-    }
-    process.stderr.write(`${job.error?.message ?? 'replication job failed'}\n`)
-    return 1
+    const out = runnerOutput(job, opts)
+    if (out.stdout)
+      process.stdout.write(out.stdout)
+    if (out.stderr)
+      process.stderr.write(out.stderr)
+    return job.status === 'completed' ? 0 : 1
   }
   catch (err) {
     process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`)

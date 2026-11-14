@@ -68,7 +68,7 @@ function armed(local = true): MockExecutor {
   // only `rrdst`, see `after-dst-pool-tree.txt`).
   targetFix(zfsTreeListArgs(TARGET_POOL), ok(`datapool\n${fixture('dst-tree.txt')}`))
   targetFix(zfsTreeSnapshotsArgs(TARGET), ok(fixture('dst-snaps-p.txt')))
-  targetFix(zfsTreeGetArgs(TARGET, ['written']), ok(fixture('dst-written.txt')))
+  targetFix(zfsTreeGetArgs(TARGET, ['written', 'readonly']), ok(fixture('dst-written.txt')))
   return mock
 }
 
@@ -104,7 +104,7 @@ describe('readTreeFacts: the captured run, local target', () => {
       { command: ZFS, args: zfsTreeGetArgs(SOURCE, ['keystatus']) },
       { command: ZFS, args: zfsTreeListArgs(TARGET_POOL) },
       { command: ZFS, args: zfsTreeSnapshotsArgs(TARGET) },
-      { command: ZFS, args: zfsTreeGetArgs(TARGET, ['written']) },
+      { command: ZFS, args: zfsTreeGetArgs(TARGET, ['written', 'readonly']) },
     ])
 
     // The fixtures parse back into exactly the fact set the planner's own
@@ -152,7 +152,7 @@ describe('readTreeFacts: the captured run through ssh', () => {
       { command: ZFS, args: zfsTreeGetArgs(SOURCE, ['keystatus']) },
       { command: SSH, args: sshArgv(zfsTreeListArgs(TARGET_POOL)).slice(1) },
       { command: SSH, args: sshArgv(zfsTreeSnapshotsArgs(TARGET)).slice(1) },
-      { command: SSH, args: sshArgv(zfsTreeGetArgs(TARGET, ['written'])).slice(1) },
+      { command: SSH, args: sshArgv(zfsTreeGetArgs(TARGET, ['written', 'readonly'])).slice(1) },
     ])
     assert.equal(result.facts.localTarget, false)
     assert.deepEqual(result.facts.targetTree, parseTreeList(fixture('dst-tree.txt')).filter(name => isAtOrUnder(name, TARGET)))
@@ -180,7 +180,7 @@ describe('readTreeFacts: every failed read refuses with its own sentence, and st
     { at: 2, args: zfsTreeGetArgs(SOURCE, ['keystatus']), message: `Could not read the encryption state under '${SOURCE}' — refusing the recursive replication` },
     { at: 3, args: zfsTreeListArgs(TARGET_POOL), message: `Could not list the datasets of pool '${TARGET_POOL}' on the target — refusing the recursive replication` },
     { at: 4, args: zfsTreeSnapshotsArgs(TARGET), message: `Could not list the snapshots under '${TARGET}' on the target — refusing the recursive replication` },
-    { at: 5, args: zfsTreeGetArgs(TARGET, ['written']), message: `Could not read the modification state under '${TARGET}' on the target — refusing the recursive replication` },
+    { at: 5, args: zfsTreeGetArgs(TARGET, ['written', 'readonly']), message: `Could not read the modification state under '${TARGET}' on the target — refusing the recursive replication` },
   ]
 
   for (const read of READS) {

@@ -1,0 +1,57 @@
+# Captured 2026-11-15 on the ZFS-root stunt node (ZFS 2.4.2), scratch file pools cr3src/cr3dst, cleaned up. Commands and output verbatim.
+# Replica made by: zfs send cr3src/d@S1 | zfs recv -o readonly=on cr3dst/d ; zfs hold anas-repl-test cr3dst/d@S1
+== clean replica: zfs get -Hp -o property,value,source written,readonly,userrefs cr3dst/d cr3dst/d@S1
+written	0	-
+readonly	on	local
+userrefs	-	-
+written	24576	-
+readonly	-	-
+userrefs	1	-
+== a target-only snapshot taken with NO change (zfs snapshot cr3dst/d@anas-backup-x-1): zfs get -Hp -o value written cr3dst/d
+0
+== zfs list -Hp -t snapshot -o name,written,createtxg -s createtxg cr3dst/d
+cr3dst/d@S1	24576	10
+cr3dst/d@anas-backup-x-1	0	12
+== zfs set readonly=off, one small file written, sync, 6 s: zfs get -Hp -o value written cr3dst/d
+14336
+== after zfs snapshot cr3dst/d@local1: dataset written, then per-snapshot written, then zfs get -Hp -o value written@S1 cr3dst/d
+0
+cr3dst/d@S1	24576
+cr3dst/d@anas-backup-x-1	0
+cr3dst/d@local1	14336
+14336
+== readonly=off, atime=on, ONE FILE READ (cat), sync, 6 s: zfs get -Hp -o value written cr3dst/d
+12288
+# Facts: `written@<snap>` on the dataset = bytes written since <snap> (0 on an unmodified replica, and still 0 when only empty target-only snapshots were added); a write OR an atime update on a readonly=off replica makes it non-zero; readonly=on set by `recv -o readonly=on` reads source `local`.
+
+# SECOND CAPTURE 2026-11-15, same node (ZFS 2.4.2), fresh scratch pools; replica cr3dst/d received with `recv -o readonly=on`; each value is `zfs get -Hp -o value written@S1 cr3dst/d` after sync + 6 s.
+# atime=on relatime=on readonly=on (defaults)
+== A readonly=on: cat of two files, ls -lR, find -exec md5sum, du
+0
+== B readonly=on: a write attempt -> "Read-only file system"
+0
+== C readonly=on: ls of .zfs/snapshot/S1, then `zfs snapshot cr3dst/d@t1` on the replica
+0
+== D readonly=off, atime=off: cat + ls -lR
+0
+== E readonly=off, atime inherited (on, relatime on): one cat
+12288
+== F readonly set back to on after E; source gets S2; `zfs send -i @S1 cr3src/d@S2 | zfs recv cr3dst/d`
+cannot receive incremental stream: destination cr3dst/d has been modified since most recent snapshot   (rc=1)
+== G after `zfs rollback -r cr3dst/d@S1`: zfs umount + zfs mount of the read-only replica
+0
+# Facts: a READ-ONLY replica is not changed by reading, listing, checksumming, browsing .zfs, snapshotting, a refused write, or a remount. With readonly=off, reads change it only when atime is on. Setting readonly back to on does NOT undo a change already made.
+# THIRD CAPTURE 2026-11-15, same node (ZFS 2.4.2), fresh scratch pools. The capture note showed each tab as a marker; this fixture copy writes them as real tab characters (copied by repl.drift).
+== A clean replica: zfs get -Hp -o property,value,source written@S1,readonly -- cr3dst/d   (rc 0)
+written@S1	0	local
+readonly	on	local
+== B an INCREMENTAL receive with a property override: zfs send -i @S1 cr3src/d@S2 | zfs recv -o atime=off -- cr3dst/d   => rc 0; then: atime off local / readonly on local
+== C an incremental receive re-asserting read-only on a replica that had been set readonly=off: zfs send -i @S2 cr3src/d@S3 | zfs recv -o readonly=on -- cr3dst/d   => rc 0; then: readonly on local
+== D readonly=off, atime inherited (on), one cat, sync, 6 s: same get against @S3
+written@S3	12288	local
+readonly	off	local
+== E a base snapshot that does not exist: zfs get -Hp -o property,value,source written@nope,readonly -- cr3dst/d   (rc 0!)
+written@nope	-	-
+readonly	off	local
+== F a dataset that does not exist: rc 1, stderr: cannot open 'cr3dst/nope': dataset does not exist
+# Facts: `zfs recv -o <prop>=<val>` IS accepted on an incremental stream (the code comment near routes/replication.ts:805 saying it would be rejected is false). A missing base reads `-` at exit 0.

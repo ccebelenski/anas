@@ -45,6 +45,15 @@ export type TreeReadResult
 /** The sentence every read failure ends in. */
 const REFUSING = ' — refusing the recursive replication'
 
+/**
+ * A read failure's sentence without the run's ending (repl.drift review 2,
+ * defect 1): a status read or the daily check that could not read the tree
+ * refuses nothing, so it says only what could not be read.
+ */
+export function readFailureReason(message: string): string {
+  return message.endsWith(REFUSING) ? message.slice(0, -REFUSING.length) : message
+}
+
 function snapshotsUnreadable(root: string, onTarget: boolean): string {
   return `Could not list the snapshots under '${root}'${onTarget ? ' on the target' : ''}${REFUSING}`
 }
@@ -61,13 +70,32 @@ function parseRefusal(err: unknown): { ok: false, message: string } {
  */
 export async function readTreeFacts(deps: TreeReadDeps, input: TreeReadInput): Promise<TreeReadResult> {
   const { executor, transport } = deps
-  const { sourceRoot, targetRoot, exclude, placement } = input
-  const sourceRunner = (args: string[]): Promise<ExecResult> => executor.exec(ZFS, args)
+  const { placement } = input
   // The target side: a local target is a second local `zfs`; a peer/remote is
   // `ssh ... zfs ...` (the unqualified remote binary, ZFS_REMOTE).
-  const targetRunner = placement.isRemote
-    ? (args: string[]): Promise<ExecResult> => transport.sshExec(placement.resolved, [ZFS_REMOTE, ...args])
-    : (args: string[]): Promise<ExecResult> => executor.exec(ZFS, args)
+  return readTreeFactsWith({
+    source: (args: string[]): Promise<ExecResult> => executor.exec(ZFS, args),
+    target: placement.isRemote
+      ? (args: string[]): Promise<ExecResult> => transport.sshExec(placement.resolved, [ZFS_REMOTE, ...args])
+      : (args: string[]): Promise<ExecResult> => executor.exec(ZFS, args),
+  }, { sourceRoot: input.sourceRoot, targetRoot: input.targetRoot, exclude: input.exclude, localTarget: !placement.isRemote })
+}
+
+/** `zfs <args>` on one side of the tree read. */
+export type TreeZfsRunner = (args: string[]) => Promise<ExecResult>
+
+/**
+ * The same six reads over runners the caller built (repl.drift P1: a task's
+ * status read and the daily check reach a peer/remote target through the task
+ * list's own ssh reader, not through a resolved placement).
+ */
+export async function readTreeFactsWith(
+  runners: { source: TreeZfsRunner, target: TreeZfsRunner },
+  input: { sourceRoot: string, targetRoot: string, exclude: string[], localTarget: boolean },
+): Promise<TreeReadResult> {
+  const { sourceRoot, targetRoot, exclude } = input
+  const sourceRunner = runners.source
+  const targetRunner = runners.target
 
   // 1. The source's own tree. A failure is the same fact a failed recursive
   //    verb reports elsewhere: the subtree could not be listed.
@@ -153,7 +181,9 @@ export async function readTreeFacts(deps: TreeReadDeps, input: TreeReadInput): P
 
     // 6. The target tree's `written` (R5g): has a replica been modified since
     //    its last received snapshot? A failure is UNREADABLE, never "0".
-    const writtenRead = await targetRunner(zfsTreeGetArgs(targetRoot, ['written']))
+    //    repl.drift: `readonly` in the same command (the captured
+    //    `dst-written.txt` shape) — a copy that is not read-only is `exposed`.
+    const writtenRead = await targetRunner(zfsTreeGetArgs(targetRoot, ['written', 'readonly']))
     if (writtenRead.exitCode !== 0)
       return { ok: false, message: `Could not read the modification state under '${targetRoot}' on the target${REFUSING}` }
     try {
@@ -170,7 +200,7 @@ export async function readTreeFacts(deps: TreeReadDeps, input: TreeReadInput): P
       sourceRoot,
       targetRoot,
       exclude,
-      localTarget: !placement.isRemote,
+      localTarget: input.localTarget,
       sourceTree,
       sourceSnaps,
       sourceProps,
