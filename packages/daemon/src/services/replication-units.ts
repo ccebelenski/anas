@@ -3,7 +3,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { LenientReplicationTask as LenientReplicationTaskSchema, ReplicationTask as ReplicationTaskSchema } from '@anas/shared'
-import { parseSnapshotList, zfsSnapshotDetailArgs } from '../parsers/zfs-list.js'
+import { readLocalSnapshots } from './replication-snapshots.js'
 import { isTransientRunSnapshot } from './snapshot-naming.js'
 // The unit-store plumbing (marker regex, unlink, systemctl, unit-dir listing)
 // is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
@@ -31,7 +31,6 @@ import { deriveUnitRunStatus, toSystemdRunResult } from './unit-run-status.js'
 
 const SYSTEMCTL = '/usr/bin/systemctl'
 const SYSTEMD_ANALYZE = '/usr/bin/systemd-analyze'
-const ZFS = '/usr/sbin/zfs'
 /** The timer executes this compiled runner (ships in dist — see replicate-task.ts). */
 const RUNNER_NODE = '/usr/bin/node'
 const RUNNER_SCRIPT = '/opt/anas/packages/daemon/dist/replicate-task.js'
@@ -373,17 +372,18 @@ export function resolveTaskDatasets(task: ReplicationTask): { sourceFull: string
   return { sourceFull, targetFull: `${task.target.pool}/${targetRel}` }
 }
 
-/** A dataset's snapshots newest-first, or [] on any error (fail-open). */
-async function listSnapshots(executor: CommandExecutor, fullDataset: string): Promise<Snapshot[]> {
-  try {
-    const r = await executor.exec(ZFS, zfsSnapshotDetailArgs(fullDataset))
-    if (r.exitCode !== 0 || !r.stdout.trim())
-      return []
-    return parseSnapshotList(r.stdout)
-  }
-  catch {
-    return []
-  }
+/**
+ * A dataset's snapshots newest-first (by createtxg), `[]` when ZFS says the
+ * dataset does not exist, or null when the listing could not be read (cr3
+ * REPLICATION-L6 / INVENTED-STATE-M5). Before, every failure was `[]`: a
+ * LOCAL target whose listing failed read as "never replicated" and the grid
+ * showed every source snapshot behind and "Last replicated —".
+ */
+async function listSnapshots(executor: CommandExecutor, fullDataset: string): Promise<Snapshot[] | null> {
+  const r = await readLocalSnapshots(executor, fullDataset)
+  if (!r.ok)
+    return null
+  return r.exists ? r.snapshots : []
 }
 
 /**
@@ -412,7 +412,9 @@ export async function deriveTaskStatus(
   // replicated by design, so counting them would report a healthy task as N
   // behind for as long as a backup run is in flight — and the count would then
   // silently fix itself when the run's `finally` destroyed them.
-  const sourceSnaps = (await listSnapshots(executor, sourceFull))
+  // A source listing that could not be read leaves all three unknown (null),
+  // exactly as a source with no snapshots does: no lag is derived from it.
+  const sourceSnaps = ((await listSnapshots(executor, sourceFull)) ?? [])
     .filter(s => !isTransientRunSnapshot(s.snapshotName))
   let lastReplicatedSnapshot: string | null = null
   let lastReplicatedAt: string | null = null
@@ -425,7 +427,11 @@ export async function deriveTaskStatus(
     const isLocalTarget = !task.target.location || task.target.location.kind === 'local'
     let targetNames: Set<string> | null
     if (isLocalTarget) {
-      targetNames = new Set((await listSnapshots(executor, targetFull)).map(s => s.snapshotName))
+      // cr3: a target listing that could not be read is UNKNOWN (null), never
+      // "nothing replicated"; a target ZFS says does not exist is the truth
+      // "nothing replicated yet" (an empty set).
+      const listed = await listSnapshots(executor, targetFull)
+      targetNames = listed === null ? null : new Set(listed.map(s => s.snapshotName))
     }
     else if (remoteTargetNames) {
       targetNames = await remoteTargetNames(task, targetFull)

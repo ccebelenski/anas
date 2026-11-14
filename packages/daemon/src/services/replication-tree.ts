@@ -66,6 +66,13 @@ export type TreePlan
      * happened" are the same screen. SOURCE dataset names, like `skipped`.
      */
     upToDate: string[]
+    /**
+     * Of `upToDate`, the copies whose holds are left as they are (review of
+     * cr3, {@link decideBase} rule 1): the target's newest snapshot is a
+     * backup/cloud transient the source still has, and the next send starts
+     * from it. Absent when there is none.
+     */
+    holdsKept?: string[]
   }
   | { ok: false, refusals: string[] }
 
@@ -75,23 +82,129 @@ function unreadableRow(prop: string, dataset: string): string {
 }
 
 /**
- * Decide full vs incremental for ONE dataset — the per-dataset restatement of
- * the single-dataset `discover` in routes/replication.ts (the rule, not an
- * import: the route works on parsed `Snapshot` objects and discovers the
- * newest snapshot itself, while here S came from the tree's root, and uniting
- * the two is the next story's job). Same rule over plain name lists, newest
- * first: the base is the newest SOURCE snapshot older than S (after S in the
- * list) that is not a transient run snapshot and that the target's list also
- * has — transients ignored on the target side too, backup2.3's reason.
- * No base splits into "up to date" vs "diverged" in the caller.
+ * What ONE existing target copy needs to receive S — the ONE rule the
+ * single-dataset run (`discover`, routes/replication.ts) and the recursive
+ * planner below both ask (review of cr3: they must agree). Both lists are
+ * NEWEST FIRST in the order ZFS took the snapshots in (createtxg): the
+ * source's, and the target's OWN order. ZFS (no `-F`, which ANAS never
+ * passes) receives `-i @B` when @B is on the target and the target is
+ * unmodified since its newest snapshot, whose content then equals @B's
+ * (fixtures/zfs/replication-tree/README.md: a replica holding a
+ * destination-only snapshot received its incremental). Where the target
+ * HAS changed, ZFS's own refusal arbitrates and the run's failure sentence
+ * names the rollback ({@link modifiedTargetHint}).
+ *
+ *   1. The target has S (any name, transient or not) → up to date. The
+ *      newest NON-transient snapshot both have that is newer than S, if any,
+ *      is `newerCommon` (the chain's base is already past S: no hold moves).
+ *      `keepHolds` when the target's newest snapshot is a backup/cloud
+ *      transient the source still has, newer than S: the NEXT snapshot is
+ *      sent from it (rule 2), so the holds are left as they are (an older
+ *      build may have held that transient; moving the hold off it would let
+ *      the backup run's cleanup destroy it on the source).
+ *   2. The target's newest snapshot is a transient T the source still has,
+ *      older than S → the base is T for THIS send (the caller then settles the
+ *      hold on S, which releases it from T on both sides) — the stream ZFS
+ *      receives whether or not T carried changes. Newer than S → refused
+ *      (the target is past S).
+ *   3. (review 3 of cr3: deleted) A transient the source does not have —
+ *      an older build's leftover, or a backup/cloud run on the TARGET node of
+ *      the replica — is treated like any target-only snapshot: the later
+ *      rules pick the base and ZFS's own accept/refuse arbitrates.
+ *   4. A non-transient snapshot both have that is newer than S → refused
+ *      (`newerOnTarget`): the target is past S.
+ *   5. The newest non-transient source snapshot older than S that the target
+ *      has → the base.
+ *   6. Any snapshot both have (a transient included) → refused NAMING it;
+ *      "remove the target dataset" is never said while one exists.
+ *   7. Nothing in common → diverged.
  */
-function findBase(sourceSnaps: string[], targetSnaps: string[], S: string): string | undefined {
-  const targetNames = new Set(targetSnaps.filter(n => !isTransientRunSnapshot(n)))
-  const idx = sourceSnaps.indexOf(S)
-  // S missing from the source list is the caller's rule-7 question, not this one.
-  if (idx === -1)
-    return undefined
-  return sourceSnaps.slice(idx + 1).find(n => !isTransientRunSnapshot(n) && targetNames.has(n))
+export type BaseDecision
+  = | { kind: 'upToDate', newerCommon?: string, keepHolds?: true, keepHoldsOn?: string }
+    | { kind: 'incremental', base: string, transientBase?: true }
+    | { kind: 'refuse', message: string, newerCommon?: string }
+    | { kind: 'diverged' }
+
+/** ZFS's refusal of an incremental into a target written after its newest snapshot (the stderr wraps between "modified" and "since"). */
+const TARGET_MODIFIED_RE = /has been modified\s+since most recent snapshot/
+
+/**
+ * The hint ADDED to a failed receive's sentence when ZFS says the target was
+ * modified since its most recent snapshot (review 3 of cr3). The raw stderr
+ * stays in the sentence; this only names what changed and the one remedy:
+ * the target's snapshots newer than the base (by name, `targetSnaps` newest
+ * first) and a rollback to the base after releasing any hold on them —
+ * ground truth on the node pair 2026-11-14 (ZFS 2.4.2): destroying the newer
+ * snapshot does NOT make the receive succeed, the rollback does. Empty when
+ * the stderr is anything else.
+ */
+export function modifiedTargetHint(stderr: string, target: string, base: string | undefined, targetSnaps: string[]): string {
+  if (base === undefined || !TARGET_MODIFIED_RE.test(stderr))
+    return ''
+  const i = targetSnaps.indexOf(base)
+  const newer = i <= 0 ? [] : targetSnaps.slice(0, i)
+  const named = newer.slice(0, 5).map(n => `'@${n}'`).join(', ') + (newer.length > 5 ? ', ...' : '')
+  const holds = newer.length > 0
+    ? `release any hold on ${newer.length === 1 ? 'that snapshot' : 'those snapshots'} ('zfs holds ${target}@${newer[0]}' lists them; 'zfs release <tag> <snapshot>' for each), then `
+    : ''
+  return `the target was written to after '@${base}'${newer.length > 0 ? ` and has newer snapshot(s) ${named}` : ''}; to continue the chain, on the target ${holds}roll it back to '@${base}' ('zfs rollback -r ${target}@${base}', which destroys the snapshots newer than it there and anything written since)`
+}
+
+/** The sentence of the one diverged case: nothing in common at all. */
+export function divergedMessage(target: string): string {
+  return `Target '${target}' has diverged — no common snapshot; remove the target dataset or replicate to a new path`
+}
+
+export function decideBase(sourceSnaps: string[], targetSnaps: string[], S: string, ctx: { target: string, where?: string }): BaseDecision {
+  const where = ctx.where ?? ''
+  const onSource = new Set(sourceSnaps)
+  const sIdx = sourceSnaps.indexOf(S)
+  const newerOnSource = (name: string): boolean => {
+    const i = sourceSnaps.indexOf(name)
+    return i !== -1 && sIdx !== -1 && i < sIdx
+  }
+  const targetNewest = targetSnaps[0]
+  const newerCommon = sIdx <= 0
+    ? undefined
+    : sourceSnaps.slice(0, sIdx).find(n => !isTransientRunSnapshot(n) && targetSnaps.includes(n))
+  const transientAhead = targetNewest !== undefined && targetNewest !== S && isTransientRunSnapshot(targetNewest)
+
+  // 1. Up to date.
+  if (targetSnaps.includes(S)) {
+    const keep = transientAhead && onSource.has(targetNewest) && newerOnSource(targetNewest)
+    return { kind: 'upToDate', ...(newerCommon ? { newerCommon } : {}), ...(keep ? { keepHolds: true as const, keepHoldsOn: targetNewest } : {}) }
+  }
+
+  // 2. The target's newest snapshot is a transient the source still has.
+  //    (A transient the source does NOT have falls through: review 3 of cr3.)
+  if (transientAhead && onSource.has(targetNewest)) {
+    if (!newerOnSource(targetNewest))
+      return { kind: 'incremental', base: targetNewest, transientBase: true }
+    return { kind: 'refuse', message: `Target '${ctx.target}'${where} already has '@${targetNewest}' (a backup or cloud run's snapshot), which is newer than '@${S}' — replicate a newer snapshot` }
+  }
+
+  // 4. The target is already past S.
+  if (newerCommon !== undefined)
+    return { kind: 'refuse', newerCommon, message: `Target '${ctx.target}'${where} already has '@${newerCommon}', which is newer than '@${S}' — replicate '@${newerCommon}' or a later snapshot` }
+
+  // 5. The base.
+  const base = sIdx === -1 ? undefined : sourceSnaps.slice(sIdx + 1).find(n => !isTransientRunSnapshot(n) && targetSnaps.includes(n))
+  if (base !== undefined)
+    return { kind: 'incremental', base }
+
+  // 6. Something in common that is not a base: name it, never "diverged".
+  const common = sourceSnaps.filter(n => targetSnaps.includes(n))
+  if (common.length > 0) {
+    const named = common.slice(0, 3).map(n => `'@${n}'`).join(', ')
+    const c = common[0]
+    return {
+      kind: 'refuse',
+      message: `Target '${ctx.target}'${where} cannot receive '@${S}': its newest snapshot '@${targetNewest}' is not a base for it, and the snapshot(s) it shares with the source (${named}${common.length > 3 ? ', ...' : ''}) are not either — the target has not diverged; nothing was sent. On the target, roll it back to '@${c}' ('zfs rollback -r ${ctx.target}@${c}', which destroys the snapshots newer than it there) and the next run continues from '@${c}', or replicate to a new path`,
+    }
+  }
+
+  // 7. Nothing in common.
+  return { kind: 'diverged' }
 }
 
 /**
@@ -238,6 +351,7 @@ export function planTreeReplication(facts: TreeFacts): TreePlan {
   // 8. R5g + R5e: per dataset, full vs incremental vs up-to-date.
   const datasets: PlannedDataset[] = []
   const upToDate: string[] = []
+  const holdsKept: string[] = []
   const plannedFull = new Set<string>()
   for (const dataset of sweep) {
     if (invisible(dataset) || !holdsS(dataset))
@@ -274,16 +388,19 @@ export function planTreeReplication(facts: TreeFacts): TreePlan {
     // receive of such a stream says "already exists; ignoring" and exits 0 on
     // OpenZFS 2.4 — ground truth 2026-11-14 — so it was waste, not breakage,
     // but R6's "continues from each dataset's own base" means: skip these).
-    if ((facts.targetSnaps.get(t) ?? []).includes(S)) {
+    // (review of cr3) The ONE base rule, shared with the single-dataset run.
+    const decision = decideBase(facts.sourceSnaps.get(dataset) ?? [], facts.targetSnaps.get(t) ?? [], S, { target: t })
+    if (decision.kind === 'upToDate') {
       upToDate.push(dataset)
+      if (decision.keepHolds)
+        holdsKept.push(dataset)
       continue
     }
-    const base = findBase(facts.sourceSnaps.get(dataset) ?? [], facts.targetSnaps.get(t) ?? [], S)
-    if (base !== undefined) {
-      datasets.push({ dataset, target: t, mode: 'incremental', baseSnapshot: base })
+    if (decision.kind === 'incremental') {
+      datasets.push({ dataset, target: t, mode: 'incremental', baseSnapshot: decision.base })
       continue
     }
-    refusals.push(`Target '${t}' has diverged — no common snapshot; remove the target dataset or replicate to a new path`)
+    refusals.push(decision.kind === 'refuse' ? decision.message : divergedMessage(t))
   }
 
   if (refusals.length > 0)
@@ -294,5 +411,5 @@ export function planTreeReplication(facts: TreeFacts): TreePlan {
   const covered = new Set(sweep.map(targetName))
   const targetOnly = facts.targetTree.filter(name => isAtOrUnder(name, targetRoot) && !covered.has(name))
 
-  return { ok: true, snapshot: S, datasets, skipped, targetOnly, upToDate }
+  return { ok: true, snapshot: S, datasets, skipped, targetOnly, upToDate, ...(holdsKept.length > 0 ? { holdsKept } : {}) }
 }

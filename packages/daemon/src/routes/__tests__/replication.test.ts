@@ -97,6 +97,9 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
+    // cr3: the target's absence is ZFS's own answer to its snapshot listing
+    // (captured: fixtures/zfs/replication-tree/tree-missing.stderr.txt).
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: '', stderr: 'cannot open \'testpool2/share1\': dataset does not exist', exitCode: 1 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
 
@@ -181,7 +184,15 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
   // it is the NEWEST snapshot common to both sides — exactly the shape the base
   // discovery reaches for — and adopting it would leave the next incremental
   // send pointing at a base that no longer exists.
-  it('plan → the newest common snapshot IGNORES an anas-backup-* transient', async () => {
+  // Review of cr3 (decideBase rule 2): this fixture's TARGET has the transient
+  // as its NEWEST snapshot and the source still has it, so that ONE send is
+  // from the transient, and the run then settles the hold on repl-next (never
+  // on the transient). ZFS (no -F) would also receive `-i @repl-base` while the
+  // target is unmodified since its newest snapshot (whose content then equals
+  // repl-base's); the transient base is the one that holds when it carried
+  // changes. A transient that is NOT the target's newest is still never a base
+  // (cr3-replication.test.ts).
+  it('plan → a transient that is the TARGET\'s newest snapshot (and the source still has) is the base for that one send', async () => {
     server = createServer({ mock: true, logger: false })
     const mock = mockOf(server)
     mock.clearFixtures()
@@ -215,7 +226,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
         exitCode: 0,
       },
     })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@repl-base', '--', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@anas-backup-nightly-share1-1756000000', '--', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
 
     const res = await server.inject({
       method: 'POST',
@@ -226,8 +237,8 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.equal(res.statusCode, 200)
     const { data } = res.json() as { data: ReplicatePlan }
     assert.equal(data.mode, 'incremental')
-    assert.equal(data.baseSnapshot, 'repl-base', 'a transient must never become an incremental base')
-    // And the dry run was estimated against that base, not the transient.
+    assert.equal(data.baseSnapshot, 'anas-backup-nightly-share1-1756000000', 'the target\'s newest snapshot, which the source still has, is the base')
+    // And the dry run was estimated against that base.
     assert.equal(data.estimatedBytes, 8411760)
   })
 
@@ -266,6 +277,9 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
+    // cr3: the target's absence is ZFS's own answer to its snapshot listing
+    // (captured: fixtures/zfs/replication-tree/tree-missing.stderr.txt).
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: '', stderr: 'cannot open \'testpool2/share1\': dataset does not exist', exitCode: 1 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: '', stderr: '', exitCode: 0 } })
 
     const res = await server.inject({
@@ -305,6 +319,9 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
+    // cr3: the target's absence is ZFS's own answer to its snapshot listing
+    // (captured: fixtures/zfs/replication-tree/tree-missing.stderr.txt).
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: '', stderr: 'cannot open \'testpool2/share1\': dataset does not exist', exitCode: 1 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
     // hold / holds / release fall through to the command-only zfs fallback:
@@ -453,6 +470,9 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
+    // cr3: the target's absence is ZFS's own answer to its snapshot listing
+    // (captured: fixtures/zfs/replication-tree/tree-missing.stderr.txt).
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: '', stderr: 'cannot open \'testpool2/share1\': dataset does not exist', exitCode: 1 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -740,6 +760,9 @@ describe('snapshotFirst ownership — the in-job re-check (review fixes 1 + 4)',
 
     const mock = new MockExecutor()
     mock.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    // cr3: the target guard reads `zpool list -j` itself (three-valued);
+    // the injected boolean `poolExists` is no longer asked.
+    mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
     const queue = new JobQueue()
     const handlers = createReplicationHandlers({
       executor: mock,
@@ -853,10 +876,15 @@ describe('cr.64b2-ii step 5 — the target guard at the job\'s turn, the local t
     // with no common snapshot would read as diverged).
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
+    // cr3: the target's absence is ZFS's own answer to its snapshot listing
+    // (captured: fixtures/zfs/replication-tree/tree-missing.stderr.txt).
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: '', stderr: 'cannot open \'testpool2/share1\': dataset does not exist', exitCode: 1 } })
     mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
     // The guid — the dev mock's own pinned line (server.ts, ident.1).
     mock.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', 'testpool'], result: { stdout: `${TESTPOOL_GUID}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    // cr3: the sibling target's absence is ZFS's own answer to its snapshot listing.
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/backup'), result: { stdout: '', stderr: 'cannot open \'testpool/backup\': dataset does not exist', exitCode: 1 } })
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     return mock
   }

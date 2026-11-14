@@ -322,11 +322,27 @@ describe('rule 8: per-dataset full, incremental, up to date, refused', () => {
     ])
   })
 
-  it('a transient snapshot is never the base, on either side: the base skips to S1', () => {
+  // Review of cr3 (decideBase rule 2, shared with the single-dataset run):
+  // here the transient is the TARGET's NEWEST snapshot and the source still
+  // has it, so it is the base for this one send — the stream ZFS receives
+  // whether or not that transient carried changes (`-i @S1` is received only
+  // while the target is unmodified since its newest snapshot). A transient
+  // that is not the target's newest is still never a base (the next test).
+  it('a transient that is the TARGET\'s newest snapshot (the source still has it) is the base for that one send', () => {
     const plan = planOf(baseFacts({
       sourceSnaps: new Map([['tank', [S2, 'anas-backup-run-1794600000', S1]]]),
       targetTree: ['backup'],
       targetSnaps: new Map([['backup', ['anas-backup-run-1794600000', S1]]]),
+      targetProps: new Map([['backup', { written: '0' }]]),
+    }))
+    assert.deepEqual(plan.datasets, [inc('tank', 'backup', 'anas-backup-run-1794600000')])
+  })
+
+  it('a transient that is NOT the target\'s newest snapshot is never the base: the base skips to S1', () => {
+    const plan = planOf(baseFacts({
+      sourceSnaps: new Map([['tank', [S2, S1, 'anas-backup-run-1794600000']]]),
+      targetTree: ['backup'],
+      targetSnaps: new Map([['backup', [S1, 'anas-backup-run-1794600000']]]),
       targetProps: new Map([['backup', { written: '0' }]]),
     }))
     assert.deepEqual(plan.datasets, [inc('tank', 'backup', S1)])

@@ -17,7 +17,7 @@ import {
   writeRemotes,
 } from '../services/replication-remotes.js'
 import { resolvedRemoteFields } from '../services/replication-transport.js'
-import { readAllTasks } from '../services/replication-units.js'
+import { readAllTasksChecked } from '../services/replication-units.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -78,6 +78,14 @@ const AUTH_FAIL_RE = /permission denied|publickey|password|authentication/
  * ways depending on the key type and options; both are the same fact.
  */
 const HOSTKEY_CHANGED_RE = /remote host identification has changed|host key verification failed/
+
+/**
+ * The remote-delete result's note (cr3): the registry is cluster-wide, the
+ * task units are per node, and only this node's were read before the delete.
+ */
+function otherNodesNote(name: string): string {
+  return `Only this node's replication tasks were checked; a task on another cluster node that used remote '${name}' fails at its next run until it is edited or removed`
+}
 
 function CONFLICT(version: number) {
   return {
@@ -239,18 +247,13 @@ export async function replicationRemotesRoutes(
 
       // Refuse while a replication TASK still targets this remote — deleting it
       // would strand the task's units pointing at an unknown remote.
-      const tasks = await readAllTasks(systemdDir)
-      const referencing = tasks.filter(
-        t => t.target.location?.kind === 'remote' && t.target.location?.name === name,
-      )
-      if (referencing.length) {
-        reply.code(400)
-        return {
-          error: {
-            code: 'VALIDATION_ERROR',
-            message: `Remote '${name}' is still used by replication task(s): ${referencing.map(t => t.name).join(', ')} — remove them first`,
-          },
-        }
+      // cr3: a task store that could not be read IN FULL refuses (a task that
+      // could not be read may be the one that uses this remote), never reads
+      // as "no task uses it".
+      const refusal = await remoteInUseRefusal(name)
+      if (refusal) {
+        reply.code(refusal.status)
+        return { error: { code: refusal.code, message: refusal.message } }
       }
 
       const job = jobQueue.submit(
@@ -261,25 +264,48 @@ export async function replicationRemotesRoutes(
           // created after the route's check must not be stranded on a removed
           // remote. Same sentence and code as the route, so the job fails like
           // the 400 the route would have answered.
-          const tasks = await readAllTasks(systemdDir)
-          const referencing = tasks.filter(
-            t => t.target.location?.kind === 'remote' && t.target.location?.name === name,
-          )
-          if (referencing.length) {
-            throw new GuardRefusalError({
-              status: 400,
-              code: 'VALIDATION_ERROR',
-              message: `Remote '${name}' is still used by replication task(s): ${referencing.map(t => t.name).join(', ')} — remove them first`,
-            })
-          }
+          const inUse = await remoteInUseRefusal(name)
+          if (inUse)
+            throw new GuardRefusalError(inUse)
           const written = await writeRemotes(paths, expectedVersion, current.remotes.filter(r => r.name !== name))
-          return { removed: name, version: written.version }
+          // The registry is cluster-wide; the task units are per node, and
+          // only THIS node's were read. Said in the result, every time.
+          return { removed: name, version: written.version, note: otherNodesNote(name) }
         },
       )
       reply.code(202)
       return { job }
     },
   )
+
+  /**
+   * Why remote `name` cannot be deleted now, or null (the route and the job
+   * share it). A task on THIS node that targets it refuses 400; a task store
+   * that could not be read in full refuses 503 — the unread task may be the
+   * one that uses this remote. Tasks on other cluster nodes live in their own
+   * units and are not read here (the delete result's note says so).
+   */
+  async function remoteInUseRefusal(name: string): Promise<{ status: 400 | 503, code: 'VALIDATION_ERROR' | 'UNAVAILABLE', message: string } | null> {
+    const { tasks, complete } = await readAllTasksChecked(systemdDir)
+    const referencing = tasks.filter(
+      t => t.target.location?.kind === 'remote' && t.target.location?.name === name,
+    )
+    if (referencing.length) {
+      return {
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        message: `Remote '${name}' is still used by replication task(s): ${referencing.map(t => t.name).join(', ')} — remove them first`,
+      }
+    }
+    if (!complete) {
+      return {
+        status: 503,
+        code: 'UNAVAILABLE',
+        message: `Could not read every replication task on this node, so whether one still uses remote '${name}' is not known — refusing; remove or repair the task that cannot be read, then delete the remote`,
+      }
+    }
+    return null
+  }
 
   // --- Test-connection: staged diagnosis ------------------------------------
   /** How a probe is allowed to touch the pinned host key. */
@@ -434,7 +460,9 @@ export async function replicationRemotesRoutes(
       catch {
         // No known_hosts yet — the undo is removing the file.
       }
-      const wrote = await pinHostKey(executor, paths, input.host, input.port, { replace: input.intent.retrust })
+      // cr3 REPLICATION-M2: only the confirmed key's line(s) are written —
+      // never a key of another type the same scan returned, which nobody saw.
+      const wrote = await pinHostKey(executor, paths, input.host, input.port, { replace: input.intent.retrust, onlyFingerprint: input.fingerprint })
       if (wrote !== input.fingerprint) {
         if (previous === null)
           await rm(paths.knownHostsFile, { force: true })

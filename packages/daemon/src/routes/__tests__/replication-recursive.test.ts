@@ -216,7 +216,7 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
       sshFix(['zfs', ...zfsTreeSnapshotsArgs(TARGET_ROOT)], ok(fixture('dst-snaps-p.txt')))
       sshFix(['zfs', ...zfsTreeGetArgs(TARGET_ROOT, ['written'])], ok(fixture('dst-written.txt')))
       // The post-receive target read (fail-open; nothing held there yet).
-      sshFix(['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', '--', TARGET_ROOT], ok(''))
+      sshFix(['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', '-s', 'createtxg', '--', TARGET_ROOT], ok(''))
     }
     // Per-dataset dry-run estimates.
     for (const dataset of PLANNED) {
@@ -796,6 +796,8 @@ describe('recursive replication run (rrep.1b): the captured before-state', () =>
         m.addFixture({ command: ZPOOL, args: ['list', '-j'], result: ok(zpoolListJson(['testpool', 'testpool2'])) })
         m.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: ok(zfsListJson(['testpool', 'testpool/share1'])) })
         m.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: ok(zfsListJson(['testpool2'])) })
+        // cr3: the target's absence is ZFS's own answer to its snapshot listing.
+        m.addFixture({ command: ZFS, args: ['list', '-j', '-o', 'name,creation,used,referenced', '-t', 'snapshot', '--', 'testpool2/share1'], result: { stdout: '', stderr: 'cannot open \'testpool2/share1\': dataset does not exist', exitCode: 1 } })
         m.addFixture({ command: ZFS, args: ['list', '-j', '-o', 'name,creation,used,referenced', '-t', 'snapshot', '--', 'testpool/share1'], result: ok(JSON.stringify({ datasets: { 'testpool/share1@repl-base': { name: 'testpool/share1@repl-base', type: 'SNAPSHOT', pool: 'testpool', dataset: 'testpool/share1', snapshot_name: 'repl-base', createtxg: '100', properties: {} } } })) })
         m.addFixture({ command: ZFS, args: ['send', '-nvP', '--', 'testpool/share1@repl-base'], result: ok('full\ttestpool/share1@repl-base\t13424\nsize\t13424\n') })
         m.addFixture({ command: ZFS, result: ok('') })

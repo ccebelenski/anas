@@ -45,7 +45,8 @@ export interface ReplicationNotifyResult {
   /**
    * Absent when a RECURSIVE run sent nothing (every copy already at S) — a
    * mode over zero sends would claim a send shape that never happened
-   * (fold 5, review J). A single-dataset result always carries it.
+   * (fold 5, review J), and when a single-dataset run found the target
+   * already at S (cr3) — every other single-dataset result carries it.
    */
   mode?: 'full' | 'incremental'
   snapshot: string
@@ -64,8 +65,14 @@ export interface ReplicationNotifyResult {
   recursive?: true
   /** The datasets this recursive run sent, in plan order. */
   datasets?: ReplicationNotifyDataset[]
-  /** Source datasets whose copy was already at S — listed, never sent. */
+  /**
+   * Source datasets whose copy was already at S — listed, never sent. A
+   * single-dataset run that sent nothing (cr3 REPLICATION-M1) carries its
+   * one source here and no `mode`.
+   */
   upToDate?: string[]
+  /** One sentence a run that sent nothing adds about why (cr3). */
+  note?: string
 }
 
 export interface ReplicationNotifyContext extends UnattendedNotifyBase {
@@ -81,6 +88,25 @@ export interface ReplicationNotifyContext extends UnattendedNotifyBase {
   snapshot?: string
   /** The finished run result — absent when the run threw. */
   result?: ReplicationNotifyResult
+}
+
+/** Every C0 control character (the newline included) and DEL. */
+// eslint-disable-next-line no-control-regex
+const CONTROL_RE = /[\x00-\x1F\x7F]/g
+
+/** The longest text one line of the body carries; the journal has the rest. */
+const SINGLE_LINE_MAX = 2000
+
+/**
+ * Text another program wrote (a remote `zfs recv`'s stderr, a hold's stderr)
+ * as ONE line: control characters become spaces and a long text is cut (cr3 REPLICATION-L5). The notification body is plain
+ * text whose lines are `Key:  value`; a newline or a carriage return carried
+ * in verbatim wrote lines of its own into it — a forged `Result: success`
+ * under a failure was one remote stderr away.
+ */
+export function singleLine(text: string): string {
+  const flat = text.replace(CONTROL_RE, ' ').trim()
+  return flat.length > SINGLE_LINE_MAX ? `${flat.slice(0, SINGLE_LINE_MAX)}...` : flat
 }
 
 /** Classify a finished replication into the shared four-outcome vocabulary. */
@@ -142,6 +168,12 @@ export function buildReplicationNotifyBody(ctx: ReplicationNotifyContext): strin
     lines.push(`Mode:        ${ctx.result.mode}`
       + `${ctx.result.baseSnapshot ? ` (from @${ctx.result.baseSnapshot})` : ''}`)
   }
+  else if (ctx.result !== undefined && ctx.result.recursive !== true && (ctx.result.upToDate?.length ?? 0) > 0) {
+    // cr3: a single-dataset run that sent nothing says so.
+    lines.push('Mode:        nothing sent (the target already has this snapshot)')
+  }
+  if (ctx.result?.note)
+    lines.push(`Note:        ${singleLine(ctx.result.note)}`)
 
   // rrep.1b: a recursive run lists what it sent and how many copies needed
   // nothing. Gated on the flag, so a single-dataset body never changes.
@@ -156,13 +188,13 @@ export function buildReplicationNotifyBody(ctx: ReplicationNotifyContext): strin
     lines.push('')
     lines.push('Warnings:')
     for (const w of ctx.result.warnings)
-      lines.push(`  ${w}`)
+      lines.push(`  ${singleLine(w)}`)
   }
 
   if (ctx.error !== undefined) {
     lines.push('')
     lines.push('Error:')
-    lines.push(`  ${ctx.error}`)
+    lines.push(`  ${singleLine(ctx.error)}`)
   }
 
   // The body ends on the facts (backup's rule) - no closing pointer to the UI.

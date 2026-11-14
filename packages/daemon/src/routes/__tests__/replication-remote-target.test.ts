@@ -110,7 +110,7 @@ describe('replication to a REMOTE target (Epic 5.5.2)', () => {
     sshFix(mock, ['zpool', 'list', '-H', '-o', 'name'], { stdout: 'backup\n', stderr: '', exitCode: 0 })
     sshFix(mock, ['zfs', 'list', '-H', '-o', 'name', '--', TARGET], { stdout: '', stderr: 'dataset does not exist', exitCode: 1 })
     sshFix(mock, ['zfs', 'hold', '--', TAG, `${TARGET}@${SNAP}`], { stdout: '', stderr: '', exitCode: 0 })
-    sshFix(mock, ['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', '--', TARGET], { stdout: '', stderr: '', exitCode: 0 })
+    sshFix(mock, ['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name,creation', '-s', 'createtxg', '--', TARGET], { stdout: '', stderr: '', exitCode: 0 })
   })
 
   afterEach(async () => {

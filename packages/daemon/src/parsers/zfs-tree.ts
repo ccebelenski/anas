@@ -4,7 +4,7 @@
  * stunt nodes (`fixtures/zfs/replication-tree/`, see its README):
  *
  *   zfs list -H  -o name                  -r -t filesystem,volume  → tree
- *   zfs list -Hp -t snapshot -o name,creation,guid -r              → snapshots
+ *   zfs list -Hp -t snapshot -o name,creation,guid -s createtxg -r → snapshots
  *   zfs get -Hp  -r -t filesystem,volume -o name,property,value    → props
  *
  * One rule runs through all three: A LINE WE CANNOT READ IS AN ERROR, NEVER
@@ -66,22 +66,25 @@ export function parseTreeList(stdout: string): string[] {
 }
 
 /**
- * `zfs list -Hp -t snapshot -o name,creation,guid -r -- <root>` — every
- * snapshot of the tree ({@link zfsTreeSnapshotsArgs} builds the argv; fixture
- * `src-snaps-p.txt`). Each line is `<dataset>@<name>\t<creation epoch>\t<guid>`
- * → dataset → snapshot NAMES, NEWEST FIRST. Order comes from the creation
- * epoch, not the listing order; two snapshots of ONE dataset sharing an epoch
- * keep the listing's meaning of "later line = newer", so the later line comes
- * FIRST (an equal-epoch pair cannot be told apart any other way from stdout —
- * `-Hp` gives no finer clock). A dataset with no snapshots gets no key at all
- * (empty stdout = no keys: the fixture README's "nothing there").
+ * `zfs list -Hp -t snapshot -o name,creation,guid -s createtxg -r -- <root>` —
+ * every snapshot of the tree ({@link zfsTreeSnapshotsArgs} builds the argv;
+ * fixture `src-snaps-p.txt`). Each line is
+ * `<dataset>@<name>\t<creation epoch>\t<guid>` → dataset → snapshot NAMES,
+ * NEWEST FIRST. cr3: the order is the LISTING order, which `-s createtxg`
+ * makes the order ZFS took the snapshots in (the transaction group only
+ * grows): a later line is a newer snapshot. Before, the order came from the
+ * creation epoch — the wall clock, which a clock stepped backwards makes
+ * disagree with the order the snapshots were taken in (the datasets review's
+ * finding on `parseSnapshotList`, the same rule). The epoch column is still
+ * read and must be an epoch (an unreadable line refuses the run). A dataset
+ * with no snapshots gets no key at all (empty stdout = no keys: the fixture
+ * README's "nothing there").
  */
 export function parseTreeSnapshots(stdout: string): Map<string, string[]> {
   interface Entry {
     dataset: string
     name: string
-    epoch: number
-    /** Position in the listing; breaks equal-epoch ties (later = newer). */
+    /** Position in the createtxg-sorted listing (later = newer). */
     order: number
   }
   const entries: Entry[] = []
@@ -97,10 +100,10 @@ export function parseTreeSnapshots(stdout: string): Map<string, string[]> {
     const epoch = DIGITS_RE.test(fields[1]) ? Number(fields[1]) : Number.NaN
     if (at <= 0 || at === fields[0].length - 1 || !Number.isFinite(epoch))
       unreadable('zfs snapshot listing', line)
-    entries.push({ dataset: fields[0].slice(0, at), name: fields[0].slice(at + 1), epoch, order: entries.length })
+    entries.push({ dataset: fields[0].slice(0, at), name: fields[0].slice(at + 1), order: entries.length })
   }
-  const newest = (a: Entry, b: Entry): number =>
-    b.epoch - a.epoch || b.order - a.order
+  // Newest first: the reverse of the createtxg-sorted listing.
+  const newest = (a: Entry, b: Entry): number => b.order - a.order
   entries.sort(newest)
   const out = new Map<string, string[]>()
   for (const e of entries) {
@@ -146,10 +149,12 @@ export function parseTreeProps(stdout: string): Map<string, Record<string, strin
  * `-p` matters here exactly as it does in `zfsListArgs`: under `-Hp` the
  * `creation` column is an exact epoch integer, while without `-p` it is a
  * display date that two snapshots taken in one recursive call would share to
- * the second.
+ * the second. `-s createtxg` (cr3) sorts the rows by the transaction group
+ * each snapshot was taken in — {@link parseTreeSnapshots} reads "newer" from
+ * that order, never from the clock.
  */
 export function zfsTreeSnapshotsArgs(root: string): string[] {
-  return ['list', '-Hp', '-t', 'snapshot', '-o', 'name,creation,guid', '-r', '--', root]
+  return ['list', '-Hp', '-t', 'snapshot', '-o', 'name,creation,guid', '-s', 'createtxg', '-r', '--', root]
 }
 
 /**

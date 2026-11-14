@@ -10,10 +10,10 @@ import { join } from 'node:path'
 import { ReplicationTask, ReplicationTaskFields, ReplicationTaskName } from '@anas/shared'
 import { currentLane } from '../executor/deadline.js'
 import { parseTreeList } from '../parsers/zfs-tree.js'
-import { parseZpoolList } from '../parsers/zpool-list.js'
 import { guardCheck, guarded, sendRefusal, taskClaim } from '../safety/guard.js'
 import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage } from '../services/pve-footprint.js'
-import { guardReplicationTarget, memoisePoolExists } from '../services/replication-target.js'
+import { readRemoteSnapshotNames } from '../services/replication-snapshots.js'
+import { guardReplicationTarget, memoisePoolExists, readLocalPoolExistence } from '../services/replication-target.js'
 import { ownedMessage } from '../services/replication-tree-gate.js'
 import { treePlacementRefusals, treeTargetName, treeTargetNameRefusals } from '../services/replication-tree.js'
 import {
@@ -31,7 +31,6 @@ import { isRunActive, showUnitPropsStrict } from '../services/unit-run-status.js
 import { isAtOrUnder, sweepSet, zfsTreeListArgs } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
-const ZPOOL = '/usr/sbin/zpool'
 const ZFS = '/usr/sbin/zfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
 
@@ -92,15 +91,20 @@ export async function replicationTaskRoutes(
   /**
    * Resolve a NON-local task target's snapshot names over the SSH transport.
    * Any transport/resolution failure → null (unknown), never a false
-   * "everything is behind".
+   * "everything is behind". cr3: so is a listing that FAILED — before, the
+   * ssh listing answered `[]` on any failure (`remoteSnapshotNames`), and the
+   * comment here was not true of it; a target ZFS says does not exist is an
+   * empty set (nothing replicated yet, the truth).
    */
   const remoteTargetNames: TargetNamesResolver = async (task, targetFull) => {
     try {
       const res = await transport.resolveLocation(task.target.location!)
       if (!res.ok)
         return null
-      const names = await transport.remoteSnapshotNames(res.resolved, targetFull)
-      return new Set(names)
+      const read = await readRemoteSnapshotNames(cmd => transport.sshExec(res.resolved, cmd), targetFull)
+      if (!read.ok)
+        return null
+      return new Set(read.exists ? read.snapshots : [])
     }
     catch {
       return null
@@ -108,21 +112,12 @@ export async function replicationTaskRoutes(
   }
 
   /**
-   * Does the named pool exist? (source of truth is `zpool list`). Same probe
-   *  the stage-1 replicate guard uses.
+   * Does the named pool exist on THIS node — three-valued (cr3): a failing
+   * `zpool list` is "could not list the pools on this node: <line>", never
+   * "does not exist" (the remote probe's shape since repl.r2). Before, both
+   * probes here read a failed listing as "no pools".
    */
-  async function poolExists(poolName: string): Promise<boolean> {
-    const r = await executor.exec(ZPOOL, ['list', '-j'])
-    const pools = r.exitCode === 0 && r.stdout.trim() ? parseZpoolList(r.stdout) : []
-    return pools.some(p => p.name === poolName)
-  }
-
-  /**
-   * The LOCAL probe in the target guard's three-valued shape (repl.r2). A
-   * failed local `zpool list` keeps reading as "no" — the local branch is
-   * left as it was; the third value exists for the remote transport.
-   */
-  const localPoolExists = async (poolName: string): Promise<PoolExistence> => ({ ok: true, exists: await poolExists(poolName) })
+  const localPoolExists = (poolName: string): Promise<PoolExistence> => readLocalPoolExistence(executor, poolName)
 
   /**
    * Story pvepool.1: the ONE footprint service answers "does PVE own this
@@ -157,7 +152,13 @@ export async function replicationTaskRoutes(
     // so `zpool list` is authoritative for it. It was never checked: a task could
     // be written pointing at a pool that does not exist, and only fail at 03:00
     // in a timer run.
-    if (!(await poolExists(task.source.pool))) {
+    const sourcePool = await localPoolExists(task.source.pool)
+    if (!sourcePool.ok) {
+      reply.code(400)
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Could not list the pools on this node: ${sourcePool.error}` } })
+      return false
+    }
+    if (!sourcePool.exists) {
       reply.code(400)
       reply.send({ error: { code: 'VALIDATION_ERROR', message: `Source pool '${task.source.pool}' does not exist` } })
       return false
@@ -572,14 +573,27 @@ export async function replicationTaskRoutes(
     // a body sending only `exclude` keeps the stored recursion, and the
     // version-skew case answers with R3's own sentence instead of a silently
     // flipped field — an older client that knows nothing of `recursive`
-    // sends `snapshotFirst: true` (or omits it and gets the default), which
-    // merged with a stored recursive task is exactly R3's forbidden pair (R12).
+    // sends `snapshotFirst: true`, which merged with a stored recursive task
+    // is exactly R3's forbidden pair (R12). (cr3: one that OMITS it keeps the
+    // stored `false` below, and the stored recursion with it.)
+    //
+    // cr3 (the EPICS candidate "a PUT that omits snapshotFirst, enabled or
+    // notify resets them to the defaults"): the same rule for the three
+    // DEFAULTED fields. The shape parse above fills an omitted one with its
+    // schema default (true / true / on-failure), so a body that omits
+    // `enabled` re-enabled a disabled task and one that omits `snapshotFirst`
+    // turned it back on; an omitted key now keeps the STORED value. These
+    // three take no `null` (the schema has no "cleared" value for them): a
+    // client that wants the default sends it.
     const rawBody = request.body as Record<string, unknown> | null | undefined
-    const sent = (key: 'recursive' | 'exclude'): boolean => rawBody !== null && typeof rawBody === 'object' && Object.hasOwn(rawBody, key)
+    const sent = (key: 'recursive' | 'exclude' | 'snapshotFirst' | 'enabled' | 'notify'): boolean => rawBody !== null && typeof rawBody === 'object' && Object.hasOwn(rawBody, key)
     const recursive = sent('recursive') ? task.recursive === true : stored.recursive === true
     const exclude = sent('exclude') ? task.exclude : recursive ? stored.exclude : undefined
     const mergedParse = ReplicationTask.safeParse({
       ...task,
+      ...(sent('snapshotFirst') ? {} : { snapshotFirst: stored.snapshotFirst }),
+      ...(sent('enabled') ? {} : { enabled: stored.enabled }),
+      ...(sent('notify') ? {} : { notify: stored.notify }),
       ...(sent('recursive') || stored.recursive === undefined ? {} : { recursive: stored.recursive }),
       ...(exclude === undefined ? {} : { exclude }),
     })

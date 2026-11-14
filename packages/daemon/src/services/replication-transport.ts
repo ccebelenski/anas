@@ -2,6 +2,7 @@ import type { ReplicationLocation, ReplicationRemote } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { RemotesPaths } from './replication-remotes.js'
 import { readFile } from 'node:fs/promises'
+import { PoolName, RemoteHost } from '@anas/shared'
 import { readRemotes } from './replication-remotes.js'
 
 /**
@@ -261,8 +262,20 @@ export interface Transport {
   buildSshArgv: (resolved: ResolvedLocation, cmd: string[]) => string[]
   remotePoolNames: (resolved: ResolvedLocation) => Promise<RemotePoolList>
   remotePoolExists: (resolved: ResolvedLocation, pool: string) => Promise<PoolExistence>
+  /**
+   * @deprecated cr3: fail-open — a failed ssh reads as "absent". No caller is
+   * left; use `readRemoteSnapshotNames` (services/replication-snapshots.ts),
+   * which answers list / absent / could not read. Kept on the interface only
+   * because a test double outside this area's fence still supplies it.
+   */
   remoteDatasetExists: (resolved: ResolvedLocation, ds: string) => Promise<boolean>
-  /** Snapshot NAMES (after the '@') present on a remote dataset (fail-open []). */
+  /**
+   * @deprecated cr3: fail-open — a failed listing reads as `[]` ("nothing
+   * replicated", "diverged"). No caller is left; use
+   * `readRemoteSnapshotNames` (services/replication-snapshots.ts). Kept on
+   * the interface only because a test double outside this area's fence still
+   * supplies it.
+   */
   remoteSnapshotNames: (resolved: ResolvedLocation, ds: string) => Promise<string[]>
   remoteHold: (resolved: ResolvedLocation, snapFull: string, tag: string) => Promise<ExecResult>
   remoteRelease: (resolved: ResolvedLocation, snapFull: string, tag: string) => Promise<ExecResult>
@@ -309,7 +322,10 @@ export function createTransport(executor: CommandExecutor, config: TransportConf
     const members = await readMembers(config.membersFile)
     if (!members)
       return []
-    return members.nodes.filter(n => n !== members.nodename)
+    // cr3: a name read from a config file is validated where it enters the
+    // daemon — the picker renders it. A PVE node name is a host name; one
+    // that is not (RemoteHost's charset) is not offered.
+    return members.nodes.filter(n => n !== members.nodename && RemoteHost.safeParse(n).success)
   }
 
   async function remotePoolNames(resolved: ResolvedLocation): Promise<RemotePoolList> {
@@ -318,7 +334,15 @@ export function createTransport(executor: CommandExecutor, config: TransportConf
     // An exit 0 with empty stdout is a host with no pools — an answer.
     if (r.exitCode !== 0)
       return { ok: false, error: sshFailureLine(r) }
-    return { ok: true, pools: r.stdout.split('\n').map(l => l.trim()).filter(Boolean) }
+    // cr3 REPLICATION-M3: a line is a pool only when it passes the shared
+    // PoolName — the far side's text enters the daemon here and is rendered
+    // in the admin's PVE session (a pool picker), so a compromised target
+    // must not get markup through. A line that fails is DROPPED, not made
+    // a "could not list": such a name can never be a replication target
+    // anyway (ReplicationTarget.pool is PoolName), a login banner printed
+    // to stdout by the remote's shell rc must not take every real pool
+    // with it, and an answer that did arrive is still an answer.
+    return { ok: true, pools: r.stdout.split('\n').map(l => l.trim()).filter(l => PoolName.safeParse(l).success) }
   }
 
   async function remotePoolExists(resolved: ResolvedLocation, pool: string): Promise<PoolExistence> {

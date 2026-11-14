@@ -18,7 +18,10 @@ const ReplicationDataset = DatasetPath.or(z.literal(''))
  * Design (EPICS 5.5.x): stateless — the incremental base is
  * DISCOVERED at run time as the newest snapshot common to source and target
  * (never bookkept); the destination is created `readonly=on`; the incremental
- * base carries a `zfs hold` (tag `anas-repl`) so cleanup cannot sever the
+ * base carries a `zfs hold` under the chain's own tag (`anas-repl-<12 hex of
+ * sha256(location, target)>`, `replicationHoldTag` in the daemon's
+ * services/replication-holds.ts — ident.4; the suffix-less `anas-repl` is the
+ * tag earlier installs placed, migrated away) so cleanup cannot sever the
  * chain; a broken chain means a FULL send and the caller must be told (with
  * bytes) before running. journald is forensics, never correctness.
  *
@@ -89,6 +92,14 @@ export const ReplicatePlan = z.object({
    *  UI must say so instead of offering the run).
    */
   targetDiverged: z.boolean(),
+  /**
+   * cr3 (REPLICATION-M1): true when the target already has `snapshot` —
+   * nothing would be sent (`estimatedBytes` 0, no `baseSnapshot`; `mode`
+   * stays 'incremental' so a panel that predates the field shows no full
+   * send). A run of such a plan sends nothing and moves no hold onto an older
+   * snapshot. ADDITIVE/optional: absent everywhere else.
+   */
+  upToDate: z.boolean().optional(),
 })
 export type ReplicatePlan = z.infer<typeof ReplicatePlan>
 

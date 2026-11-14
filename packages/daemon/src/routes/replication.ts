@@ -11,12 +11,13 @@ import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
 import { GuardRefusalError, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { ownershipRefusal } from '../services/pve-footprint.js'
-import { legacyReleasableOnSource, replicationHoldTag, settleReplicationHolds } from '../services/replication-holds.js'
-import { notifyReplicationRun } from '../services/replication-notify.js'
-import { guardReplicationTarget } from '../services/replication-target.js'
+import { legacyReleasableOnSource, readLocalHoldsChecked, replicationHoldTag, settleReplicationHolds } from '../services/replication-holds.js'
+import { notifyReplicationRun, singleLine } from '../services/replication-notify.js'
+import { newestReplicable, readLocalSnapshots, readRemoteSnapshotNames } from '../services/replication-snapshots.js'
+import { guardReplicationTarget, readLocalPoolExistence } from '../services/replication-target.js'
 import { gateTreeRun } from '../services/replication-tree-gate.js'
 import { readTreeFacts } from '../services/replication-tree-read.js'
-import { treeTargetName } from '../services/replication-tree.js'
+import { decideBase, divergedMessage, modifiedTargetHint, treeTargetName } from '../services/replication-tree.js'
 import { isTransientRunSnapshot } from '../services/snapshot-naming.js'
 import { datasetSourceClaims } from '../services/source-claims.js'
 import { createZfsSnapshot, ZFS_REMOTE } from '../services/zfs-snapshot.js'
@@ -56,9 +57,20 @@ export interface ReplicationDeps {
    *  sends a 400 and returns null on an invalid path.
    */
   resolveDatasetName: (poolName: string, datasetPath: string, reply: FastifyReply) => string | null
+  /**
+   * The datasets wiring's boolean pool probe (false on a failed read). Kept
+   * for that wiring; replication asks `readLocalPoolExistence` instead (cr3).
+   */
   poolExists: (poolName: string) => Promise<boolean>
   datasetExists: (poolName: string, fullName: string) => Promise<boolean>
-  /** A dataset's snapshots, newest-first (empty when it has none). */
+  /**
+   * A dataset's snapshots, newest-first (empty when it has none). The
+   * datasets wiring still hands it in; the replication runs no longer read
+   * through it (cr3): it answers `[]` on a failed listing and orders by
+   * creation time, and replication reads its snapshots through
+   * services/replication-snapshots.ts, which says "could not read" and
+   * orders by createtxg.
+   */
   listSnapshotsDetail: (fullName: string) => Promise<Snapshot[]>
   /**
    * PVE footprint ownership (story pvepool.1): the ONE service that answers
@@ -133,37 +145,103 @@ interface Discovered {
   baseSnapshot?: string
   targetExists: boolean
   targetDiverged: boolean
+  /**
+   * cr3 REPLICATION-M1: the target already has `snapshot` — nothing is sent
+   * (the planner's `upToDate`, replication-tree.ts). Before, the base search
+   * ran anyway, an incremental from an older base was "received" (ZFS: "snap
+   * ... already exists; ignoring", exit 0) and the holds were settled on
+   * `snapshot` — for a Replicate Once of an OLDER snapshot that moved the
+   * chain's hold BACK and released the real base on both sides.
+   */
+  upToDate: boolean
+  /**
+   * The newest non-transient source snapshot NEWER than `snapshot` that the
+   * target also has, when there is one: the chain's base is already past
+   * `snapshot`, so its holds are never moved onto `snapshot`.
+   */
+  newerCommon?: string
+  /**
+   * Review of cr3: up to date, and the target's newest snapshot is this
+   * backup/cloud transient the source still has — the next send starts from
+   * it, so no hold is settled (decideBase rule 1).
+   */
+  keepHoldsOn?: string
+  /** A sentence the run refuses with before sending (decideBase rules 2–4, 6). */
+  refusal?: string
 }
 
 /**
- * Decide full vs incremental from live ZFS state. The base is the NEWEST source
- * snapshot older than `snapshot` (in creation order) that also exists on the
- * target. Target absent → full. Target present but no common base → diverged
- * (reported as a full send whose bytes we still estimate; stage 1 cannot run it).
+ * Decide full vs incremental from live ZFS state: target absent → full;
+ * otherwise the ONE base rule the recursive planner also asks
+ * ({@link decideBase}, services/replication-tree.ts — review of cr3: the two
+ * paths must agree). Both lists are newest-first by createtxg; the target's is
+ * its OWN order. ZFS (no -F) receives `-i @B` when @B is on the target and the
+ * target is unmodified since its newest snapshot; where it was modified, ZFS
+ * refuses and the failure sentence names the rollback (`modifiedTargetHint`).
  *
- * ⚠ TRANSIENT BACKUP SNAPSHOTS ARE NEVER A BASE (backup2.3). A snapshot-consistent
- * backup run takes `anas-backup-<task>-<ts>` on the source and destroys it in a
- * `finally`. If one were ever adopted as an incremental base, the destroy would
- * pull the base out from under the next incremental send and break the chain —
- * so they are filtered out of BOTH sides of the comparison, using the one shared
- * predicate in `snapshot-naming.ts`.
+ * ⚠ TRANSIENT BACKUP SNAPSHOTS (backup2.3). A snapshot-consistent backup run
+ * takes `anas-backup-<task>-<ts>` on the source and destroys it in a
+ * `finally`; one is never chosen as an ordinary base and the chain's hold is
+ * never settled onto one. The single exception is decideBase's rule 2: when
+ * the target's NEWEST snapshot is a transient the source still has (an older
+ * build sent one), it is the base for that one send — the stream ZFS receives
+ * whether or not that transient carried changes — and the hold is then
+ * settled on S, releasing the transient.
  */
-function discover(sourceSnaps: Snapshot[], targetSnaps: Snapshot[] | null, snapshot: string): Discovered {
+function discover(sourceSnaps: Snapshot[], targetSnaps: Snapshot[] | null, snapshot: string, ctx: { target: string, where: string }): Discovered {
   if (targetSnaps === null)
-    return { mode: 'full', snapshot, targetExists: false, targetDiverged: false }
+    return { mode: 'full', snapshot, targetExists: false, targetDiverged: false, upToDate: false }
+  const d = decideBase(sourceSnaps.map(s => s.snapshotName), targetSnaps.map(s => s.snapshotName), snapshot, ctx)
+  switch (d.kind) {
+    case 'upToDate':
+      return {
+        mode: 'incremental',
+        snapshot,
+        targetExists: true,
+        targetDiverged: false,
+        upToDate: true,
+        ...(d.newerCommon ? { newerCommon: d.newerCommon } : {}),
+        ...(d.keepHoldsOn ? { keepHoldsOn: d.keepHoldsOn } : {}),
+      }
+    case 'incremental':
+      return { mode: 'incremental', snapshot, baseSnapshot: d.base, targetExists: true, targetDiverged: false, upToDate: false }
+    case 'refuse':
+      return { mode: 'incremental', snapshot, targetExists: true, targetDiverged: false, upToDate: false, refusal: d.message }
+    case 'diverged':
+      // Nothing in common at all (reported as a full send whose bytes the
+      // plan still estimates; the run refuses it).
+      return { mode: 'full', snapshot, targetExists: true, targetDiverged: true, upToDate: false }
+  }
+}
 
-  const targetNames = new Set(
-    targetSnaps.map(s => s.snapshotName).filter(n => !isTransientRunSnapshot(n)),
-  )
-  // sourceSnaps is newest-first; snapshots OLDER than `snapshot` are the ones
-  // after it in the list — a valid `-i` base must be older than what we send.
-  const snapIdx = sourceSnaps.findIndex(s => s.snapshotName === snapshot)
-  const older = snapIdx === -1 ? [] : sourceSnaps.slice(snapIdx + 1)
-  const common = older.find(s => !isTransientRunSnapshot(s.snapshotName) && targetNames.has(s.snapshotName))
-  if (common)
-    return { mode: 'incremental', snapshot, baseSnapshot: common.snapshotName, targetExists: true, targetDiverged: false }
-  // Target exists but shares no common base → divergence (out of stage-1 scope).
-  return { mode: 'full', snapshot, targetExists: true, targetDiverged: true }
+/**
+ * The refusal of a NAMED backup or cloud transient (review of cr3). Such a
+ * snapshot (`anas-backup-*`, `anas-cloud-*`, `isTransientRunSnapshot`) is
+ * destroyed by the run that took it, so it can never be a replication base:
+ * sent, the settle would move the chain's hold onto it (and keep the run's
+ * own cleanup from destroying it), and once the hold's old base was pruned
+ * the next run would read "diverged". Refused at the request, before any job,
+ * rather than sent without moving the hold: a replica whose newest snapshot
+ * is a transient breaks the next incremental anyway (ZFS refuses a stream
+ * whose base is not the target's newest snapshot).
+ */
+function namedTransientMessage(source: string, snapshot: string): string {
+  return `'${source}@${snapshot}': snapshot names beginning with 'anas-backup-' or 'anas-cloud-' are reserved for backup and cloud runs and are never replicated by name — name another snapshot, or none for the newest`
+}
+
+/**
+ * What a failed `zfs send | zfs recv` said, for the job error and the mail
+ * body: the receive's stderr, else the send's, else both exit codes. The
+ * stderr is text the far side writes (a remote `zfs recv` over ssh), so it is
+ * made ONE line with no control characters (cr3 REPLICATION-L5): verbatim, a
+ * newline in it wrote lines of its own into the notification body.
+ */
+function pipelineFailureDetail(pipe: PipelineResult): string {
+  if (pipe.rightStderr.trim())
+    return `recv: ${singleLine(pipe.rightStderr)}`
+  if (pipe.leftStderr.trim())
+    return `send: ${singleLine(pipe.leftStderr)}`
+  return `send exited ${pipe.leftExitCode}, recv exited ${pipe.rightExitCode}`
 }
 
 const ISO_PUNCT_RE = /[:.]/g
@@ -174,7 +252,7 @@ function defaultSnapName(): string {
 }
 
 export function createReplicationHandlers(deps: ReplicationDeps) {
-  const { executor, jobQueue, resolveDatasetName, poolExists, datasetExists, listSnapshotsDetail, transport } = deps
+  const { executor, jobQueue, resolveDatasetName, datasetExists, transport } = deps
 
   /**
    * The target-side guards — location resolution, pool existence WHERE THE
@@ -182,26 +260,74 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
    * check — all live in services/replication-target.ts, shared verbatim with
    * the recurring-task routes (issue #46).
    */
-  // The LOCAL probe stays the boolean it always was (repl.r2 leaves the local
-  // branch alone); the guard deps speak the three-valued shape the remote
-  // transport answers in, so a local "no" can never be mistaken for a remote
-  // "did not answer" or the other way round.
-  const localPoolExists = async (pool: string): Promise<PoolExistence> => ({ ok: true, exists: await poolExists(pool) })
+  // cr3: the LOCAL probe is three-valued like the remote one (repl.r2): a
+  // failing `zpool list` on this node is "could not list the pools on this
+  // node", never "does not exist". It reads `zpool list -j` itself — the
+  // datasets wiring's `poolExists` dep is a boolean that answers false on a
+  // failed read, so it is no longer asked here.
+  const localPoolExists = (pool: string): Promise<PoolExistence> => readLocalPoolExistence(executor, pool)
   const guardDeps = { transport, poolExists: localPoolExists, pveFootprint: deps.pveFootprint }
+
+  /** `<kind> '<name>'` for a sentence about a peer/remote target. */
+  function whereLabel(target: { location?: { kind: string, name?: string } }): string {
+    const loc = target.location
+    return loc && loc.kind !== 'local' ? ` on ${loc.kind} '${loc.name ?? ''}'` : ''
+  }
+
+  /**
+   * The SOURCE's snapshots, newest first by createtxg (cr3): a listing that
+   * failed is an error naming the read, never "no snapshots" (before, the
+   * datasets helper answered `[]` and the run said "create a snapshot first").
+   */
+  async function sourceSnapshots(source: string): Promise<{ ok: true, snaps: Snapshot[] } | { ok: false, status: 404 | 503, message: string }> {
+    const r = await readLocalSnapshots(executor, source)
+    if (!r.ok)
+      return { ok: false, status: 503, message: `Could not list the snapshots of '${source}': ${r.error} — refusing the replication` }
+    if (!r.exists)
+      return { ok: false, status: 404, message: `Dataset '${source}' not found` }
+    return { ok: true, snaps: r.snapshots }
+  }
 
   /**
    * The target dataset's snapshots (as minimal Snapshot records — only
-   * snapshotName is read downstream), or null when the target dataset is absent.
-   * Remote targets go over ssh; the zfs -H list yields names only.
+   * snapshotName is read downstream), null when the target dataset is absent,
+   * or the sentence of a read that failed (cr3). A failed listing used to read
+   * as `[]` — an existing target with no snapshots — and the run then said
+   * "has diverged ... remove the target dataset": a replica the operator was
+   * told to destroy because a read had failed. Remote targets go over ssh
+   * (the same two commands as before); the zfs -H list yields names only.
    */
-  async function targetSnapshots(loc: TargetPlacement, targetPool: string, targetFull: string): Promise<Snapshot[] | null> {
+  async function targetSnapshots(loc: TargetPlacement, target: ReplicateRequestBody['target'], targetFull: string): Promise<{ ok: true, snaps: Snapshot[] | null } | { ok: false, error: string, message: string }> {
+    const failed = (error: string) => ({ ok: false as const, error, message: `Could not list the snapshots of target '${targetFull}'${whereLabel(target)}: ${error} — refusing the replication; nothing was sent` })
     if (loc.isRemote) {
-      if (!(await transport.remoteDatasetExists(loc.resolved, targetFull)))
-        return null
-      const names = await transport.remoteSnapshotNames(loc.resolved, targetFull)
-      return names.map(n => ({ snapshotName: n }) as Snapshot)
+      const resolved = loc.resolved
+      const r = await readRemoteSnapshotNames(cmd => transport.sshExec(resolved, cmd), targetFull)
+      if (!r.ok)
+        return failed(r.error)
+      return { ok: true, snaps: r.exists ? r.snapshots.map(n => ({ snapshotName: n }) as Snapshot) : null }
     }
-    return (await datasetExists(targetPool, targetFull)) ? listSnapshotsDetail(targetFull) : null
+    // Absent is ZFS's own answer ("dataset does not exist", the read's
+    // `exists: false`); the datasets helper's boolean read a failed pool
+    // listing as "absent" too and is not asked here (review of cr3).
+    const r = await readLocalSnapshots(executor, targetFull)
+    if (!r.ok)
+      return failed(r.error)
+    return { ok: true, snaps: r.exists ? r.snapshots : null }
+  }
+
+  /**
+   * A target's snapshot NAMES re-read after a receive into it, for the hold
+   * settle: ONE listing, as it always was (the receive answered whether the
+   * dataset exists). cr3: a listing that failed says so — the callers carry it
+   * as a warning — instead of reading as "no snapshots".
+   */
+  async function snapshotNamesAfterReceive(loc: TargetPlacement, targetFull: string) {
+    if (loc.isRemote) {
+      const resolved = loc.resolved
+      return readRemoteSnapshotNames(cmd => transport.sshExec(resolved, cmd), targetFull, { afterReceive: true })
+    }
+    const r = await readLocalSnapshots(executor, targetFull)
+    return r.ok && r.exists ? { ...r, snapshots: r.snapshots.map(x => x.snapshotName) } : r
   }
 
   // --- POST …/datasets/*path/replicate/plan — dry-run (read-only, 200) -----
@@ -216,6 +342,10 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid replicate plan request: ${bodyParsed.error.issues[0]?.message}` } }
     }
     const { target, snapshot } = bodyParsed.data
+    if (snapshot !== undefined && isTransientRunSnapshot(snapshot)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: namedTransientMessage(source, snapshot) } }
+    }
 
     // Source must exist (system is the source of truth).
     if (!(await datasetExists(poolName, source))) {
@@ -233,20 +363,51 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     }
     const loc = guard.placement
 
-    // Pick the snapshot to send: explicit (must exist) or the newest source snapshot.
-    const sourceSnaps = await listSnapshotsDetail(source)
-    if (sourceSnaps.length === 0) {
+    // Pick the snapshot to send: explicit (must exist) or the newest source
+    // snapshot that is not a backup/cloud run's transient (cr3).
+    const src = await sourceSnapshots(source)
+    if (!src.ok) {
+      reply.code(src.status)
+      return { error: { code: src.status === 404 ? 'NOT_FOUND' : 'UNAVAILABLE', message: src.message } }
+    }
+    const sourceSnaps = src.snaps
+    const newest = newestReplicable(sourceSnaps)
+    if (!newest && !snapshot) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Dataset '${source}' has no snapshots — create a snapshot first` } }
     }
-    const snapName = snapshot ?? sourceSnaps[0].snapshotName
+    const snapName = snapshot ?? newest!.snapshotName
     if (snapshot && !sourceSnaps.some(s => s.snapshotName === snapshot)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Snapshot '${source}@${snapshot}' not found` } }
     }
 
-    const targetSnaps = await targetSnapshots(loc, target.pool, targetFull)
-    const d = discover(sourceSnaps, targetSnaps, snapName)
+    const tgt = await targetSnapshots(loc, target, targetFull)
+    if (!tgt.ok) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: tgt.message } }
+    }
+    const d = discover(sourceSnaps, tgt.snaps, snapName, { target: targetFull, where: whereLabel(target) })
+    if (d.refusal !== undefined) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: d.refusal } }
+    }
+
+    // cr3 REPLICATION-M1: the target already has the snapshot — nothing would
+    // be sent, so there is nothing to estimate. `mode` stays the schema's
+    // required field ('incremental': nothing full is implied); `upToDate`
+    // is the additive fact a panel reads.
+    if (d.upToDate) {
+      const plan: ReplicatePlan = {
+        mode: 'incremental',
+        snapshot: snapName,
+        estimatedBytes: 0,
+        targetExists: true,
+        targetDiverged: false,
+        upToDate: true,
+      }
+      return { data: plan }
+    }
 
     // Estimate the stream size for the resolved mode (full when diverged, so the
     // UI can show the honest byte cost even though it must not offer the run).
@@ -295,9 +456,34 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     if (!identity)
       return
 
+    // cr3 (the EPICS candidate "the single-dataset run's route-level refusals
+    // send no notification"): a refusal AT THE ROUTE is a failed run to the
+    // operator — a nightly task's runner meets it before any job exists — so
+    // it notifies exactly as the job's catch does, as the recursive branch has
+    // since rrep.2 (the request's mode decides, through notifyReplicationRun).
+    // Before the guard the location is the one the request named.
+    const requestedTarget = resolveTarget(source, poolName, target)
+    const requestedRemote = target.location !== undefined && target.location.kind !== 'local'
+    const notifyRefusal = (message: string): Promise<void> => notifyReplicationRun(executor, {
+      source,
+      target: requestedTarget,
+      ...(requestedRemote && target.location ? { location: target.location } : {}),
+      notify: notifyMode,
+      error: message,
+    })
+
+    if (snapshot !== undefined && isTransientRunSnapshot(snapshot)) {
+      const message = namedTransientMessage(source, snapshot)
+      await notifyRefusal(message)
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message } }
+    }
+
     if (!(await datasetExists(poolName, source))) {
+      const message = `Dataset '${source}' not found`
+      await notifyRefusal(message)
       reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Dataset '${source}' not found` } }
+      return { error: { code: 'NOT_FOUND', message } }
     }
 
     // pvepool.1 review fixes: `snapshotFirst` creates a NEW snapshot on the
@@ -321,18 +507,21 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       if (owned) {
         // cr.47b: a snapshot door — the ownership fact answers 409 PVE_MANAGED
         // here as at every dataset door (a config-unreadable verdict keeps 400).
-        return sendRefusal(reply, ownershipRefusal(owned, `Snapshot-first replication would snapshot '${source}' — ${owned.reason}`))
+        const refusal = ownershipRefusal(owned, `Snapshot-first replication would snapshot '${source}' — ${owned.reason}`)
+        await notifyRefusal(refusal.message)
+        return sendRefusal(reply, refusal)
       }
     }
 
     // Stage 3: resolve where the target lives (local / peer / remote) and run
     // every target-side guard in THAT context.
-    const targetFull = resolveTarget(source, poolName, target)
+    const targetFull = requestedTarget
     const guard = await guardReplicationTarget(
       pve ? { ...guardDeps, pveFootprintPreloaded: pve } : guardDeps,
       { target, sourceFull: source, targetFull },
     )
     if (!guard.ok) {
+      await notifyRefusal(guard.message)
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: guard.message } }
     }
@@ -429,20 +618,100 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             snapName = name
           }
 
-          // 2) Recompute the plan INSIDE the job — state may have changed since planning.
-          const sourceSnaps = await listSnapshotsDetail(source)
-          if (sourceSnaps.length === 0)
-            throw new Error(`Dataset '${source}' has no snapshots — create a snapshot first`)
-          if (!snapName)
-            snapName = sourceSnaps[0].snapshotName
-          else if (!sourceSnaps.some(s => s.snapshotName === snapName))
+          // 2) Recompute the plan INSIDE the job — state may have changed since
+          //    planning. Every read here fails CLOSED (cr3): a listing that did
+          //    not answer stops the run with its own sentence.
+          const src = await sourceSnapshots(source)
+          if (!src.ok)
+            throw new Error(src.message)
+          const sourceSnaps = src.snaps
+          if (!snapName) {
+            // The newest snapshot that is not a backup/cloud run's transient
+            // (cr3; the recursive run's S has always been filtered, R4).
+            const newest = newestReplicable(sourceSnaps)
+            if (!newest)
+              throw new Error(`Dataset '${source}' has no snapshots — create a snapshot first`)
+            snapName = newest.snapshotName
+          }
+          else if (!sourceSnaps.some(s => s.snapshotName === snapName)) {
             throw new Error(`Snapshot '${source}@${snapName}' does not exist on source`)
+          }
           notify.snapshot = snapName
+          // The chain's hold is never settled onto a transient: S here is
+          // never one (the request refused a named one, the default skips
+          // them, snapshot-first names its own) — said again where the hold
+          // is decided, so no later path can make it one.
+          if (isTransientRunSnapshot(snapName))
+            throw new Error(namedTransientMessage(source, snapName))
 
-          const targetSnaps = await targetSnapshots(loc, target.pool, targetFull)
-          const d = discover(sourceSnaps, targetSnaps, snapName)
+          const tgt = await targetSnapshots(loc, target, targetFull)
+          if (!tgt.ok)
+            throw new Error(tgt.message)
+          const d = discover(sourceSnaps, tgt.snaps, snapName, { target: targetFull, where: whereLabel(target) })
+          // review of cr3: "diverged" only when NOTHING is in common; any
+          // other no-base state refuses with a sentence naming what is.
           if (d.targetDiverged)
-            throw new Error(`Target '${targetFull}' has diverged — no common snapshot; remove the target dataset or replicate to a new path`)
+            throw new Error(divergedMessage(targetFull))
+          if (d.refusal !== undefined)
+            throw new Error(d.refusal)
+
+          const holdTag = replicationHoldTag(target.location, targetFull)
+          const sourceNames = sourceSnaps.map(s => s.snapshotName)
+
+          // cr3 REPLICATION-M1: the target already has S — nothing is sent.
+          // When S is the newest snapshot the two sides share, its holds are
+          // settled exactly as the recursive run settles a copy already at S
+          // (a stopped earlier run may have received it and not held it); when
+          // the target already has a NEWER one, nothing is touched — the
+          // chain's hold never moves back.
+          if (d.upToDate) {
+            const warnings: string[] = []
+            let note: string | undefined
+            if (d.keepHoldsOn !== undefined) {
+              // review of cr3 (decideBase rule 1): the target's newest
+              // snapshot is a transient the source still has; the next new
+              // snapshot is sent from it, so the holds stay as they are.
+              // review 3 of cr3: "sent from it" is only true while the source
+              // keeps it — when no hold of this chain pins it there, the run
+              // that took it may destroy it first, and the next run then
+              // sends from '@S' (ZFS accepts that while the target is
+              // unmodified since its newest snapshot).
+              const pinned = await readLocalHoldsChecked(executor, [`${source}@${d.keepHoldsOn}`]).catch(() => null)
+              const isHeld = pinned?.get(`${source}@${d.keepHoldsOn}`)?.includes(holdTag) === true
+              note = isHeld
+                ? `The target's newest snapshot is '@${d.keepHoldsOn}', a backup or cloud run's snapshot the source still has: nothing was sent, the holds were left as they are, and the next new snapshot is sent from it`
+                : `The target's newest snapshot is '@${d.keepHoldsOn}', a backup or cloud run's snapshot the source still has: nothing was sent and the holds were left as they are; the next new snapshot is sent from it only while the source still has it — it is not held there, so the run that took it may destroy it first, and the run then sends from '@${snapName}'`
+            }
+            else if (d.newerCommon === undefined) {
+              try {
+                warnings.push(...await settleReplicationHolds({ executor, transport }, {
+                  tag: holdTag,
+                  snapName,
+                  source: { dataset: source, snapshotNames: sourceNames },
+                  target: { dataset: targetFull, snapshotNames: (tgt.snaps ?? []).map(s => s.snapshotName) },
+                  ...(loc.isRemote ? { remote: loc.resolved } : {}),
+                  releaseLegacyOnSource: false,
+                }))
+              }
+              catch (err) {
+                warnings.push(`holds could not be settled — ${err instanceof Error ? err.message : String(err)}`)
+              }
+            }
+            else {
+              note = `The target already has '@${d.newerCommon}', which is newer than '@${snapName}': nothing was sent and no hold was moved`
+            }
+            const result = {
+              snapshot: snapName,
+              bytesEstimated: 0,
+              target: targetFull,
+              holdTag,
+              upToDate: [source],
+              ...(note ? { note } : {}),
+              ...(warnings.length ? { warnings } : {}),
+            }
+            await notifyReplicationRun(executor, { ...notify, result, elapsedMs: Date.now() - startedAt })
+            return result
+          }
 
           const srcSnapFull = `${source}@${snapName}`
 
@@ -484,12 +753,10 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           // ssh peer is cr.35's (ServerAlive*/ConnectTimeout on the argv).
           const pipe = await executor.pipeline(ZFS, sendArgs, recvCmd, recvArgv, { timeoutMs: null, longRunning: 'zfs send | zfs recv: a data mover, hours for a large send' })
           if (pipe.leftExitCode !== 0 || pipe.rightExitCode !== 0) {
-            const detail = pipe.rightStderr.trim()
-              ? `recv: ${pipe.rightStderr.trim()}`
-              : pipe.leftStderr.trim()
-                ? `send: ${pipe.leftStderr.trim()}`
-                : `send exited ${pipe.leftExitCode}, recv exited ${pipe.rightExitCode}`
-            throw new Error(`Replication failed — ${detail}`)
+            // review 3 of cr3: ZFS's "has been modified since most recent
+            // snapshot" gets the rollback hint ADDED; the raw stderr stays.
+            const hint = modifiedTargetHint(pipe.rightStderr, targetFull, d.baseSnapshot, (tgt.snaps ?? []).map(s => s.snapshotName))
+            throw new Error(`Replication failed — ${pipelineFailureDetail(pipe)}${hint ? ` — ${hint}` : ''}`)
           }
 
           // 5) Hold the new base on BOTH sides under THIS chain's tag, release
@@ -498,12 +765,13 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           //    replication-holds.ts). The SOURCE is always local; the TARGET
           //    side goes over ssh for a peer/remote. Fail-open: hiccups are
           //    warnings, not job failures.
-          const holdTag = replicationHoldTag(target.location, targetFull)
-          const sourceNames = sourceSnaps.map(s => s.snapshotName)
-          // Re-read the target's snapshots — the recv just added snapName there.
-          const targetNames = loc.isRemote
-            ? await transport.remoteSnapshotNames(loc.resolved, targetFull)
-            : (await listSnapshotsDetail(targetFull)).map(s => s.snapshotName)
+          // Re-read the target's snapshots — the recv just added snapName
+          // there. A re-read that fails is a warning (cr3), never "the target
+          // has no snapshots": the settle then holds S and releases nothing
+          // on the target, so its older holds stay.
+          const targetRead = await snapshotNamesAfterReceive(loc, targetFull)
+          const reReadWarning = targetRead.ok ? null : `Could not list the snapshots of target '${targetFull}'${whereLabel(target)} after the receive: ${targetRead.error} — the chain's older holds on the target were kept`
+          const targetNames = targetRead.ok && targetRead.exists ? targetRead.snapshots : []
           const legacy = await legacyReleasableOnSource(executor, {
             sourceFull: source,
             ownTag: holdTag,
@@ -519,7 +787,11 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             ...(loc.isRemote ? { remote: loc.resolved } : {}),
             releaseLegacyOnSource: legacy.releasable,
           })
-          const warnings = legacy.warning ? [...holdWarnings, legacy.warning] : holdWarnings
+          const warnings = [
+            ...holdWarnings,
+            ...(legacy.warning ? [legacy.warning] : []),
+            ...(reReadWarning ? [reReadWarning] : []),
+          ]
 
           const result = {
             mode: d.mode,
@@ -655,7 +927,8 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     // 4. R9: a shared claim on EVERY swept dataset (the run reads them all),
     //    plus today's EXCLUSIVE claim on a LOCAL target root (the recv writes
     //    the tree below it). A peer/remote target is not ours to lock.
-    const locks = await datasetSourceClaims(executor, gate.sweep)
+    const sweepAtRoute = gate.sweep
+    const locks = await datasetSourceClaims(executor, sweepAtRoute)
     if (!loc.isRemote) {
       let targetGuid: string | null = null
       try {
@@ -694,6 +967,20 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           const gateNow = await gateTreeRun({ pve: pveNow, guard: guardDeps }, { facts: factsNow.facts, target })
           if (!gateNow.ok)
             throw new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message: gateNow.refusals.map(r => r.message).join('; ') })
+          // cr3 REPLICATION-L4 (R9): the claims were taken on the ROUTE's
+          // sweep. A dataset the job's fresh sweep finds that the route's did
+          // not (a child created while the run waited) is not claimed by this
+          // run — a destroy or rename of it would not wait for the send — so
+          // the run refuses before the first send; the next run claims it.
+          const claimed = new Set(sweepAtRoute)
+          const unclaimed = gateNow.sweep.filter(dataset => !claimed.has(dataset))
+          if (unclaimed.length > 0) {
+            throw new GuardRefusalError({
+              status: 409,
+              code: 'STATE_CHANGED',
+              message: `The tree under '${source}' changed after the run was accepted: ${unclaimed.map(d => `'${d}'`).join(', ')} ${unclaimed.length === 1 ? 'is' : 'are'} not claimed by this run — nothing was sent; run it again`,
+            })
+          }
 
           const plan = gateNow.plan
           const facts = factsNow.facts
@@ -707,6 +994,11 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           //    already present, and it is asked for no legacy release here —
           //    nothing was sent for this dataset this run.
           for (const dataset of plan.upToDate) {
+            // review of cr3 (decideBase rule 1, the single-dataset run's
+            // rule): a copy whose newest snapshot is a transient the source
+            // still has keeps its holds; the next send starts from it.
+            if (plan.holdsKept?.includes(dataset))
+              continue
             const tgt = targetFor(dataset)
             // A settle that THROWS (a spawn failure, a deadline) is a warning
             // here as it is after a receive: nothing was sent for this
@@ -792,12 +1084,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
               throw new Error(r6Sentence(err instanceof Error ? err.message : String(err)))
             }
             if (pipe.leftExitCode !== 0 || pipe.rightExitCode !== 0) {
-              const detail = pipe.rightStderr.trim()
-                ? `recv: ${pipe.rightStderr.trim()}`
-                : pipe.leftStderr.trim()
-                  ? `send: ${pipe.leftStderr.trim()}`
-                  : `send exited ${pipe.leftExitCode}, recv exited ${pipe.rightExitCode}`
-              throw new Error(r6Sentence(detail))
+              // review 3 of cr3: the same rollback hint as the single path.
+              const hint = modifiedTargetHint(pipe.rightStderr, planned.target, planned.baseSnapshot, facts.targetSnaps.get(planned.target) ?? [])
+              throw new Error(r6Sentence(`${pipelineFailureDetail(pipe)}${hint ? ` — ${hint}` : ''}`))
             }
             sent.push(planned.dataset)
             datasets.push({
@@ -817,9 +1106,13 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             //    warning, never R6's sentence. The next run re-settles the
             //    holds and continues from each dataset's own base regardless.
             try {
-              const targetNames = jobLoc.isRemote
-                ? await transport.remoteSnapshotNames(jobLoc.resolved, planned.target)
-                : (await listSnapshotsDetail(planned.target)).map(s => s.snapshotName)
+              // cr3: a re-read that fails is a warning, never "the copy has
+              // no snapshots" — the settle then holds S and releases nothing
+              // on the target, so its older holds stay.
+              const reRead = await snapshotNamesAfterReceive(jobLoc, planned.target)
+              const targetNames = reRead.ok && reRead.exists ? reRead.snapshots : []
+              if (!reRead.ok)
+                warnings.push(`${planned.dataset}: could not list the snapshots of '${planned.target}' after the receive: ${reRead.error} — the chain's older holds on it were kept`)
               let releaseLegacy = false
               if (planned.dataset === source && !legacySettled) {
                 legacySettled = true
@@ -866,6 +1159,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             holdTag,
             datasets,
             upToDate: plan.upToDate,
+            ...(plan.holdsKept ? { holdsKept: plan.holdsKept } : {}),
             skipped: plan.skipped.map(s => s.dataset),
             targetOnly: plan.targetOnly,
             // Fold E1: exclude entries the source no longer holds are inert —

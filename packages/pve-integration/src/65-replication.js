@@ -131,6 +131,124 @@
         return ANAS.enc(s);
     }
 
+    // cr3 (REPLICATION-M3, settled in a browser on PVE 9.2): a combo's
+    // DEFAULT list template renders its display field as raw HTML. Every
+    // combo here lists text that came from a command or another host (pool
+    // names from `zpool list` here or on a remote, dataset paths, snapshot
+    // names, peer names from /etc/pve/.members), so each one carries this
+    // template — the shape 10-api.js and 72-cloud.js already use.
+    function encodedList(field) {
+        return {
+            tpl: '<tpl for="."><div class="x-boundlist-item">{' + field + ':htmlEncode}</div></tpl>',
+        };
+    }
+
+    // The Replicate Once snapshot pick that sends NO name (review of cr3): the
+    // daemon then sends its newest non-transient snapshot by createtxg. A '/'
+    // cannot appear in a snapshot name, so this never collides with one.
+    var NEWEST_SNAPSHOT = '/newest';
+
+    // A backup or cloud run's transient snapshot — the daemon's own predicate
+    // (`isTransientRunSnapshot`, services/snapshot-naming.ts: the prefixes
+    // `anas-backup-` and `anas-cloud-`). Such a snapshot is destroyed by the
+    // run that took it and is never offered for replication.
+    var TRANSIENT_SNAPSHOT_PREFIXES = ['anas-backup-', 'anas-cloud-'];
+    function isTransientSnapshot(name) {
+        var n = '' + (name == null ? '' : name);
+        for (var i = 0; i < TRANSIENT_SNAPSHOT_PREFIXES.length; i++) {
+            if (n.indexOf(TRANSIENT_SNAPSHOT_PREFIXES[i]) === 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // cr3: a list that could not be read is not an empty list. A grid whose
+    // load failed shows a line above its rows saying so, with the reason; the
+    // rows of the last successful read stay (marked as possibly out of date),
+    // and with none the empty-grid text is withheld — "No replication tasks
+    // defined" under a failed read would state what nobody read.
+    // `grid._anasEmptyText` keeps the grid's own empty text for a later
+    // successful load.
+    function showLoadState(grid, what, err) {
+        if (!grid || grid.destroyed || grid.destroying) {
+            return;
+        }
+        var bar = null;
+        var view = null;
+        try {
+            bar = grid.down('#loadFail');
+            view = grid.getView();
+        } catch (eFind) {
+            bar = null;
+        }
+        if (view && grid._anasEmptyText === undefined) {
+            grid._anasEmptyText = view.emptyText;
+        }
+        var failed = err !== undefined && err !== null;
+        var rows = 0;
+        try {
+            rows = grid.getStore().getCount();
+        } catch (eCount) {
+            rows = 0;
+        }
+        try {
+            if (failed) {
+                var reason = ANAS.errText(err);
+                var tail = rows
+                    ? t('the rows below are from the last successful read and may be out of date.')
+                    : t('the list is unknown, not empty.');
+                if (bar) {
+                    bar.update('<span style="color:var(--anas-danger,#c23b2c);">'
+                        + '<i class="fa fa-exclamation-triangle" aria-hidden="true" style="margin-right:6px;"></i>'
+                        + enc(what + ' ' + t('could not be read') + ': ' + reason + ' — ' + tail)
+                        + '</span>');
+                    bar.show();
+                }
+                if (typeof grid.addCls === 'function') {
+                    grid.addCls('anas-repl-load-failed');
+                }
+                if (view) {
+                    view.emptyText = '';
+                    if (typeof view.setStyle === 'function') {
+                        view.setStyle('opacity', rows ? '0.6' : '1');
+                    }
+                    if (typeof view.refresh === 'function') {
+                        view.refresh();
+                    }
+                }
+            } else {
+                if (bar) {
+                    bar.hide();
+                }
+                if (typeof grid.removeCls === 'function') {
+                    grid.removeCls('anas-repl-load-failed');
+                }
+                if (view) {
+                    view.emptyText = grid._anasEmptyText;
+                    if (typeof view.setStyle === 'function') {
+                        view.setStyle('opacity', '1');
+                    }
+                }
+            }
+        } catch (eShow) {
+            ANAS.warn('replication load state failed: ' + ANAS.errText(eShow));
+        }
+    }
+
+    // The hidden line a grid shows its load failure in (showLoadState).
+    function loadFailCfg() {
+        return {
+            xtype: 'component',
+            dock: 'top',
+            itemId: 'loadFail',
+            cls: 'anas-repl-load-fail',
+            hidden: true,
+            padding: '6 10',
+            html: '',
+        };
+    }
+
     // ---- Path helpers (view-local; do NOT reference 60-datasets.js) --------
     //
     // The daemon addresses a dataset by its path relative to the pool. The pool
@@ -273,7 +391,10 @@
     function renderLag(v, meta, rec) {
         var behind = rec.get('snapshotsBehind');
         if (behind === undefined || behind === null || behind === '') {
-            return '<span style="color:gray;">&mdash;</span>';
+            // cr3: null is UNKNOWN (a snapshot listing that could not be read,
+            // or a source with no snapshots) — never "N behind", never current.
+            return '<span class="anas-repl-lag-unknown" title="'
+                + enc(t('unknown — the snapshots could not be compared')) + '" style="color:gray;">&mdash;</span>';
         }
         var n = Number(behind);
         if (isNaN(n)) {
@@ -435,6 +556,7 @@
             } catch (e2) {
                 ANAS.warn('replication grid load failed: ' + ANAS.errText(e2));
             }
+            showLoadState(grid, t('The replication tasks'), null);
             if (priorName) {
                 try {
                     var idx = grid.getStore().findExact('name', priorName);
@@ -460,6 +582,9 @@
                 // non-fatal
             }
             ANAS.warn('replication tasks load failed: ' + ANAS.errText(err));
+            // cr3: said on the grid, not only in the console — and the rows
+            // the grid already had stay, marked, instead of "no tasks".
+            showLoadState(grid, t('The replication tasks'), err);
         });
     }
 
@@ -512,6 +637,11 @@
     ANAS.replication.deleteTask = deleteTask;
     // The grid's Last run cell, exposed for the pill harness (lastrun-pill.harness.mjs).
     ANAS.replication.renderLastRun = renderLastRun;
+    ANAS.replication.renderPlan = renderPlan;
+    // Review of cr3: exposed for cr3-replication.harness.mjs.
+    ANAS.replication.loadOnceSnapshots = loadOnceSnapshots;
+    ANAS.replication.fetchPlan = fetchPlan;
+    ANAS.replication.NEWEST_SNAPSHOT = NEWEST_SNAPSHOT;
     // rrep.3: the row builder, the Source -> Target cell, the Enable/Disable
     // toggle and Run Now, exposed for the dialog contract harness (a toggle
     // must round-trip recursive + exclude; the row must say what it excludes;
@@ -520,6 +650,11 @@
     ANAS.replication.renderRoute = renderRoute;
     ANAS.replication.toggle = toggleTask;
     ANAS.replication.runTask = runTask;
+    // cr3: exposed for cr3-replication.harness.mjs.
+    ANAS.replication.renderLag = renderLag;
+    ANAS.replication.encodedList = encodedList;
+    ANAS.replication.locationComboCfg = locationComboCfg;
+    ANAS.replication.reloadRemotes = reloadRemotes;
 
     // ---- Selection + toolbar state -----------------------------------------
 
@@ -978,6 +1113,7 @@
                 data: [{ value: 'local', label: t('This node'), kind: 'local', name: '' }] }),
             valueField: 'value',
             displayField: 'label',
+            listConfig: encodedList('label'),
             queryMode: 'local',
             editable: false,
             forceSelection: true,
@@ -1121,6 +1257,7 @@
             } catch (eLoad) {
                 ANAS.warn('remotes grid load failed: ' + ANAS.errText(eLoad));
             }
+            showLoadState(grid, t('The remotes registry'), null);
             // cr.62 (review L9): the GET only READS the cluster key — it no
             // longer creates one on first sight — so a node that never made one
             // answers ''. The window says so and offers Create, a POST (Sys.Modify).
@@ -1142,6 +1279,9 @@
             }
             ANAS.warn('remotes load failed: ' + ANAS.errText(err));
             ANAS.alertMsg('Load failed', t('Failed to load the remotes registry') + ': ' + ANAS.errText(err));
+            // cr3: the grid says so too — an empty grid under "No remotes
+            // registered" was the failed first load's whole picture.
+            showLoadState(grid, t('The remotes registry'), err);
         });
     }
 
@@ -1208,7 +1348,10 @@
             Ext.Msg.confirm(
                 t('Delete Remote'),
                 t('Delete the remote') + ' "' + enc(name) + '"? '
-                    + t('This removes it from the cluster registry.'),
+                    + t('This removes it from the cluster registry.') + ' '
+                    // cr3: the registry is cluster-wide, the tasks are per
+                    // node — only this node's are checked before the delete.
+                    + t('Only this node\'s replication tasks are checked: a task on another node that uses this remote stops working.'),
                 function (btn) {
                     if (btn !== 'yes') {
                         return;
@@ -1355,6 +1498,7 @@
                         store: store,
                         selModel: { mode: 'SINGLE' },
                         emptyText: t('No remotes registered'),
+                        dockedItems: [loadFailCfg()],
                         columns: [
                             { text: t('Name'), dataIndex: 'name', width: 130, renderer: Ext.String.htmlEncode },
                             { text: t('Connection'), dataIndex: 'host', flex: 1, minWidth: 180,
@@ -1707,7 +1851,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-repl-remote-edit',
-                title: isEdit ? (t('Edit Remote') + ': ' + (r.name || '')) : t('Add Remote'),
+                title: isEdit ? (enc(t('Edit Remote') + ': ' + (r.name || ''))) : enc(t('Add Remote')),
                 modal: true,
                 width: 480,
                 resizable: false,
@@ -1939,8 +2083,8 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-repl-task',
-                title: isEdit ? (t('Edit Replication Task') + ': ' + (task.name || ''))
-                    : t('New Replication Task'),
+                title: isEdit ? enc(t('Edit Replication Task') + ': ' + (task.name || ''))
+                    : enc(t('New Replication Task')),
                 modal: true,
                 width: 520,
                 // rrep.3: Recursive, its Exclude picker and the two hints make
@@ -1984,6 +2128,7 @@
                             store: srcPoolStore,
                             valueField: 'name',
                             displayField: 'label',
+                            listConfig: encodedList('label'),
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -1998,6 +2143,7 @@
                             store: srcDsStore,
                             valueField: 'rel',
                             displayField: 'label',
+                            listConfig: encodedList('label'),
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -2032,6 +2178,7 @@
                             store: tgtPoolStore,
                             valueField: 'name',
                             displayField: 'label',
+                            listConfig: encodedList('label'),
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -2716,6 +2863,34 @@
         setOnceSubmit(win, true);
     }
 
+    // Review of cr3: the plan request was REFUSED (a listing that could not
+    // be read, a named transient, a pool that is not there). The daemon's
+    // sentence is shown, and Replicate stays off while the plan could not be
+    // computed — the run would meet the same refusal.
+    function renderPlanError(win, err) {
+        updatePlanCmp(win, '<span style="color:var(--anas-danger,#c23b2c);">'
+            + enc(t('plan unavailable') + ': ' + ANAS.errText(err)) + '</span>', false);
+        setOnceSubmit(win, false);
+    }
+
+    // Review 2 of cr3: with "Snapshot now and replicate" checked the run sends
+    // a snapshot that does not exist yet, so no plan of the source's EXISTING
+    // snapshots describes it (the plan request cannot carry snapshot-first):
+    // the plan line says so and Replicate stays available. A plan the daemon
+    // refused (no snapshot to plan from on a fresh dataset, a target guard)
+    // is shown as its sentence, still with Replicate available — the run
+    // asks every question again once its snapshot exists.
+    function renderSnapshotFirstPlan(win, err) {
+        win._lastPlan = null;
+        var line = t('computed after the snapshot is taken');
+        if (err) {
+            line = t('plan unavailable') + ': ' + ANAS.errText(err) + ' — '
+                + t('the run asks again once its snapshot is taken');
+        }
+        updatePlanCmp(win, '<span style="color:gray;">' + enc(line) + '</span>', false);
+        setOnceSubmit(win, true);
+    }
+
     function renderPlan(win, plan) {
         if (!plan) {
             renderUnavailable(win);
@@ -2733,6 +2908,15 @@
             }
             updatePlanCmp(win, html, true);
             setOnceSubmit(win, false);
+            return;
+        }
+        if (plan.upToDate === true) {
+            // cr3 (REPLICATION-M1): the target already has this snapshot —
+            // the run sends nothing and moves no hold onto an older snapshot.
+            updatePlanCmp(win, '<span style="color:var(--anas-ok,#1f9c56);font-weight:600;">'
+                + enc(t('Already on the target')) + '</span> &mdash; '
+                + enc(t('nothing to send')), false);
+            setOnceSubmit(win, true);
             return;
         }
         var bytes = fmtBytes(plan.estimatedBytes);
@@ -2776,15 +2960,21 @@
         }
         if (!valOf(win, '#snapshotFirst')) {
             var snap = valOf(win, '#snapshot');
-            if (snap) {
+            if (snap && snap !== NEWEST_SNAPSHOT) {
                 body.snapshot = snap;
             }
         }
         var seq = (win._planSeq = (win._planSeq || 0) + 1);
+        var snapshotFirst = !!valOf(win, '#snapshotFirst');
+        win._lastPlan = null;
         renderCalculating(win);
         ANAS.api.post(node, datasetPathRel(srcPool, srcRel, 'replicate/plan'), body).then(
             function (res) {
                 if (win.destroyed || win.destroying || seq !== win._planSeq) {
+                    return;
+                }
+                if (snapshotFirst) {
+                    renderSnapshotFirstPlan(win, null);
                     return;
                 }
                 renderPlan(win, (res && res.data) || null);
@@ -2794,7 +2984,11 @@
                     return;
                 }
                 ANAS.warn('replicate plan failed: ' + ANAS.errText(err));
-                renderUnavailable(win);
+                if (snapshotFirst) {
+                    renderSnapshotFirstPlan(win, err);
+                    return;
+                }
+                renderPlanError(win, err);
             }
         );
     }
@@ -2813,22 +3007,31 @@
             if (win.destroyed || win.destroying) {
                 return;
             }
-            var snaps = ((res && res.data) || []).slice().sort(function (a, b) {
-                var ca = new Date(a && a.created).getTime() || 0;
-                var cb = new Date(b && b.created).getTime() || 0;
-                return cb - ca;
-            });
+            // Review of cr3: the list is the daemon's own order (newest first;
+            // no re-sort by the creation CLOCK here), backup and cloud run
+            // transients are never offered (the daemon refuses one by name —
+            // the run that took it destroys it), and the preselection is
+            // "the newest snapshot", which sends no name: the daemon picks
+            // the newest non-transient snapshot by the order ZFS took them
+            // in (createtxg), which this list cannot see.
+            var snaps = (res && res.data) || [];
             var data = [];
             for (var j = 0; j < snaps.length; j++) {
                 var s = snaps[j] || {};
+                if (!s.snapshotName || isTransientSnapshot(s.snapshotName)) {
+                    continue;
+                }
                 data.push({
                     snapshotName: s.snapshotName,
                     label: '@' + s.snapshotName + (s.created ? '  (' + absTime(s.created) + ')' : ''),
                 });
             }
+            if (data.length) {
+                data.unshift({ snapshotName: NEWEST_SNAPSHOT, label: t('(the newest snapshot when the run starts)') });
+            }
             store.loadData(data);
             if (data.length && !valOf(win, '#snapshotFirst')) {
-                snapFld.setValue(data[0].snapshotName);
+                snapFld.setValue(NEWEST_SNAPSHOT);
             }
             fetchPlan(win, node);
         }, function (err) {
@@ -2885,6 +3088,7 @@
                             store: srcPoolStore,
                             valueField: 'name',
                             displayField: 'name',
+                            listConfig: encodedList('name'),
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -2899,6 +3103,7 @@
                             store: srcDsStore,
                             valueField: 'rel',
                             displayField: 'label',
+                            listConfig: encodedList('label'),
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -2913,6 +3118,7 @@
                             store: tgtPoolStore,
                             valueField: 'name',
                             displayField: 'name',
+                            listConfig: encodedList('name'),
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -2935,6 +3141,7 @@
                             store: snapStore,
                             valueField: 'snapshotName',
                             displayField: 'label',
+                            listConfig: encodedList('label'),
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -3089,7 +3296,7 @@
         }
         if (snapFirst) {
             body.snapshotFirst = true;
-        } else {
+        } else if (snap !== NEWEST_SNAPSHOT) {
             body.snapshot = snap;
         }
         var loc = selectedLocation(win);
@@ -3101,8 +3308,12 @@
         var locPrefix = (loc.kind === 'peer' || loc.kind === 'remote') ? (loc.kind + ':' + loc.name + ' ') : '';
         var targetLabel = locPrefix + targetPool + (targetDs ? ('/' + targetDs) : '');
         var suffix = '';
-        var plan = win._lastPlan;
-        if (plan && plan.mode) {
+        // With snapshot-first the run sends a NEW snapshot: no plan of the
+        // existing ones describes it (review 2 of cr3).
+        var plan = snapFirst ? null : win._lastPlan;
+        if (plan && plan.upToDate === true) {
+            suffix = ' (' + t('already on the target, nothing sent') + ')';
+        } else if (plan && plan.mode) {
             var b = fmtBytes(plan.estimatedBytes);
             suffix = ' (' + plan.mode + (b ? ', ' + b : '') + ')';
         }
@@ -3292,6 +3503,7 @@
                 store: store,
                 selModel: { mode: 'SINGLE' },
                 emptyText: t('No replication tasks defined'),
+                dockedItems: [loadFailCfg()],
                 columns: [
                     {
                         text: t('Name'),

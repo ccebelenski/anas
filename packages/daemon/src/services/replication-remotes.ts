@@ -288,13 +288,28 @@ export interface PinOptions {
    * fingerprints), never a side effect of an ordinary pin.
    */
   replace?: boolean
+  /**
+   * Write ONLY the scanned line(s) whose fingerprint is this one — the key the
+   * operator was shown and confirmed (cr3 REPLICATION-M2). `ssh-keyscan`
+   * connects once per key type, and every answer is a separate line: before
+   * this, the pin job checked the one confirmed (ed25519) fingerprint and then
+   * wrote EVERY scanned line, so an RSA or ECDSA key nobody was shown — from
+   * the host, or from whatever answered one of those connections — became a
+   * trusted key for this host. With this set, a scan that carries no line of
+   * that fingerprint writes nothing and the return value is the preferred
+   * scanned fingerprint (which then differs from the confirmed one, so the
+   * caller refuses).
+   */
+  onlyFingerprint?: string
 }
 
 /**
- * Pin a host's key(s): scan, write every new line into our known_hosts, and
- * return the (preferred) fingerprint. Returns null when nothing was scanned
- * (unreachable host / closed port) — and in that case known_hosts is left
- * exactly as it was, so a failed scan can never un-trust a working remote.
+ * Pin a host's key(s): scan, write the new line(s) into our known_hosts, and
+ * return the fingerprint written (or, with nothing written, the preferred
+ * scanned one). With `onlyFingerprint` only the confirmed key's line(s) are
+ * written. Returns null when nothing was scanned (unreachable host / closed
+ * port) — and in that case known_hosts is left exactly as it was, so a failed
+ * scan can never un-trust a working remote.
  */
 export async function pinHostKey(
   executor: CommandExecutor,
@@ -303,10 +318,16 @@ export async function pinHostKey(
   port: number,
   opts: PinOptions = {},
 ): Promise<string | null> {
-  const keys = await scanHostKeys(executor, host, port)
-  const chosen = preferredKey(keys)
-  if (!chosen)
+  const scanned = await scanHostKeys(executor, host, port)
+  const preferred = preferredKey(scanned)
+  if (!preferred)
     return null
+  const keys = opts.onlyFingerprint === undefined
+    ? scanned
+    : scanned.filter(k => k.fingerprint === opts.onlyFingerprint)
+  if (keys.length === 0)
+    return preferred.fingerprint
+  const chosen = preferredKey(keys) ?? preferred
 
   let existing = ''
   try {

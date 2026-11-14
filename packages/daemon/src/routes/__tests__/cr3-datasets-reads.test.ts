@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
 import { zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs, zfsSweepSnapshotListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
-import { DatasetListUnreadableError, SnapshotListUnreadableError } from '../datasets.js'
+import { DatasetListUnreadableError } from '../datasets.js'
 
 /**
  * The error the server's error handler saw (it maps by error NAME to 503 —
@@ -119,10 +119,11 @@ describe('cr3: dataset and snapshot reads that failed are never "none"', () => {
     const res = await plan()
     assert.notEqual(res.statusCode, 400, res.body)
     assert.doesNotMatch(res.body, /has no snapshots/)
-    assert.match(res.body, /snapshots of 'testpool\/media' could not be read/)
-    assert.equal(seen.length, 1)
-    assert.ok(seen[0] instanceof SnapshotListUnreadableError)
-    assert.equal((seen[0] as Error).name, 'SnapshotListUnreadableError')
+    // Composed at the cr3 merge: the replication plan reads through its own
+    // strict reader (cr3.replication) and answers the refusal itself, so the
+    // typed error no longer reaches the server's mapping from this door.
+    assert.match(res.body, /Could not list the snapshots of 'testpool\/media'/)
+    assert.equal(seen.length, 0)
     assert.equal(res.statusCode, 503, res.body)
   })
 

@@ -150,8 +150,8 @@ describe('parseTreeProps — zfs get -Hp -r -o name,property,value (fixtures src
 })
 
 describe('tree-listing argv builders', () => {
-  it('zfsTreeSnapshotsArgs: -Hp snapshot listing with name,creation,guid', () => {
-    assert.deepEqual(zfsTreeSnapshotsArgs('rpool/rrsrc'), ['list', '-Hp', '-t', 'snapshot', '-o', 'name,creation,guid', '-r', '--', 'rpool/rrsrc'])
+  it('zfsTreeSnapshotsArgs: -Hp snapshot listing with name,creation,guid, sorted by createtxg (cr3)', () => {
+    assert.deepEqual(zfsTreeSnapshotsArgs('rpool/rrsrc'), ['list', '-Hp', '-t', 'snapshot', '-o', 'name,creation,guid', '-s', 'createtxg', '-r', '--', 'rpool/rrsrc'])
   })
 
   it('zfsTreeGetArgs: -Hp property listing, the requested props joined', () => {

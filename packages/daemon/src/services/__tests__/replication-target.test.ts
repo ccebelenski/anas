@@ -111,7 +111,7 @@ describe('repl.r2 — memoisePoolExists keeps "did not answer" as itself', () =>
     }))
     const first = await guardReplicationTarget(deps, { target: { pool: 'backup' }, sourceFull: 'testpool/a', targetFull: 'backup/a' })
     const second = await guardReplicationTarget(deps, { target: { pool: 'backup' }, sourceFull: 'testpool/b', targetFull: 'backup/b' })
-    assert.deepEqual(first, { ok: false, message: `Could not list the pools: local probe failed` })
+    assert.deepEqual(first, { ok: false, message: `Could not list the pools on this node: local probe failed` })
     assert.deepEqual(second, first, 'the memo shares the answer — it never becomes a fresh or different one')
     assert.equal(asked, 1, 'one pool read for the whole pass')
     if (!first.ok)

@@ -1,7 +1,62 @@
 import type { ReplicationTarget } from '@anas/shared'
+import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { PveFootprint } from './pve-footprint.js'
 import type { PoolExistence, ResolvedLocation, Transport } from './replication-transport.js'
+import { parseZpoolList } from '../parsers/zpool-list.js'
 import { pveNamingGuardMessage } from './pve-footprint.js'
+
+/** C0 control characters and DEL: a quoted failure line carries none. */
+// eslint-disable-next-line no-control-regex
+const LOCAL_FAILURE_CONTROL_RE = /[\x00-\x1F\x7F]/g
+
+/** `zpool list`'s legacy answer on a node with no pools (non-zero exit). */
+const NO_POOLS_AVAILABLE = 'no pools available'
+
+/** The longest failure line a sentence carries (repl.r2's cut). */
+const LOCAL_FAILURE_LINE_MAX = 300
+
+/** The first non-empty stderr line of a failed local command, or its exit status. */
+function localFailureLine(r: ExecResult, command: string): string {
+  const line = r.stderr.split('\n').map(l => l.replace(LOCAL_FAILURE_CONTROL_RE, ' ').trim()).find(Boolean)
+  if (line === undefined)
+    return `${command} exited ${r.exitCode}`
+  return line.length > LOCAL_FAILURE_LINE_MAX ? `${line.slice(0, LOCAL_FAILURE_LINE_MAX)}...` : line
+}
+
+/**
+ * Does `pool` exist on THIS node — three-valued, as the remote probe has been
+ * since repl.r2 (cr3: "a read that failed never reads as absent"). Exit 0 is
+ * the node's answer (no output = no pools); a non-zero exit, a thrown spawn or
+ * an answer the parser refuses is `{ ok: false }` with the first line of
+ * stderr, and the guard says "Could not list the pools on this node: <line>",
+ * never "Target pool '<pool>' does not exist". Before, the routes' local
+ * probes read a failing `zpool list` as "no pools".
+ */
+export async function readLocalPoolExistence(executor: CommandExecutor, pool: string): Promise<PoolExistence> {
+  let r: ExecResult
+  try {
+    r = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
+  }
+  catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+  // The legacy shape of "this node has no pools" (older `zpool list`): a
+  // non-zero exit whose whole stderr is exactly `no pools available`. It is
+  // the node's answer, not a failure (review 2 of cr3; OpenZFS 2.4's `-j`
+  // exits 0 with nothing on stdout instead, read below).
+  if (r.exitCode !== 0 && r.stderr.trim() === NO_POOLS_AVAILABLE)
+    return { ok: true, exists: false }
+  if (r.exitCode !== 0)
+    return { ok: false, error: localFailureLine(r, 'zpool list') }
+  if (!r.stdout.trim())
+    return { ok: true, exists: false }
+  try {
+    return { ok: true, exists: parseZpoolList(r.stdout).some(p => p.name === pool) }
+  }
+  catch (err) {
+    return { ok: false, error: `unreadable zpool list output: ${err instanceof Error ? err.message : String(err)}` }
+  }
+}
 
 /**
  * WHERE a replication target lives, and whether it may be written to.
@@ -58,9 +113,9 @@ export async function resolveTargetPlacement(
  * Does the target pool exist — locally (`zpool list`) or on the peer/remote
  * (`ssh zpool list`)? The answer is three-valued (repl.r2): the remote can say
  * "yes", "no", or "I did not answer" with the ssh failure's own line, and the
- * guard must keep the third apart from the second. The LOCAL probe is the
- * boolean it always was — a failing local `zpool list` still reads as no pool,
- * left to a later pass (EPICS §2, repl.r2).
+ * guard must keep the third apart from the second. The LOCAL probe answers
+ * the same three values ({@link readLocalPoolExistence}, cr3): a failing local
+ * `zpool list` is "could not list", never "no pool".
  */
 export async function targetPoolExists(
   transport: Transport,
@@ -77,10 +132,10 @@ export interface TargetGuardDeps {
   /** Stage-3 SSH transport — location resolution + remote `zpool list`. */
   transport: Transport
   /**
-   * Does this pool exist on THIS node (`zpool list`)? A local probe answers
-   * `{ ok: true, exists }`; `{ ok: false, error }` is the shape a probe that
-   * could not answer uses — today only the remote transport produces one
-   * (repl.r2), so the type keeps a guard from ever mistaking it for "absent".
+   * Does this pool exist on THIS node (`zpool list`)? `{ ok: true, exists }`
+   * is the node's answer; `{ ok: false, error }` is a probe that could not
+   * answer — the remote transport since repl.r2, the local read
+   * ({@link readLocalPoolExistence}) since cr3 — and is never "absent".
    */
   poolExists: (pool: string) => Promise<PoolExistence>
   /**
@@ -159,7 +214,8 @@ export async function guardReplicationTarget(
     // repl.r2: a peer/remote that did not answer is NOT a missing pool. The
     // refusal carries what its ssh said, so the operator is sent to the remote
     // (its key, its sshd) rather than to look for a pool that is there.
-    return { ok: false, message: `Could not list the pools${where}: ${pool.error}` }
+    // cr3: the local twin says where too — "on this node".
+    return { ok: false, message: `Could not list the pools${where || ' on this node'}: ${pool.error}` }
   }
   if (!pool.exists)
     return { ok: false, message: `Target pool '${target.pool}' does not exist${where}` }
