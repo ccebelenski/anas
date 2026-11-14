@@ -1,0 +1,8 @@
+datapool
+datapool/rrdst
+datapool/rrdst/a
+datapool/rrdst/a/deep
+datapool/rrdst/enc
+datapool/rrdst/new
+datapool/rrdst/targetonly
+datapool/rrdst/vol

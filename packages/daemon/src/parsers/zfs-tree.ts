@@ -21,8 +21,16 @@
 /** A `-p` epoch: digits only (`Number('')` is 0, so an empty column must not pass). */
 const DIGITS_RE = /^\d+$/
 
+/** Every C0 control character but the tab, and DEL. */
+// eslint-disable-next-line no-control-regex
+const CONTROL_RE = /[\x00-\x08\x0A-\x1F\x7F]/g
+
 function unreadable(what: string, line: string): never {
-  throw new Error(`Unreadable ${what} line: '${line}'`)
+  // Control characters are shown, not carried: this message travels into a
+  // job error and a mail body, and a raw carriage return there rewrites the
+  // line it lands on. A tab stays a tab (it is the listing's own separator).
+  const shown = line.replace(CONTROL_RE, c => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`)
+  throw new Error(`Unreadable ${what} line: '${shown}'`)
 }
 
 /** Split stdout into content lines (a trailing newline is not a line). */

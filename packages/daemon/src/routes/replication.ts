@@ -1,11 +1,12 @@
-import type { ReplicatePlan, Snapshot } from '@anas/shared'
+import type { ReplicatePlan, ReplicateRequest as ReplicateRequestBody, Snapshot } from '@anas/shared'
 import type { FastifyReply, FastifyRequest } from 'fastify'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, PipelineResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
 import type { ReplicationNotifyContext } from '../services/replication-notify.js'
 import type { TargetPlacement } from '../services/replication-target.js'
 import type { Transport } from '../services/replication-transport.js'
+import type { TreeGateRefusal } from '../services/replication-tree-gate.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
 import { GuardRefusalError, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
@@ -13,9 +14,12 @@ import { ownershipRefusal } from '../services/pve-footprint.js'
 import { legacyReleasableOnSource, replicationHoldTag, settleReplicationHolds } from '../services/replication-holds.js'
 import { notifyReplicationRun } from '../services/replication-notify.js'
 import { guardReplicationTarget } from '../services/replication-target.js'
+import { gateTreeRun } from '../services/replication-tree-gate.js'
+import { readTreeFacts } from '../services/replication-tree-read.js'
+import { treeTargetName } from '../services/replication-tree.js'
 import { isTransientRunSnapshot } from '../services/snapshot-naming.js'
 import { datasetSourceClaims } from '../services/source-claims.js'
-import { createZfsSnapshot } from '../services/zfs-snapshot.js'
+import { createZfsSnapshot, ZFS_REMOTE } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -39,11 +43,6 @@ import { requireIdentity } from './identity.js'
  */
 
 const ZFS = '/usr/sbin/zfs'
-/**
- * The remote-side zfs — UNQUALIFIED (rely on the remote login PATH; we don't
- *  own the remote and can't assume /usr/sbin). Used inside `ssh … zfs …`.
- */
-const ZFS_REMOTE = 'zfs'
 
 /**
  * Dependencies handed in from datasetRoutes — its executor, queue, and the
@@ -276,6 +275,13 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid replicate request: ${bodyParsed.error.issues[0]?.message}` } }
     }
+
+    // R0: a request WITHOUT `recursive: true` falls straight through to the
+    // single-dataset path below, untouched. The recursive branch is its own
+    // function, so no line of today's run is shared with it.
+    if (bodyParsed.data.recursive === true)
+      return runRecursiveReplication(poolName, source, bodyParsed.data, request, reply)
+
     const { target, snapshot, snapshotFirst, notify: notifyMode } = bodyParsed.data
 
     const identity = requireIdentity(request, reply)
@@ -527,6 +533,320 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
         }
       },
       // cr.33 (§4.3): a data mover rides the long lane (at most 3 of the 4 slots).
+      { lane: 'long', locks },
+    )
+
+    reply.code(202)
+    return { job }
+  }
+
+  /**
+   * The gate's refusals as the route answers them: joined into ONE sentence;
+   * an ownership verdict answers through the single-dataset door's own shape
+   * (409 PVE_MANAGED, or 400 when storage.cfg is unreadable), because the fact
+   * stated is PVE's territory, not a malformed request.
+   */
+  function refuseTreeGate(reply: FastifyReply, refusals: TreeGateRefusal[]): ReturnType<typeof sendRefusal> | { error: { code: 'VALIDATION_ERROR', message: string } } {
+    const message = refusals.map(r => r.message).join('; ')
+    const ownership = refusals.find(r => r.ownership !== undefined)?.ownership
+    if (ownership)
+      return sendRefusal(reply, ownershipRefusal(ownership, message))
+    reply.code(400)
+    return { error: { code: 'VALIDATION_ERROR', message } }
+  }
+
+  /**
+   * The RECURSIVE run (rrep.1b, #84, R1/R5–R9): read the tree, gate it, then
+   * one today's-shape `zfs send | zfs recv` per planned dataset in sweep order.
+   *
+   * Nothing here is shared with the single-dataset path (R0): the reads, the
+   * gates, the loop and the result are this function's. What it does reuse are
+   * the ONE helpers — the planner, the fact reader, the target guard, the hold
+   * settle — so the two paths cannot drift.
+   */
+  async function runRecursiveReplication(
+    poolName: string,
+    source: string,
+    body: ReplicateRequestBody,
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ) {
+    const { target, snapshot, notify: notifyMode } = body
+    const exclude = body.exclude ?? []
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    // 1. R4: one snapshot name across the tree — the root's newest, chosen by
+    //    the planner. A named snapshot is a single-dataset concept.
+    if (snapshot !== undefined) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: 'Recursive replication sends the newest snapshot of the source across the tree — it cannot be combined with a named snapshot' } }
+    }
+
+    // 2. The source exists, and the ROOT target pair passes today's guard
+    //    (location resolution, target pool exists, PVE ownership of the root,
+    //    onto-itself).
+    if (!(await datasetExists(poolName, source))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${source}' not found` } }
+    }
+    const targetRoot = resolveTarget(source, poolName, target)
+    const guard = await guardReplicationTarget(guardDeps, { target, sourceFull: source, targetFull: targetRoot })
+    if (!guard.ok) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: guard.message } }
+    }
+    const loc = guard.placement
+
+    const notify: ReplicationNotifyContext = {
+      source,
+      target: targetRoot,
+      ...(loc.isRemote && target.location ? { location: target.location } : {}),
+      notify: notifyMode,
+    }
+
+    // 3. Every fact first, then every gate, on ONE fresh footprint. A read that
+    //    did not answer refuses here (fail-closed); nothing has been sent.
+    const pve = await deps.pveFootprint()
+    const read = await readTreeFacts({ executor, transport }, { sourceRoot: source, targetRoot, exclude, placement: loc })
+    if (!read.ok) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: read.message } }
+    }
+    const gate = await gateTreeRun({ pve, guard: guardDeps }, { facts: read.facts, target })
+    if (!gate.ok)
+      return refuseTreeGate(reply, gate.refusals)
+
+    // 4. R9: a shared claim on EVERY swept dataset (the run reads them all),
+    //    plus today's EXCLUSIVE claim on a LOCAL target root (the recv writes
+    //    the tree below it). A peer/remote target is not ours to lock.
+    const locks = await datasetSourceClaims(executor, gate.sweep)
+    if (!loc.isRemote) {
+      let targetGuid: string | null = null
+      try {
+        targetGuid = (await readPoolGuid(executor, target.pool))?.guid ?? null
+      }
+      catch {
+        targetGuid = null
+      }
+      locks.push(...zfsDatasetClaims(targetGuid, targetRoot, 'exclusive'))
+    }
+
+    const job = jobQueue.submit(
+      'zfs.replicate',
+      { ...identity, params: { source, target: targetRoot, recursive: true, ...(loc.isRemote ? { location: target.location } : {}) } },
+      async (updateProgress) => {
+        const startedAt = Date.now()
+        // R7: ONE tag for the whole run, derived from the ROOT's target name —
+        // so a refused destroy of any child names the task that owns the tree.
+        const holdTag = replicationHoldTag(target.location, targetRoot)
+        try {
+          // 1. Re-run the ROOT guard, the reads and every gate on a FRESH
+          //    footprint (ruling (j): the route's listing is not trusted). A
+          //    refusal fails the job as STATE_CHANGED and NOTHING is sent.
+          const pveNow = await deps.pveFootprint()
+          const guardNow = await guardReplicationTarget(
+            { ...guardDeps, pveFootprintPreloaded: pveNow },
+            { target, sourceFull: source, targetFull: targetRoot },
+          )
+          if (!guardNow.ok)
+            throw new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message: guardNow.message })
+          const jobLoc = guardNow.placement
+
+          const factsNow = await readTreeFacts({ executor, transport }, { sourceRoot: source, targetRoot, exclude, placement: jobLoc })
+          if (!factsNow.ok)
+            throw new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message: factsNow.message })
+          const gateNow = await gateTreeRun({ pve: pveNow, guard: guardDeps }, { facts: factsNow.facts, target })
+          if (!gateNow.ok)
+            throw new GuardRefusalError({ status: 409, code: 'STATE_CHANGED', message: gateNow.refusals.map(r => r.message).join('; ') })
+
+          const plan = gateNow.plan
+          const facts = factsNow.facts
+          notify.snapshot = plan.snapshot
+          const targetFor = (dataset: string): string => treeTargetName(source, targetRoot, dataset)
+          const warnings: string[] = []
+
+          // 2. Copies already AT S get their holds settled first, with no
+          //    base: a stopped earlier run may have received a dataset and
+          //    failed to hold it. `settleReplicationHolds` tolerates a hold
+          //    already present, and it is asked for no legacy release here —
+          //    nothing was sent for this dataset this run.
+          for (const dataset of plan.upToDate) {
+            const tgt = targetFor(dataset)
+            // A settle that THROWS (a spawn failure, a deadline) is a warning
+            // here as it is after a receive: nothing was sent for this
+            // dataset, its copy is intact, and failing the whole run on it
+            // would stop every dataset behind it on every retry (verification
+            // of the rrep.1b fold).
+            try {
+              const holdWarnings = await settleReplicationHolds({ executor, transport }, {
+                tag: holdTag,
+                snapName: plan.snapshot,
+                source: { dataset, snapshotNames: facts.sourceSnaps.get(dataset) ?? [] },
+                target: { dataset: tgt, snapshotNames: facts.targetSnaps.get(tgt) ?? [] },
+                ...(jobLoc.isRemote ? { remote: jobLoc.resolved } : {}),
+                releaseLegacyOnSource: false,
+              })
+              warnings.push(...holdWarnings.map(w => `${dataset}: ${w}`))
+            }
+            catch (err) {
+              warnings.push(`${dataset}: holds could not be settled — ${err instanceof Error ? err.message : String(err)}`)
+            }
+          }
+
+          // 3. R6: sends in sweep order, stopping at the first failure. Nothing
+          //    is rolled back; the next run continues from each dataset's own
+          //    base (a copy that already holds S is up to date).
+          const sent: string[] = []
+          const datasets: { dataset: string, target: string, mode: 'full' | 'incremental', baseSnapshot?: string, bytesEstimated: number }[] = []
+          let bytesEstimated = 0
+          let anyFull = false
+          let legacySettled = false
+          for (const planned of plan.datasets) {
+            const srcSnapFull = `${planned.dataset}@${plan.snapshot}`
+
+            // The estimate is best-effort, exactly as the single-dataset run's.
+            const dryArgs = ['send', '-nvP']
+            if (planned.mode === 'incremental' && planned.baseSnapshot)
+              dryArgs.push('-i', `@${planned.baseSnapshot}`)
+            dryArgs.push('--', srcSnapFull)
+            // Best-effort means a THROW too (a spawn failure, a deadline):
+            // the estimate is 0 and the send decides. It must never end the
+            // run with a bare error that names no dataset (verification of
+            // the rrep.1b fold; R6's sentence belongs to the send).
+            let datasetBytes = 0
+            try {
+              const dry = await executor.exec(ZFS, dryArgs)
+              datasetBytes = parseSendDryRun(dry.stdout)
+            }
+            catch {
+              datasetBytes = 0
+            }
+            bytesEstimated += datasetBytes
+            if (planned.mode === 'full')
+              anyFull = true
+
+            // R1: today's argv, per dataset — never -R, -p, -F, -w, -I.
+            const sendArgs = planned.mode === 'incremental' && planned.baseSnapshot
+              ? ['send', '-i', `@${planned.baseSnapshot}`, '--', srcSnapFull]
+              : ['send', '--', srcSnapFull]
+            const recvArgs = planned.mode === 'full'
+              ? ['recv', '-o', 'readonly=on', '--', planned.target]
+              : ['recv', '--', planned.target]
+            let recvCmd = ZFS
+            let recvArgv = recvArgs
+            if (jobLoc.isRemote) {
+              const argv = transport.buildSshArgv(jobLoc.resolved, [ZFS_REMOTE, ...recvArgs])
+              recvCmd = argv[0]
+              recvArgv = argv.slice(1)
+            }
+
+            updateProgress(`zfs send ${srcSnapFull} | zfs recv ${planned.target}`)
+            // R6's sentence covers BOTH failure shapes (fold 4, review B8):
+            // the executor REJECTS on a spawn failure (ENOENT/EACCES/EAGAIN)
+            // and RESOLVES with a non-zero exit otherwise — a throw used to
+            // escape as a bare `spawn EAGAIN`, naming no dataset and no
+            // already-sent list. One sentence builder for both branches.
+            const r6Sentence = (detail: string): string =>
+              `Replication failed at '${planned.dataset}' — ${detail}; already sent this run: ${sent.join(', ') || 'nothing'}; the next run continues from each dataset's own base`
+            let pipe: PipelineResult
+            try {
+              pipe = await executor.pipeline(ZFS, sendArgs, recvCmd, recvArgv, { timeoutMs: null, longRunning: 'zfs send | zfs recv: a data mover, hours for a large send' })
+            }
+            catch (err) {
+              throw new Error(r6Sentence(err instanceof Error ? err.message : String(err)))
+            }
+            if (pipe.leftExitCode !== 0 || pipe.rightExitCode !== 0) {
+              const detail = pipe.rightStderr.trim()
+                ? `recv: ${pipe.rightStderr.trim()}`
+                : pipe.leftStderr.trim()
+                  ? `send: ${pipe.leftStderr.trim()}`
+                  : `send exited ${pipe.leftExitCode}, recv exited ${pipe.rightExitCode}`
+              throw new Error(r6Sentence(detail))
+            }
+            sent.push(planned.dataset)
+            datasets.push({
+              dataset: planned.dataset,
+              target: planned.target,
+              mode: planned.mode,
+              ...(planned.baseSnapshot ? { baseSnapshot: planned.baseSnapshot } : {}),
+              bytesEstimated: datasetBytes,
+            })
+
+            // 4. R7: settle THIS dataset's holds under the run's one tag. The
+            //    target's snapshot names are re-read after the receive, as the
+            //    single-dataset run does (that read stays fail-open, as today).
+            //    Nothing in this block is a SEND (fold 4, review B8): the
+            //    stream already landed, so a throw here — settleReplicationHolds
+            //    runs unguarded exec, which rejects on a spawn failure — is a
+            //    warning, never R6's sentence. The next run re-settles the
+            //    holds and continues from each dataset's own base regardless.
+            try {
+              const targetNames = jobLoc.isRemote
+                ? await transport.remoteSnapshotNames(jobLoc.resolved, planned.target)
+                : (await listSnapshotsDetail(planned.target)).map(s => s.snapshotName)
+              let releaseLegacy = false
+              if (planned.dataset === source && !legacySettled) {
+                legacySettled = true
+                const legacy = await legacyReleasableOnSource(executor, {
+                  sourceFull: source,
+                  ownTag: holdTag,
+                  sourceSnapshotNames: facts.sourceSnaps.get(source) ?? [],
+                  ...(deps.systemdDir ? { systemdDir: deps.systemdDir } : {}),
+                })
+                releaseLegacy = legacy.releasable
+                if (legacy.warning)
+                  warnings.push(legacy.warning)
+              }
+              const holdWarnings = await settleReplicationHolds({ executor, transport }, {
+                tag: holdTag,
+                snapName: plan.snapshot,
+                ...(planned.baseSnapshot ? { baseSnapshot: planned.baseSnapshot } : {}),
+                source: { dataset: planned.dataset, snapshotNames: facts.sourceSnaps.get(planned.dataset) ?? [] },
+                target: { dataset: planned.target, snapshotNames: targetNames },
+                ...(jobLoc.isRemote ? { remote: jobLoc.resolved } : {}),
+                releaseLegacyOnSource: releaseLegacy,
+              })
+              warnings.push(...holdWarnings.map(w => `${planned.dataset}: ${w}`))
+            }
+            catch (err) {
+              warnings.push(`${planned.dataset}: holds could not be settled — ${err instanceof Error ? err.message : String(err)}`)
+            }
+          }
+
+          // 5. A skipped dataset is a warning (the operator must know it was
+          //    left out), never a refusal — R5d's "no entry, no plan" case.
+          for (const skipped of plan.skipped)
+            warnings.push(skipped.message)
+
+          const result = {
+            recursive: true as const,
+            // The run's mode: full if ANY dataset needed a full send, else
+            // incremental. With NOTHING sent the field is omitted (fold 5,
+            // review J) — a mode would describe a send that never happened,
+            // and the notification's Mode line follows the field.
+            ...(datasets.length > 0 ? { mode: anyFull ? 'full' as const : 'incremental' as const } : {}),
+            snapshot: plan.snapshot,
+            target: targetRoot,
+            holdTag,
+            datasets,
+            upToDate: plan.upToDate,
+            skipped: plan.skipped.map(s => s.dataset),
+            targetOnly: plan.targetOnly,
+            bytesEstimated,
+            ...(warnings.length ? { warnings } : {}),
+          }
+          await notifyReplicationRun(executor, { ...notify, result, elapsedMs: Date.now() - startedAt })
+          return result
+        }
+        catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          await notifyReplicationRun(executor, { ...notify, error: message, elapsedMs: Date.now() - startedAt })
+          throw err
+        }
+      },
       { lane: 'long', locks },
     )
 

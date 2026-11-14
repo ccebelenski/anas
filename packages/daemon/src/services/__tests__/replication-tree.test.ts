@@ -6,6 +6,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { parseTreeList, parseTreeProps, parseTreeSnapshots } from '../../parsers/zfs-tree.js'
 import { planTreeReplication } from '../replication-tree.js'
+import { isAtOrUnder } from '../zfs-snapshot.js'
 
 /**
  * Story rrep.1a (#84), planner half: {@link planTreeReplication} over the
@@ -38,7 +39,10 @@ function fixtureFacts(overrides: Partial<TreeFacts> = {}): TreeFacts {
     sourceTree: parseTreeList(loadFixture('src-tree.txt')),
     sourceSnaps: parseTreeSnapshots(loadFixture('src-snaps-p.txt')),
     sourceProps: parseTreeProps(loadFixture('src-keystatus.txt')),
-    targetTree: parseTreeList(loadFixture('dst-tree.txt')),
+    // The reader hands the planner the pool listing filtered to the root
+    // (`dst-tree.txt` is the capture of the root's own listing; the filter
+    // is what the reader applies to the pool's).
+    targetTree: parseTreeList(loadFixture('dst-tree.txt')).filter(name => isAtOrUnder(name, 'datapool/rrdst')),
     targetSnaps: parseTreeSnapshots(loadFixture('dst-snaps-p.txt')),
     targetProps: parseTreeProps(loadFixture('dst-written.txt')),
     ...overrides,

@@ -22,6 +22,16 @@ import type { CommandExecutor, ExecResult } from '../executor/types.js'
 
 export const ZFS = '/usr/sbin/zfs'
 
+/**
+ * The remote-side `zfs` — UNQUALIFIED, because the remote login PATH is the
+ * remote's business (we do not own the remote and cannot assume /usr/sbin).
+ * Used inside `ssh ... zfs ...`. It lived in routes/replication.ts until rrep.1b;
+ * the recursive run's tree reads (services/replication-tree-read.ts) invoke it
+ * from a service, so it lives beside the local binary here and both modules
+ * import the one definition.
+ */
+export const ZFS_REMOTE = 'zfs'
+
 /** Which snapshot, and whether the verb recurses into child datasets. */
 export interface ZfsSnapshotOptions {
   /** The dataset (or volume) the snapshot belongs to, e.g. `tank/media`. */

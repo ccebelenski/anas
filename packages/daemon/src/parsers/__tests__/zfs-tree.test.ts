@@ -165,6 +165,8 @@ describe('tree-listing argv builders', () => {
 describe('lines zfs would not print are refused, not read', () => {
   it('a carriage return anywhere throws in all three parsers', () => {
     assert.throws(() => parseTreeList('tank\r\ntank/a\r\n'), /Unreadable zfs tree listing line/)
+    // The message shows the carriage return; it never carries one.
+    assert.throws(() => parseTreeList('tank\r\n'), (err: Error) => err.message === 'Unreadable zfs tree listing line: \'tank\\x0d\'')
     assert.throws(() => parseTreeSnapshots('tank@s1\t100\t1\r\n'), /Unreadable zfs snapshot listing line/)
     assert.throws(() => parseTreeProps('tank\twritten\t0\r\n'), /Unreadable zfs property listing line/)
   })

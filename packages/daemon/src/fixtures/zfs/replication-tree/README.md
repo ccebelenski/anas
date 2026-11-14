@@ -15,6 +15,7 @@ run 2; `after-*` are the state once run 2 had sent S2.
 | File | Command |
 |---|---|
 | `src-tree.txt`, `dst-tree.txt`, `after-dst-tree.txt` | `zfs list -H -o name -r -t filesystem,volume -- <root>` |
+| `after-dst-pool-tree.txt` | the same listing asked of the target POOL (`-- datapool`), captured 2026-11-14 after run 2: the pool's own row comes first, always |
 | `src-snaps.txt`, `dst-snaps.txt`, `after-dst-snaps.txt` | `zfs list -H -t snapshot -o name,creation -r -- <root>` |
 | `src-snaps-p.txt`, `dst-snaps-p.txt` | `zfs list -Hp -t snapshot -o name,creation,guid -r -- <root>` |
 | `src-keystatus.txt`, `src-keystatus-unloaded.txt` | `zfs get -Hp -r -t filesystem,volume -o name,property,value keystatus,encryptionroot -- <root>` (second: after `zfs unload-key` on `enc`) |

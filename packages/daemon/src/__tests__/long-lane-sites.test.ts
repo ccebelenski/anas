@@ -39,7 +39,8 @@ const LONG_SITES: { file: string, operation: string }[] = [
   { file: 'routes/backup.ts', operation: `'backup.restore.image'` }, // to a new LUN
   { file: 'routes/backup.ts', operation: `'backup.task.run'` }, // the direct run (its supervisor is in WATCH_SITES)
   { file: 'routes/cloud.ts', operation: `'cloud.task.run'` }, // the direct run (its supervisor is in WATCH_SITES)
-  { file: 'routes/replication.ts', operation: `'zfs.replicate'` },
+  { file: 'routes/replication.ts', operation: `'zfs.replicate'` }, // the single-dataset run
+  { file: 'routes/replication.ts', operation: `'zfs.replicate'` }, // rrep.1b: the recursive run (one tag, one send loop)
   // The one expansion driver: expand, guided replace, resume and the boot
   // re-attach (`ahr.expand`, `ahr.replace`, `ahr.expand.resume`), by argument.
   { file: 'services/ahr-expand-resume.ts', operation: 'operation' },

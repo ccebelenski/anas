@@ -33,9 +33,21 @@ import {
  * credentials — and zfs stderr).
  */
 
+/** One dataset a recursive run SENT (rrep.1b) — name, where it went, and how. */
+export interface ReplicationNotifyDataset {
+  dataset: string
+  target: string
+  mode: 'full' | 'incremental'
+}
+
 /** What a finished replication hands back, when it completed. */
 export interface ReplicationNotifyResult {
-  mode: 'full' | 'incremental'
+  /**
+   * Absent when a RECURSIVE run sent nothing (every copy already at S) — a
+   * mode over zero sends would claim a send shape that never happened
+   * (fold 5, review J). A single-dataset result always carries it.
+   */
+  mode?: 'full' | 'incremental'
   snapshot: string
   baseSnapshot?: string
   /**
@@ -45,6 +57,15 @@ export interface ReplicationNotifyResult {
    * even to an `on-failure` operator.
    */
   warnings?: string[]
+  /**
+   * rrep.1b: a RECURSIVE run. Absent on the single-dataset result, so the
+   * notification below is byte-identical to today's for a non-recursive run.
+   */
+  recursive?: true
+  /** The datasets this recursive run sent, in plan order. */
+  datasets?: ReplicationNotifyDataset[]
+  /** Source datasets whose copy was already at S — listed, never sent. */
+  upToDate?: string[]
 }
 
 export interface ReplicationNotifyContext extends UnattendedNotifyBase {
@@ -114,9 +135,21 @@ export function buildReplicationNotifyBody(ctx: ReplicationNotifyContext): strin
   const snapshot = ctx.result?.snapshot ?? ctx.snapshot
   if (snapshot)
     lines.push(`Snapshot:    ${ctx.source}@${snapshot}`)
-  if (ctx.result) {
+  // Printed only when the run has a mode to state (fold 5, review J): a
+  // recursive run that sent nothing omits the field, and a single-dataset
+  // result always carries one — so that body stays byte-identical.
+  if (ctx.result?.mode !== undefined) {
     lines.push(`Mode:        ${ctx.result.mode}`
       + `${ctx.result.baseSnapshot ? ` (from @${ctx.result.baseSnapshot})` : ''}`)
+  }
+
+  // rrep.1b: a recursive run lists what it sent and how many copies needed
+  // nothing. Gated on the flag, so a single-dataset body never changes.
+  if (ctx.result?.recursive === true) {
+    const sent = ctx.result.datasets ?? []
+    lines.push(`Datasets:    ${sent.length} sent, ${ctx.result.upToDate?.length ?? 0} up to date`)
+    for (const d of sent)
+      lines.push(`  ${d.dataset} -> ${d.target} (${d.mode})`)
   }
 
   if (ctx.result?.warnings?.length) {

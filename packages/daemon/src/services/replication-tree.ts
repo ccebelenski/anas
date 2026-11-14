@@ -95,6 +95,15 @@ function findBase(sourceSnaps: string[], targetSnaps: string[], S: string): stri
 }
 
 /**
+ * A source name's target name: swap the root prefix (root -> targetRoot).
+ * ONE definition (rrep.1b fold 2, single source of truth): the planner, the
+ * gate's target guard and the route's run loop all map names through here.
+ */
+export function treeTargetName(sourceRoot: string, targetRoot: string, dataset: string): string {
+  return targetRoot + dataset.slice(sourceRoot.length)
+}
+
+/**
  * The per-dataset plan for a recursive replication, or EVERY reason the run
  * cannot happen (rules 3–8 collected in one pass, so the operator fixes them
  * once; rules 1–2 return at once — without the root or without S there is no
@@ -120,7 +129,7 @@ export function planTreeReplication(facts: TreeFacts): TreePlan {
   //    subtrees dropped — never a second definition of "what is covered".
   const sweep = sweepSet({ target: { kind: 'zfs', dataset: sourceRoot }, recursive: true, exclude }, facts.sourceTree)
   /** A source name's target name: swap the root prefix (root -> targetRoot). */
-  const targetName = (dataset: string): string => targetRoot + dataset.slice(sourceRoot.length)
+  const targetName = (dataset: string): string => treeTargetName(sourceRoot, targetRoot, dataset)
   const targetTreeSet = new Set(facts.targetTree)
   const holdsS = (dataset: string): boolean => (facts.sourceSnaps.get(dataset) ?? []).includes(S)
 
