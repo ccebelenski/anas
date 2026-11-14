@@ -27,9 +27,11 @@ const PROVIDERS = [{
 
 describe('cloud retarget guard (ident.4 (b))', () => {
   it('destination options are named by suffix; a bool switch is not a place', () => {
-    for (const key of ['endpoint', 'host', 'url', 'bucket', 'remote', 'upstreams', 'region', 'provider', 'root_folder_id', 'storage_url', 'port'])
+    // cr3 CLOUD-M7: the login (`user`, `username`, `domain`) and seafile's
+    // `library` are places too — `user` moved from the second list.
+    for (const key of ['endpoint', 'host', 'url', 'bucket', 'remote', 'upstreams', 'region', 'provider', 'root_folder_id', 'storage_url', 'port', 'user', 'username', 'domain', 'tenant_domain', 'library'])
       assert.ok(isDestinationOption(key, 's3', PROVIDERS), key)
-    for (const key of ['acl', 'user', 'chunk_size', 'upload_cutoff', 'pass'])
+    for (const key of ['acl', 'chunk_size', 'upload_cutoff', 'pass'])
       assert.ok(!isDestinationOption(key, 's3', PROVIDERS), key)
     assert.ok(!isDestinationOption('use_accelerate_endpoint', 's3', PROVIDERS))
   })

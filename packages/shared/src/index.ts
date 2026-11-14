@@ -10,6 +10,7 @@ export const VERSION = '0.4.5'
 export {
   CLOUD_BACKEND_GUIDES,
   validateOwnClient,
+  validateOwnClientUpdate,
 } from './cloud-guide.js'
 export type { CloudBackendGuide, OwnClientVerdict } from './cloud-guide.js'
 
@@ -302,6 +303,7 @@ export {
   CloudRemoteTestResult,
   CloudRemoteTestVerdict,
   CloudRemoteUpdate,
+  CloudRemoteUpdateOptions,
   CloudRemoteWrite,
   CloudRunDetail,
   CloudRunRecentEvent,
@@ -315,7 +317,10 @@ export {
   CloudSyncTask,
   CloudSyncTaskDetail,
   CloudSyncTaskRequest,
+  CloudSyncTaskUpdateFields,
   CloudSyncTaskView,
+  cloudTaskUpdateBody,
+  mergeCloudSyncTaskUpdate,
 } from './schemas/cloud.js'
 
 // Common validators

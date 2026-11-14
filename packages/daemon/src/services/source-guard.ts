@@ -231,7 +231,9 @@ export async function boundedRealpathRun(
 ): Promise<{ path: string | undefined, answered: boolean }> {
   try {
     const r = await executor.exec(TIMEOUT, ['-s', 'KILL', REALPATH_TIMEOUT_S, REALPATH, mode === 'existing' ? '-e' : '-m', '--', path])
-    const out = r.stdout.trim()
+    // cr3 (merge, from the cloud lane): exactly one trailing newline is
+    // realpath's own; a path that ENDS in whitespace must stay that path.
+    const out = r.stdout.endsWith('\n') ? r.stdout.slice(0, -1) : r.stdout
     const ok = r.exitCode === 0 && out.startsWith('/') && !out.includes('\n')
     return { path: ok ? out : undefined, answered: r.exitCode === 0 || r.exitCode === 1 }
   }
@@ -436,10 +438,10 @@ export function notThereClause(mount: UnmountedMount): string {
  * refusal means (a 400 on a door, a thrown run failure inside a job).
  */
 export function guardSourcePath(path: string, facts: SourceGuardFacts): string | null {
-  // The cloud doors tighten on an unreadable fstab (handed by cloud); an
-  // unreadable MOUNT TABLE still passes here — that half is the cloud area's
-  // call (handed back), the backup doors refuse on it below.
-  const unreadable = unreadableFactsRefusal(path, { ...facts, mountTableUnavailable: false })
+  // The cloud doors tighten on an unreadable fstab AND on an unreadable mount
+  // table (cr3 merge: the cloud lane's tests give every world a readable
+  // table), the same refusal the backup doors give.
+  const unreadable = unreadableFactsRefusal(path, facts)
   if (unreadable)
     return unreadable
   const mount = unmountedMountFor(path, facts)

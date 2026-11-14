@@ -17,7 +17,7 @@ import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.j
 // parse, dir read, write + enable/disable). What stays HERE is what is
 // genuinely cloud sync's — the unit TEXT this store renders and the
 // CloudSyncTask schema it parses back.
-import { quoteExecArg, refuseControlChars } from './systemd-unit-store.js'
+import { listServiceUnitsChecked, quoteExecArg, readUnitFile, refuseControlChars } from './systemd-unit-store.js'
 import {
   buildTaskWarnings,
   clearCancelledRunFailedState as clearCancelledRunFailedStateGeneric,
@@ -216,15 +216,66 @@ export async function readUnitTexts(dir: string, name: string): Promise<{ unit: 
 }
 
 /**
+ * The task store could not be read completely, so which tasks name a remote
+ * is unknown (cr3 CLOUD-L8). The message names what could not be read.
+ */
+export class TaskStoreUnreadableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'TaskStoreUnreadableError'
+  }
+}
+
+/**
  * The names of the tasks that reference `remote` — the hard 409 the remotes
- * DELETE door asks for (rclone.1 shipped the check against an empty store;
- * this is the real one). Fail-open to none: an unreadable unit dir is an empty
- * store everywhere else in this module, and a delete is already a deliberate
- * act the operator can repeat.
+ * DELETE door and the retarget confirm ask for. FAIL CLOSED (cr3 CLOUD-L8): a
+ * missing fact may only tighten, and before cr3 an unreadable unit dir — or a
+ * unit whose task JSON no longer parses (version skew, a hand edit) — read as
+ * "no task", which opened the delete refusal and skipped the retarget confirm
+ * for exactly the task it could not see. Now either throws
+ * {@link TaskStoreUnreadableError}, naming the unit (the task DELETE door
+ * removes an unparseable unit, cr.41b).
  */
 export async function tasksReferencingRemote(dir: string, remote: string): Promise<string[]> {
-  const tasks = await readAllTasks(dir)
-  return tasks.filter(t => t.remote === remote).map(t => t.name).sort()
+  const store = await readAllTasksChecked(dir)
+  if (!store.listed)
+    throw new TaskStoreUnreadableError(`the cloud sync task units in ${dir} could not be listed, so whether a task uses remote '${remote}' is unknown`)
+  if (store.unreadable.length) {
+    const first = store.unreadable[0]!
+    throw new TaskStoreUnreadableError(`${first.file} could not be ${first.why}, so whether its task uses remote '${remote}' is unknown `
+      + '- fix or remove that cloud sync task first')
+  }
+  const names = store.tasks.filter(t => t.remote === remote).map(t => t.name)
+  names.sort()
+  return names
+}
+
+/**
+ * Every cloud sync task, read with what could NOT be read said by name (cr3):
+ * `listed: false` when the unit directory could not be listed at all, and one
+ * `unreadable` row per `anas-cloud-*.service` that could not be read or whose
+ * task JSON does not parse. The fail-closed doors refuse on either; the
+ * dashboard collector warns the readable ones and reports the rest.
+ */
+export async function readAllTasksChecked(dir: string): Promise<{
+  listed: boolean
+  tasks: CloudSyncTask[]
+  unreadable: { file: string, why: 'read' | 'parsed' }[]
+}> {
+  const listed = await listServiceUnitsChecked(dir, CLOUD_UNIT_KIND.prefix)
+  if (!listed.complete)
+    return { listed: false, tasks: [], unreadable: [] }
+  const tasks: CloudSyncTask[] = []
+  const unreadable: { file: string, why: 'read' | 'parsed' }[] = []
+  for (const file of listed.files) {
+    const text = await readUnitFile(dir, file)
+    const task = text === null ? null : parseTaskUnit(CLOUD_UNIT_KIND, text, CloudSyncTaskSchema)
+    if (task)
+      tasks.push(task)
+    else
+      unreadable.push({ file, why: text === null ? 'read' : 'parsed' })
+  }
+  return { listed: true, tasks, unreadable }
 }
 
 // --- Store: write + remove ---------------------------------------------------
@@ -476,10 +527,25 @@ export function buildCloudWarnings(inputs: CloudWarningInput[]): DashboardWarnin
   return buildTaskWarnings(CLOUD_UNIT_KIND, inputs)
 }
 
-/** Collect the dashboard 'cloud' warnings from the task store, fail-open. */
+/**
+ * Collect the dashboard 'cloud' warnings from the task store (cr3, the backup
+ * area's hand-off). With `incomplete`, the store is read CHECKED: the readable
+ * tasks still warn, and `incomplete(reason)` is told, once per thing, what
+ * could not be seen — the unit directory, or a unit file by name — so the
+ * section can say it is partial instead of reading as "no cloud warnings".
+ * Without it, today's fail-open behaviour (an unreadable unit is skipped).
+ */
 export async function collectCloudWarnings(
   executor: CommandExecutor,
   dir: string,
+  incomplete?: (reason: string) => void,
 ): Promise<DashboardWarning[]> {
-  return collectTaskWarnings(CLOUD_UNIT_KIND, executor, dir, readAllTasks)
+  if (!incomplete)
+    return collectTaskWarnings(CLOUD_UNIT_KIND, executor, dir, readAllTasks)
+  const store = await readAllTasksChecked(dir)
+  if (!store.listed)
+    incomplete(`the cloud sync task units in ${dir} could not be listed`)
+  for (const u of store.unreadable)
+    incomplete(`cloud sync task unit ${u.file} could not be ${u.why}`)
+  return collectTaskWarnings(CLOUD_UNIT_KIND, executor, dir, async () => store.tasks, incomplete)
 }

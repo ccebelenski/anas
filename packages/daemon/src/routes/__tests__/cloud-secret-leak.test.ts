@@ -11,7 +11,16 @@ import { main as cloudTaskMain } from '../../cloud-task.js'
 import { listSections, parseRcloneConf } from '../../parsers/rclone-conf.js'
 import { TASK_RUNNER_USER } from '../../runner-poll.js'
 import { createServer } from '../../server.js'
+import { passThroughRealpath } from '../../services/__tests__/cloud-realpath-passthrough.js'
 import { RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
+
+/**
+ * A READABLE mount table for every cloud test world (the cr3 backup hand-off):
+ * the source guard refuses a source whose mount table could not be read, so a
+ * world that answers no `findmnt` would refuse every run and preview. A
+ * command-only fixture: a test's own exact `findmnt --json` fixture still wins.
+ */
+const READABLE_MOUNT_TABLE = JSON.stringify({ filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }] })
 
 /**
  * cr.55 (review 2026-10-16 M1 + W5) — the route-level LEAK PROBE: a saved
@@ -138,6 +147,8 @@ describe('cr.55 — the cloud doors never hand out a saved remote\'s credential 
 
     const mock = mockOf(server)
     mock.clearFixtures()
+    mock.addFixture({ command: '/usr/bin/findmnt', result: { stdout: READABLE_MOUNT_TABLE, stderr: '', exitCode: 0 } })
+    passThroughRealpath(mock)
     mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: SYSTEMD_ANALYZE, result: { stdout: 'Normalized form: Tue *-*-* 02:00:00\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -232,7 +243,9 @@ describe('cr.55 — the cloud doors never hand out a saved remote\'s credential 
 
   it('the task Preview: rclone\'s error line quoting the credential reaches errors[] as [secret]', async () => {
     await createTask('s3leak')
-    mockOf(server).addFixture({ command: TIMEOUT, result: { stdout: '', stderr: `${errorObject(S3_ECHO)}\n${statsObject(1)}\n`, exitCode: 1 } })
+    // cr3 (second review): the rclone child only — the preview's checked
+    // `timeout ... realpath` must not be answered with this log.
+    mockOf(server).addFixture({ command: TIMEOUT, argsMatch: args => args.includes('--dry-run'), result: { stdout: '', stderr: `${errorObject(S3_ECHO)}\n${statsObject(1)}\n`, exitCode: 1 } })
     const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/preview', headers: JSON_HEADERS, payload: { name: 'offsite' } })
     assert.equal(res.statusCode, 202, res.body)
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
@@ -353,6 +366,8 @@ describe('cr.55r D1 — the config-dump failure path quotes rclone\'s line only 
 
     const mock = mockOf(server)
     mock.clearFixtures()
+    mock.addFixture({ command: '/usr/bin/findmnt', result: { stdout: READABLE_MOUNT_TABLE, stderr: '', exitCode: 0 } })
+    passThroughRealpath(mock)
     mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1\n', stderr: '', exitCode: 0 } })
     // A minimal s3 catalogue — enough for the write door's provider lookup
     // (the gate test writes an s3 section; the name rule makes
@@ -435,9 +450,10 @@ describe('cr.55r D1 — the config-dump failure path quotes rclone\'s line only 
   })
 
   it('the remove gate: a dump failure after the removal fails the job with [secret] in the error', async () => {
-    // precheck read (1), the job's re-check read (2), removeRemote's own read
-    // (3), the gate (4) fails.
-    failDumpFrom = 4
+    // precheck read (1), the job's identity re-gate (2 — cr3 CLOUD-L9 binds
+    // the delete to the section it read), the job's reference re-check (3),
+    // removeRemote's own read (4), the gate (5) fails.
+    failDumpFrom = 5
     // `cryptleak` — nothing wraps it, so the precheck lets the removal through.
     const res = await server.inject({ method: 'DELETE', url: '/v1/cloud/remotes/cryptleak', headers: IDENTITY })
     assert.equal(res.statusCode, 202, res.body)
@@ -493,6 +509,8 @@ remote = s3wrap:
     server = createServer({ mock: true, logger: false })
     const mock = mockOf(server)
     mock.clearFixtures()
+    mock.addFixture({ command: '/usr/bin/findmnt', result: { stdout: READABLE_MOUNT_TABLE, stderr: '', exitCode: 0 } })
+    passThroughRealpath(mock)
     mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1\n', stderr: '', exitCode: 0 } })
   })
 

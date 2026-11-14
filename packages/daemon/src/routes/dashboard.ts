@@ -174,7 +174,7 @@ export async function dashboardRoutes(
       // Cloud sync (rclone.2): failed/overdue enabled tasks → 'cloud' warnings,
       // the same rule and the same code backup's go through (task-units.ts with
       // the cloud descriptor). Healthy and disabled tasks contribute nothing.
-      readSection('cloud', [] as DashboardWarning[], exec => collectCloudWarnings(exec, systemdDir)),
+      readSection('cloud', [] as DashboardWarning[], (exec, incomplete) => collectCloudWarnings(exec, systemdDir, incomplete)),
       // AHR (11.10): only bad states card (degraded/failed/readonly/halted
       // expansion); healthy pools contribute nothing.
       readSection('ahr', [] as DashboardWarning[], exec => collectAhrWarnings(exec, ahrIntentDir, ahrCreateStatus)),

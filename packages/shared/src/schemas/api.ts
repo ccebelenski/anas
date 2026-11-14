@@ -168,7 +168,11 @@ export function forbiddenMessage(user: string, privilege: Privilege): string {
  * schemas/jobs.ts) is admitted on `Sys.Audit`, and the daemon's
  * `jobs/authority.ts` stays the authority for the cancel — cancelling a
  * non-read job still answers 403 naming `Sys.Modify` from the daemon, which
- * no gateway-side rule could know. A daemon test
+ * no gateway-side rule could know. The remote Test is the same shape (cr3
+ * CLOUD-C1): the path is admitted on `Sys.Audit`, and only its saved-remote
+ * arm (`{ name }`) is a read. The UNSAVED arm (`{ remote }`) hands rclone
+ * options that can run a command or write a path on the node, so the daemon
+ * answers it 403 naming `Sys.Modify` unless the request holds it. A daemon test
  * (`jobs/__tests__/read-job-routes.test.ts`) pins that every
  * `READ_JOB_OPERATIONS` route is registered at one of these paths and every
  * non-cancel entry here is a registered read-job route, so the two lists

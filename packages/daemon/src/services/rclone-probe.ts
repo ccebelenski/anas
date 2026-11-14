@@ -91,6 +91,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { listSections, parseRcloneConf } from '../parsers/rclone-conf.js'
 import {
+  carriesViewMarker,
   isSecretKey,
   obscure,
   passwordKeysFor,
@@ -99,6 +100,7 @@ import {
   rcloneBaseArgs,
   RemoteNotFoundError,
   remoteSecretValues,
+  restoreRedacted,
 } from './rclone-config.js'
 import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
 
@@ -246,6 +248,57 @@ export interface RcloneProbeTarget {
   name?: string
   /** An unsaved dialog — served through the env-defined remote, never written. */
   remote?: CloudRemoteWrite
+  /**
+   * With `remote` only (cr3 CLOUD-L11): the dialog is an EDIT of the saved
+   * remote of the same name, and every secret option it leaves out (blank =
+   * "unchanged") is that saved remote's stored value — see
+   * {@link storedSecretsFor}. Without it an edit's Test of one retyped secret
+   * dropped the remote's other stored secrets (a crypt `password2`, an s3
+   * secret beside a retyped key) and read "auth failed" on a remote that is
+   * fine.
+   */
+  keepStoredSecrets?: boolean
+  /** With `keepStoredSecrets`: stored secrets the edit clears — never filled (cr3). */
+  clearedSecrets?: readonly string[]
+}
+
+/**
+ * The stored secret options of the saved remote `remote.name` that the dialog
+ * left out, exactly as rclone.conf holds them — an `IsPassword` value is
+ * already obscured there, and a name-rule secret is plain, which is what the
+ * env-defined remote must be handed either way. Non-secret options are NOT
+ * filled: the dialog sends every one it holds, and one it cleared is tested
+ * cleared. Throws {@link RemoteNotFoundError} when no such remote is saved,
+ * and a plain error when the saved one is of another type.
+ */
+async function storedSecretsFor(
+  configFile: string,
+  remote: CloudRemoteWrite,
+  providers: CloudProvider[],
+  cleared: readonly string[] = [],
+): Promise<Record<string, string>> {
+  let text = ''
+  try {
+    text = await readFile(configFile, 'utf-8')
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+      throw err
+  }
+  const section = listSections(parseRcloneConf(text)).find(s => s.name === remote.name)
+  if (!section)
+    throw new RemoteNotFoundError(remote.name)
+  if (section.values.type !== remote.type)
+    throw new Error(`remote '${remote.name}' is saved as type '${section.values.type ?? ''}', not '${remote.type}'`)
+  const passwordKeys = passwordKeysFor(providers, remote.type)
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(section.values)) {
+    if (key === 'type' || value === '' || (remote.options[key] ?? '') !== '' || cleared.includes(key))
+      continue
+    if (isSecretKey(key, providerOption(providers, remote.type, key)) || passwordKeys.has(key))
+      out[key] = value
+  }
+  return out
 }
 
 export interface RcloneProbeOptions {
@@ -436,8 +489,32 @@ export async function testRemote(
     fs = `${PROBE_REMOTE_NAME}:${path}`
     namedFs = `${remote.name}:${path}`
     env = { [`${PROBE_ENV_PREFIX}TYPE`]: remote.type }
+    // cr3 CLOUD-L11: an edit's Test — the stored secrets the dialog left out,
+    // as stored (already obscured where rclone obscures). Stored values: they
+    // mask, never guard (cr.55r P2), like a saved target's.
+    if (target.keepStoredSecrets === true) {
+      const stored = await storedSecretsFor(paths.configFile, remote, opts.providers, target.clearedSecrets ?? [])
+      for (const [key, value] of Object.entries(stored)) {
+        env[`${PROBE_ENV_PREFIX}${key.toUpperCase()}`] = value
+        maskValues.push(value)
+      }
+      maskValues.push(...await remoteSecretValues(paths.configFile, remote.name))
+    }
+    // Review of cr3, fix 4: an edit's dialog holds the REDACTED view of a
+    // value (`https://u:[secret]@h`); on an edit's Test the stored credential
+    // stands where the marker is, exactly as the save would write it.
+    let options = remote.options
+    if (target.keepStoredSecrets === true && Object.values(options).some(v => carriesViewMarker(v))) {
+      const text = await readFile(paths.configFile, 'utf-8').catch(() => '')
+      const section = listSections(parseRcloneConf(text)).find(sec => sec.name === remote.name)?.values ?? {}
+      options = Object.fromEntries(Object.entries(options).map(([k, v]) => [k, restoreRedacted(k, v, section[k])]))
+    }
     const passwordKeys = passwordKeysFor(opts.providers, remote.type)
-    for (const [key, value] of Object.entries(remote.options)) {
+    for (const [key, value] of Object.entries(options)) {
+      // A blank secret on an edit's Test is "unchanged": the stored value
+      // filled above stays.
+      if (value === '' && env[`${PROBE_ENV_PREFIX}${key.toUpperCase()}`] !== undefined)
+        continue
       const secret = isSecretKey(key, providerOption(opts.providers, remote.type, key))
       if (secret) {
         // A dialog value: masks AND guards (cr.55r P2 — the guard's list is

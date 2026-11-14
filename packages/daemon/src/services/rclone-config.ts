@@ -111,14 +111,52 @@ const SECRET_SUFFIX_RE = /(?:^|_)(?:pass|password|secret|token|key)$/
  *    `key`, so the suffix rule let it show in a reply, ride the argv guard
  *    blind, and enter the identity facts. rclone stores it in PLAIN text.
  *
- * Credential-SHAPED names in the capture that stay out on purpose:
+ *  - sftp `key_pem` ("Raw PEM-encoded private key", `IsPassword: false`):
+ *    the private key itself, stored plain (cr3 CLOUD-H2).
+ *  - drive / google cloud storage `service_account_credentials` ("Service
+ *    Account Credentials JSON blob", hidden from the catalogue): a whole
+ *    service account, private key included (cr3 CLOUD-H2).
+ *  - sugarsync `authorization` ("Sugarsync authorization", auto-configured by
+ *    rclone): the auth token rclone writes itself (cr3 CLOUD-H2; before cr3
+ *    this list called it "a header name", which the help text contradicts).
+ *  - s3 `sse_customer_key_base64` ("the secret encryption key encoded in
+ *    base64") and `sse_customer_key_md5` (its checksum: derived from a
+ *    secret, and nothing derivable from a secret leaves the daemon).
+ *  - http / webdav `headers` (CommaSepList, "e.g. Cookie,name=value ...
+ *    Authorization,xxx"): the help text's own examples are credentials.
+ *
+ *  - sftp `set_env` (review of cr3): environment handed to sftp and to the
+ *    commands it runs — where passphrases are passed.
+ *
+ * A credential INSIDE a readable value is redacted instead of hiding the whole
+ * option (review of cr3, fix 4 — {@link redactOptionValue}): the password in
+ * a URL's userinfo (`url` of http/webdav: rclone's own help suggests
+ * `https://user:pass@host`), and the secret-rule parameters of an on-the-fly
+ * remote inlined in a reference option (`:s3,secret_access_key=...:bucket`).
+ *
+ * Credential-SHAPED names in the capture that stay out on purpose — the
+ * closed list `rclone-config.test.ts` checks the 1.60.1 catalogue against:
  * `access_key_id`, `client_id`, `application_credential_id`/`_name`,
- * `account` (identifiers, not secrets), `auth_url`, `api_url`, `endpoint`
- * (endpoints), `authorization` (a header name, not a value). From memory of
- * rclone's backends, `ftp`/`sftp`-style `ask_password` already matches the
- * suffix rule, and no other missed name is citable from this capture.
+ * `account`, `username` (identifiers, not secrets), `auth_url`, `api_url`,
+ * `endpoint`, `token_url` (endpoints), `key_file`, `service_account_file`,
+ * `service_principal_file`, `shared_credentials_file`, `profile` (a path or
+ * a name inside a file, never the credential), `authorization_expiry`,
+ * `token_expiry`, `download_auth_duration` (times), `bearer_token_command`
+ * (a command; the token it prints is never stored).
  */
-const SECRET_NAMES: ReadonlySet<string> = new Set(['sas_url'])
+const SECRET_NAMES: ReadonlySet<string> = new Set([
+  'sas_url',
+  'key_pem',
+  'service_account_credentials',
+  'authorization',
+  'sse_customer_key_base64',
+  'sse_customer_key_md5',
+  'headers',
+  // Review of cr3 (fix 4): sftp `set_env` (SpaceSepList "VAR=value ...",
+  // "passed to the sftp client and to any commands run") is where a
+  // passphrase or an agent socket secret is handed over.
+  'set_env',
+])
 
 export function isSecretKey(key: string, option?: Partial<Pick<CloudProviderOption, 'secret' | 'type'>>): boolean {
   if (option?.secret)
@@ -126,6 +164,24 @@ export function isSecretKey(key: string, option?: Partial<Pick<CloudProviderOpti
   if (option?.type === 'bool')
     return false
   return SECRET_SUFFIX_RE.test(key) || SECRET_NAMES.has(key)
+}
+
+/**
+ * Second review of cr3 (11): a secret of only whitespace is never a secret.
+ * Any secret option (by rclone's own fact or the name rule) given a value
+ * that is not empty but trims to nothing is refused — at every door and in
+ * the writer — with this sentence, or null when there is none.
+ */
+export function whitespaceSecretRefusal(
+  options: Record<string, string | null>,
+  type: string,
+  providers: CloudProvider[] = [],
+): string | null {
+  for (const [key, value] of Object.entries(options)) {
+    if (typeof value === 'string' && value !== '' && value.trim() === '' && isSecretKey(key, providerOption(providers, type, key)))
+      return `option '${key}' is only whitespace - a secret of only whitespace is never a secret; type the value, or leave the field blank`
+  }
+  return null
 }
 
 // ── The OAuth token paste ──────────────────────────────────────────────────
@@ -349,8 +405,30 @@ export async function rcloneVersion(executor: CommandExecutor): Promise<string> 
   return m[1]!
 }
 
-/** A password-protected config file's failure signature. */
-const ENCRYPTED_CONFIG_RE = /password|encrypted|decrypt/i
+/** rclone's encrypted-config marker: the first line that is not blank or a comment (config/crypt.go). */
+const ENCRYPTED_MARKER_PREFIX = 'RCLONE_ENCRYPT_V'
+const LINE_SPLIT_RE = /\r?\n/
+
+/**
+ * Is this rclone.conf TEXT password-protected? (cr3 CLOUD-L12.) rclone's own
+ * test: the first line that is neither blank nor a `#`/`;` comment starts
+ * with `RCLONE_ENCRYPT_V` (`RCLONE_ENCRYPT_V0:` then the base64 blob — the
+ * file `rclone config encryption set` writes, fixtures/rclone/
+ * config-encrypted-1.75.2.conf). A STATE read from the file, never a word
+ * matched in an error: before cr3 any failing `config dump` whose output
+ * mentioned password/encrypted/decrypt (a malformed `password = ...` line
+ * rclone echoes back) was reported as a password-protected file and the
+ * remotes list came back empty instead of the error.
+ */
+export function isEncryptedConfigText(text: string): boolean {
+  for (const raw of text.split(LINE_SPLIT_RE)) {
+    const line = raw.trim()
+    if (line === '' || line.startsWith('#') || line.startsWith(';'))
+      continue
+    return line.startsWith(ENCRYPTED_MARKER_PREFIX)
+  }
+  return false
+}
 
 /** The rclone config read: the raw file text, the encrypted flag, the remotes. */
 export interface RcloneConfigRead {
@@ -374,8 +452,9 @@ export interface RcloneConfigRead {
  *  - exit 0 → the dump parsed into remotes (`options` = non-secret keys,
  *    `secretsSet` = the secret keys that are set — a secret value never
  *    comes back),
- *  - non-zero whose output mentions `password` / `encrypted` / `decrypt`
- *    → `{ encrypted: true, remotes: [] }` — a password-protected file,
+ *  - non-zero on a file rclone encrypted ({@link isEncryptedConfigText},
+ *    cr3 CLOUD-L12) → `{ encrypted: true, remotes: [] }` — a
+ *    password-protected file,
  *  - any other non-zero → an Error carrying rclone's last output line,
  *    masked against the file's stored secrets (cr.55r D1 — the echoed bad
  *    line can carry one; see {@link remoteSecretValuesFromText}).
@@ -419,7 +498,7 @@ export async function readConfig(
     return { text, encrypted: false, remotes: dumpToRemotes(dump, providers), existedBefore }
   }
 
-  if (ENCRYPTED_CONFIG_RE.test(`${result.stderr}\n${result.stdout}`))
+  if (isEncryptedConfigText(text))
     return { text, encrypted: true, remotes: [], existedBefore }
   // cr.55r (D1): a corrupted rclone.conf makes rclone echo the bad LINE — and
   // a bad line can carry a stored credential. The quoted text is masked where
@@ -448,7 +527,7 @@ function dumpToRemotes(dump: Record<string, unknown>, providers?: CloudProvider[
       if (isSecretKey(key, providerOption(providers ?? [], type, key)))
         secretsSet.push(key)
       else
-        options[key] = value
+        options[key] = redactOptionValue(key, value) // review of cr3, fix 4
     }
     remotes.push({ name, type, options, secretsSet: secretsSet.sort() })
   }
@@ -504,6 +583,9 @@ function referencedRemoteNames(value: string): string[] {
 /** The reference-naming parameters inside a connection string entry. */
 const CONNECTION_REFERENCE_PARAM_RE = /(?:^|,)(?:remote|upstreams|dir)=([^,]*)/g
 
+/** Where a remote name ends inside a reference entry: the first `,` or `:`. */
+const NAME_END_RE = /[,:]/
+
 /** The remote NAMES one reference-list ENTRY points at ({@link referencedRemoteNames}). */
 function entryRemoteNames(entry: string): string[] {
   const quote = entry[0]
@@ -518,11 +600,15 @@ function entryRemoteNames(entry: string): string[] {
       names.push(...entryRemoteNames(m[1]!))
     return names
   }
+  // A combine/union `X=` modifier: only when the `=` comes before any `,` or
+  // `:` (third review: `mys3,region=eu-west-1:bucket` names `mys3`, an
+  // override on a named remote — never `eu-west-1`).
+  const cut = entry.search(NAME_END_RE)
   const eq = entry.indexOf('=')
-  if (eq >= 0)
+  if (eq >= 0 && (cut < 0 || eq < cut))
     return entryRemoteNames(entry.slice(eq + 1))
-  const colon = entry.indexOf(':')
-  return colon > 0 ? [entry.slice(0, colon)] : []
+  // The referenced name is everything before the first `,` or `:`.
+  return cut > 0 ? [entry.slice(0, cut)] : []
 }
 
 /**
@@ -745,11 +831,192 @@ export const PASSWORD_KEYS_OUTSIDE_NAME_RULE: Readonly<Record<string, readonly s
   crypt: ['password2'],
 }
 
-/** The `key=value` parameters of an rclone connection string (`:s3,k=v,k2=v2:path`). */
-const CONNECTION_PARAM_RE = /(?:^|,)([\w-]+)=("[^"]*"|'[^']*'|[^,:]*)/g
+// ── What a reader may see of an option value (third review: an ALLOW-LIST) ──
+//
+// RULE: NOTHING DERIVABLE FROM A SECRET LEAVES THE DAEMON. A secret OPTION
+// (`isSecretKey`) is write-only. Every OTHER value is shown only when it is
+// PROVEN to be of a shape that cannot carry a secret; anything else is
+// hidden WHOLE. The ONE classifier ({@link classifyOptionValue}) decides for
+// every exit — the remotes list and the edit prefill, job results, the
+// retarget 409 and its confirm, the bound identity — and feeds the output
+// mask everything a hidden or redacted value conceals. rclone's own
+// connection-string grammar is never parsed to decide what is safe.
+//
+// The grammar, in one place:
+//   reference option (`remote` one entry; `upstreams`, `remotes` a
+//   whitespace-separated list):            each entry is `<name>:<path>` or an
+//     absolute local path; a list entry may carry the combine `<dir>=` prefix
+//     and the union `:ro|:nc|:rw|:writeback` suffix. `<name>` [A-Za-z0-9_.+@-]+ (no
+//     comma); the entry does not start with `:` and holds no quote, no `=`
+//     (but the combine prefix), no control character, no whitespace
+//                                                 -> PLAIN, else HIDDEN
+//   a value holding `://`:                  exactly one `://`, the WHOLE value
+//     `scheme://[userinfo@]host[:port][/path][?query][#fragment]`, host a DNS
+//     name, IPv4 or bracketed IPv6, path from [A-Za-z0-9._~%/+:@!$&()*;-]:
+//       no userinfo, no query, no fragment     -> PLAIN
+//       otherwise                              -> URL-REDACTED
+//                         `scheme://[secret]@host[:port]/path?[secret]`
+//     anything else                            -> HIDDEN
+//   any other value: no `,<key>=` and not starting with `:` -> PLAIN, else HIDDEN
 
-/** A leading/trailing quote character around a token. */
-const QUOTE_RE = /^["']|["']$/g
+/** What a redacted part of a URL reads as — the same marker the output mask writes. */
+export const REDACTED = '[secret]'
+
+/** What a HIDDEN value reads as, whole: nothing of the original, not its length. */
+export const HIDDEN_VALUE = '[hidden: this value carries inline settings]'
+
+/** The options whose value names remotes (and the list-valued ones among them). */
+const REFERENCE_KEYS: ReadonlySet<string> = new Set(['remote', 'upstreams', 'remotes'])
+const LIST_REFERENCE_KEYS: ReadonlySet<string> = new Set(['upstreams', 'remotes'])
+
+/** One reference entry: `[dir=]name:path[:ro|:nc|:rw]` or `[dir=]/abs/path[:ro|:nc|:rw]` (decorations: list entries only). */
+// eslint-disable-next-line no-control-regex -- the control characters ARE what is refused
+const REF_NAME_ENTRY_RE = /^[\w.+@-]+:[^\s"'`=\x00-\x1F\x7F]*$/
+// eslint-disable-next-line no-control-regex -- the control characters ARE what is refused
+const REF_PATH_ENTRY_RE = /^\/[^\s"'`=\x00-\x1F\x7F]*$/
+const COMBINE_DIR_PREFIX_RE = /^[\w.+-]+=/
+const UNION_SUFFIX_RE = /:(?:ro|nc|rw|writeback)$/
+const WHITESPACE_RE = /\s+/
+
+/** A strict URL: scheme, [userinfo@], host, [:port], [/path], [?query], [#fragment] — the WHOLE value. */
+const STRICT_URL_RE = /^([a-z][a-z0-9+.-]*):\/\/(?:([^/?#\s]*)@)?([a-z0-9.-]+|\[[0-9a-f:.]+\])(:\d{1,5})?(\/[\w.~%/+:@!$&()*;-]*)?(?:\?([^#\s]*))?(?:#(\S*))?$/i
+/** A `,<key>=` inline setting anywhere in a plain value. */
+const INLINE_SETTING_RE = /,[\w-]+=/
+/** The separators a hidden value is cut on for the mask's tokens. */
+const MASK_TOKEN_SPLIT_RE = /[\s,:;'"`=@?&#/\\()[\]{}]+/
+const MASK_TOKEN_MIN = 4
+const QUERY_PAIR_SPLIT_RE = /[&#]/
+
+/** How an option value may be shown. */
+export type OptionValueClass = 'plain' | 'url-redacted' | 'hidden'
+
+function isSafeReference(key: string, value: string): boolean {
+  if (value === '')
+    return true
+  const list = LIST_REFERENCE_KEYS.has(key)
+  const entries = list ? value.trim().split(WHITESPACE_RE) : [value]
+  if (!list && WHITESPACE_RE.test(value))
+    return false
+  return entries.every((raw) => {
+    let entry = raw
+    if (list) {
+      entry = entry.replace(COMBINE_DIR_PREFIX_RE, '')
+      if (UNION_SUFFIX_RE.test(entry) && entry.indexOf(':') !== entry.lastIndexOf(':'))
+        entry = entry.replace(UNION_SUFFIX_RE, '')
+    }
+    return !entry.startsWith(':') && (REF_NAME_ENTRY_RE.test(entry) || REF_PATH_ENTRY_RE.test(entry))
+  })
+}
+
+/** The tokens of a concealed string the mask carries: the whole, and every 4+ piece. */
+function concealTokens(text: string): string[] {
+  const out = [text]
+  for (const t of text.split(MASK_TOKEN_SPLIT_RE)) {
+    if (t.length >= MASK_TOKEN_MIN)
+      out.push(t)
+  }
+  return out
+}
+
+/**
+ * THE classifier (third review): how option `key`'s `value` may be shown,
+ * the view, and everything the view conceals (the output mask's half). A
+ * secret-rule key never reaches here — it is write-only.
+ */
+export function classifyOptionValue(key: string, value: string): { cls: OptionValueClass, view: string, conceals: string[] } {
+  if (REFERENCE_KEYS.has(key)) {
+    return isSafeReference(key, value)
+      ? { cls: 'plain', view: value, conceals: [] }
+      : { cls: 'hidden', view: HIDDEN_VALUE, conceals: concealTokens(value) }
+  }
+  if (value.includes('://')) {
+    const m = value.indexOf('://') === value.lastIndexOf('://') ? STRICT_URL_RE.exec(value) : null
+    if (!m)
+      return { cls: 'hidden', view: HIDDEN_VALUE, conceals: concealTokens(value) }
+    const [, scheme, userinfo, host, port, path, query, fragment] = m
+    if (userinfo === undefined && query === undefined && fragment === undefined)
+      return { cls: 'plain', view: value, conceals: [] }
+    const conceals: string[] = []
+    if (userinfo !== undefined && userinfo !== '')
+      conceals.push(...concealTokens(userinfo))
+    const hidden = [query, fragment].filter((x): x is string => x !== undefined && x !== '').join('#')
+    if (hidden !== '') {
+      conceals.push(...concealTokens(hidden))
+      for (const pair of hidden.split(QUERY_PAIR_SPLIT_RE)) {
+        const eq = pair.indexOf('=')
+        const v = eq >= 0 ? pair.slice(eq + 1) : pair
+        if (v.length >= MASK_TOKEN_MIN)
+          conceals.push(v)
+      }
+    }
+    const view = `${scheme}://${userinfo !== undefined ? `${REDACTED}@` : ''}${host}${port ?? ''}${path ?? ''}${query !== undefined || fragment !== undefined ? `?${REDACTED}` : ''}`
+    return { cls: 'url-redacted', view, conceals }
+  }
+  if (value.startsWith(':') || INLINE_SETTING_RE.test(value))
+    return { cls: 'hidden', view: HIDDEN_VALUE, conceals: concealTokens(value) }
+  return { cls: 'plain', view: value, conceals: [] }
+}
+
+/** The view of an option value at every exit ({@link classifyOptionValue}). */
+export function redactOptionValue(key: string, value: string): string {
+  return classifyOptionValue(key, value).view
+}
+
+/** What a value's view conceals — the output mask's half of the same classifier. */
+function credentialsIn(key: string, value: string): string[] {
+  return classifyOptionValue(key, value).conceals
+}
+
+/** A value carrying a view marker (`[secret]` or the hidden marker). */
+export function carriesViewMarker(value: string): boolean {
+  return value.includes(REDACTED) || value.includes(HIDDEN_VALUE)
+}
+
+/**
+ * The sentence refusing a value that came back from a view but is not the
+ * stored value's view unchanged — or null when `requested` is fine as it is.
+ * (Third review: decided at the ROUTE too, before a job exists.)
+ */
+export function viewMarkerRefusal(key: string, requested: string, stored: string | undefined): string | null {
+  if (!carriesViewMarker(requested))
+    return null
+  if (stored !== undefined && redactOptionValue(key, stored) === requested && requested !== stored)
+    return null
+  return `option '${key}' was shown hidden or redacted, and the value sent is not that view unchanged - re-enter the whole value of '${key}' to change it`
+}
+
+/**
+ * An UPDATE value carrying a view marker: the stored value when the marker
+ * came back as the stored value's view UNCHANGED (kept), else refused with
+ * {@link viewMarkerRefusal}'s sentence — nothing is written, the marker
+ * never. A hidden value is kept or retyped WHOLE; a redacted URL too.
+ */
+export function restoreRedacted(key: string, requested: string, stored: string | undefined): string {
+  const refusal = viewMarkerRefusal(key, requested, stored)
+  if (refusal !== null)
+    throw new Error(refusal)
+  return carriesViewMarker(requested) ? stored! : requested
+}
+
+/**
+ * The remotes whose REFERENCE options the views hide (third review): what
+ * they point at cannot be read from a view, so "is this remote referenced?"
+ * is unknown for each — a delete refuses, naming them; a retarget counts
+ * their tasks as reaching the remote. `[{ remote, key }]`, sorted.
+ */
+export function remotesWithHiddenReferences(remotes: CloudRemote[], except: string): { remote: string, key: string }[] {
+  const out: { remote: string, key: string }[] = []
+  for (const remote of remotes) {
+    if (remote.name === except)
+      continue
+    for (const key of REMOTE_REFERENCE_OPTIONS) {
+      if (remote.options[key] === HIDDEN_VALUE)
+        out.push({ remote: remote.name, key })
+    }
+  }
+  out.sort((a, b) => (a.remote < b.remote ? -1 : a.remote > b.remote ? 1 : 0))
+  return out
+}
 
 /** One secret-rule value: the stored bytes, and the in-process decode when it recovers. */
 function pushSecretValue(out: string[], value: string): void {
@@ -775,11 +1042,15 @@ function sectionSecretValues(values: Record<string, string>): string[] {
   for (const [key, value] of Object.entries(values)) {
     if (value === '')
       continue
-    if (REMOTE_REFERENCE_OPTIONS.includes(key)) {
-      for (const param of connectionStringSecrets(value))
-        pushSecretValue(out, param)
-      continue
+    // Review of cr3, fix 4 (second review): the credentials INSIDE a readable
+    // value — a URL's password, token userinfo and query values; an inlined
+    // remote's secret parameters (one predicate with the views: isSecretParam).
+    for (const secret of credentialsIn(key, value)) {
+      if (secret.length >= 4)
+        pushSecretValue(out, secret)
     }
+    if (REMOTE_REFERENCE_OPTIONS.includes(key))
+      continue
     if (BOOL_LITERAL_RE.test(value) || !(isSecretKey(key) || outside.includes(key)))
       continue
     pushSecretValue(out, value)
@@ -803,20 +1074,6 @@ export function remoteSecretValuesFromText(text: string): string[] {
   return [...new Set(out)]
 }
 
-/**
- * The secret-rule parameter values inline in a reference value's connection
- * string (`:s3,access_key_id=AK,secret_access_key=SK:bucket`).
- */
-function connectionStringSecrets(value: string): string[] {
-  const found: string[] = []
-  for (const m of value.matchAll(CONNECTION_PARAM_RE)) {
-    const raw = m[2]!.replace(QUOTE_RE, '')
-    if (raw !== '' && !BOOL_LITERAL_RE.test(raw) && isSecretKey(m[1]!))
-      found.push(raw)
-  }
-  return found
-}
-
 // ── A remote section's identity, for the retarget confirm (cr.64c → cr.64cr) ──
 
 /**
@@ -826,20 +1083,6 @@ function connectionStringSecrets(value: string): string[] {
  * survives it either.
  */
 const SECTION_IDENTITY_KEY = randomBytes(32)
-
-/**
- * A reference option's connection string with every secret-rule parameter's
- * VALUE dropped (`:s3,secret_access_key=SK:b` → `:s3,secret_access_key=:b`):
- * the parameter's presence stays, its value never enters an identity.
- */
-function withoutInlineSecrets(value: string): string {
-  return value.replace(CONNECTION_PARAM_RE, (whole: string, key: string, raw: string) => {
-    const bare = raw.replace(QUOTE_RE, '')
-    return bare !== '' && !BOOL_LITERAL_RE.test(bare) && isSecretKey(key)
-      ? whole.slice(0, whole.length - raw.length)
-      : whole
-  })
-}
 
 /**
  * The identity of a remote's stored section — what the cloud retarget confirm
@@ -880,13 +1123,15 @@ export function remoteSectionIdentity(text: string, name: string): string | null
   const facts: [string, string][] = []
   for (const key of Object.keys(section.values).sort()) {
     const value = section.values[key]!
-    if (REMOTE_REFERENCE_OPTIONS.includes(key)) {
-      facts.push([key, withoutInlineSecrets(value)])
+    if (!REMOTE_REFERENCE_OPTIONS.includes(key) && value !== '' && !BOOL_LITERAL_RE.test(value) && (isSecretKey(key) || outside.includes(key)))
       continue
-    }
-    if (value !== '' && !BOOL_LITERAL_RE.test(value) && (isSecretKey(key) || outside.includes(key)))
-      continue
-    facts.push([key, value])
+    // Third review: a URL's credential is a rotation, never a new remote (its
+    // view enters); a HIDDEN value enters whole — it cannot be split into its
+    // secret and non-secret halves, so any change to it is another remote.
+    // Either way only inside the per-process KEYED digest: nothing derivable
+    // from it leaves the daemon.
+    const c = classifyOptionValue(key, value)
+    facts.push([key, c.cls === 'hidden' ? value : c.view])
   }
   return createHmac('sha256', SECTION_IDENTITY_KEY).update(JSON.stringify([name, facts])).digest('hex')
 }
@@ -952,8 +1197,10 @@ export async function remoteSecretValues(
       queue.push(own)
   }
   else {
-    // An unsaved dialog: only its REFERENCES are walked (see the doc).
-    queue.push(Object.fromEntries(Object.entries(start).filter(([key]) => REMOTE_REFERENCE_OPTIONS.includes(key))))
+    // An unsaved (or edited) dialog: EVERY typed value through the one
+    // classifier (third review, D2: a token or query value typed in the
+    // dialog is concealed too), and its references walked.
+    queue.push({ ...start })
   }
   while (queue.length) {
     const values = queue.shift()!
@@ -1153,6 +1400,13 @@ export async function writeRemote(
      * IDENTITY_MISMATCH and nothing is written.
      */
     expectSection?: string
+    /**
+     * Keys an UPDATE clears (cr3, operator ruling 2026-11-14: `null` on the
+     * PUT): removed from the section whatever they hold — a secret included,
+     * which `''` (the dialog's "unchanged") cannot do. A key must be one of
+     * the backend's options or one the section carries.
+     */
+    clear?: readonly string[]
   },
 ): Promise<CloudRemote> {
   return withFileLock(paths.configFile, async () => {
@@ -1197,9 +1451,32 @@ export async function writeRemote(
     if (!provider)
       throw new Error(`unknown remote type '${type}' — rclone's provider list knows no such backend`)
 
+    const blank = whitespaceSecretRefusal(input.options, input.type, opts.providers)
+    if (blank)
+      throw new Error(blank)
+    // Second review of cr3 (D5): the redaction marker is never written. A
+    // CREATE has nothing stored to restore it from; an update restores it
+    // per entry below or refuses (restoreRedacted).
+    if (opts.mode === 'create') {
+      const marked = Object.entries(input.options).find(([, v]) => carriesViewMarker(v))
+      if (marked)
+        throw new Error(`option '${marked[0]}' carries ${REDACTED}, the marker a redacted view shows — there is no stored value to keep on a new remote; type the value`)
+    }
     const known = new Set(provider.options.map(o => o.name))
     for (const key of Object.keys(input.options)) {
       if (!known.has(key))
+        throw new Error(`unknown option '${key}' for remote type '${type}'`)
+    }
+    const clear = new Set(opts.clear ?? [])
+    if (clear.size && opts.mode !== 'update')
+      throw new Error('only an update clears an option')
+    const sectionKeys = existingSectionRaw(current.text, input.name)
+    for (const key of clear) {
+      if (key === 'type')
+        throw new Error('type is immutable — create a new remote')
+      if (Object.hasOwn(input.options, key))
+        throw new Error(`option '${key}' cannot be both set and cleared`)
+      if (!known.has(key) && !sectionKeys.has(key))
         throw new Error(`unknown option '${key}' for remote type '${type}'`)
     }
 
@@ -1217,7 +1494,15 @@ export async function writeRemote(
 
     const existingRaw = existingSectionRaw(current.text, input.name)
     for (const key of optionOrder) {
-      const requested = input.options[key]
+      if (clear.has(key)) {
+        removed.add(key) // cr3: `null` on the PUT — gone, a secret included
+        continue
+      }
+      // Review of cr3, fix 4: a value an edit sent back from a REDACTED view
+      // (`https://u:[secret]@h`, `:s3,secret_access_key=[secret]:b`) keeps the
+      // stored credential where the marker stands; it never writes the marker.
+      const sent = input.options[key]
+      const requested = sent !== undefined && opts.mode === 'update' ? restoreRedacted(key, sent, existingRaw.get(key)) : sent
       if (requested === undefined) {
         // Absent: keep the section's current line verbatim (its exact file
         // spelling — an obscured password stays byte-for-byte).
@@ -1246,7 +1531,7 @@ export async function writeRemote(
       added.add(key)
     }
     for (const [key, value] of existingRaw) {
-      if (!added.has(key) && !removed.has(key)) {
+      if (!added.has(key) && !removed.has(key) && !clear.has(key)) {
         entries.push({ key, value, fresh: false })
         added.add(key)
       }
@@ -1298,7 +1583,10 @@ export async function writeRemote(
     return {
       name: input.name,
       type,
-      options: Object.fromEntries(entries.filter(e => e.key !== 'type' && !secretsSet.includes(e.key)).map(e => [e.key, e.value])),
+      // Second review of cr3 (D1): the job RESULT is a view like any other —
+      // after an edit it holds the RESTORED credential. Nothing derivable
+      // from a secret leaves the daemon: redacted here as in dumpToRemotes.
+      options: Object.fromEntries(entries.filter(e => e.key !== 'type' && !secretsSet.includes(e.key)).map(e => [e.key, redactOptionValue(e.key, e.value)])),
       secretsSet: secretsSet.sort(),
     }
   })
@@ -1315,6 +1603,16 @@ export async function removeRemote(
   paths: RcloneConfigPaths,
   executor: CommandExecutor,
   name: string,
+  opts: {
+    /**
+     * The {@link remoteSectionIdentity} the DELETE route read (cr3
+     * CLOUD-L9): compared UNDER the per-file lock, so a remote deleted and
+     * re-created under the same name while this job waited is
+     * IDENTITY_MISMATCH and the new remote is not removed — the update
+     * door's binding (cr.64b2-ii), on the delete door.
+     */
+    expectSection?: string
+  } = {},
 ): Promise<void> {
   return withFileLock(paths.configFile, async () => {
     const current = await readConfig(paths, executor)
@@ -1322,6 +1620,16 @@ export async function removeRemote(
       throw new ConfigEncryptedError(paths.configFile)
     if (!current.remotes.some(r => r.name === name))
       throw new RemoteNotFoundError(name)
+    if (opts.expectSection !== undefined) {
+      const now = remoteSectionIdentity(current.text, name)
+      if (now !== opts.expectSection) {
+        throw new IdentityMismatchError(
+          `remote '${name}'`,
+          { remote: name, section: opts.expectSection },
+          now === null ? null : { remote: name, section: now },
+        )
+      }
+    }
 
     const newText = removeSection(current.text, name)
     // cr.16: same change-detection guard as writeRemote — the bytes readConfig

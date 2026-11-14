@@ -18,10 +18,20 @@ import { OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs } from '../../services/rclone
 import { PROBE_REMOTE_NAME, probeArgs } from '../../services/rclone-probe.js'
 import { cloudRoutes, RCLONE_CONFIG_CHANGED, RCLONE_NOT_INSTALLED } from '../cloud.js'
 
+/**
+ * A READABLE mount table for every cloud test world (the cr3 backup hand-off):
+ * the source guard refuses a source whose mount table could not be read, so a
+ * world that answers no `findmnt` would refuse every run and preview. A
+ * command-only fixture: a test's own exact `findmnt --json` fixture still wins.
+ */
+const READABLE_MOUNT_TABLE = JSON.stringify({ filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }] })
+
 // The REAL 1.60.1 provider capture — the `config providers` fixture returns
 // the raw bytes verbatim (the route trims them, like the real binary's output).
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone/providers-1.60.1.json')
 const PROVIDERS_STDOUT = await readFile(FIXTURE, 'utf-8')
+/** rclone's own encrypted rclone.conf (fixtures/rclone/config-encrypted-1.75.2.conf; cr3 CLOUD-L12). */
+const ENCRYPTED_CONF = await readFile(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone/config-encrypted-1.75.2.conf'), 'utf-8')
 
 // The shared own-client vectors, read straight from the shared package — the
 // three consumers (this suite, the shared unit test, the dialog-contracts
@@ -72,7 +82,10 @@ async function testJob(server: ReturnType<typeof createServer> | FastifyInstance
   const res = await server.inject({ method: 'POST', url: '/v1/cloud/remotes/test', headers: JSON_HEADERS, payload: JSON.stringify(payload) })
   assert.equal(res.statusCode, 202, res.body)
   const accepted = (res.json() as { job: { id: string, operation: string } }).job
-  assert.equal(accepted.operation, 'read.cloud.remote.test')
+  // Review of cr3 (C1 depth): only the SAVED arm is the read job; the unsaved
+  // dialog is its own Sys.Modify operation.
+  const unsaved = typeof payload === 'object' && payload !== null && 'remote' in payload
+  assert.equal(accepted.operation, unsaved ? 'cloud.remote.test' : 'read.cloud.remote.test')
   return waitForJob(server, accepted.id)
 }
 
@@ -99,6 +112,7 @@ function failToSpawn(server: ReturnType<typeof createServer>, command: string): 
  */
 function installRcloneFixtures(mock: MockExecutor, configFile: string): void {
   mock.clearFixtures()
+  mock.addFixture({ command: '/usr/bin/findmnt', result: { stdout: READABLE_MOUNT_TABLE, stderr: '', exitCode: 0 } })
   const base = rcloneBaseArgs(configFile)
   mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1-DEV\n', stderr: '', exitCode: 0 } })
   mock.addFixture({ command: RCLONE, args: [...base, 'config', 'providers'], result: { stdout: PROVIDERS_STDOUT, stderr: '', exitCode: 0 } })
@@ -203,6 +217,9 @@ describe('cloud remotes routes (rclone.1)', () => {
     })
 
     it('a password-protected file → encrypted fact, empty remotes', async () => {
+      // cr3 CLOUD-L12: the file IS encrypted (rclone's own marker); the
+      // dump error's wording no longer decides.
+      await writeFile(configFile, ENCRYPTED_CONF, 'utf-8')
       const mock = mockOf(server)
       const orig = mock.exec.bind(mock)
       mock.exec = async (command, args, execOpts) => {
@@ -308,6 +325,8 @@ describe('cloud remotes routes (rclone.1)', () => {
     })
 
     it('an encrypted file → 409 config-encrypted', async () => {
+      // cr3 CLOUD-L12: the file IS encrypted (rclone's own marker).
+      await writeFile(configFile, ENCRYPTED_CONF, 'utf-8')
       const mock = mockOf(server)
       const orig = mock.exec.bind(mock)
       mock.exec = async (command, args, execOpts) => {
@@ -742,6 +761,7 @@ password = mock-obscured
       for (const c of cases) {
         const mock = mockOf(server)
         mock.clearFixtures()
+        mock.addFixture({ command: '/usr/bin/findmnt', result: { stdout: READABLE_MOUNT_TABLE, stderr: '', exitCode: 0 } })
         installRcloneFixtures(mock, configFile)
         mock.addFixture({ command: '/usr/bin/timeout', result: { stdout: '', stderr: c.stderr, exitCode: c.exitCode } })
         const job = await testJob(server, { name: 'gt' })
@@ -1357,10 +1377,23 @@ password = mock-obscured
       it('no confirm when nothing re-points: an unchanged value, a non-destination option, or no task', async () => {
         await bare({ referencingTasks: async name => (name === 'gt' ? ['nightly'] : []) })
         await writeFile(bareFile, GT_SECTION, 'utf-8')
-        // The same host (the dialog sends rendered fields) and a non-destination option.
-        const res = await put({ host: '127.0.0.1', user: 'rclonegt2' })
+        // The same host (the dialog sends rendered fields) and a non-destination
+        // option. (cr3 CLOUD-M7: `user` is a destination now — the login's
+        // home is where relative sftp paths resolve — so the non-destination
+        // option here is sftp's `md5sum_command`.)
+        const res = await put({ host: '127.0.0.1', md5sum_command: 'md5sum' })
         assert.equal(res.statusCode, 202, res.payload)
-        await untilFileHas('user = rclonegt2')
+        await untilFileHas('md5sum_command = md5sum')
+      })
+
+      it('cr3 CLOUD-M7: changing an sftp LOGIN re-points the tasks (relative paths resolve under its home) → 409 + confirm', async () => {
+        await bare({ referencingTasks: async name => (name === 'gt' ? ['nightly'] : []) })
+        await writeFile(bareFile, GT_SECTION, 'utf-8')
+        const res = await put({ user: 'otheruser' })
+        assert.equal(res.statusCode, 409, res.payload)
+        assert.match(res.json().error.message, /re-points cloud sync task\(s\): nightly/)
+        assert.ok(res.headers['x-anas-confirm-code'], 'a confirm code rides the 409')
+        assert.equal(await readFile(bareFile, 'utf-8'), GT_SECTION, 'nothing written before the confirm')
       })
 
       it('a destination change on a remote NO task uses → 202 straight away', async () => {

@@ -166,15 +166,39 @@ export const CloudRemoteWrite = z
 export type CloudRemoteWrite = z.infer<typeof CloudRemoteWrite>
 
 /**
- * Update a remote. An ABSENT secret key means unchanged (secrets are
- * write-only — the dialog cannot read one back to send it); an EMPTY string
- * for a non-secret key means "remove the key". `type` is immutable — a retype
- * is a remove + create (rclone's own posture). Same per-format key/value
- * rules as {@link CloudRemoteWrite}.
+ * The option record of a remote UPDATE: {@link CloudRemoteOptions}, plus
+ * `null` (cr3, operator ruling 2026-11-14 — the §2 dialog contract on the
+ * one door that lacked a clear).
+ */
+export const CloudRemoteUpdateOptions = z
+  .record(RcloneOptionKey, z.string().max(65536).nullable())
+  .superRefine((options, ctx) => {
+    for (const [key, value] of Object.entries(options)) {
+      if (value === null || key === 'token')
+        continue // a clear carries no value; the token has its own gate (above)
+      if (!isRcloneOptionValue(value))
+        ctx.addIssue({ code: 'custom', path: [key], message: RCLONE_OPTION_VALUE_MSG })
+    }
+  })
+
+/**
+ * Update a remote. Per option key:
+ *  - a VALUE sets it;
+ *  - `null` CLEARS it — removes the key from the section, a secret included
+ *    (cr3, operator ruling 2026-11-14: before, a stored secret could not be
+ *    removed at all);
+ *  - ABSENT keeps it as stored;
+ *  - `''` keeps a SECRET as stored (the dialog's "(unchanged)": it cannot
+ *    read a secret back to send it) and REMOVES a non-secret key (a field the
+ *    user emptied) — exactly as before cr3.
+ * The result must still pass the own-OAuth-client pair rule
+ * (`validateOwnClientUpdate`). `type` is immutable — a retype is a remove +
+ * create (rclone's own posture). Same per-format key/value rules as
+ * {@link CloudRemoteWrite}.
  */
 export const CloudRemoteUpdate = z
   .object({
-    options: CloudRemoteOptions,
+    options: CloudRemoteUpdateOptions,
   })
 export type CloudRemoteUpdate = z.infer<typeof CloudRemoteUpdate>
 
@@ -233,9 +257,30 @@ export const CloudRemoteTestRequest = z
     name: CloudRemoteName.optional(),
     remote: CloudRemoteWrite.optional(),
     path: z.string().max(2048).optional(),
+    /**
+     * cr3 CLOUD-L11, with `remote` only: the dialog is an EDIT of the saved
+     * remote `remote.name`, and every secret option it leaves out or blank
+     * ("unchanged") is that saved remote's stored value. The dialog cannot
+     * read a stored secret back, so without this an edit's Test of one
+     * retyped secret ran without the remote's others. Additive: an older
+     * daemon strips it and tests the dialog alone, as before.
+     */
+    keepStoredSecrets: z.boolean().optional(),
+    /**
+     * cr3, with `keepStoredSecrets` only: stored secrets the edit CLEARS (the
+     * dialog's "remove the stored value"), which the daemon must therefore
+     * not fill — the Test runs without them, as the saved remote will.
+     */
+    clearedSecrets: z.array(RcloneOptionKey).max(64).optional(),
   })
   .refine(v => (v.name === undefined) !== (v.remote === undefined), {
     message: 'exactly one of name or remote is required',
+  })
+  .refine(v => v.keepStoredSecrets !== true || v.remote !== undefined, {
+    message: 'keepStoredSecrets applies to an unsaved remote (remote), not to a saved one (name)',
+  })
+  .refine(v => v.clearedSecrets === undefined || v.keepStoredSecrets === true, {
+    message: 'clearedSecrets applies only with keepStoredSecrets',
   })
 export type CloudRemoteTestRequest = z.infer<typeof CloudRemoteTestRequest>
 
@@ -348,6 +393,54 @@ export const CloudSyncTaskRequest = z.preprocess((raw) => {
 export type CloudSyncTaskRequest = z.infer<typeof CloudSyncTaskRequest>
 
 /**
+ * The fields of a task UPDATE body, each optional and with NO default (cr3
+ * CLOUD-L10): what the PUT door checks before it has read the stored task, so
+ * a malformed field still answers 400 at once. `null` (clear) is taken out
+ * before this runs — see {@link mergeCloudSyncTaskUpdate}.
+ */
+export const CloudSyncTaskUpdateFields = CloudSyncTask.partial()
+
+/**
+ * An update body as the PUT door reads it (review of cr3, fix 7): an EMPTY
+ * `bwlimit` is what a cleared field (and an older panel) sends, and it means
+ * "no limit" — a clear, exactly `null`, the same answer the create door's
+ * {@link normalizeEmptyBwlimit} gives it. Every other key is as sent.
+ */
+export function cloudTaskUpdateBody(body: Record<string, unknown>): Record<string, unknown> {
+  return body.bwlimit === '' ? { ...body, bwlimit: null } : body
+}
+
+/**
+ * The §2 dialog contract for `PUT /v1/cloud/tasks/:name` (cr3 CLOUD-L10): a
+ * value SETS, `null` CLEARS (an optional field goes absent; a field with a
+ * default takes it: `excludes` null = none, `mode` null = copy, `notify`
+ * null = always, `enabled` null = enabled), and an OMITTED field KEEPS the
+ * stored value. Before cr3 the body was parsed with the schema's defaults, so
+ * an omitted `enabled` re-enabled a disabled task and an omitted `notify`,
+ * `mode` or `excludes` reset to the default.
+ *
+ * `schedule` and `cadence` are one decision: a body carrying either replaces
+ * both (a cadence regenerates the schedule in {@link CloudSyncTaskRequest}; a
+ * raw schedule alone drops the stored cadence, which would otherwise
+ * overwrite it). Returns the merged raw body for {@link CloudSyncTaskRequest}.
+ */
+export function mergeCloudSyncTaskUpdate(stored: CloudSyncTask, body: Record<string, unknown>): Record<string, unknown> {
+  body = cloudTaskUpdateBody(body)
+  const merged: Record<string, unknown> = { ...stored }
+  if (Object.hasOwn(body, 'schedule') || Object.hasOwn(body, 'cadence')) {
+    delete merged.schedule
+    delete merged.cadence
+  }
+  for (const [key, value] of Object.entries(body)) {
+    if (value === null)
+      delete merged[key]
+    else if (value !== undefined)
+      merged[key] = value
+  }
+  return merged
+}
+
+/**
  * A grid row: the stored task plus its LOCAL-ONLY runtime status, derived per
  * load from systemd unit + timer state (no shadow state). `lastRunResult` is
  * the SAME systemd-derived enum a backup task reports — one vocabulary for
@@ -389,14 +482,20 @@ export type CloudSyncTaskView = z.infer<typeof CloudSyncTaskView>
 
 /**
  * `GET /v1/cloud/tasks/:name` — the detail window's facts: the row, the DERIVED
- * source consistency, the nested filesystems that will NOT be included, the two
+ * source consistency, the nested filesystems under the source (not included
+ * when the run reads a snapshot; read through and included when it is live), the two
  * units as written, and the recent journald tail (labeled recent-only).
  */
 export const CloudSyncTaskDetail = z.object({
   task: CloudSyncTaskView,
   /** The derived source consistency — the same derivation a backup source gets. */
   consistency: BackupArchiveConsistency.optional(),
-  /** Absolute paths of nested filesystems under the source (a snapshot omits them). */
+  /**
+   * Absolute paths of nested filesystems under the source. Whether a run
+   * includes them follows `consistency`: a snapshot omits them (cr3: the run
+   * excludes them, leaving their destination copies as they are), a live copy
+   * reads through them.
+   */
   nested: z.array(z.string()).optional(),
   unit: z.string(),
   timer: z.string(),
@@ -444,7 +543,11 @@ export const CloudSyncRunResult = z.object({
   countersReported: z.boolean().default(true),
   /** rclone's error-level log lines, verbatim and in order. */
   errorLines: z.array(z.string()).default([]),
-  /** Nested filesystems under the source that the run did NOT include. */
+  /**
+   * Nested filesystems under the source. A snapshot-mode run did NOT include
+   * them (and left their destination copies as they are); a live-mode run read
+   * through them (`consistency` says which).
+   */
   nested: z.array(z.string()).optional(),
   /** Why a run did nothing (the cadence skip's detail). */
   reason: z.string().optional(),

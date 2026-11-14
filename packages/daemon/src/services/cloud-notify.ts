@@ -3,6 +3,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { PveNotifySeverity } from './pve-notify.js'
 import type { NotifyOutcome } from './unattended-notify.js'
 import { BACKUP_SKIPPED_OFF_WEEK } from '@anas/shared'
+import { NESTED_LIVE_NOTE, NESTED_SNAPSHOT_NOTE } from './cloud-runner.js'
 import { ANAS_CLOUD_NOTIFY_TEMPLATE, pveNotify } from './pve-notify.js'
 import { elapsedLine, notifySeverity, shouldNotify } from './unattended-notify.js'
 
@@ -146,11 +147,16 @@ export function buildCloudNotifyBody(ctx: CloudNotifyContext): string {
     }
   }
 
+  // cr3 (operator ruling 2026-11-14): per mode. A snapshot run leaves them
+  // out (and their copies at the destination as they are); a live run reads
+  // through them and includes them.
   if (result?.nested?.length) {
+    const snapshot = result.consistency.consistency === 'snapshot'
     lines.push('')
-    lines.push('Nested filesystems NOT included:')
+    lines.push(snapshot ? 'Nested filesystems NOT included:' : 'Nested filesystems included (read through as a live copy):')
     for (const path of result.nested)
       lines.push(`  ${path}`)
+    lines.push(`  (${snapshot ? NESTED_SNAPSHOT_NOTE : NESTED_LIVE_NOTE})`)
   }
 
   if (result?.warnings?.length) {

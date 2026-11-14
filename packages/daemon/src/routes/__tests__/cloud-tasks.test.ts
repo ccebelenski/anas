@@ -10,8 +10,18 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { TASK_RUNNER_USER } from '../../runner-poll.js'
 import { createServer } from '../../server.js'
+import { passThroughRealpath } from '../../services/__tests__/cloud-realpath-passthrough.js'
 import { PREVIEW_TIMEOUT_S } from '../../services/cloud-preview.js'
 import { RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
+import { sharePathProbeArgs } from '../../services/share-path.js'
+
+/**
+ * A READABLE mount table for every cloud test world (the cr3 backup hand-off):
+ * the source guard refuses a source whose mount table could not be read, so a
+ * world that answers no `findmnt` would refuse every run and preview. A
+ * command-only fixture: a test's own exact `findmnt --json` fixture still wins.
+ */
+const READABLE_MOUNT_TABLE = JSON.stringify({ filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }] })
 
 /**
  * The cloud sync TASK routes (rclone.2). The store is the unit files in a temp
@@ -31,7 +41,7 @@ const TIMEOUT = '/usr/bin/timeout'
  * bounded `realpath` (ident.4 (c)), which is a `timeout` child too.
  */
 function isRcloneOrScan(c: { command: string, args: string[] }): boolean {
-  return c.command === TIMEOUT && !c.args.includes('/usr/bin/realpath')
+  return c.command === TIMEOUT && !c.args.includes('/usr/bin/realpath') && !c.args.includes('/usr/bin/stat')
 }
 
 /** The captured sync-after-deletion dry-run log — one would-be delete (b.bin). */
@@ -77,7 +87,10 @@ async function previewJob(server: ReturnType<typeof createServer>, payload: Reco
   const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/preview', headers: JSON_HEADERS, payload })
   assert.equal(res.statusCode, 202, res.body)
   const accepted = (res.json() as JobAccepted).job
-  assert.equal(accepted.operation, 'read.cloud.preview')
+  // cr3 (second review): a SAVED task's preview is the read job; an INLINE
+  // form is its own Sys.Modify operation.
+  const inlineForm = 'source' in payload
+  assert.equal(accepted.operation, inlineForm ? 'cloud.task.preview' : 'read.cloud.preview')
   const job = await waitForJob(server, accepted.id)
   return { job, data: job.result as PreviewData }
 }
@@ -128,6 +141,8 @@ describe('cloud sync task routes (rclone.2)', () => {
 
     const mock = mockOf(server)
     mock.clearFixtures()
+    mock.addFixture({ command: '/usr/bin/findmnt', result: { stdout: READABLE_MOUNT_TABLE, stderr: '', exitCode: 0 } })
+    passThroughRealpath(mock)
     const base = rcloneBaseArgs(configFile)
     // `config dump` reads the file ANAS holds, like the real binary.
     mock.addFixture({
@@ -191,6 +206,8 @@ describe('cloud sync task routes (rclone.2)', () => {
       await writeFile(configFile, '[gtsmb]\ntype = smb\nhost = 127.0.0.1\nuser = gtuser\npass = obscured\n', 'utf-8')
       const mock = mockOf(server)
       mock.clearFixtures()
+      mock.addFixture({ command: '/usr/bin/findmnt', result: { stdout: READABLE_MOUNT_TABLE, stderr: '', exitCode: 0 } })
+      passThroughRealpath(mock)
       const base = rcloneBaseArgs(configFile)
       mock.addFixture({
         command: RCLONE,
@@ -229,6 +246,8 @@ describe('cloud sync task routes (rclone.2)', () => {
       await writeFile(configFile, '[gtsmb]\ntype = smb\nhost = 127.0.0.1\nuser = gtuser\npass = obscured\n', 'utf-8')
       const mock = mockOf(server)
       mock.clearFixtures()
+      mock.addFixture({ command: '/usr/bin/findmnt', result: { stdout: READABLE_MOUNT_TABLE, stderr: '', exitCode: 0 } })
+      passThroughRealpath(mock)
       const base = rcloneBaseArgs(configFile)
       mock.addFixture({
         command: RCLONE,
@@ -619,6 +638,8 @@ describe('cloud sync task routes (rclone.2)', () => {
       // The source guard's bounded `realpath` (ident.4 (c)) is a `timeout`
       // child too — answered at once, so the scan is still the blocker.
       mock.addFixture({ command: TIMEOUT, args: ['-s', 'KILL', '5', '/usr/bin/realpath', '-e', '--', srcDir], result: { stdout: `${srcDir}\n`, stderr: '', exitCode: 0 } })
+      // cr3 CLOUD-M6: so is the source's liveness probe (`timeout 2 stat -f`).
+      mock.addFixture({ command: TIMEOUT, args: sharePathProbeArgs(srcDir), result: { stdout: '2fc12fc1\n', stderr: '', exitCode: 0 } })
       mock.calls.length = 0
 
       const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: RUNNER_HEADERS, payload: { direct: true } })
@@ -703,6 +724,8 @@ describe('cloud sync task routes (rclone.2)', () => {
     async function replayDryRun(stderrFile: string, exitCode = 0) {
       mockOf(server).addFixture({
         command: TIMEOUT,
+        // cr3 CLOUD-M6: the rclone child only, never the source's liveness probe.
+        argsMatch: args => args.includes(RCLONE),
         result: { stdout: '', stderr: await readFile(stderrFile, 'utf-8'), exitCode },
       })
     }
@@ -737,7 +760,9 @@ describe('cloud sync task routes (rclone.2)', () => {
       assert.deepEqual(call!.args.slice(0, 5), [String(PREVIEW_TIMEOUT_S), RCLONE, 'sync', srcDir, 'gt:dst/preview'])
       assert.equal(call!.args.at(-1), '--dry-run')
       // And it read the LIVE tree: no snapshot machinery ran at all.
-      assert.ok(!mockOf(server).calls.some(c => c.command === '/usr/sbin/zfs' && !c.args.includes('name,mountpoint,canmount,mounted')), 'no zfs call but the guard\'s read-only mount facts — a preview takes no snapshot')
+      // cr3 CLOUD-H3: the look derives the consistency now (the run's reads —
+      // `zfs list`/`get`, never a snapshot listing); still no snapshot.
+      assert.ok(mockOf(server).calls.filter(c => c.command === '/usr/sbin/zfs').every(c => (c.args[0] === 'list' || c.args[0] === 'get') && !c.args.includes('snapshot')), 'no zfs call but read-only facts — a preview takes no snapshot')
     })
 
     it('404s for an unknown task name', async () => {
@@ -835,7 +860,9 @@ describe('cloud sync task routes (rclone.2)', () => {
       const mock = mockOf(server)
       const orig = mock.exec.bind(mock)
       mock.exec = async (cmd: string, args: string[], opts?: Parameters<typeof orig>[2]): Promise<ExecResult> => {
-        if (cmd === TIMEOUT)
+        // The DRY RUN's child (cr3, second review: the door's checked
+        // `timeout ... realpath` is a `timeout` child too, and must answer).
+        if (cmd === TIMEOUT && args.includes(RCLONE))
           throw new Error('boom')
         return orig(cmd, args, opts)
       }

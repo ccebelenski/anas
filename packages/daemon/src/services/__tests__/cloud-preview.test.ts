@@ -17,6 +17,7 @@ import {
 } from '../cloud-preview.js'
 import { RCLONE_LOG_ARGS, RcloneLogReader } from '../cloud-runner.js'
 import { RCLONE } from '../rclone-config.js'
+import { passThroughRealpath } from './cloud-realpath-passthrough.js'
 
 /**
  * The dry-run PREVIEW (rclone.2 addendum): the parser over the CAPTURED
@@ -51,7 +52,7 @@ const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/r
  * `realpath` (ident.4 (c)) is a `timeout` child too, and is not rclone.
  */
 function isRcloneCall(c: { command: string, args: string[] }): boolean {
-  return c.command === TIMEOUT && !c.args.includes('/usr/bin/realpath')
+  return c.command === TIMEOUT && c.args.includes(RCLONE)
 }
 
 function task(over: Partial<CloudSyncTask> = {}): CloudSyncTask {
@@ -106,6 +107,8 @@ async function harness(opts: { findmnt?: string, fstab?: string, source?: 'dir' 
   await writeFile(fstab, opts.fstab ?? 'UUID=deadbeef / ext4 defaults 0 1\n', 'utf-8')
   const mock = new MockExecutor()
   mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: opts.findmnt ?? findmntJson(), stderr: '', exitCode: 0 } })
+  // cr3 (second review): the preview resolves its source CHECKED.
+  passThroughRealpath(mock)
   return {
     dir,
     source,
@@ -129,6 +132,9 @@ function deps(h: Harness, over: Partial<CloudPreviewDeps> = {}): CloudPreviewDep
 function replayRclone(mock: MockExecutor, stderr: string, exitCode = 0, over: { teeStderr?: boolean } = {}): void {
   mock.addFixture({
     command: TIMEOUT,
+    // cr3 CLOUD-M6: the rclone child only — the source's liveness probe is a
+    // `timeout ... stat -f` child too, and must not be answered with this log.
+    argsMatch: args => args.includes(RCLONE),
     result: { stdout: '', stderr, exitCode },
     ...(over.teeStderr !== undefined ? { teeStderr: over.teeStderr } : {}),
   })
@@ -639,7 +645,9 @@ describe('previewCloudSync — the argv', () => {
 
       const rcloneSource = h.mock.calls.find(c => isRcloneCall(c))!.args
       assert.equal(rcloneSource[3], h.source, 'rclone is pointed at the LIVE tree, not a snapshot path')
-      assert.ok(!h.mock.calls.some(c => c.command === ZFS && !c.args.includes('name,mountpoint,canmount,mounted')), 'no zfs call but the guard\'s read-only mount facts — no snapshot, no sweep')
+      // cr3 CLOUD-H3: the look derives the consistency now (the run's reads —
+      // `zfs list`/`get`, never a snapshot listing); still no snapshot, no sweep.
+      assert.ok(h.mock.calls.filter(c => c.command === ZFS).every(c => (c.args[0] === 'list' || c.args[0] === 'get') && !c.args.includes('snapshot')), 'no zfs call but read-only facts — no snapshot, no sweep')
     }
     finally {
       await h.cleanup()

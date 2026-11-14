@@ -241,6 +241,46 @@
         return msg ? (label + ' — ' + msg) : label;
     }
 
+    // A list read that FAILED (cr3, the wave's rule: a failed read never reads
+    // as empty). The grid keeps the rows of the last good read, if any, and
+    // this line above it says the list could not be read, with the reason,
+    // and what the rows below are: stale, or nothing at all — never "no
+    // remotes" / "no tasks". PURE (exported for the cr3 harness).
+    function loadFailedHtml(what, reason, hadRows) {
+        var tail = hadRows
+            ? t('The rows below are from the last successful read and may be out of date.')
+            : t('Nothing is listed because nothing could be read: this is not an empty list.');
+        return '<div style="padding:6px 10px;color:var(--anas-danger,#c23b2c);font-size:12px;">'
+            + '<i class="fa fa-exclamation-triangle" style="margin-right:6px;"></i>'
+            + enc(t('Could not read the') + ' ' + what + ': ' + reason + '. ' + tail) + '</div>';
+    }
+
+    // Show (html) or hide (null) a grid's load-failure line.
+    function setLoadError(cmp, html) {
+        if (!cmp) {
+            return;
+        }
+        try {
+            if (html) {
+                cmp.setHtml(html);
+                cmp.setHidden(false);
+            } else {
+                cmp.setHidden(true);
+            }
+        } catch (e) {
+            // cosmetic
+        }
+    }
+
+    // Does the grid hold rows (from an earlier good read)?
+    function gridHasRows(grid) {
+        try {
+            return !!grid && grid.getStore().getCount() > 0;
+        } catch (e) {
+            return false;
+        }
+    }
+
     // ======================================================================
     //  Remotes manager — 'anas-win-cloud-remotes'
     // ======================================================================
@@ -357,6 +397,7 @@
             // The unavailable note is for the 503 path only.
             var unavail = win.down('#cloudUnavailable');
             if (unavail) { unavail.setHidden(true); }
+            setLoadError(win.down('#cloudRemotesLoadError'), null);
             if (grid) { try { grid.setHidden(false); } catch (eG) { /* non-fatal */ } }
             updateRemoteButtons(grid);
         }, function (err) {
@@ -369,6 +410,7 @@
             // No rclone on this node (503): the daemon's sentence takes the
             // grid's place — the fix is named in one verb.
             if (err && err.status === 503) {
+                setLoadError(win.down('#cloudRemotesLoadError'), null);
                 if (grid) { try { grid.setHidden(true); } catch (eG) { /* non-fatal */ } }
                 var unavail = win.down('#cloudUnavailable');
                 if (unavail) {
@@ -386,6 +428,10 @@
             var stale = win.down('#cloudUnavailable');
             if (stale) { stale.setHidden(true); }
             if (grid) { try { grid.setHidden(false); } catch (eG) { /* non-fatal */ } }
+            // cr3: the grid under the alert must not read "No remotes
+            // configured" — the line above it says the list could not be read.
+            setLoadError(win.down('#cloudRemotesLoadError'),
+                loadFailedHtml(t('rclone remotes'), ANAS.errText(err), gridHasRows(grid)));
             ANAS.warn('cloud remotes load failed: ' + ANAS.errText(err));
             ANAS.alertMsg('Load failed', t('Failed to load the rclone remotes') + ': ' + ANAS.errText(err));
         });
@@ -480,6 +526,14 @@
                 resizable: true,
                 layout: { type: 'vbox', align: 'stretch' },
                 items: [
+                    {
+                        // cr3: a failed (non-503) read — said here, above the
+                        // rows of the last good read (if any).
+                        xtype: 'component',
+                        itemId: 'cloudRemotesLoadError',
+                        cls: 'anas-cloud-load-error',
+                        hidden: true,
+                    },
                     {
                         xtype: 'gridpanel',
                         itemId: 'cloudRemotesGrid',
@@ -774,11 +828,33 @@
         return { ok: true };
     }
 
-    // The own-client values the dialog HOLDS (the stash + the rendered fields,
-    // exactly what the wire body would carry) — the input the rule judges.
+    // A stand-in for a client secret the remote already has stored: the rule
+    // only asks whether one is set, and the dialog never holds its value.
+    var STORED_SECRET_MARK = '(stored)';
+
+    // The own-client pair the dialog LEAVES (cr3 CLOUD-M5), from what it holds
+    // (the stash + the rendered fields): the client ID as shown (pre-filled on
+    // an edit; cleared = removed), and the client secret as typed — or, on an
+    // EDIT with the field blank, the stored one, which the API names only in
+    // secretsSet. Judging the blank field alone held Save and Test shut on
+    // every edit of a remote with its own client. The daemon's update door
+    // judges the same pair (shared validateOwnClientUpdate). PURE, exported
+    // for the cr3 harness.
+    function ownClientEffective(vals, isEdit, storedSecrets) {
+        vals = vals || {};
+        var secret = vals.client_secret == null ? '' : '' + vals.client_secret;
+        // Exactly '' is "unchanged" (review of cr3, fix 8 — the daemon's writer
+        // and update rule say the same): spaces are a typed value, judged empty.
+        if (secret === '' && isEdit === true && indexOfName(storedSecrets, 'client_secret') >= 0) {
+            secret = STORED_SECRET_MARK;
+        }
+        return { client_id: vals.client_id, client_secret: secret };
+    }
+
+    // The own-client values the rule judges for this dialog.
     function ownClientValues(win) {
-        var vals = dialogValues(win);
-        return { client_id: vals.client_id, client_secret: vals.client_secret };
+        var stored = keptSecrets((win._cloudExisting && win._cloudExisting.secretsSet) || [], win._cloudClear);
+        return ownClientEffective(dialogValues(win), win._cloudIsEdit === true, stored);
     }
 
     // Mark (or clear) one option field's inline error. Fail-open on the mark:
@@ -907,7 +983,7 @@
 
     // Field config for one option row. The row is a fieldcontainer so the
     // help's first sentence rides beneath the field as muted subtext.
-    function optionFieldCfg(opt, value, isEdit) {
+    function optionFieldCfg(opt, value, isEdit, clearState) {
         var type = '' + (opt.type || '');
         var required = opt.required === true;
         var label = opt.name + (required ? ' *' : '');
@@ -997,17 +1073,155 @@
                         ? ANAS.noAutofill.secret.inputAttrTpl
                         : undefined,
                     emptyText: isSecretOption(opt)
-                        ? (isEdit ? t('(unchanged)') : '')
+                        ? (isEdit ? ((clearState && clearState.cleared) ? t('(removed on save)') : t('(unchanged)')) : '')
                         : (opt.default || ''),
-                    value: value || '',
+                    value: (clearState && clearState.cleared) ? '' : (value || ''),
+                    disabled: !!(clearState && clearState.cleared),
                     // An int's box stays empty unless typed/stored — the
                     // default rides rclone's side, never forced in.
                     _anasOption: opt,
                     listeners: optionFieldListeners(opt),
                 },
                 subFieldCfg(sub),
-            ],
+            ].concat(hiddenValueRows(value))
+                .concat(clearState && clearState.stored ? clearSecretRows(opt, clearState.cleared) : []),
         };
+    }
+
+    // What the daemon shows of a value that may carry a credential (cr3,
+    // third review): a value carrying inline settings arrives as ONE marker,
+    // a URL with a credential with its secret parts as [secret]. Either is
+    // kept as stored unless the whole value is retyped. PURE (exported for
+    // the cr3 harness): the sentence for a value, or ''.
+    var HIDDEN_VALUE_MARK = '[hidden: this value carries inline settings]';
+    function hiddenValueNote(value) {
+        var v = value == null ? '' : '' + value;
+        if (v === HIDDEN_VALUE_MARK) {
+            return t('This value is hidden because it carries inline settings; it stays as stored unless you retype the whole value.');
+        }
+        if (v.indexOf('://') > 0 && v.indexOf('[secret]') >= 0) {
+            return t('Parts of this address are hidden; it stays as stored unless you retype the whole address.');
+        }
+        return '';
+    }
+
+    function hiddenValueRows(value) {
+        var note = hiddenValueNote(value);
+        return note ? [{
+            xtype: 'component',
+            cls: 'anas-cloud-hidden-note',
+            html: '<div style="font-size:11px;color:var(--anas-muted,gray);margin:0 0 6px 165px;">' + enc(note) + '</div>',
+        }] : [];
+    }
+
+    // ---- Removing a STORED secret (cr3, operator ruling 2026-11-14) ---------
+    //
+    // A secret is write-only: blank = "(unchanged)", so before cr3 a stored
+    // secret could not be removed at all. On an EDIT, each secret the remote
+    // has stored gets a "Remove the stored value" box; ticked, the field is
+    // held empty and Save sends `null` for that key (the daemon removes it from
+    // rclone.conf). The consequence is said under the box before Save. The
+    // own-client pair rule and the required-field gate then judge the dialog
+    // WITHOUT that secret: removing a client secret while the client ID stays
+    // holds Save shut with the pair sentence; removing both returns the remote
+    // to rclone's built-in client.
+
+    // What removing `name` does, in one plain sentence. PURE (exported for the
+    // cr3 harness).
+    function clearSecretNote(name) {
+        var base = t('Saving removes the stored') + ' ' + name + ' ' + t('from this node\'s rclone.conf; it cannot be read back or restored. Type a value instead to replace it.');
+        if (name === 'client_secret') {
+            return base + ' ' + t('Remove the client ID too to return the remote to rclone\'s built-in OAuth client; a client ID without its secret is refused.');
+        }
+        if (name === 'token') {
+            return base + ' ' + t('Without a token the remote has to be authorised again (rclone authorize) before it works.');
+        }
+        return base + ' ' + t('The remote works afterwards only if the backend does not need it.');
+    }
+
+    function clearSecretRows(opt, cleared) {
+        return [
+            {
+                xtype: 'checkboxfield',
+                itemId: 'cloudClear_' + opt.name,
+                cls: 'anas-fld-cloud-clear anas-fld-cloud-clear-' + opt.name,
+                fieldLabel: ' ',
+                labelSeparator: '',
+                boxLabel: t('Remove the stored value'),
+                checked: cleared === true,
+                listeners: {
+                    change: function (box, checked) {
+                        var w = box.up('window');
+                        if (!w) {
+                            return;
+                        }
+                        setSecretCleared(w, opt.name, checked === true);
+                    },
+                },
+            },
+            {
+                xtype: 'component',
+                itemId: 'cloudClearNote_' + opt.name,
+                cls: 'anas-cloud-clear-note',
+                hidden: cleared !== true,
+                html: '<div style="font-size:11px;color:var(--anas-warn,#b06a12);margin:0 0 6px 165px;">'
+                    + enc(clearSecretNote(opt.name)) + '</div>',
+            },
+        ];
+    }
+
+    // Tick or untick "Remove the stored value" for `name`: the state lives on
+    // the window (it survives a rebuild), the field is held empty and
+    // disabled while ticked, the consequence line shows, the gate re-runs.
+    function setSecretCleared(win, name, cleared) {
+        win._cloudClear = win._cloudClear || {};
+        if (cleared) {
+            win._cloudClear[name] = true;
+        } else {
+            delete win._cloudClear[name];
+        }
+        try {
+            var fld = win.down('#cloudOpt_' + name);
+            if (fld) {
+                if (cleared) { fld.setValue(''); }
+                fld.setDisabled(cleared);
+                if (fld.setEmptyText) {
+                    fld.setEmptyText(cleared ? t('(removed on save)') : t('(unchanged)'));
+                }
+            }
+            var note = win.down('#cloudClearNote_' + name);
+            if (note) { note.setHidden(!cleared); }
+        } catch (e) {
+            // cosmetic: the wire builders read win._cloudClear regardless
+        }
+        if (win._cloudRefresh) {
+            win._cloudRefresh();
+        }
+    }
+
+    // The stored secrets an edit still has: secretsSet less the ones ticked
+    // for removal. PURE (exported for the cr3 harness).
+    function keptSecrets(secretsSet, clear) {
+        var out = [];
+        for (var i = 0; i < (secretsSet || []).length; i++) {
+            if (!(clear && clear[secretsSet[i]] === true)) {
+                out.push(secretsSet[i]);
+            }
+        }
+        return out;
+    }
+
+    // The keys ticked for removal, sorted (the wire's order).
+    function clearedKeys(win) {
+        var out = [];
+        var c = (win && win._cloudClear) || {};
+        for (var k in c) {
+            if (Object.prototype.hasOwnProperty.call(c, k) && c[k] === true) {
+                out.push(k);
+            }
+        }
+        out.sort();
+        return out;
     }
 
     // The change listeners every option field carries — plus, on the token
@@ -1103,7 +1317,7 @@
     function requiredMissing(win) {
         var vals = dialogValues(win);
         var map = win._cloudOptionByName || {};
-        var stored = (win._cloudExisting && win._cloudExisting.secretsSet) || [];
+        var stored = keptSecrets((win._cloudExisting && win._cloudExisting.secretsSet) || [], win._cloudClear);
         for (var i = 0; i < (win._cloudRequired || []).length; i++) {
             var name = win._cloudRequired[i];
             if (vals[name]) {
@@ -1290,7 +1504,11 @@
                 // and only the `!A,B` rows survive — the wrong form. Mark the
                 // row required so Save and Test wait for the pick.
                 var effOpt = opt.name === 'provider' ? requiredCopy(opt) : opt;
-                var cfg = optionFieldCfg(effOpt, value, isEdit);
+                var storedSet = (win._cloudExisting && win._cloudExisting.secretsSet) || [];
+                var clearState = (isEdit && isSecretOption(opt) && indexOfName(storedSet, opt.name) >= 0)
+                    ? { stored: true, cleared: !!(win._cloudClear && win._cloudClear[opt.name]) }
+                    : null;
+                var cfg = optionFieldCfg(effOpt, value, isEdit, clearState);
                 if (effOpt.required === true) {
                     required.push(opt.name);
                 }
@@ -1441,11 +1659,19 @@
                 }
             } else if (isSecretOption(opt)) {
                 // Write-only: only a TYPED value rides; blank = unchanged.
-                if (v !== '') {
+                // A secret ticked "Remove the stored value" is null below.
+                if (v !== '' && !(win._cloudClear && win._cloudClear[k] === true)) {
                     out[k] = v;
                 }
             } else if (v !== storedValueOf(stored, opt)) {
                 out[k] = v; // '' = remove the key
+            }
+        }
+        if (!isCreate) {
+            // cr3: null CLEARS the stored secret (the daemon removes the key).
+            var cl = clearedKeys(win);
+            for (var c = 0; c < cl.length; c++) {
+                out[cl[c]] = null;
             }
         }
         return out;
@@ -1476,55 +1702,72 @@
         }
     }
 
-    // Has the user typed into ANY secret field of this dialog?
-    function anySecretTyped(win) {
-        var vals = dialogValues(win);
-        var map = win._cloudOptionByName || {};
-        var k;
-        for (k in vals) {
-            if (Object.prototype.hasOwnProperty.call(vals, k)
-                && isSecretOption(map[k]) && vals[k] !== '') {
-                return true;
-            }
-        }
-        return false;
-    }
-
     // What the dialog's Test sends.
     //
     // An ADD has no stored remote, so the whole dialog rides inline and the
-    // daemon serves it from an env-defined remote — nothing is written before
+    // daemon serves it from an env-defined remote: nothing is written before
     // the user saves.
     //
-    // An EDIT is different: the dialog CANNOT read a stored secret back (the
-    // API only names it), so an inline envelope would test a remote with no
-    // password and report "Authentication failed" on a remote that is fine.
-    // With nothing typed into a secret, Test names the SAVED remote and the
-    // daemon reads the stored value. Once a secret IS typed, the point is to
-    // try that value before saving it — so the inline envelope comes back,
-    // carrying the typed values over the stored non-secret options.
+    // An EDIT (cr3 CLOUD-L11): the dialog CANNOT read a stored secret back
+    // (the API only names it). With nothing changed, Test names the SAVED
+    // remote and the daemon reads it as stored (a read: Sys.Audit may run
+    // it). Once anything is changed, the point is to try the edit before
+    // saving it, so the dialog rides inline with `keepStoredSecrets`: the
+    // daemon fills every secret the dialog left blank from the saved remote.
+    // Before cr3 the inline envelope carried only the typed secret, so the
+    // remote's OTHER stored secrets (a crypt password2, an s3 secret beside a
+    // retyped key) were dropped and the verdict read "auth failed" on a
+    // remote that is fine; and a changed non-secret field with no secret
+    // typed was tested with its STORED value.
     function testBody(win, name, type) {
         var inline = wireOptions(win, true, {});
         if (win._cloudIsEdit !== true) {
             return { remote: { name: name, type: type, options: inline } };
         }
-        if (!anySecretTyped(win)) {
+        var stored = win._cloudStoredOptions || {};
+        var changes = wireOptions(win, false, stored);
+        return editTestBody(name, type, changes, inline, dialogValues(win), stored, clearedKeys(win));
+    }
+
+    // PURE (exported for the cr3 harness). `changes` is the update diff the
+    // Save would send, `inline` the dialog's non-empty values, `held` every
+    // value the dialog holds ('' = cleared), `stored` the saved non-secret
+    // options. A stored option the dialog does not hold (an advanced field
+    // never rendered, a key rclone added) rides as stored; one the dialog
+    // holds rides as the dialog has it, so a cleared field is tested cleared.
+    function editTestBody(name, type, changes, inline, held, stored, cleared) {
+        var k;
+        var any = false;
+        for (k in (changes || {})) {
+            if (Object.prototype.hasOwnProperty.call(changes, k)) {
+                any = true;
+            }
+        }
+        if (!any) {
             return { name: name };
         }
-        var merged = {};
-        var stored = win._cloudStoredOptions || {};
-        var k;
-        for (k in stored) {
-            if (Object.prototype.hasOwnProperty.call(stored, k)) {
-                merged[k] = stored[k];
+        var options = {};
+        for (k in (stored || {})) {
+            if (Object.prototype.hasOwnProperty.call(stored, k)
+                && !Object.prototype.hasOwnProperty.call(held || {}, k)) {
+                options[k] = stored[k];
             }
         }
-        for (k in inline) {
+        for (k in (inline || {})) {
             if (Object.prototype.hasOwnProperty.call(inline, k)) {
-                merged[k] = inline[k];
+                options[k] = inline[k];
             }
         }
-        return { remote: { name: name, type: type, options: merged } };
+        var body = { remote: { name: name, type: type, options: options }, keepStoredSecrets: true };
+        if (cleared && cleared.length) {
+            // cr3: secrets ticked for removal are not filled — the Test runs
+            // without them, as the saved remote will.
+            for (var c = 0; c < cleared.length; c++) {
+                delete options[cleared[c]];
+            }
+            body.clearedSecrets = cleared.slice();
+        }
+        return body;
     }
 
     function runDialogTest(win, node) {
@@ -1631,13 +1874,26 @@
         }
     }
 
+    // The Test window while a cancel is under way: Cancel held, the line says so.
+    function showTestCancelling(win) {
+        var cancel = win.down('#cloudTestCancel');
+        if (cancel) {
+            try {
+                cancel.setDisabled(true);
+                cancel.setText(t('Cancelling...'));
+            } catch (e) { /* cosmetic */ }
+        }
+        setTestArea(win, spinnerHtml(t('stopping the test...')));
+    }
+
     function runRemoteTest(win, node, body) {
         abandonTest(win);
         setTestBusy(win, true);
         setTestArea(win, spinnerHtml(t('testing remote…')));
         var job;
         function stale() {
-            return win.destroyed || win.destroying || win._cloudTestJob !== job;
+            var current = win._cloudTestJob;
+            return win.destroyed || win.destroying || !current || (current !== job && current.raw !== job);
         }
         function done() {
             win._cloudTestJob = null;
@@ -1651,12 +1907,7 @@
             what: t('The remote test'),
             onCancelling: function () {
                 if (stale()) { return; }
-                var cancel = win.down('#cloudTestCancel');
-                if (cancel) {
-                    cancel.setDisabled(true);
-                    cancel.setText(t('Cancelling…'));
-                }
-                setTestArea(win, spinnerHtml(t('stopping the test…')));
+                showTestCancelling(win);
             },
             onCancelFailed: function (msg) {
                 if (stale()) { return; }
@@ -1692,7 +1943,59 @@
                 setTestArea(win, '<span style="color:var(--anas-warn,#b06a12);">' + enc(msg) + '</span>');
             },
         });
-        win._cloudTestJob = job;
+        win._cloudTestJob = (body && body.remote) ? unsavedTestHandle(job, node, win) : job;
+    }
+
+    // The Cancel of an UNSAVED Test (review of cr3, C1 depth): that Test is a
+    // Sys.Modify job of its own (`cloud.remote.test`, not a read), so the
+    // daemon's cancel door asks its confirm like any non-read job. The
+    // operator pressing Cancel in the dialog that is waiting on their own
+    // Test IS that confirmation, and stopping a probe changes nothing, so the
+    // code the door answers with is sent back at once. Every outcome still
+    // arrives through the read poll (cancelled / failed / result).
+    function unsavedTestHandle(job, node, win) {
+        return confirmedCancelHandle(job, node, win, function () { showTestCancelling(win); });
+    }
+
+    // The cancel of a NON-read job this dialog itself is waiting on (the
+    // unsaved Test, the inline preview — both Sys.Modify jobs since cr3): the
+    // door's confirm code is replayed at once, the user's Cancel being that
+    // confirmation; every outcome still arrives through the read poll.
+    function confirmedCancelHandle(job, node, win, onCancelling) {
+        function stop(quiet) {
+            var id = job.jobId();
+            if (!id) {
+                return job.cancel(quiet ? { quiet: true } : undefined);
+            }
+            var path = '/jobs/' + encodeURIComponent(id) + '/cancel';
+            if (!quiet) {
+                onCancelling();
+            }
+            function failed(err) {
+                if (quiet || win.destroyed || win.destroying) {
+                    return;
+                }
+                if (err && (err.status === 404 || (err.status === 409 && err.body && err.body.error && err.body.error.code === 'CONFLICT'))) {
+                    return; // it ended meanwhile: the poll says how
+                }
+                ANAS.alertMsg('Cancel failed', ANAS.errText(err));
+            }
+            ANAS.api.post(node, path, {}).then(function () {}, function (err) {
+                if (err && err.status === 409 && err.confirmCode) {
+                    ANAS.api.post(node, path, {}, { confirmCode: err.confirmCode }).then(function () {}, failed);
+                    return;
+                }
+                failed(err);
+            });
+            return true;
+        }
+        return {
+            cancel: function (o) { return stop(!!(o && o.quiet)); },
+            jobId: function () { return job.jobId(); },
+            // The readJob handle it wraps: the runner's staleness check
+            // compares against it.
+            raw: job,
+        };
     }
 
     // --- Submit ---------------------------------------------------------------
@@ -1963,6 +2266,7 @@
 
         win._cloudExisting = r;
         win._cloudIsEdit = isEdit;
+        win._cloudClear = {};
         win._cloudStoredOptions = r.options || {};
         win._cloudStash = {};
         win._cloudRebuild = function () {
@@ -2029,12 +2333,45 @@
     // backup precedent: "Register a PBS repository first (Repositories…).").
     var EMPTY_REMOTES_TOAST = 'Add a remote first (Remotes…)';
 
-    // The nested note's lead — the daemon's own run-time sentence, said BEFORE
-    // the save: a snapshot captures one filesystem. Rendered as "Contains N
-    // nested filesystems that will not be included: <paths>".
-    function nestedNote(n) {
-        return n + ' ' + (n === 1 ? t('nested filesystem') : t('nested filesystems'))
-            + ' ' + t('that will not be included');
+    // The nested filesystems under a source, said PER MODE (cr3, operator
+    // ruling 2026-11-14: a live task keeps what it copies; every screen tells
+    // the truth). A snapshot holds one filesystem: the nested ones are not
+    // included, and the run leaves their copies at the destination as they
+    // are. A live copy reads through them: they are included. With no derived
+    // consistency the screen says it cannot tell. The daemon's run-time line
+    // and notification say the same (cloud-runner.ts nestedProgressLine).
+    // `consistency` is the derived value ('snapshot' | 'live' | anything else
+    // = unknown). PURE (exported for the cr3 harness).
+    var NESTED_SNAPSHOT_NOTE = 'a snapshot holds one filesystem; their copies at the destination are left as they are';
+    var NESTED_LIVE_NOTE = 'a live copy reads through them';
+    function nestedWords(n) {
+        return n + ' ' + (n === 1 ? t('nested filesystem') : t('nested filesystems'));
+    }
+
+    // The wizard's note: "Contains N nested filesystem(s) <mode clause>: <paths> (<why>)".
+    function nestedNoteText(n, consistency, paths) {
+        var list = (paths || []).join(', ');
+        if (consistency === 'snapshot') {
+            return t('Contains') + ' ' + nestedWords(n) + ' ' + t('that will not be included') + ': '
+                + list + ' (' + t(NESTED_SNAPSHOT_NOTE) + ')';
+        }
+        if (consistency === 'live') {
+            return t('Contains') + ' ' + nestedWords(n) + ' ' + t('that will be included') + ': '
+                + list + ' (' + t(NESTED_LIVE_NOTE) + ')';
+        }
+        return t('Contains') + ' ' + nestedWords(n) + ': ' + list + ' ('
+            + t('whether they are included depends on the source consistency, which could not be read') + ')';
+    }
+
+    // One path's line in the Details window, per mode.
+    function nestedDetailNote(consistency) {
+        if (consistency === 'snapshot') {
+            return t('not included') + ' (' + t(NESTED_SNAPSHOT_NOTE) + ')';
+        }
+        if (consistency === 'live') {
+            return t('included') + ' (' + t(NESTED_LIVE_NOTE) + ')';
+        }
+        return t('included or not: unknown (the source consistency could not be read)');
     }
 
     // Relative + absolute time. absTime delegates to the schedules common
@@ -2391,6 +2728,7 @@
             // it back and clears the note that contradicts it.
             var unavail = view ? view.down('#cloudTasksUnavailable') : null;
             if (unavail) { unavail.setHidden(true); }
+            setLoadError(view ? view.down('#cloudTasksLoadError') : null, null);
             try { grid.setHidden(false); } catch (eG) { /* non-fatal */ }
             // The run-error tooltips live on the STORE, which survives a
             // loadData — a reload must not forget what this user watched fail.
@@ -2441,9 +2779,11 @@
                 }
             }
             // No rclone on this node (503): the daemon's sentence takes the
-            // grid's place; any other failure is transient — warn and keep the
-            // last good rows.
+            // grid's place. Any other failure keeps the last good rows — and
+            // (cr3) SAYS the list could not be read, with the reason: a failed
+            // first load used to read as "No cloud sync tasks defined".
             if (err && err.status === 503) {
+                setLoadError(view ? view.down('#cloudTasksLoadError') : null, null);
                 var unavail = view ? view.down('#cloudTasksUnavailable') : null;
                 if (unavail) {
                     unavail.setHidden(false);
@@ -2456,6 +2796,8 @@
                 }
                 return;
             }
+            setLoadError(view ? view.down('#cloudTasksLoadError') : null,
+                loadFailedHtml(t('cloud sync tasks'), ANAS.errText(err), gridHasRows(grid)));
             ANAS.warn('cloud tasks load failed: ' + ANAS.errText(err));
         });
     }
@@ -2805,11 +3147,13 @@
         var excludes = (task.excludes && task.excludes.length)
             ? mono(task.excludes.join('  '))
             : '<span style="color:var(--anas-muted,gray);">' + enc(t('none')) + '</span>';
+        var nestedMode = d.consistency ? d.consistency.consistency : null;
         var nested = (d.nested && d.nested.length)
             ? d.nested.map(function (n) {
-                return '<div style="font-size:11px;margin-left:2px;color:var(--anas-warn,#c9820b);">'
+                return '<div style="font-size:11px;margin-left:2px;color:'
+                    + (nestedMode === 'live' ? 'var(--anas-muted,gray)' : 'var(--anas-warn,#c9820b)') + ';">'
                     + '<span style="font-family:monospace;">' + enc(n) + '</span> — '
-                    + enc(t('not included (a snapshot captures one filesystem)')) + '</div>';
+                    + enc(nestedDetailNote(nestedMode)) + '</div>';
             }).join('')
             : '';
         var rows = ''
@@ -3645,8 +3989,14 @@
         if (!err || err.status !== 400) {
             ANAS.warn('cloud preview failed: ' + msg);
         }
+        // cr3 (second review): previewing an UNSAVED form is part of creating
+        // or editing a task, so it needs what saving needs. A caller without
+        // Sys.Modify is told why, before the daemon's own sentence.
+        var lead = (err && err.status === 403)
+            ? t('Previewing an unsaved task needs Sys.Modify, the same privilege as saving it. Saved tasks can be previewed from the task list.') + ' '
+            : '';
         return '<div style="color:var(--anas-danger,#c23b2c);font-size:11px;">'
-            + enc(msg) + '</div>';
+            + enc(lead + msg) + '</div>';
     }
 
     function previewNoteHtml(text, color) {
@@ -3708,7 +4058,9 @@
         setPreviewCancel(win, true);
         var job;
         function stale() {
-            return win.destroyed || win.destroying || win._previewSeq !== seq || win._previewJob !== job;
+            var current = win._previewJob;
+            return win.destroyed || win.destroying || win._previewSeq !== seq
+                || !current || (current !== job && current.raw !== job);
         }
         function done(html) {
             win._previewJob = null;
@@ -3752,7 +4104,12 @@
                 done(previewNoteHtml(msg, 'var(--anas-warn,#b06a12)'));
             },
         });
-        win._previewJob = job;
+        // cr3 (second review): an INLINE preview (an unsaved form) is a
+        // Sys.Modify job of its own, so its cancel is confirm-gated like any
+        // non-read job: the window replays the code at once.
+        win._previewJob = (body && body.source)
+            ? confirmedCancelHandle(job, node, win, function () { setPreviewCancel(win, true, true); })
+            : job;
     }
 
     // The line both windows render into — the same itemId on purpose, so one
@@ -3920,11 +4277,12 @@
         }
     }
 
-    // What a snapshot will NOT contain, plus the derived consistency — both
-    // from the ONE preview-nested scan backup's wizard uses (the derived
+    // The nested filesystems under the source, plus the derived consistency —
+    // both from the ONE preview-nested scan backup's wizard uses (the derived
     // consistency rides it). Cloud tasks have no nested choice: a snapshot
-    // captures one filesystem, so every nested one is left out, and the note
-    // says so BEFORE the save (the daemon's run-time sentence, up front).
+    // captures one filesystem, so every nested one is left out; a live copy
+    // reads through them (cr3: said per mode). The note says so BEFORE the
+    // save (the daemon's run-time sentence, up front).
     function scanCloudSource(win, node) {
         if (!win || win.destroyed || win.destroying) {
             return;
@@ -3967,7 +4325,7 @@
                     }
                     html += '<div style="font-size:11px;color:var(--anas-warn,#c9820b);">'
                         + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
-                        + enc(t('Contains') + ' ' + nestedNote(nested.length) + ': ' + paths.join(', '))
+                        + enc(nestedNoteText(nested.length, c ? c.consistency : null, paths))
                         + '</div>';
                 }
                 if (scan.truncated === true) {
@@ -4427,6 +4785,22 @@
     // body and the preview body (two field walks diverge into bugs). A cleared
     // bandwidth limit sends nothing (absent = no limit — the schema normalises
     // the empty string, but absent is what a cleared field means).
+    // What a cleared field sends on an EDIT (review of cr3, fix 3), the whole
+    // table for the task dialog:
+    //   source, remote, mode, notify, enabled  always sent (a value)
+    //   path        '' = the remote's root (a value, never "unchanged")
+    //   excludes    [] when the box is emptied (a value)
+    //   schedule / cadence  one of the two always rides; either replaces both
+    //   bwlimit     null when the box is emptied (cleared = no limit)
+    // A CREATE omits an empty bwlimit (absent = no limit there). PURE on the
+    // body (exported for the cr3 harness).
+    function editTaskClears(body, isEdit) {
+        if (isEdit === true && !Object.prototype.hasOwnProperty.call(body, 'bwlimit')) {
+            body.bwlimit = null;
+        }
+        return body;
+    }
+
     function cloudTaskFields(win) {
         var fields = {
             source: trim(valOf(win, '#cloudSource') || ''),
@@ -4482,6 +4856,11 @@
         if (!body) {
             return; // cloudTaskBody already said what is wrong
         }
+        // The edit door keeps what a body OMITS (cr3 CLOUD-L10), so a field the
+        // user CLEARED must say so: null (review of cr3, fix 3). Of the task
+        // dialog's fields only the bandwidth limit can be left out — every
+        // other one rides on every save (editTaskClears).
+        editTaskClears(body, isEdit);
         if (!TASK_NAME_RE.test(body.name) || body.name.length > 64) {
             ANAS.alertMsg('Invalid input',
                 t('Task name must be lowercase letters, digits and hyphens (≤64 chars).'));
@@ -4705,6 +5084,14 @@
             border: false,
             items: [
                 {
+                    // cr3: a failed (non-503) read — said here, above the
+                    // rows of the last good read (if any).
+                    xtype: 'component',
+                    itemId: 'cloudTasksLoadError',
+                    cls: 'anas-cloud-load-error',
+                    hidden: true,
+                },
+                {
                     xtype: 'gridpanel',
                     itemId: 'cloudTasksGrid',
                     cls: 'anas-grid-cloud-tasks',
@@ -4832,6 +5219,23 @@
         // harness pattern, over `packages/shared/test-vectors/own-client.json`
         // — the daemon's doors run the shared rule the port literalises.
         validateOwnClient: validateOwnClient,
+        // cr3 (review 2026-11-14), exported for cr3-cloud.harness.mjs: the
+        // own-client pair an edit leaves (CLOUD-M5), what an edit's Test sends
+        // (CLOUD-L11), and the verdict sentence a refused Test renders
+        // (CLOUD-C1: a 403 reads as its own sentence, never a bare failure).
+        ownClientEffective: ownClientEffective,
+        editTestBody: editTestBody,
+        verdictSentence: verdictSentence,
+        loadFailedHtml: loadFailedHtml,
+        nestedNoteText: nestedNoteText,
+        clearSecretNote: clearSecretNote,
+        editTaskClears: editTaskClears,
+        unsavedTestHandle: unsavedTestHandle,
+        previewErrorHtml: previewErrorHtml,
+        hiddenValueNote: hiddenValueNote,
+        confirmedCancelHandle: confirmedCancelHandle,
+        keptSecrets: keptSecrets,
+        nestedDetailNote: nestedDetailNote,
         // The grid's per-task run-detail map (rclone.6 review batch B) —
         // exposed for the harness to seed and assert against.
         rowDetailBagOf: function (grid) {

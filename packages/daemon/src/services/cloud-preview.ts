@@ -3,6 +3,7 @@ import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
 import type { RcloneLogState, RcloneStats } from './cloud-runner.js'
 import type { RcloneConfigPaths } from './rclone-config.js'
 import { stat } from 'node:fs/promises'
+import { CommandTimeoutError } from '../executor/deadline.js'
 import {
   buildRcloneArgs,
   DELETED_FILES_CAP,
@@ -11,6 +12,9 @@ import {
   missingSourceRefusal,
   rcloneFailureMessage,
   rcloneRunCompleted,
+  readCloudSourceView,
+  snapshotSyncRefusal,
+  sourceNotAnsweringRefusal,
 } from './cloud-runner.js'
 import { RCLONE, remoteSecretValues } from './rclone-config.js'
 import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
@@ -42,8 +46,11 @@ import { guardSourcePath, readSourceGuardFacts } from './source-guard.js'
  *     "would delete N files" is the whole point of the feature — the
  *     protection for the real run stays the guard, and the preview is what
  *     shows the operator what that protection is standing in front of.
- *   - the consistency derivation and the transient snapshot (see above),
- *     the job, the notification and the cadence gate.
+ *   - the transient snapshot (see above), the job, the notification and the
+ *     cadence gate. The consistency derivation IS reused since cr3
+ *     (CLOUD-H3): it decides whether the run reads a snapshot, and with it
+ *     which nested filesystems the look must leave out to count what the run
+ *     will do.
  *
  * Ground truth the parsing is built on (DESIGN + GT 2026-09-24, rclone 1.60.1,
  * stunt node — the fixtures under `fixtures/rclone/dry-run-*`):
@@ -63,6 +70,7 @@ import { guardSourcePath, readSourceGuardFacts } from './source-guard.js'
 
 /** `timeout` binary — wraps the preview so a stalled remote can never hang the door. */
 const TIMEOUT = '/usr/bin/timeout'
+const REALPATH = '/usr/bin/realpath'
 
 /**
  * The whole preview's wall ceiling, in seconds (the `timeout` argument): ten
@@ -146,6 +154,22 @@ export interface CloudPreviewDeps {
    * (cr.55), so no caller can forget them and no test can feed the mask.
    */
   secrets?: string[]
+  /** Passed through to the consistency derivation (the PVE storage.cfg override), as the run's. */
+  consistencyOptions?: { pveStorageCfg?: string }
+  /**
+   * The source's real path as {@link checkPreviewSource} resolved it (the
+   * source guard's bounded `realpath -e`); absent, the path as written. The
+   * consistency and the nested scan are judged on it, as the run judges them
+   * (cr3 CLOUD-M4).
+   */
+  realSource?: string
+  /**
+   * A reader's preview (cr3 CORE-L9, review fix 6): rclone is handed
+   * `realSource` — the path whose bound was checked — and the job re-resolves
+   * the source first and refuses if it no longer leads there (a symlink
+   * swapped between the check and the look).
+   */
+  pinRealSource?: boolean
 }
 
 /**
@@ -155,8 +179,13 @@ export interface CloudPreviewDeps {
  * masked with is NOT a field here — {@link runPreview} derives it from the
  * remote the task names, in the config file the route points it at.
  */
-export function cloudPreviewDeps(task: PreviewTask, paths: RcloneConfigPaths, fstabPath: string): CloudPreviewDeps {
-  return { task, paths, fstabPath }
+export function cloudPreviewDeps(
+  task: PreviewTask,
+  paths: RcloneConfigPaths,
+  fstabPath: string,
+  consistencyOptions?: { pveStorageCfg?: string },
+): CloudPreviewDeps {
+  return { task, paths, fstabPath, ...(consistencyOptions ? { consistencyOptions } : {}) }
 }
 
 /**
@@ -175,20 +204,22 @@ export async function previewCloudSync(
   deps: CloudPreviewDeps,
   hooks: PreviewRunHooks = {},
 ): Promise<CloudSyncPreviewResult> {
-  await checkPreviewSource(executor, deps)
-  return runPreview(executor, deps, hooks)
+  const realSource = await checkPreviewSource(executor, deps)
+  return runPreview(executor, { ...deps, realSource }, hooks)
 }
 
 /**
  * The preview's guards — the run's own, minus the empty-source one. Throws a
  * {@link PreviewRefusal} with the run's sentence; the route answers it 400
  * BEFORE the job is submitted (cr.48), so the refusal still arrives as the
- * door's answer, not as a failed job.
+ * door's answer, not as a failed job. Returns the source's real path (the
+ * guard's bounded `realpath -e`, or the path as written), which the look
+ * judges consistency on ({@link CloudPreviewDeps.realSource}).
  */
 export async function checkPreviewSource(
   executor: CommandExecutor,
   deps: CloudPreviewDeps,
-): Promise<void> {
+): Promise<string> {
   const { task } = deps
   // The unmounted-mount check first: the one that explains an empty
   // directory, and the only one that can answer without touching the path.
@@ -196,6 +227,10 @@ export async function checkPreviewSource(
   const refusal = guardSourcePath(task.source, guardFacts)
   if (refusal)
     throw new PreviewRefusal(refusal)
+  // cr3 CLOUD-M6: the run's liveness probe, before the in-process stat below.
+  const dead = await sourceNotAnsweringRefusal(executor, task.source)
+  if (dead)
+    throw new PreviewRefusal(dead)
 
   // The source must be a DIRECTORY that exists — LIVE. A preview takes no
   // snapshot, so this is the same check the run makes, on the live tree.
@@ -205,6 +240,44 @@ export async function checkPreviewSource(
 
   // Deliberately ABSENT: the empty-source guard. A `sync` preview of an empty
   // source reporting "would delete everything" is the point.
+  // The real path the look will read, resolved CHECKED: a resolution that
+  // failed or did not answer refuses (never "the path as written").
+  const real = await resolveSourceChecked(executor, task.source)
+  if ('problem' in real)
+    throw new PreviewRefusal(`${task.source} could not be resolved (${real.problem}) - nothing was read`)
+  return real.real
+}
+
+const TIMEOUT_EXITS = new Set([124, 137])
+
+/**
+ * `realpath -e` of the source in a child bounded by `timeout` (the hang
+ * trap), CHECKED: the real path, or why it could not be had — a failure or a
+ * timeout is never read as "the path as written". The argv is the source
+ * guard's own (`timeout -s KILL 5 realpath -e -- <path>`); MERGE: the backup
+ * area could export a checked form of source-guard.ts `resolvePath` to replace
+ * this one.
+ */
+export async function resolveSourceChecked(executor: CommandExecutor, path: string): Promise<{ real: string } | { problem: string }> {
+  let r
+  try {
+    r = await executor.exec(TIMEOUT, ['-s', 'KILL', '5', REALPATH, '-e', '--', path])
+  }
+  catch (err) {
+    // The executor's own deadline is a read that did not answer; any other
+    // throw is an internal fault and stays one (never a 400 about the input).
+    if (err instanceof CommandTimeoutError)
+      return { problem: 'realpath did not answer' }
+    throw err
+  }
+  // Third review (D4): strip exactly ONE trailing newline — a directory name
+  // may end in whitespace, and a trimmed answer would preview another tree.
+  const out = r.stdout.endsWith('\n') ? r.stdout.slice(0, -1) : r.stdout
+  if (r.exitCode === 0 && out.startsWith('/') && !out.includes('\n'))
+    return { real: out }
+  if (TIMEOUT_EXITS.has(r.exitCode))
+    return { problem: 'realpath did not answer within 5 s' }
+  return { problem: `realpath exited ${r.exitCode}${r.stderr.trim() ? `: ${r.stderr.trim().split('\n')[0]}` : ''}` }
 }
 
 /**
@@ -219,7 +292,39 @@ export async function runPreview(
   hooks: PreviewRunHooks = {},
 ): Promise<CloudSyncPreviewResult> {
   const { task } = deps
-  const args = buildRcloneArgs(task, deps.paths.configFile, task.source, { dryRun: true })
+  // cr3 CORE-L9 / review fix 6 (corrected by the second review): the look
+  // reads the REAL path the door resolved — re-resolved here first, and
+  // refused when it now leads elsewhere OR when the re-resolution itself
+  // failed or did not answer (a read that failed never reads as "unchanged").
+  let source = task.source
+  if (deps.pinRealSource === true && deps.realSource !== undefined) {
+    const now = await resolveSourceChecked(executor, task.source)
+    if ('problem' in now)
+      throw new Error(`${task.source} could not be checked again before the look (${now.problem}) - nothing was read`)
+    if (now.real !== deps.realSource) {
+      throw new Error(deps.realSource === task.source
+        ? `${task.source} now resolves to ${now.real} (it was not a link when the preview was asked for) - nothing was read; run the preview again`
+        : `${task.source} now resolves to ${now.real}, not to ${deps.realSource} as when the preview was asked for - nothing was read; run the preview again`)
+    }
+    source = deps.realSource
+  }
+  // cr3 CLOUD-H3: the look reads the live tree, the run a snapshot of it. A
+  // snapshot holds one filesystem, so for a snapshot-mode task the look gets
+  // the run's own nested-filesystem excludes AND `--one-file-system` — it
+  // then counts what the run will copy and delete, not what the live tree
+  // holds across its mounts. A sync the run would refuse (the complete nested
+  // read failed, or a nested name cannot be left out) fails the look with the
+  // run's sentence. The look needs no boundary walk: the excludes come from
+  // the complete reads.
+  const view = await readCloudSourceView(executor, task.source, deps.realSource ?? task.source, deps.consistencyOptions ?? {}, { walk: false })
+  const refusedSync = snapshotSyncRefusal(view, task.source, task.mode)
+  if (refusedSync)
+    throw new Error(refusedSync)
+  const args = buildRcloneArgs(task, deps.paths.configFile, source, {
+    dryRun: true,
+    excludes: view.excludes,
+    oneFileSystem: view.snapshot,
+  })
   // The executor-side argv backstop, uniform with every other rclone call
   // ANAS makes (the run's own call, over the same argv).
   assertNoSecretValues(args, deps.secrets ?? [])

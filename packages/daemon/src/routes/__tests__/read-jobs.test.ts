@@ -10,16 +10,26 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { CloudSyncTask as CloudSyncTaskSchema } from '@anas/shared'
 import { AbandonedRegistry, CommandTimeoutError } from '../../executor/deadline.js'
 import { ProdExecutor } from '../../executor/prod.js'
 import { READ_CANCEL_WAIT_MS } from '../../jobs/child-cancel.js'
 import { isReadOnlyOperation, READ_JOB_OPERATIONS, READ_JOB_PREFIX } from '../../jobs/read-jobs.js'
 import { createServer } from '../../server.js'
+import { passThroughRealpath } from '../../services/__tests__/cloud-realpath-passthrough.js'
 import { CATALOG_SHELL_TIMEOUT_S } from '../../services/backup-catalog.js'
 import { PREVIEW_TIMEOUT_S } from '../../services/cloud-preview.js'
 import { RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
 import { PROBE_TIMEOUT_S } from '../../services/rclone-probe.js'
-import { RCLONE_NOT_INSTALLED } from '../cloud.js'
+import { RCLONE_NOT_INSTALLED, UNSAVED_TEST_OPERATION } from '../cloud.js'
+
+/**
+ * A READABLE mount table for every cloud test world (the cr3 backup hand-off):
+ * the source guard refuses a source whose mount table could not be read, so a
+ * world that answers no `findmnt` would refuse every run and preview. A
+ * command-only fixture: a test's own exact `findmnt --json` fixture still wins.
+ */
+const READABLE_MOUNT_TABLE = JSON.stringify({ filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }] })
 
 /**
  * cr.48 (operator ruling 2026-10-15) — the three slow interactive reads as
@@ -132,6 +142,20 @@ async function accept(server: Server, url: string, payload: unknown, operation: 
 }
 
 /**
+ * Review of cr3 (C1 depth): the UNSAVED remote Test is its own NON-read job
+ * (`cloud.remote.test`) — Sys.Modify at the queue's backstop and at its
+ * cancel. POST it; assert the 202 and that operation; the job id.
+ */
+async function acceptUnsaved(server: Server, payload: unknown): Promise<string> {
+  const res = await server.inject({ method: 'POST', url: '/v1/cloud/remotes/test', headers: JSON_HEADERS, payload: JSON.stringify(payload) })
+  assert.equal(res.statusCode, 202, res.body)
+  const { job } = res.json() as JobAccepted
+  assert.equal(job.operation, UNSAVED_TEST_OPERATION)
+  assert.ok(!isReadOnlyOperation(job.operation), 'an unsaved Test is not a read job')
+  return job.id
+}
+
+/**
  * Cancel a running read job through the ONE cancel door, and prove it: 202
  * with no confirm code, the job ends `cancelled` naming who, and every
  * process of the child's group is gone.
@@ -209,6 +233,8 @@ describe('cr.48 the cloud reads as jobs (preview, remote test)', () => {
     server = createServer({ mock: true, logger: false })
     const mock = mockOf(server)
     mock.clearFixtures()
+    mock.addFixture({ command: '/usr/bin/findmnt', result: { stdout: READABLE_MOUNT_TABLE, stderr: '', exitCode: 0 } })
+    passThroughRealpath(mock)
     mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: RCLONE, args: [...rcloneBaseArgs(configFile), 'config', 'providers'], result: { stdout: '[]', stderr: '', exitCode: 0 } })
   })
@@ -228,9 +254,20 @@ describe('cr.48 the cloud reads as jobs (preview, remote test)', () => {
 
   const isRclone = (args: string[]): boolean => args[1] === RCLONE
 
+  /**
+   * cr3 (second review): the READ preview is a SAVED task's (an inline form
+   * is a Sys.Modify job of its own — cr3-cloud.test.ts). The task is written
+   * as its unit file into this world's systemd dir; previews go by name.
+   */
+  async function savePreviewTask(over: Record<string, unknown> = {}): Promise<{ name: string }> {
+    const task = CloudSyncTaskSchema.parse({ name: 'pv', source: srcDir, remote: 'gt', path: '', schedule: 'daily', ...over })
+    await writeFile(join(dir, 'anas-cloud-pv.service'), `[Unit]\n# X-ANAS-Task=${JSON.stringify(task)}\n`, 'utf-8')
+    return { name: 'pv' }
+  }
+
   it('preview: accepted → the counters ride job.result; the dry run\'s stats are the progress line', async () => {
     mockOf(server).addFixture({ command: TIMEOUT, argsMatch: isRclone, result: { stdout: '', stderr: readFileSync(DRY_RUN_DELETE_LOG, 'utf-8'), exitCode: 0 } })
-    const id = await accept(server, '/v1/cloud/tasks/preview', { source: srcDir, remote: 'gt', path: 'dst', mode: 'sync' }, READ_JOB_OPERATIONS.cloudPreview)
+    const id = await accept(server, '/v1/cloud/tasks/preview', await savePreviewTask({ path: 'dst', mode: 'sync' }), READ_JOB_OPERATIONS.cloudPreview)
     const job = await waitForJob(server, id)
     assert.equal(job.status, 'completed')
     const r = job.result as CloudSyncPreviewResult
@@ -246,7 +283,7 @@ describe('cr.48 the cloud reads as jobs (preview, remote test)', () => {
     const mark = marker()
     marks.push(mark)
     const seen = realChild(mockOf(server), isRclone, `sleep ${mark}; true`)
-    const id = await accept(server, '/v1/cloud/tasks/preview', { source: srcDir, remote: 'gt' }, READ_JOB_OPERATIONS.cloudPreview)
+    const id = await accept(server, '/v1/cloud/tasks/preview', await savePreviewTask(), READ_JOB_OPERATIONS.cloudPreview)
     const { ms } = await cancelAndProve(server, id, mark, 'preview')
     assert.ok(ms < READ_CANCEL_WAIT_MS, `the SIGTERM was enough (${ms} ms)`)
     assert.equal(seen[0]?.[0], String(PREVIEW_TIMEOUT_S))
@@ -260,7 +297,7 @@ describe('cr.48 the cloud reads as jobs (preview, remote test)', () => {
         throw new Error('boom')
       return orig(cmd, args, opts)
     }
-    const job = await waitForJob(server, await accept(server, '/v1/cloud/tasks/preview', { source: srcDir, remote: 'gt' }, READ_JOB_OPERATIONS.cloudPreview))
+    const job = await waitForJob(server, await accept(server, '/v1/cloud/tasks/preview', await savePreviewTask(), READ_JOB_OPERATIONS.cloudPreview))
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.message, 'boom')
     assert.equal(job.result, null)
@@ -288,8 +325,18 @@ describe('cr.48 the cloud reads as jobs (preview, remote test)', () => {
     const mark = marker()
     marks.push(mark)
     const seen = realChild(mockOf(server), isRclone, `sleep ${mark}; true`)
-    const id = await accept(server, '/v1/cloud/remotes/test', { remote: { name: 'draft', type: 'sftp', options: { host: '127.0.0.1' } } }, READ_JOB_OPERATIONS.cloudRemoteTest)
-    await cancelAndProve(server, id, mark, 'unsaved test')
+    const id = await acceptUnsaved(server, { remote: { name: 'draft', type: 'sftp', options: { host: '127.0.0.1' } } })
+    // cr3 (C1 depth): a non-read job's cancel is confirm-gated like every
+    // other — the dialog replays the code it is given (72-cloud.js).
+    assert.ok(await until(() => sleepers(mark).length === 1, 5_000), 'the real child is running')
+    const first = await server.inject({ method: 'POST', url: `/v1/jobs/${id}/cancel`, headers: IDENTITY })
+    assert.equal(first.statusCode, 409, first.body)
+    const code = String(first.headers['x-anas-confirm-code'])
+    const confirmed = await server.inject({ method: 'POST', url: `/v1/jobs/${id}/cancel`, headers: { ...IDENTITY, 'x-anas-request-id': randomUUID(), 'x-anas-confirm': code } })
+    assert.equal(confirmed.statusCode, 202, confirmed.body)
+    const cancelled = await waitForJob(server, id)
+    assert.equal(cancelled.status, 'cancelled', JSON.stringify(cancelled))
+    assert.deepEqual(sleepers(mark), [], 'the child\'s whole process group is gone')
     const probeConfig = seen[0]![seen[0]!.indexOf('--config') + 1]!
     assert.notEqual(probeConfig, configFile)
     assert.ok(await until(() => {
@@ -332,9 +379,9 @@ describe('cr.48 the cloud reads as jobs (preview, remote test)', () => {
         exitCode: 1,
       },
     })
-    const job = await waitForJob(server, await accept(server, '/v1/cloud/remotes/test', {
+    const job = await waitForJob(server, await acceptUnsaved(server, {
       remote: { name: 'draft', type: 'sftp', options: { host: '127.0.0.1', user: 'rclonegt', pass: 'gtpass' } },
-    }, READ_JOB_OPERATIONS.cloudRemoteTest))
+    }))
     assert.equal(job.status, 'completed')
     const r = job.result as CloudRemoteTestResult
     assert.equal(r.verdict, 'auth', 'the classifier still read the RAW text')
@@ -353,9 +400,9 @@ describe('cr.48 the cloud reads as jobs (preview, remote test)', () => {
         throw new CommandTimeoutError(TIMEOUT, [String(PROBE_TIMEOUT_S), RCLONE], 'job', 125_000, false)
       return orig(cmd, args, opts)
     }
-    const job = await waitForJob(server, await accept(server, '/v1/cloud/remotes/test', {
+    const job = await waitForJob(server, await acceptUnsaved(server, {
       remote: { name: 'draft', type: 'sftp', options: { host: '127.0.0.1', user: 'rclonegt', pass: 'gtpass' } },
-    }, READ_JOB_OPERATIONS.cloudRemoteTest))
+    }))
     assert.equal(job.status, 'failed')
     assert.equal(job.error?.code, 'TIMEOUT')
     assert.match(job.error?.message ?? '', /did not finish within/)

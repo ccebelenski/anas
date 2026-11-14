@@ -12200,9 +12200,12 @@ async function cloudChecks() {
   await settle()
   findCmp(dlg, 'anas-btn-cloud-remote-testconn').handler()
   await settle()
-  eq('cloud(dialog test, edit): a TYPED secret goes back inline, over the stored non-secret options',
+  // cr3 CLOUD-L11: the inline envelope now asks the daemon to keep the
+  // remote's OTHER stored secrets (keepStoredSecrets) — before cr3 they were
+  // dropped and the verdict could read a false auth failure.
+  eq('cloud(dialog test, edit): a TYPED secret goes back inline, over the stored non-secret options, keeping the other stored secrets',
     b2TestBodies[b2TestBodies.length - 1],
-    { remote: { name: 'b2gt', type: 'b2', options: { account: 'acct123', key: 'typedkey' } } })
+    { remote: { name: 'b2gt', type: 'b2', options: { account: 'acct123', key: 'typedkey' } }, keepStoredSecrets: true })
 
   cloudOption(dlg, 'key').setValue('')
   cloudOption(dlg, 'account').setValue('x')
@@ -12217,6 +12220,25 @@ async function cloudChecks() {
     /Remote saved: b2gt$/.test(String((jobs[0] || {}).successMsg || '')), String((jobs[0] || {}).successMsg))
   ok('cloud(edit b2): the PUT went to the named remote',
     jobs[0] && jobs[0].path === '/cloud/remotes/b2gt', jobs[0] && jobs[0].path)
+
+  // --- cr3 (operator ruling 2026-11-14): removing a STORED secret ----------
+  {
+    const clearBox = dlg.down('#cloudClear_key')
+    ok('cloud(edit b2, cr3): the stored secret offers "Remove the stored value"', !!clearBox && clearBox.checked !== true)
+    ok('cloud(edit b2, cr3): the consequence line is hidden until it is ticked', dlg.down('#cloudClearNote_key').hidden === true)
+    clearBox.setValue(true)
+    await settle()
+    ok('cloud(edit b2, cr3): ticked, the consequence is said under the box',
+      dlg.down('#cloudClearNote_key').hidden === false
+        && /Saving removes the stored key from this node.s rclone.conf/.test(dlg.down('#cloudClearNote_key').html || ''),
+      dlg.down('#cloudClearNote_key').html)
+    ok('cloud(edit b2, cr3): b2 `key` is REQUIRED — with it removed, Save and Test wait (the required gate counts it gone)',
+      dlg.down('#submit').disabled === true && dlg.down('#cloudTestBtn').disabled === true)
+    clearBox.setValue(false)
+    await settle()
+    ok('cloud(edit b2, cr3): unticked, Save is live again and the note hides',
+      dlg.down('#submit').disabled === false && dlg.down('#cloudClearNote_key').hidden === true)
+  }
   created.windows.length = 0
 
   // --- (d3) a secret-by-NAME BOOL is never write-only ----------------------
@@ -12619,6 +12641,20 @@ async function cloudChecks() {
       && cloudOption(dlg, 'token').emptyText === '(unchanged)'
       && cloudRowOrder(dlg, 'cloudOptionsBasic').indexOf('token') >= 0,
     cloudOption(dlg, 'token') && cloudOption(dlg, 'token').emptyText)
+  // cr3 (operator ruling 2026-11-14): the stored token can be removed — the
+  // consequence is said, and Save sends null for it (the daemon removes it).
+  dlg.down('#cloudClear_token').setValue(true)
+  await settle()
+  ok('cloud(edit drive, cr3): removing the stored token says the remote must be authorised again',
+    /authorised again \(rclone authorize\)/.test(dlg.down('#cloudClearNote_token').html || '') && dlg.down('#cloudClearNote_token').hidden === false,
+    dlg.down('#cloudClearNote_token').html)
+  ok('cloud(edit drive, cr3): the token box is held empty, "(removed on save)"',
+    cloudOption(dlg, 'token').disabled === true && cloudOption(dlg, 'token').getValue() === '')
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-cloud-remote-save').handler()
+  await settle()
+  eq('cloud(edit drive, cr3): Save sends null for the removed secret, nothing else',
+    jobs[0] && jobs[0].body, { options: { token: null } })
   created.windows.length = 0
 
   // --- (g) encrypted: the mutations go, the fact is in the footer ----------
@@ -12677,6 +12713,11 @@ async function cloudChecks() {
     `grid.hidden=${win.down('#cloudRemotesGrid').hidden} note.hidden=${win.down('#cloudUnavailable').hidden}`)
   ok('cloud(load failure): the failure is named in an alert carrying rclone\'s own line, never swallowed',
     warnings.some(w => /alert: Load failed/.test(w) && /exit 1/.test(w)), warnings.join(' | '))
+  ok('cloud(load failure, cr3): the grid under the alert is marked unread — the line says it could not be read, never "No remotes configured"',
+    win.down('#cloudRemotesLoadError').hidden === false
+      && /Could not read the rclone remotes: rclone config dump failed: exit 1/.test(win.down('#cloudRemotesLoadError').html)
+      && /not an empty list/.test(win.down('#cloudRemotesLoadError').html),
+    win.down('#cloudRemotesLoadError').html)
   warnings.length = 0
   created.windows.length = 0
 
@@ -12807,6 +12848,34 @@ async function cloudTaskChecks() {
   const { ANAS, view, grid } = await openCloudTasks(routes)
   ok('cloud tasks: the view carries the menu entry', ANAS.views.cloud && ANAS.views.cloud.text === 'Cloud Sync')
   ok('cloud tasks: the grid loaded the saved task', grid && grid.getStore().getCount() === 1, String(grid && grid.getStore().getCount()))
+  ok('cloud tasks: a good read shows no load-failure line', view.down('#cloudTasksLoadError') && view.down('#cloudTasksLoadError').hidden === true)
+
+  // --- cr3: a failed read never reads as "No cloud sync tasks defined" -------
+  {
+    const failing = cloudTaskRoutes()
+    const err500 = new Error('cloud sync tasks could not be read: EACCES')
+    err500.status = 500
+    failing['GET /cloud/tasks'] = err500
+    const opened = await openCloudTasks(failing)
+    const line = opened.view.down('#cloudTasksLoadError')
+    ok('cloud tasks (cr3): a failed FIRST load says the list could not be read, with the reason — not an empty list',
+      line && line.hidden === false && /Could not read the cloud sync tasks: cloud sync tasks could not be read: EACCES/.test(line.html)
+        && /this is not an empty list/.test(line.html) && opened.grid.hidden !== true,
+      line && line.html)
+    failing['GET /cloud/tasks'] = { data: [CLOUD_TASK_VIEW] }
+    opened.view.fireEvent('activate', opened.view)
+    await settle()
+    ok('cloud tasks (cr3): the next good read clears the line and lists the task',
+      line.hidden === true && opened.grid.getStore().getCount() === 1)
+    failing['GET /cloud/tasks'] = err500
+    opened.view.fireEvent('activate', opened.view)
+    await settle()
+    ok('cloud tasks (cr3): a failed RELOAD keeps the last good rows, marked as from the last successful read',
+      line.hidden === false && /last successful read/.test(line.html) && opened.grid.getStore().getCount() === 1,
+      line && line.html)
+    // The two failed reads above warned on purpose; the checks below start clean.
+    warnings.length = 0
+  }
 
   // --- the Remotes… door opens the rclone.1 manager window ------------------
   created.windows.length = 0
@@ -12986,6 +13055,15 @@ async function cloudTaskChecks() {
     })
   validates('cloud tasks(edit): the payload validates against CloudSyncTaskRequest',
     CloudSyncTaskRequest, jobs[0] && jobs[0].body)
+  // Review of cr3, fix 3: the edit door keeps what a body omits, so a CLEARED
+  // bandwidth limit rides as null (it used to be left out — and kept at 8M).
+  editDlg.down('#cloudBwlimit').setValue('')
+  jobs.length = 0
+  editDlg.down('#submit').handler()
+  await settle()
+  ok('cloud tasks(edit, cr3): a cleared bandwidth limit is sent as null (clear), never omitted (keep)',
+    jobs[0] && Object.prototype.hasOwnProperty.call(jobs[0].body, 'bwlimit') && jobs[0].body.bwlimit === null,
+    JSON.stringify(jobs[0] && jobs[0].body))
   created.windows.length = 0
 
   // --- the SMB path hint (cloudproof.1 finding 4, 0.4.1) ---------------------

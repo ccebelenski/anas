@@ -1,10 +1,13 @@
 import type { AhrPool, BackupArchiveConsistency, CloudRunDetail, CloudRunRecentEvent, CloudSyncRunResult, CloudSyncTask } from '@anas/shared'
 import type { DeadlineOptions } from '../executor/deadline.js'
 import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
+import type { FindmntNode } from '../parsers/findmnt.js'
 import type { BackupSnapshotOptions, TakenSnapshot } from './backup-snapshots.js'
 import type { RcloneConfigPaths } from './rclone-config.js'
 import { readdir, stat } from 'node:fs/promises'
-import { CLOUD_STATS_INTERVAL_SECS } from '@anas/shared'
+import { posix } from 'node:path'
+import { CLOUD_STATS_INTERVAL_SECS, isPathWithin } from '@anas/shared'
+import { btrfsSubvolListArgs, parseBtrfsSubvolList } from '../parsers/btrfs-subvol-list.js'
 import { readAhrPools } from './ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from './backup-consistency.js'
 import { snapshotRoot } from './backup-expansion.js'
@@ -20,6 +23,7 @@ import {
 import { scanNestedFilesystems } from './nested-filesystems.js'
 import { RCLONE, rcloneBaseArgs, remoteSecretValues } from './rclone-config.js'
 import { assertNoSecretValues, maskSecretValues } from './secret-argv.js'
+import { probeSharePath } from './share-path.js'
 import { formatTransientCloudSnapshot, parseTransientCloudSnapshot } from './snapshot-naming.js'
 import { guardSourcePath, readSourceGuardFacts } from './source-guard.js'
 
@@ -126,12 +130,18 @@ export function rcloneDestination(task: Pick<CloudSyncTask, 'remote' | 'path'>):
  *
  * `dryRun` (the rclone.2 addendum's preview) appends `--dry-run` to the SAME
  * command a run would issue — one builder, no preview-specific argv copy.
+ *
+ * `excludes` (cr3 CLOUD-H3) are the nested-filesystem rules of a snapshot-mode
+ * run ({@link nestedFilesystemExcludes}), after the task's own; the run and
+ * its preview pass the same list. `oneFileSystem` (the preview of a
+ * snapshot-mode run only) keeps rclone on the source's own filesystem, which
+ * is what the snapshot the run reads holds.
  */
 export function buildRcloneArgs(
   task: Pick<CloudSyncTask, 'mode' | 'remote' | 'path' | 'bwlimit' | 'excludes'>,
   configFile: string,
   source: string,
-  opts: { dryRun?: boolean } = {},
+  opts: { dryRun?: boolean, excludes?: readonly string[], oneFileSystem?: boolean } = {},
 ): string[] {
   const args: string[] = [
     task.mode,
@@ -144,9 +154,340 @@ export function buildRcloneArgs(
     args.push('--bwlimit', task.bwlimit)
   for (const pattern of task.excludes)
     args.push('--exclude', pattern)
+  for (const pattern of opts.excludes ?? [])
+    args.push('--exclude', pattern)
+  if (opts.oneFileSystem)
+    args.push('--one-file-system')
   if (opts.dryRun)
     args.push('--dry-run')
   return args
+}
+
+// ---------------------------------------------------------------------------
+//  What the run reads (cr3 CLOUD-H3, CLOUD-M4, CLOUD-M6)
+// ---------------------------------------------------------------------------
+
+/** The characters rclone's filter glob gives a meaning; a backslash makes each literal. */
+const RCLONE_GLOB_SPECIAL_RE = /[\\*?[\]{}]/g
+
+/** `text` as a literal inside an rclone filter rule (every glob character escaped). */
+export function rcloneGlobLiteral(text: string): string {
+  return text.replace(RCLONE_GLOB_SPECIAL_RE, c => `\\${c}`)
+}
+
+/**
+ * The filter rules that keep the nested filesystems under `root` out of a
+ * snapshot-mode run (cr3 CLOUD-H3). A snapshot holds ONE filesystem: each
+ * nested one is an EMPTY directory inside it, so a `sync` from the snapshot
+ * deleted the destination's copy of every nested filesystem while the
+ * preview, reading the live tree, said "would delete 0". rclone neither reads
+ * nor deletes what a filter excludes (unless `--delete-excluded`, which ANAS
+ * never passes), so one anchored rule per nested filesystem makes the run do
+ * what every screen says in snapshot mode — nested filesystems are not
+ * included — and leaves their copies at the destination as they are. (A LIVE
+ * run reads through them and includes them: {@link nestedProgressLine}.) Paths outside `root`
+ * name nothing under the source and are dropped.
+ */
+export function nestedFilesystemExcludes(root: string, nested: readonly string[]): string[] {
+  const rules = new Set<string>()
+  for (const path of nested) {
+    const rel = posix.relative(root, path)
+    if (rel === '' || rel === '..' || rel.startsWith('../') || posix.isAbsolute(rel))
+      continue
+    rules.add(`/${rcloneGlobLiteral(rel)}/**`)
+  }
+  const sorted = [...rules]
+  sorted.sort()
+  return sorted
+}
+
+/** The top-level entries of the source that are nested filesystems (their own rule excludes them). */
+function excludedTopLevelNames(root: string, nested: readonly string[]): Set<string> {
+  const names = new Set<string>()
+  for (const path of nested) {
+    const rel = posix.relative(root, path)
+    if (rel !== '' && !rel.startsWith('..') && !rel.includes('/'))
+      names.add(rel)
+  }
+  return names
+}
+
+/**
+ * What a cloud sync of `source` reads, decided ONCE for the run and its
+ * preview alike (cr3 CLOUD-H3 / CLOUD-M4).
+ */
+export interface CloudSourceView {
+  /**
+   * The path the kernel reaches for the source — the source guard's bounded
+   * `realpath -e` — or the path as written when that did not resolve. The
+   * consistency and the nested filesystems are judged HERE (cr3 CLOUD-M4: a
+   * symlinked source was snapshotted on the filesystem its TEXT names, while
+   * rclone followed the link to the live data behind it).
+   */
+  real: string
+  consistency: BackupArchiveConsistency
+  /**
+   * The nested filesystems under `real`, for DISPLAY (the progress line, the
+   * result, the notification): the bounded boundary walk's list, joined in
+   * snapshot mode with {@link excluded}.
+   */
+  nested: string[]
+  /** Why the boundary walk could not see everything (a display WARNING, never a refusal), or null. */
+  nestedUnknown: string | null
+  /** The run reads a transient snapshot (and so excludes the nested filesystems). */
+  snapshot: boolean
+  /**
+   * Snapshot mode: every nested filesystem under `real`, from COMPLETE,
+   * hang-proof reads (review of cr3, finding 1): the mount table (every
+   * mount target under the source) plus the source dataset's descendant
+   * datasets (`zfs list`), or the AHR pool's nested subvolumes (`btrfs
+   * subvolume list`). Never the bounded directory walk, whose depth and time
+   * caps would refuse a healthy deep tree for ever.
+   */
+  excluded: string[]
+  /** Why {@link excluded} could not be read (snapshot mode), or null. A sync is refused on it. */
+  excludedUnknown: string | null
+  /**
+   * A nested filesystem whose name rclone cannot be told to leave out (a
+   * control character: rclone encodes those names, so the generated rule
+   * would not match) — the sentence naming it, or null. A sync is refused.
+   */
+  unexcludable: string | null
+  /** The filter rules {@link nestedFilesystemExcludes} adds — snapshot mode only. */
+  excludes: string[]
+  /** The AHR pools the derivation read (the transient take resolves its pool here). */
+  ahrPools: AhrPool[]
+}
+
+/** A path inside a ZFS snapshot directory (an automounted snapshot — never a nested filesystem of the tree). */
+const ZFS_SNAPDIR_RE = /(?:^|\/)\.zfs\/snapshot(?:\/|$)/
+
+/** A control character (or DEL): rclone's local backend encodes such a name. */
+// eslint-disable-next-line no-control-regex -- the control characters ARE the thing detected
+const CONTROL_CHAR_RE = /[\x00-\x1F\x7F]/
+
+const BTRFS = '/usr/bin/btrfs'
+const ZFS_CANMOUNT_VALUES: ReadonlySet<string> = new Set(['on', 'off', 'noauto'])
+const SUBVOL_DATA_PREFIX = '@data/'
+
+const ZFS = '/usr/sbin/zfs'
+/** The ZFS filesystem list the exclusion reads: name, mountpoint, canmount — tab separated (-H). */
+export const ZFS_FILESYSTEMS_ARGS = ['list', '-H', '-o', 'name,mountpoint,canmount', '-t', 'filesystem'] as const
+
+/**
+ * `zfs list` of every filesystem, CHECKED (second review, E1): exit 0 with a
+ * row that does not parse (three tab-separated fields, a canmount of on,
+ * off or noauto), a non-zero exit, or a spawn that failed (ENOENT included)
+ * is a FAILED complete read — never a short set.
+ */
+export async function readZfsFilesystemsChecked(executor: CommandExecutor): Promise<{ rows: { name: string, mountpoint: string, canmount: string }[] } | { problem: string }> {
+  let r
+  try {
+    r = await executor.exec(ZFS, [...ZFS_FILESYSTEMS_ARGS])
+  }
+  catch (err) {
+    return { problem: `zfs list could not run: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  if (r.exitCode !== 0)
+    return { problem: `zfs list exited ${r.exitCode}${r.stderr.trim() ? `: ${r.stderr.trim().split('\n')[0]}` : ''}` }
+  const rows: { name: string, mountpoint: string, canmount: string }[] = []
+  for (const line of r.stdout.split('\n')) {
+    if (line === '')
+      continue
+    const f = line.split('\t')
+    if (f.length !== 3 || f[0] === '' || f[1] === '' || !ZFS_CANMOUNT_VALUES.has(f[2]!))
+      return { problem: `zfs list answered a row that does not parse: ${JSON.stringify(line.slice(0, 120))}` }
+    rows.push({ name: f[0]!, mountpoint: f[1]!, canmount: f[2]! })
+  }
+  return { rows }
+}
+
+/** The nested filesystems a snapshot of `real` leaves out, from the complete reads. */
+async function readExcludedNested(
+  executor: CommandExecutor,
+  real: string,
+  consistency: BackupArchiveConsistency,
+  facts: { mounts: Map<string, FindmntNode>, ahrPools: AhrPool[] },
+): Promise<{ excluded: { path: string, name: string }[], problem: string | null }> {
+  const out = new Map<string, string>()
+  const under = (path: string): boolean => path !== real && isPathWithin(real, path) && !ZFS_SNAPDIR_RE.test(path)
+  // 1. The mount table (read from /proc/self/mountinfo by findmnt: it never
+  //    hangs, and it lists every mount, however deep).
+  for (const [target, node] of facts.mounts) {
+    if (under(target))
+      out.set(target, node.source || target)
+  }
+  // 2. The dataset tree / the pool's subvolumes: a nested filesystem that is
+  //    not mounted right now (a locked encrypted child, one that failed to
+  //    mount) is still not in the snapshot, and its copy at the destination
+  //    must survive a sync too.
+  if (consistency.backend === 'zfs' && consistency.target) {
+    const table = await readZfsFilesystemsChecked(executor)
+    if ('problem' in table)
+      return { excluded: [], problem: table.problem }
+    // Third review (D3): a list without the source's OWN dataset is not a
+    // complete read (an empty answer included) — never a short set.
+    if (!table.rows.some(r => r.name === consistency.target))
+      return { excluded: [], problem: `zfs list answered no row for the source's dataset ${consistency.target}` }
+    // Second review (E1): by MOUNTPOINT inside the source, for EVERY dataset
+    // the list returns — a descendant or not, mounted or not. A dataset is a
+    // separate filesystem at its mountpoint when it is, or would be, mounted
+    // there: canmount=on and canmount=noauto are excluded; canmount=off is
+    // NOT (it never mounts, so its directory holds the PARENT's data, which
+    // the snapshot carries). A non-path mountpoint (legacy, none, -) names no
+    // place: a legacy dataset that IS mounted is in the mount table above.
+    for (const row of table.rows) {
+      if (row.canmount !== 'off' && row.mountpoint.startsWith('/') && under(row.mountpoint))
+        out.set(row.mountpoint, row.name)
+    }
+  }
+  else if (consistency.backend === 'ahr' && consistency.target) {
+    const pool = facts.ahrPools.find(p => p.name === consistency.target)
+    if (!pool)
+      return { excluded: [], problem: `AHR pool '${consistency.target}' is no longer resolvable` }
+    let listed
+    try {
+      listed = await executor.exec(BTRFS, btrfsSubvolListArgs(pool.mountpoint))
+    }
+    catch (err) {
+      return { excluded: [], problem: `btrfs subvolume list failed: ${err instanceof Error ? err.message : String(err)}` }
+    }
+    if (listed.exitCode !== 0)
+      return { excluded: [], problem: `btrfs subvolume list exited ${listed.exitCode}: ${listed.stderr.trim().split('\n')[0] ?? ''}` }
+    for (const sub of parseBtrfsSubvolList(listed.stdout)) {
+      if (!sub.path.startsWith(SUBVOL_DATA_PREFIX))
+        continue
+      const path = posix.join(pool.mountpoint, sub.path.slice(SUBVOL_DATA_PREFIX.length))
+      if (under(path))
+        out.set(path, `${pool.name}:${sub.path}`)
+    }
+  }
+  const excluded = Array.from(out, ([path, name]) => ({ path, name }))
+  excluded.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  return { excluded, problem: null }
+}
+
+/**
+ * Read the view: the consistency derivation on the real path (printed with
+ * the configured one), in snapshot mode the COMPLETE nested set the run
+ * excludes, and — when `walk` is asked for (the run, whose progress names the
+ * nested filesystems in either mode) — the bounded boundary walk, for display
+ * only. Never throws: what could not be read says so in its own field.
+ */
+export async function readCloudSourceView(
+  executor: CommandExecutor,
+  source: string,
+  real: string,
+  consistencyOptions: { pveStorageCfg?: string } = {},
+  opts: { walk?: boolean } = {},
+): Promise<CloudSourceView> {
+  let walked: string[] = []
+  let nestedUnknown: string | null = null
+  if (opts.walk ?? true) {
+    try {
+      const scan = await scanNestedFilesystems(executor, real, { includeNested: 'none' })
+      walked = scan.nested.map(n => n.path)
+      if (!scan.exists || scan.truncated)
+        nestedUnknown = scan.warnings.join('; ') || `the nested-filesystem scan of ${real} did not finish`
+    }
+    catch (err) {
+      nestedUnknown = `the nested-filesystem scan of ${real} could not run: ${err instanceof Error ? err.message : String(err)}`
+    }
+  }
+  const facts = await readConsistencyFacts(executor, readAhrPools, consistencyOptions)
+  const consistency = deriveConsistency(real, facts, source)
+  const snapshot = consistency.consistency === 'snapshot' && !!consistency.target
+  let excluded: { path: string, name: string }[] = []
+  let excludedUnknown: string | null = null
+  if (snapshot) {
+    const read = await readExcludedNested(executor, real, consistency, facts)
+    excluded = read.excluded
+    excludedUnknown = read.problem
+  }
+  const bad = excluded.find(e => CONTROL_CHAR_RE.test(posix.relative(real, e.path)))
+  const unexcludable = bad
+    ? `${source} syncs from a snapshot, and the nested filesystem ${JSON.stringify(bad.path)} (${bad.name}) has a control `
+    + `character in its name, which rclone encodes - the run cannot leave it out, and a sync would delete its copy at `
+    + `the destination, so the run is refused. Rename that mountpoint, or use copy mode`
+    : null
+  const display = new Set<string>([...walked, ...excluded.map(e => e.path)])
+  const nested = [...display]
+  nested.sort()
+  return {
+    real,
+    consistency,
+    nested,
+    nestedUnknown,
+    snapshot,
+    excluded: excluded.map(e => e.path),
+    excludedUnknown,
+    unexcludable,
+    excludes: snapshot ? nestedFilesystemExcludes(real, excluded.map(e => e.path)) : [],
+    ahrPools: facts.ahrPools,
+  }
+}
+
+/**
+ * What happens to the nested filesystems under a source, said per mode (cr3,
+ * operator ruling 2026-11-14 on the live-mode question: the run's coverage
+ * stays, every message tells the truth). A SNAPSHOT holds one filesystem: the
+ * nested ones are not included, and the run excludes them, so their copies at
+ * the destination are left as they are. A LIVE copy reads through them: they
+ * are included. One wording for the run's progress line and the notification.
+ */
+export const NESTED_SNAPSHOT_NOTE = 'a snapshot holds one filesystem; their copies at the destination are left as they are'
+export const NESTED_LIVE_NOTE = 'a live copy reads through them'
+
+/** The run's progress line naming the nested filesystems, per mode. */
+export function nestedProgressLine(source: string, nested: readonly string[], snapshot: boolean): string {
+  return snapshot
+    ? `${nested.length} nested filesystem(s) under ${source} are not included (${NESTED_SNAPSHOT_NOTE}): ${nested.join(' ')}`
+    : `${nested.length} nested filesystem(s) under ${source} are included (${NESTED_LIVE_NOTE}): ${nested.join(' ')}`
+}
+
+/**
+ * The refusal of a snapshot-mode SYNC whose nested filesystems could not be
+ * listed from the complete reads (cr3 CLOUD-H3, as corrected by the review):
+ * each one missed is an empty directory in the snapshot, and a sync would
+ * delete its copy at the destination. A copy never deletes, so only a sync is
+ * refused. `why` names the read that failed (the mount table, `zfs list`,
+ * `btrfs subvolume list`) — never the bounded walk's caps.
+ */
+export function nestedUnknownRefusal(source: string, why: string): string {
+  return `${source} syncs from a snapshot, which holds no nested filesystem, and the nested filesystems `
+    + `under it could not be listed (${why}) - a sync would delete the destination's copy of each, `
+    + `so the run is refused until that read works. Use copy mode meanwhile`
+}
+
+/**
+ * Why a snapshot-mode SYNC of this view must not run, or null: the complete
+ * nested read failed ({@link nestedUnknownRefusal}), or a nested name cannot
+ * be left out. A copy never deletes and is never refused here. The run and
+ * the preview ask this ONE question.
+ */
+export function snapshotSyncRefusal(view: CloudSourceView, source: string, mode: string): string | null {
+  if (!view.snapshot || mode !== 'sync')
+    return null
+  if (view.excludedUnknown !== null)
+    return nestedUnknownRefusal(source, view.excludedUnknown)
+  return view.unexcludable
+}
+
+/**
+ * cr3 CLOUD-M6: does the source's filesystem answer at all? The bounded
+ * `timeout 2 stat -f` the shares family probes with (share-path.ts), run
+ * BEFORE any in-process read of the source: a source on a hard NFS mount
+ * whose server is down passes the unmounted-mount guard (it IS mounted), and
+ * an in-process `stat` would then block one of libuv's four pool threads
+ * until the server came back. Only `not-answering` refuses; every other
+ * answer leaves the existence checks to say what is wrong.
+ */
+export async function sourceNotAnsweringRefusal(executor: CommandExecutor, source: string): Promise<string | null> {
+  const probe = await probeSharePath(executor, source)
+  if (probe.state !== 'not-answering')
+    return null
+  return `${source} did not answer (${probe.detail ?? 'no reply'}) - the filesystem it is on is not responding, `
+    + `so it is not read`
 }
 
 // ---------------------------------------------------------------------------
@@ -820,12 +1161,18 @@ export interface CloudRunDeps {
  * truthful.
  *
  * The order is load-bearing:
- *   1. source guard (configured-but-unmounted) and the existence check — before
- *      anything is read, and before a `sync` can see an empty mountpoint;
- *   2. the empty-source refusal, `sync` only;
- *   3. the boundary scan (informational — nested filesystems are NOT included);
- *   4. consistency derivation, then the transient snapshot: sweep this task's
- *      own stale ones first, take, point rclone at the snapshot path;
+ *   1. source guard (configured-but-unmounted), the liveness probe (cr3
+ *      CLOUD-M6) and the existence check — before anything is read in
+ *      process, and before a `sync` can see an empty mountpoint;
+ *   2. the empty-source refusal, `sync` only, on the live tree;
+ *   3. the boundary scan and the consistency derivation, both on the source's
+ *      REAL path ({@link readCloudSourceView}, cr3 CLOUD-M4); a snapshot-mode
+ *      run excludes every nested filesystem (cr3 CLOUD-H3), and a snapshot-mode
+ *      SYNC whose scan could not see everything is refused;
+ *   4. the transient snapshot: sweep this task's own stale ones first, take,
+ *      point rclone at the snapshot path; a `sync` judges emptiness again on
+ *      the tree it will read (the snapshot root, less the excluded nested
+ *      filesystems);
  *   5. ONE rclone invocation, its JSON log read live for progress;
  *   6. destroy the transient in a `finally` — success, failure or throw alike.
  */
@@ -849,10 +1196,17 @@ export async function runCloudSync(
   const refusal = guardSourcePath(task.source, guardFacts)
   if (refusal)
     throw new Error(refusal)
+  // cr3 CLOUD-M6: a mounted filesystem that does not answer (a hard NFS mount
+  // whose server is down) is refused here, in a bounded child, before the
+  // in-process `stat` below could block a libuv pool thread on it.
+  const dead = await sourceNotAnsweringRefusal(executor, task.source)
+  if (dead)
+    throw new Error(dead)
 
   // The source must be a DIRECTORY that exists and can be listed. A `stat` is
-  // safe here BECAUSE the unmounted-mount guard already ran — that is the one
-  // case where the path could sit on a filesystem that is not there.
+  // safe here BECAUSE the unmounted-mount guard and the liveness probe already
+  // ran — the cases where the path could sit on a filesystem that is not there
+  // or does not answer.
   const stats = await stat(task.source).catch((err: NodeJS.ErrnoException) => err)
   if (stats instanceof Error || !stats.isDirectory())
     throw new Error(missingSourceRefusal(task.source))
@@ -868,25 +1222,26 @@ export async function runCloudSync(
   if (task.mode === 'sync' && entries.length === 0)
     throw new Error(emptySourceRefusal(task.source, deps.paths.configFile, destination))
 
-  // ---- 3. What will NOT come along ---------------------------------------
-  // Informational only, and fail-open: a scan problem never fails a run. A
-  // snapshot captures ONE filesystem, so every nested one under the source is
-  // left out — the dialog says so before save, and the run says so again.
-  let nested: string[] = []
-  try {
-    const scan = await scanNestedFilesystems(executor, task.source, { includeNested: 'none' })
-    nested = scan.nested.map(n => n.path)
-  }
-  catch {
-    // fail open — the run is not about the scan
-  }
+  // ---- 3. What the run reads ---------------------------------------------
+  // cr3 CLOUD-M4: judged on the REAL path — the source guard's bounded
+  // `realpath -e` (the path as written when it did not resolve) — and printed
+  // with the configured one, as backup does (cr.64b2-iii (O)).
+  const view = await readCloudSourceView(executor, task.source, guardFacts.realpaths.get(task.source) ?? task.source, deps.consistencyOptions ?? {})
+  const nested = view.nested
   if (nested.length)
-    updateProgress(`${nested.length} nested filesystem(s) under ${task.source} are not included: ${nested.join(' ')}`)
-
-  // ---- 4. Consistency + the transient snapshot ---------------------------
-  const facts = await readConsistencyFacts(executor, readAhrPools, deps.consistencyOptions ?? {})
-  const consistency = deriveConsistency(task.source, facts)
+    updateProgress(nestedProgressLine(task.source, nested, view.snapshot))
+  const consistency = view.consistency
   updateProgress(`source consistency: ${consistency.consistency} - ${consistency.reason}`)
+  // cr3 CLOUD-H3 (as corrected by the review): a snapshot-mode sync is
+  // refused only when the COMPLETE nested read failed, or a nested name
+  // cannot be left out. The bounded walk's caps are a display warning.
+  const refusedSync = snapshotSyncRefusal(view, task.source, task.mode)
+  if (refusedSync)
+    throw new Error(refusedSync)
+  if (view.snapshot && view.excludedUnknown !== null)
+    warnings.push(`the nested filesystems under ${task.source} could not be listed (${view.excludedUnknown})`)
+  if (view.nestedUnknown !== null)
+    warnings.push(`the nested-filesystem list shown for ${task.source} may be short (${view.nestedUnknown})`)
   // The boundary between the read-only probes and the first mutation: past
   // here a cancel leaves nothing taken — the snapshot below never happens.
   deps.checkCancel?.('the transient snapshot')
@@ -900,8 +1255,21 @@ export async function runCloudSync(
   let result: CloudSyncRunResult
 
   try {
-    const plan = await prepareSource(executor, deps, consistency, facts.ahrPools, now, updateProgress, taken, warnings)
-    const args = buildRcloneArgs(task, deps.paths.configFile, plan.source)
+    const plan = await prepareSource(executor, deps, consistency, view.ahrPools, now, updateProgress, taken, warnings)
+    // cr3 CLOUD-H3: the empty-source guard judged the LIVE tree above; a sync
+    // from a snapshot is judged again on the tree rclone will read — the
+    // snapshot root, less the nested filesystems it excludes (each an empty
+    // directory there). A source whose whole content is nested filesystems
+    // passed the live check and would sync as an empty tree.
+    if (task.mode === 'sync' && plan.snapshot) {
+      const read = await readdir(plan.source).catch((err: NodeJS.ErrnoException) => err)
+      if (read instanceof Error)
+        throw new Error(`${plan.source} (the snapshot of ${task.source}) could not be listed: ${read.message}`)
+      const skip = excludedTopLevelNames(view.real, view.excluded)
+      if (!read.some(name => !skip.has(name)))
+        throw new Error(emptySourceRefusal(task.source, deps.paths.configFile, destination))
+    }
+    const args = buildRcloneArgs(task, deps.paths.configFile, plan.source, { excludes: view.excludes })
     // The executor-side argv backstop, uniform with every other rclone call
     // ANAS makes. Nothing secret is in scope here (see `deps.secrets`), so it
     // normally has nothing to check — which is the point of a backstop.

@@ -166,3 +166,39 @@ export function validateOwnClient(backend: string, options: Record<string, strin
     return { ok: false, message: OWN_CLIENT_PAIR_ERROR }
   return { ok: true }
 }
+
+/**
+ * What an UPDATE leaves the own-client pair as, judged by
+ * {@link validateOwnClient} (cr3 CLOUD-M5). The update door receives the
+ * dialog's DIFF, not the remote: an unchanged `client_id` is absent, and a
+ * secret is write-only — a blank or absent `client_secret` keeps the stored
+ * one, which the API names only in `secretsSet`. Judging the diff alone
+ * refused every secret rotation and every token re-paste of a remote with its
+ * own client ("must be set together"), and the dialog's gate did the same
+ * with the blank secret field, so such a remote could not be edited at all.
+ *
+ * The rule, the same at both boundaries: `client_id` is the update's value
+ * when the update carries the key ('' removes it), else the stored one;
+ * `client_secret` is set when the update types one, or when the remote has
+ * one stored and the update does not clear it (`null`; '' is "unchanged").
+ * Clearing both returns the remote to rclone's built-in client; clearing the
+ * secret alone while the id stays is the pair refusal.
+ */
+export function validateOwnClientUpdate(
+  backend: string,
+  update: Record<string, string | null>,
+  stored: { options: Record<string, string>, secretsSet: readonly string[] },
+): OwnClientVerdict {
+  // `null` clears (cr3, operator ruling 2026-11-14): a cleared id is empty,
+  // and a cleared secret is no longer the stored one.
+  const id = Object.hasOwn(update, 'client_id') ? update.client_id ?? '' : stored.options.client_id ?? ''
+  // Review of cr3, fix 8: ONE rule with the writer — a value is "unchanged"
+  // only when it is exactly '' (the writer writes anything else, spaces
+  // included). Whitespace-only is therefore TYPED, and the pair rule (which
+  // trims) judges it empty: refused, never written.
+  const typed = (update.client_secret ?? '') !== ''
+  const secret = typed || (update.client_secret !== null && stored.secretsSet.includes('client_secret'))
+  // The stored secret's VALUE is never read here: the rule only asks whether
+  // one is set, so a placeholder stands in for it.
+  return validateOwnClient(backend, { client_id: id, client_secret: secret ? (typed ? update.client_secret! : 'stored') : '' })
+}

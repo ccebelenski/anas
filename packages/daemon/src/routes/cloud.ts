@@ -26,20 +26,27 @@ import {
   CloudSyncPreviewTask as CloudSyncPreviewTaskSchema,
   CloudSyncRunRequest,
   CloudSyncTaskRequest,
+  CloudSyncTaskUpdateFields,
+  cloudTaskUpdateBody,
+  forbiddenMessage,
+  mergeCloudSyncTaskUpdate,
+  privilegeSatisfied,
   validateOwnClient,
+  validateOwnClientUpdate,
 } from '@anas/shared'
+import { currentRequestAuthority, JobForbiddenError } from '../jobs/authority.js'
 import { assertRunNotCancelled, ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError, JobFailedDespiteCancelError } from '../jobs/queue.js'
 import { READ_JOB_OPERATIONS, readJobCancel } from '../jobs/read-jobs.js'
+import { listSections, parseRcloneConf } from '../parsers/rclone-conf.js'
 import { directFromClientRefusal, TASK_RUNNER_USER } from '../runner-poll.js'
 import { ConfirmStore } from '../safety/confirm.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, sendRefusal, sourcePathsMoved, taskClaim, unheldClaimsRefusal } from '../safety/guard.js'
 import { readAhrPools } from '../services/ahr-topology.js'
-import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
 import { checkPreviewSource, cloudPreviewDeps, PreviewRefusal, runPreview } from '../services/cloud-preview.js'
 import { describeChange, describeTasks, destinationChanges, tasksReachingRemote } from '../services/cloud-retarget.js'
-import { runCloudSync } from '../services/cloud-runner.js'
+import { readCloudSourceView, runCloudSync } from '../services/cloud-runner.js'
 import {
   clearCancelledRunFailedState,
   CLOUD_UNIT_KIND,
@@ -61,14 +68,15 @@ import {
   superviseRun,
   taskFileExists,
   tasksReferencingRemote,
+  TaskStoreUnreadableError,
   validateSchedule,
   writeTaskUnits,
 } from '../services/cloud-units.js'
 import { ConfigConflictError } from '../services/config-writer.js'
-import { scanNestedFilesystems } from '../services/nested-filesystems.js'
-import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, remoteSectionIdentity, remotesReferencing, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
+import { carriesViewMarker, normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, remoteSectionIdentity, remotesReferencing, remotesWithHiddenReferences, removeRemote, trimProviders, viewMarkerRefusal, whitespaceSecretRefusal, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
 import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
+import { readSourceGuardFacts } from '../services/source-guard.js'
 import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
@@ -179,6 +187,53 @@ function remoteView(name: string, readCurrent: () => Promise<RcloneConfigRead>):
 }
 
 /**
+ * Third review: a remote whose reference option the views HIDE may point at
+ * `name` — that cannot be read, so a delete is refused, naming each such
+ * remote and option. Null when there is none.
+ */
+function hiddenReferenceRefusal(remotes: CloudRemote[], name: string): string | null {
+  const hidden = remotesWithHiddenReferences(remotes, name)
+  if (hidden.length === 0)
+    return null
+  return `whether remote '${name}' is referenced cannot be told: ${hidden.map(h => `remote '${h.remote}' option '${h.key}'`).join(', ')} carries inline settings, which are hidden - `
+    + 'rewrite it as plain remote:path references, or remove it first. This refusal has no confirm bypass.'
+}
+
+/**
+ * The INLINE (unsaved form) task preview's job operation (cr3, coordinator's
+ * decision on the second review): not a `read.` operation, so the queue's
+ * backstop and the cancel door hold it to Sys.Modify. A saved task's preview
+ * stays the read job `read.cloud.preview`.
+ */
+export const INLINE_PREVIEW_OPERATION = 'cloud.task.preview'
+
+/**
+ * The UNSAVED remote Test's job operation (review of cr3, C1 depth): not a
+ * `read.` operation — options a requester typed can act on the node — so
+ * the queue's backstop and the cancel door hold it to Sys.Modify.
+ */
+export const UNSAVED_TEST_OPERATION = 'cloud.remote.test'
+
+/**
+ * cr3 CLOUD-C1: the refusal of an UNSAVED remote Test for a request without
+ * `Sys.Modify` on `/`, or null when it may proceed. The same error (and so the
+ * same 403 FORBIDDEN sentence, naming `Sys.Modify`) the job queue answers for
+ * any non-read job: the server's error handler turns it into the reply.
+ * `null` authority is the daemon's own work — no HTTP request reached here.
+ */
+function unsavedTestRefusal(fallbackUser: string): JobForbiddenError | null {
+  const authority = currentRequestAuthority()
+  if (authority === null)
+    return null
+  if (authority.privileges !== null && privilegeSatisfied(authority.privileges, 'Sys.Modify'))
+    return null
+  const held = authority.privileges === null
+    ? (authority.problem ?? 'no privileges')
+    : `holds ${authority.privileges.length > 0 ? authority.privileges.join(',') : 'no privilege'} on /`
+  return new JobForbiddenError(authority.user ?? fallbackUser, 'Sys.Modify', UNSAVED_TEST_OPERATION, `an unsaved remote's options can act on the node (${held})`)
+}
+
+/**
  * Default availability probe: is the whitelisted binary there and executable?
  * Stateless — asked fresh every time, never cached (Principle 11). The dev
  * mock overrides it (nothing is ever really spawned there), and the tests do
@@ -235,6 +290,17 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
   const referencingTasks = opts.referencingTasks ?? (name => tasksReferencingRemote(systemdDir, name))
   const confirmStore = opts.confirmStore ?? new ConfirmStore()
 
+  /**
+   * cr3 CORE-L9: is this request bounded as a READER (no Sys.Modify)? Null
+   * authority is the daemon's own work.
+   */
+  function boundedReader(): { user: string | undefined } | null {
+    const authority = currentRequestAuthority()
+    if (authority === null || (authority.privileges !== null && privilegeSatisfied(authority.privileges, 'Sys.Modify')))
+      return null
+    return { user: authority.user }
+  }
+
   /** Refuse before the call: the availability probe (no binary → the sentinel). */
   async function requireRclone(): Promise<void> {
     if (!(await available()))
@@ -279,6 +345,13 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       if (err instanceof RcloneNotInstalledError || (err as NodeJS.ErrnoException).code === 'ENOENT') {
         reply.code(503)
         await reply.send({ error: { code: 'UNAVAILABLE', message: RCLONE_NOT_INSTALLED } })
+        return undefined
+      }
+      // cr3 CLOUD-L8: which tasks use a remote could not be read — the
+      // delete refusal and the retarget confirm fail closed, naming why.
+      if (err instanceof TaskStoreUnreadableError) {
+        reply.code(503)
+        await reply.send({ error: { code: 'UNAVAILABLE', message: err.message } })
         return undefined
       }
       throw err
@@ -391,6 +464,14 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: ownClient } }
     }
+    // Second review of cr3: a whitespace-only secret, and the redaction
+    // marker on a NEW remote (nothing stored to keep), are refused here.
+    const createRefusal = whitespaceSecretRefusal(input.options, input.type)
+      ?? (Object.values(input.options).some(v => carriesViewMarker(v)) ? `an option carries the marker a hidden or redacted view shows - a new remote has no stored value to keep; type the value` : null)
+    if (createRefusal !== null) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: createRefusal } }
+    }
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -448,13 +529,31 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid remote update: ${zodIssue(parsed.error)}` } }
     }
-    const input = parsed.data
-    const normalized = normalizeTokenOption(input.options)
+    // cr3 (operator ruling 2026-11-14): `null` CLEARS an option, a stored
+    // secret included. The values to write and the keys to clear are split
+    // here; the token normalisation reads only what is written.
+    const cleared = Object.entries(parsed.data.options).filter(([, v]) => v === null).map(([k]) => k).sort()
+    const setOptions: Record<string, string> = {}
+    for (const [k, v] of Object.entries(parsed.data.options)) {
+      if (v !== null)
+        setOptions[k] = v
+    }
+    const normalized = normalizeTokenOption(setOptions)
     if (normalized === null) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: OAUTH_TOKEN_ERROR } }
     }
-    input.options = normalized
+    {
+      const blank = whitespaceSecretRefusal(normalized, '')
+      if (blank !== null) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: blank } }
+      }
+    }
+    /** The update as judged: the values written, `null` for each key cleared. */
+    const input: { options: Record<string, string | null> } = {
+      options: { ...normalized, ...Object.fromEntries(cleared.map(k => [k, null])) },
+    }
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -474,8 +573,13 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         reply.code(404).send({ error: { code: 'NOT_FOUND', message: `remote '${name}' does not exist` } })
         return null
       }
-      // The update door judges the fields against the STORED backend's type.
-      const ownClient = ownClientRefusal(existing.type, input.options)
+      // The update door judges the fields against the STORED backend's type —
+      // and (cr3 CLOUD-M5) the pair the update LEAVES: the body is the
+      // dialog's diff, so an unchanged client_id is absent and a stored
+      // client_secret is named only in secretsSet. Judging the diff alone
+      // refused every secret rotation of a remote with its own client.
+      const ownVerdict = validateOwnClientUpdate(existing.type, input.options, existing)
+      const ownClient = ownVerdict.ok ? null : ownVerdict.message
       if (ownClient !== null) {
         reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: ownClient } })
         return null
@@ -493,6 +597,17 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       if (section === null) {
         reply.code(409).send({ error: { code: 'CONFLICT', message: `remote '${name}' could not be bound to its section in rclone.conf — refusing the update` } })
         return null
+      }
+      // Third review: a value sent back from a HIDDEN or redacted view is kept
+      // only when it is that view unchanged; anything else is refused HERE,
+      // before a job exists ("re-enter the whole value").
+      const storedRaw = listSections(parseRcloneConf(current.text)).find(sec => sec.name === name)?.values ?? {}
+      for (const [key, value] of Object.entries(normalized)) {
+        const refusal = viewMarkerRefusal(key, value, storedRaw[key])
+        if (refusal !== null) {
+          reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: refusal } })
+          return null
+        }
       }
       // Story ident.4 (b), audit #15: an update that changes WHERE the remote
       // points re-points every task syncing through it — directly or through
@@ -518,7 +633,11 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       // stay non-secret), the rest of the option values would be secrets, and
       // signing one would echo it into the 409 — so a secret rotation with the
       // same keys is the same request.
-      const changes = destinationChanges(existing, input.options, catalog)
+      // A cleared destination option is a removal ('' in the change list).
+      // Judged on the STORED values (a hidden view reads one marker whatever
+      // it holds); a value kept from its view is no change.
+      const asWritten = Object.fromEntries(Object.entries(normalized).map(([k, v]) => [k, carriesViewMarker(v) ? (storedRaw[k] ?? v) : v]))
+      const changes = destinationChanges(existing, { ...asWritten, ...Object.fromEntries(cleared.map(k => [k, ''])) }, catalog, storedRaw)
       const pass: GuardPass<CloudRemote> = {
         object: existing,
         bound: { id: { remote: name, section } },
@@ -570,12 +689,13 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
 
     // The write needs a CloudRemoteWrite: the name + the EXISTING type (the
     // service re-checks it under the lock — a drift cannot slip through).
-    const write: CloudRemoteWrite = { name, type: precheck.type, options: input.options }
+    const write: CloudRemoteWrite = { name, type: precheck.type, options: normalized }
     const { door } = precheck
     const update = (): Promise<CloudRemote> => writeRemote(paths, executor, write, {
       providers: precheck.catalog,
       mode: 'update',
       expectSection: door.section,
+      ...(cleared.length ? { clear: cleared } : {}),
     })
     // cr.64cr item 5 (ruling (j)) and cr.64b2-ii step 4: the job re-reads the
     // remote and re-gates the bound identity before it writes (`guarded`), and
@@ -606,15 +726,23 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (!identity)
       return
 
-    const precheck = await guard503(reply, async (): Promise<boolean | null> => {
+    const precheck = await guard503(reply, async (): Promise<{ existing: CloudRemote, section: string } | null> => {
       await requireRclone()
       const current = await readConfig(paths, executor)
       if (current.encrypted) {
         refuseEncrypted(reply)
         return null
       }
-      if (!current.remotes.some(r => r.name === name)) {
+      const existing = current.remotes.find(r => r.name === name)
+      if (!existing) {
         reply.code(404).send({ error: { code: 'NOT_FOUND', message: `remote '${name}' does not exist` } })
+        return null
+      }
+      // cr3 CLOUD-L9: the delete is bound to the section the route read —
+      // name + remoteSectionIdentity, as the update door is (cr.64b2-ii).
+      const section = remoteSectionIdentity(current.text, name)
+      if (section === null) {
+        reply.code(409).send({ error: { code: 'CONFLICT', message: `remote '${name}' could not be bound to its section in rclone.conf — refusing the removal` } })
         return null
       }
       // The hard refusal (rclone.2 wires the real store behind the hook):
@@ -637,15 +765,36 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         })
         return null
       }
-      return true
+      const unknownRefs = hiddenReferenceRefusal(current.remotes, name)
+      if (unknownRefs !== null) {
+        reply.code(409).send({ error: { code: 'CONFLICT', message: unknownRefs } })
+        return null
+      }
+      return { existing, section }
     })
     if (precheck === undefined || precheck === null)
       return undefined
 
+    // cr3 CLOUD-L9: the job re-reads the remote and re-gates the bound
+    // identity before it removes (`guarded`), and removeRemote compares once
+    // more under the per-file lock: DELETE#1 queued, the remote removed and
+    // RE-CREATED meanwhile — DELETE#1 is IDENTITY_MISMATCH, the new remote
+    // stays.
+    const removeSpec: GuardSpec<CloudRemote> = {
+      operation: 'cloud.remote.remove',
+      object: remoteView(name, () => readConfig(paths, executor)),
+      gates: [],
+    }
+    const removePass: GuardPass<CloudRemote> = {
+      object: precheck.existing,
+      bound: { id: { remote: name, section: precheck.section } },
+      advisories: [],
+      locks: [],
+    }
     const job = jobQueue.submit(
       'cloud.remote.remove',
       { ...identity, params: { remote: name } },
-      async () => rcloneJob(async () => {
+      async (removeProgress, ctx) => rcloneJob(() => guarded(removeSpec, removePass, async () => {
         // cr.41: the reference checks RE-RUN in the job — a task or a wrapper
         // remote created after the route's check must not be stranded on a
         // removed section. The 409s carry the route's codes so the UI reads a
@@ -667,9 +816,12 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
             message: `remote '${name}' is referenced by remote(s): ${wrappedBy.join(', ')}. Remove them first.`,
           })
         }
-        await removeRemote(paths, executor, name)
+        const unknownRefs = hiddenReferenceRefusal(current.remotes, name)
+        if (unknownRefs !== null)
+          throw new GuardRefusalError({ status: 409, code: 'CONFLICT', message: unknownRefs })
+        await removeRemote(paths, executor, name, { expectSection: precheck.section })
         return { removed: name }
-      }),
+      })(removeProgress, ctx)),
     )
     reply.code(202)
     return { job }
@@ -697,7 +849,14 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         return { error: { code: 'VALIDATION_ERROR', message: OAUTH_TOKEN_ERROR } }
       }
       req.remote.options = normalized
-      const ownClient = ownClientRefusal(req.remote.type, req.remote.options)
+      const blank = whitespaceSecretRefusal(req.remote.options, req.remote.type)
+      if (blank !== null) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: blank } }
+      }
+      // An edit's Test (cr3 CLOUD-L11) is judged with the stored secret in
+      // the precheck below, once the stored remote has been read.
+      const ownClient = req.keepStoredSecrets === true ? null : ownClientRefusal(req.remote.type, req.remote.options)
       if (ownClient !== null) {
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: ownClient } }
@@ -708,16 +867,70 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (!identity)
       return
 
-    const ready = await guard503(reply, async () => {
+    // cr3 CLOUD-C1: the UNSAVED arm hands rclone options the requester typed,
+    // and rclone acts on some of them as root before it lists anything
+    // (webdav `bearer_token_command` runs a command; cache `chunk_path` /
+    // `db_path` create directories). That is not a read, so it needs what a
+    // save of the same options needs: Sys.Modify. Only the `{name}` arm stays
+    // the read job Sys.Audit may start — it can use only remotes a Sys.Modify
+    // user already saved. The gateway admits the path on Sys.Audit (it
+    // classifies read jobs by path only), so the daemon, which has the
+    // request's privileges, refuses here with the job queue's own sentence.
+    if (req.remote) {
+      const refusal = unsavedTestRefusal(identity.user)
+      if (refusal) {
+        request.log.warn(`[authz] cloud.remote.test refused: ${refusal.user} (${refusal.reason}) asked to test an unsaved remote of type '${req.remote.type}'`)
+        reply.code(403)
+        return { error: { code: 'FORBIDDEN', message: refusal.message } }
+      }
+    }
+
+    const ready = await guard503(reply, async (): Promise<true | null> => {
       await requireRclone()
-      return true as const
+      // cr3 CLOUD-L11: an edit's Test borrows the stored secrets of the saved
+      // remote it edits — which must exist, be of the dialog's type, and leave
+      // the own-client pair whole (CLOUD-M5's rule: a blank client_secret is
+      // the stored one).
+      if (req.remote && req.keepStoredSecrets === true) {
+        const current = await readConfig(paths, executor, await providers())
+        if (current.encrypted) {
+          refuseEncrypted(reply)
+          return null
+        }
+        const stored = current.remotes.find(r => r.name === req.remote!.name)
+        if (!stored) {
+          reply.code(404).send({ error: { code: 'NOT_FOUND', message: `remote '${req.remote.name}' does not exist` } })
+          return null
+        }
+        if (stored.type !== req.remote.type) {
+          reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `remote '${stored.name}' is saved as type '${stored.type}', not '${req.remote.type}'` } })
+          return null
+        }
+        const typedSecret = (req.remote.options.client_secret ?? '') !== ''
+        const pair = {
+          ...req.remote.options,
+          client_secret: typedSecret
+            ? req.remote.options.client_secret!
+            : (stored.secretsSet.includes('client_secret') && !(req.clearedSecrets ?? []).includes('client_secret') ? 'stored' : ''),
+        }
+        const ownClient = ownClientRefusal(req.remote.type, pair)
+        if (ownClient !== null) {
+          reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: ownClient } })
+          return null
+        }
+      }
+      return true
     })
-    if (ready === undefined)
+    if (ready === undefined || ready === null)
       return undefined
 
     const label = req.name ?? req.remote?.name ?? ''
+    // Review of cr3 (C1 depth): only the SAVED arm is a read job. The UNSAVED
+    // arm is its own non-read operation, so the job queue's privilege
+    // backstop (jobs/authority.ts) holds it to Sys.Modify as well, and its
+    // cancel needs Sys.Modify — a reader cannot stop a Modify user's Test.
     const job = jobQueue.submit(
-      READ_JOB_OPERATIONS.cloudRemoteTest,
+      req.remote ? UNSAVED_TEST_OPERATION : READ_JOB_OPERATIONS.cloudRemoteTest,
       // The job IS the audit record now (submitted + finished lines); before
       // cr.48 a stand-in job carried the verdict in its params.
       { ...identity, params: { remote: req.name ?? req.remote?.type, path: req.path ?? '' } },
@@ -730,7 +943,11 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
           // which option values are password-typed and go in obscured on the
           // env).
           const provs = req.remote ? await providers() : undefined
-          return testRemote(executor, paths, { name: req.name, remote: req.remote }, {
+          return testRemote(executor, paths, {
+            name: req.name,
+            remote: req.remote,
+            ...(req.keepStoredSecrets === true ? { keepStoredSecrets: true, clearedSecrets: req.clearedSecrets ?? [] } : {}),
+          }, {
             path: req.path,
             providers: provs,
             onSpawn: cancel.onSpawn,
@@ -993,6 +1210,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     // would otherwise be shown the SAVED task's numbers under the edits it is
     // looking at. The saved-task arm is `name` and nothing else.
     let task: CloudSyncTask | CloudSyncPreviewTask
+    let inline = false
     if ('name' in body && !('source' in body)) {
       const nameParsed = BackupName.safeParse(body.name)
       if (!nameParsed.success) {
@@ -1013,17 +1231,30 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         return { error: { code: 'VALIDATION_ERROR', message: `Invalid preview request: ${zodIssue(parsed.error)}` } }
       }
       task = parsed.data
+      inline = true
+      // cr3 CORE-L9 (coordinator's decision on the second review): an INLINE
+      // preview is part of COMPOSING a task — any source, any remote and
+      // path, run as root — so it needs what saving that task needs:
+      // Sys.Modify. A reader previews SAVED tasks only (by name: it runs only
+      // what an admin saved). Decided here and again at the job queue's own
+      // privilege check (the inline arm is its own non-read operation).
+      if (boundedReader() !== null) {
+        const user = currentRequestAuthority()?.user ?? identity.user
+        request.log.warn(`[authz] cloud.preview refused: ${user} (no Sys.Modify) asked for an inline preview of ${task.source}`)
+        reply.code(403)
+        return { error: { code: 'FORBIDDEN', message: `${forbiddenMessage(user, 'Sys.Modify')} Without it, a cloud sync preview is of a saved task only: previewing an unsaved form is part of creating or editing a task.` } }
+      }
     }
 
     // cr.55 (W5): the ONE builder the unit tests use too; the secret list the
     // answer is masked with is read by the service itself at the boundary.
-    const deps = cloudPreviewDeps(task, paths, fstabPath)
-    let ready: true | undefined
+    const deps = cloudPreviewDeps(task, paths, fstabPath, opts.storagePath ? { pveStorageCfg: opts.storagePath } : undefined)
+    let ready: string | undefined
     try {
       ready = await guard503(reply, async () => {
         await requireRclone()
-        await checkPreviewSource(executor, deps)
-        return true as const
+        // The real path the look judges consistency on (cr3 CLOUD-M4).
+        return checkPreviewSource(executor, deps)
       })
     }
     catch (err) {
@@ -1039,14 +1270,15 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     }
     if (ready === undefined)
       return undefined
-
     const subject = 'name' in task ? `Preview of cloud sync task '${task.name}'` : 'Cloud sync preview'
     const job = jobQueue.submit(
-      READ_JOB_OPERATIONS.cloudPreview,
+      inline ? INLINE_PREVIEW_OPERATION : READ_JOB_OPERATIONS.cloudPreview,
       { ...identity, params: { source: task.source, remote: task.remote, path: task.path, mode: task.mode } },
       async (updateProgress, ctx): Promise<CloudSyncPreviewResult> => {
         const cancel = readJobCancel(ctx, 'rclone dry run', subject)
-        return rcloneJob(() => runPreview(executor, deps, {
+        // Every look reads the REAL path the door resolved, re-resolved in the
+        // job first (a symlink swapped in between is refused, never followed).
+        return rcloneJob(() => runPreview(executor, { ...deps, realSource: ready, pinRealSource: true }, {
           onSpawn: cancel.onSpawn,
           checkpoint: cancel.checkpoint,
           updateProgress,
@@ -1069,20 +1301,20 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       return { error: { code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` } }
     }
 
-    const [st, units, journal, consistency, nested] = await Promise.all([
+    const [st, units, journal, view] = await Promise.all([
       deriveTaskStatus(executor, task),
       readUnitTexts(systemdDir, name),
       readRecentJournal(executor, name),
-      // The DERIVED consistency, from the same facts the run will read. Both
-      // probes fail open, so this never blanks the window.
-      readConsistencyFacts(executor, readAhrPools, { ...(opts.storagePath ? { pveStorageCfg: opts.storagePath } : {}) })
-        .then(facts => deriveConsistency(task.source, facts))
+      // The DERIVED consistency and what a snapshot will NOT contain, from the
+      // same reads the run makes — on the source's REAL path (cr3 CLOUD-M4:
+      // the source guard's bounded `realpath -e`), printed with the configured
+      // one. Both fail open, so this never blanks the window.
+      readSourceGuardFacts(executor, fstabPath, [task.source])
+        .then(facts => readCloudSourceView(executor, task.source, facts.realpaths.get(task.source) ?? task.source, opts.storagePath ? { pveStorageCfg: opts.storagePath } : {}))
         .catch(() => undefined),
-      // What a snapshot will NOT contain. Informational and fail-open.
-      scanNestedFilesystems(executor, task.source, { includeNested: 'none' })
-        .then(scan => scan.nested.map(n => n.path))
-        .catch(() => [] as string[]),
     ])
+    const consistency = view?.consistency
+    const nested = view?.nested ?? []
 
     const detail: CloudSyncTaskDetail = {
       task: {
@@ -1112,15 +1344,24 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (name === null)
       return reply
 
-    const parsed = CloudSyncTaskRequest.safeParse(request.body ?? {})
-    if (!parsed.success) {
+    // cr3 CLOUD-L10 (§2 dialog contract): value = set, null = clear, omitted
+    // = keep. The body is checked field by field here (no defaults), merged
+    // over the STORED task once that is read, and the merge is what is
+    // validated and written.
+    if (typeof request.body !== 'object' || request.body === null || Array.isArray(request.body)) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid cloud sync task: ${zodIssue(parsed.error)}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: 'Invalid cloud sync task: the body must be a JSON object' } }
     }
-    const task = parsed.data
-    if (task.name !== name) {
+    // Review of cr3, fix 7: `bwlimit: ''` (a cleared field) is a clear.
+    const body = cloudTaskUpdateBody(request.body as Record<string, unknown>)
+    const fields = CloudSyncTaskUpdateFields.safeParse(Object.fromEntries(Object.entries(body).filter(([, v]) => v !== null)))
+    if (!fields.success) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Task name in body ('${task.name}') does not match URL ('${name}')` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid cloud sync task: ${zodIssue(fields.error)}` } }
+    }
+    if (Object.hasOwn(body, 'name') && body.name !== name) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Task name in body ('${String(body.name)}') does not match URL ('${name}')` } }
     }
 
     const identity = requireIdentity(request, reply)
@@ -1130,11 +1371,17 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     // Story cr.41: the update is BOUND to the stored task's revision — an edit
     // whose unit changed meanwhile refuses STATE_CHANGED, and one whose task
     // was deleted refuses not-found, so an update can never resurrect a deleted
-    // cloud sync task.
+    // cloud sync task. The merge base is that same bound read.
     const spec = cloudTaskUpdateSpec(name)
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
+    const parsed = CloudSyncTaskRequest.safeParse(mergeCloudSyncTaskUpdate(pre.object.task, body))
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid cloud sync task: ${zodIssue(parsed.error)}` } }
+    }
+    const task = parsed.data
     if (!(await guardTask(task, reply)))
       return reply
 

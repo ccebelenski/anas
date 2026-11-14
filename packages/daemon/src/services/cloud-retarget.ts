@@ -1,5 +1,5 @@
 import type { CloudProvider, CloudRemote } from '@anas/shared'
-import { isSecretKey, remotesReferencing } from './rclone-config.js'
+import { isSecretKey, redactOptionValue, remotesReferencing, remotesWithHiddenReferences } from './rclone-config.js'
 
 /**
  * Cloud remote RETARGET guard (story ident.4 (b), audit #15).
@@ -42,6 +42,17 @@ export const DESTINATION_SUFFIXES = [
   'storage_url',
   'tenant',
   'share',
+  // cr3 CLOUD-M7: the LOGIN is a place too. rclone resolves an sftp/ftp
+  // relative path (and the empty one) under the login's home directory, and
+  // on account-per-user backends (mega, koofr, pcloud, seafile, swift) a
+  // different user IS a different account: a PUT changing it re-points every
+  // task with no 409 before cr3. `domain` (smb's NTLM domain, swift's
+  // user/tenant domain) names whose account; seafile's `library` is the
+  // container the path lives in.
+  'user',
+  'username',
+  'domain',
+  'library',
 ]
 
 /** Is `key` a destination option of backend `type`? */
@@ -75,6 +86,12 @@ export function destinationChanges(
   stored: CloudRemote,
   update: Record<string, string>,
   providers: CloudProvider[] = [],
+  /**
+   * The section's STORED values (third review): a change is judged on them,
+   * never on the views — a hidden value reads the same marker whatever it
+   * holds. Absent, the views are compared (the pre-cr3 behaviour).
+   */
+  storedRaw?: Record<string, string>,
 ): DestinationChange[] {
   const out: DestinationChange[] = []
   for (const [key, value] of Object.entries(update)) {
@@ -83,9 +100,16 @@ export function destinationChanges(
     const option = providers.find(p => p.name === stored.type)?.options.find(o => o.name === key)
     if (stored.secretsSet.includes(key) || isSecretKey(key, option) || !isDestinationOption(key, stored.type, providers))
       continue
+    // Review of cr3, fix 4: both sides as a VIEW shows them (`stored.options`
+    // is already redacted) — a URL password or an inlined remote's secret
+    // never rides the 409, the confirm store or a replay, and a password
+    // rotation alone is not a retarget. A value that came back from the view
+    // still carrying the marker reads as itself.
     const from = stored.options[key] ?? ''
-    if (value !== from)
-      out.push({ key, from, to: value })
+    const to = redactOptionValue(key, value)
+    const changed = storedRaw ? value !== (storedRaw[key] ?? '') : to !== from
+    if (changed)
+      out.push({ key, from, to })
   }
 
   return out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
@@ -98,9 +122,12 @@ export function destinationChanges(
 export function remotesReaching(remotes: CloudRemote[], name: string): string[] {
   const seen = new Set<string>([name])
   const queue = [name]
+  // Third review: a remote whose reference option a view HIDES may wrap any
+  // other — fail closed, it counts as reaching (its tasks join the confirm).
+  const maybe = [...new Set(remotesWithHiddenReferences(remotes, name).map(h => h.remote))]
   while (queue.length > 0) {
     const current = queue.shift() as string
-    for (const wrapper of remotesReferencing(remotes, current)) {
+    for (const wrapper of [...remotesReferencing(remotes, current), ...(current === name ? maybe : [])]) {
       if (!seen.has(wrapper)) {
         seen.add(wrapper)
         queue.push(wrapper)

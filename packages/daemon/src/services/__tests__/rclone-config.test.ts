@@ -14,6 +14,7 @@ import { ConfigConflictError } from '../config-writer.js'
 import {
   ConfigEncryptedError,
   defaultRcloneConfigPaths,
+  isEncryptedConfigText,
   isSecretKey,
   normalizeOAuthToken,
   OAUTH_TOKEN_ERROR,
@@ -45,6 +46,13 @@ import { assertNoSecretValues, SecretOnArgvError } from '../secret-argv.js'
 // assertion below runs on the actual binary's output.
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone/providers-1.60.1.json')
 const RAW_FIXTURE: { Name: string, Options?: { Hide?: number }[] }[] = JSON.parse(await readFile(FIXTURE, 'utf-8'))
+/**
+ * A password-protected rclone.conf as rclone writes it (cr3 CLOUD-L12): made
+ * by `rclone config encryption set --password-command "echo hunter2"` (rclone
+ * 1.75.2) over a one-section file. Since cr3 "encrypted" is read from the
+ * FILE (its RCLONE_ENCRYPT_V0: marker), not from a word in rclone's error.
+ */
+const ENCRYPTED_CONF = await readFile(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone/config-encrypted-1.75.2.conf'), 'utf-8')
 const providers: CloudProvider[] = trimProviders(RAW_FIXTURE)
 
 function provider(name: string): CloudProvider {
@@ -465,7 +473,9 @@ describe('rclone-config: readConfig (rclone.1)', () => {
   })
 
   it('an encrypted-style failure reads as encrypted:true with the raw text', async () => {
-    await writeFile(paths.configFile, '[x]\nhost = 0.0.0.0\n', 'utf-8')
+    // cr3 CLOUD-L12: the file IS encrypted (was: a plain `[x]` file whose
+    // dump error merely mentioned "decrypt").
+    await writeFile(paths.configFile, ENCRYPTED_CONF, 'utf-8')
     mock.addFixture({
       command: RCLONE,
       args: [...rcloneBaseArgs(paths.configFile), 'config', 'dump'],
@@ -474,7 +484,25 @@ describe('rclone-config: readConfig (rclone.1)', () => {
     const read = await readConfig(paths, mock)
     assert.equal(read.encrypted, true)
     assert.deepEqual(read.remotes, [])
-    assert.equal(read.text, '[x]\nhost = 0.0.0.0\n')
+    assert.equal(read.text, ENCRYPTED_CONF)
+  })
+
+  it('cr3 CLOUD-L12: a PLAIN file whose dump fails with a password-ish line is an error, never "encrypted" with no remotes', async () => {
+    await writeFile(paths.configFile, '[a]\ntype = sftp\npassword = "unterminated\n', 'utf-8')
+    mock.addFixture({
+      command: RCLONE,
+      args: [...rcloneBaseArgs(paths.configFile), 'config', 'dump'],
+      result: { stdout: '', stderr: 'CRITICAL: Failed to load config file: could not parse line: password = "unterminated\n', exitCode: 1 },
+    })
+    await assert.rejects(readConfig(paths, mock), /rclone config dump failed: /)
+  })
+
+  it('cr3 CLOUD-L12: the marker rule is rclone\'s — the first non-blank, non-comment line', () => {
+    assert.equal(isEncryptedConfigText(ENCRYPTED_CONF), true)
+    assert.equal(isEncryptedConfigText('; note\n\n  RCLONE_ENCRYPT_V0:\nabc\n'), true)
+    assert.equal(isEncryptedConfigText('[a]\ntype = local\n# RCLONE_ENCRYPT_V0:\n'), false)
+    assert.equal(isEncryptedConfigText('[a]\npassword = RCLONE_ENCRYPT_V0:\n'), false)
+    assert.equal(isEncryptedConfigText(''), false)
   })
 
   it('any other non-zero dump throws carrying rclone\'s last line', async () => {
@@ -592,8 +620,12 @@ describe('rclone-config: remoteSectionIdentity — the retarget confirm\'s bound
     assert.equal(remoteSectionIdentity(S3('minioadmin'), 's3a'), remoteSectionIdentity(S3('rotated'), 's3a'))
     const crypt = (pw: string, salt: string): string => `[c]\ntype = crypt\nremote = s3a:bucket\npassword = ${pw}\npassword2 = ${salt}\n`
     assert.equal(remoteSectionIdentity(crypt('AAAA', 'BBBB'), 'c'), remoteSectionIdentity(crypt('CCCC', 'DDDD'), 'c'))
+    // cr3 third review: an inline connection string is a HIDDEN value, which
+    // cannot be split into its secret and non-secret halves — it enters the
+    // keyed identity WHOLE, so any change to it (a rotation included) is
+    // another remote (was: assert.equal, the inline secret left out).
     const wrapper = (sk: string): string => `[w]\ntype = crypt\nremote = :s3,access_key_id=AK,secret_access_key=${sk}:bucket\npassword = x\n`
-    assert.equal(remoteSectionIdentity(wrapper('one'), 'w'), remoteSectionIdentity(wrapper('two'), 'w'))
+    assert.notEqual(remoteSectionIdentity(wrapper('one'), 'w'), remoteSectionIdentity(wrapper('two'), 'w'))
   })
 
   it('a changed type, provider, endpoint, access key id or wrapped remote is a DIFFERENT remote', () => {
@@ -847,6 +879,11 @@ describe('rclone-config: writeRemote (rclone.1)', () => {
   })
 
   it('an encrypted config refuses the write with ConfigEncryptedError', async () => {
+    // cr3 CLOUD-L12: the file IS encrypted now (was: no file at all, the
+    // dump error's wording alone deciding) — so it must stay byte-identical
+    // (was: must still not exist).
+    await mkdir(dirname(cfg), { recursive: true })
+    await writeFile(cfg, ENCRYPTED_CONF, 'utf-8')
     mock.addFixture({
       command: RCLONE,
       args: [...base(), 'config', 'dump'],
@@ -856,7 +893,7 @@ describe('rclone-config: writeRemote (rclone.1)', () => {
       writeRemote(paths, mock, { name: 'homelab', type: 'sftp', options: { host: 'h' } }, { providers, mode: 'create' }),
       ConfigEncryptedError,
     )
-    await assert.rejects(stat(cfg), (err: NodeJS.ErrnoException) => err.code === 'ENOENT')
+    assert.equal(await readFile(cfg, 'utf-8'), ENCRYPTED_CONF)
   })
 
   it('secret-SHAPED plain values (host "h", hard_delete "false") do not trip the guard (regression)', async () => {
@@ -1104,6 +1141,8 @@ describe('rclone-config: removeRemote (rclone.1)', () => {
   })
 
   it('an encrypted config refuses the removal', async () => {
+    // cr3 CLOUD-L12: the file IS encrypted (was: the dump error's wording alone).
+    await writeFile(cfg, ENCRYPTED_CONF, 'utf-8')
     mock.addFixture({
       command: RCLONE,
       args: [...rcloneBaseArgs(cfg), 'config', 'dump'],
@@ -1352,7 +1391,10 @@ describe('rclone-config: remoteSecretValues — a remote\'s secret list, transit
   it('union `upstreams` (several, with modifiers) and combine `dir=` references are both followed', async () => {
     await writeFile(configFile, '[a]\ntype = s3\nsecret_access_key = secretOfA1\n\n[b]\ntype = b2\nkey = secretOfB2\n\n[u]\ntype = union\nupstreams = a:x b:y:ro /local/path\n\n[k]\ntype = combine\nupstreams = "one=a:x" two=b:y\n', 'utf-8')
     assert.deepEqual((await remoteSecretValues(configFile, 'u')).sort(), ['secretOfA1', 'secretOfB2'])
-    assert.deepEqual((await remoteSecretValues(configFile, 'k')).sort(), ['secretOfA1', 'secretOfB2'])
+    // cr3 third review: k's quoted upstreams is a HIDDEN value, so the mask
+    // also carries it whole and its 4+ tokens (was: exactly the two secrets).
+    const k = await remoteSecretValues(configFile, 'k')
+    assert.ok(k.includes('secretOfA1') && k.includes('secretOfB2'), JSON.stringify(k))
   })
 
   it('a reference CYCLE ends — each section is read once', async () => {
@@ -1362,8 +1404,13 @@ describe('rclone-config: remoteSecretValues — a remote\'s secret list, transit
 
   it('an inline connection string\'s secret-rule parameters are taken (quoted or not); its other parameters are not', async () => {
     await writeFile(configFile, '[c]\ntype = crypt\nremote = :s3,access_key_id=AKIAPUBLIC,secret_access_key=inlineS3secret:bucket\n\n[d]\ntype = alias\nremote = ":sftp,host=h,pass=\'quotedPassVal\'":dir\n', 'utf-8')
-    assert.deepEqual(await remoteSecretValues(configFile, 'c'), ['inlineS3secret'])
-    assert.deepEqual(await remoteSecretValues(configFile, 'd'), ['quotedPassVal'])
+    // cr3 third review: a value with inline settings is HIDDEN, and the mask
+    // carries everything it conceals — the whole value and every 4+ token
+    // (was: exactly the secret-rule parameter, the others left out).
+    const c = await remoteSecretValues(configFile, 'c')
+    assert.ok(c.includes('inlineS3secret'), JSON.stringify(c))
+    const d = await remoteSecretValues(configFile, 'd')
+    assert.ok(d.includes('quotedPassVal'), JSON.stringify(d))
   })
 
   it('cr.55r P1: a connection-string `key=value` token never names a remote — a secret value like `backup:bucket` does not pull in a section `backup`', async () => {
@@ -1382,10 +1429,12 @@ describe('rclone-config: remoteSecretValues — a remote\'s secret list, transit
     assert.ok(values.includes('wrappedSecret1'), JSON.stringify(values))
   })
 
-  it('an UNSAVED dialog\'s option map: only what it REFERENCES is read from the file', async () => {
+  it('an UNSAVED dialog\'s option map: what it REFERENCES is read from the file, and every value it TYPED is masked too', async () => {
     await writeFile(configFile, '[s3]\ntype = s3\nsecret_access_key = Sup3rS3cretValue42\n', 'utf-8')
-    // The dialog's own `password` is the probe's business (it has the catalogue).
-    assert.deepEqual(await remoteSecretValues(configFile, { remote: 's3:bucket', password: 'typedInDialog' }), ['Sup3rS3cretValue42'])
+    // cr3 third review (D2): the dialog's own values go through the one
+    // classifier as well (was: only the referenced section's secret).
+    const values = await remoteSecretValues(configFile, { remote: 's3:bucket', password: 'typedInDialog' })
+    assert.ok(values.includes('Sup3rS3cretValue42') && values.includes('typedInDialog'), JSON.stringify(values))
   })
 
   it('fail-open READING: an absent file, an absent section and a dangling reference contribute nothing', async () => {
