@@ -125,8 +125,20 @@ export async function readLocalHoldsChecked(executor: CommandExecutor, snapFulls
  * from before per-chain tags): anas-repl` for the legacy tag, and `held by
  * '<tag>'` for anyone else's. The task list is read best-effort — it only
  * names the holder; the hold refuses whether or not a task is found.
+ *
+ * `here` (repl.guard review): the snapshot's dataset and this node's cluster
+ * name. A tag that equals the one a PEER derives for a replication into that
+ * dataset (or an ancestor, for a recursive one) belongs to a task that lives
+ * on the sending node, so "no task names" would be false of it: it reads
+ * `held by a replication sent here from another cluster node (its task is on
+ * that node)`.
  */
-export async function describeHolds(tags: string[], systemdDir: string = DEFAULT_SYSTEMD_DIR): Promise<string[]> {
+export async function describeHolds(tags: string[], systemdDir: string = DEFAULT_SYSTEMD_DIR, here?: { dataset: string, nodename: string | null }): Promise<string[]> {
+  const fromPeer = new Set<string>()
+  if (here?.nodename) {
+    for (const name of selfAndAncestors(here.dataset))
+      fromPeer.add(replicationHoldTag({ kind: 'peer', name: here.nodename }, name))
+  }
   const byTag = new Map<string, string>()
   if (tags.some(t => t.startsWith(REPLICATION_HOLD_TAG_PREFIX))) {
     const { tasks } = await readAllTasksChecked(systemdDir).catch(() => ({ tasks: [] }))
@@ -139,10 +151,189 @@ export async function describeHolds(tags: string[], systemdDir: string = DEFAULT
     if (!tag.startsWith(REPLICATION_HOLD_TAG_PREFIX))
       return `held by '${tag}'`
     const task = byTag.get(tag)
+    if (!task && fromPeer.has(tag))
+      return `held by a replication sent here from another cluster node (its task is on that node): ${tag}`
     return task
       ? `held by replication task '${task}': ${tag}`
       : `held by a replication no task names (an interactive replicate, or a removed task): ${tag}`
   })
+}
+
+/** Is this one of ANAS's replication hold tags (a per-chain tag, or the legacy global one)? */
+export function isReplicationHoldTag(tag: string): boolean {
+  return tag === LEGACY_REPLICATION_HOLD_TAG || tag.startsWith(REPLICATION_HOLD_TAG_PREFIX)
+}
+
+// ---------------------------------------------------------------------------
+// repl.guard: "is this dataset a replication TARGET?" (stateless)
+// ---------------------------------------------------------------------------
+
+/**
+ * How many of a dataset's held snapshots the predicate reads the tags of,
+ * newest first. A chain's hold sits on its newest replicated snapshot (the
+ * settle step releases the older ones), so the newest held snapshots are where
+ * a replication tag is. The cap keeps a dataset with thousands of held
+ * snapshots (a backup tool's own holds) from making a property edit slow: one
+ * `zfs holds` over at most this many operands.
+ */
+export const REPLICA_HELD_SNAPSHOT_CAP = 64
+
+/**
+ * `zfs list` argv for the predicate's first read: the dataset's OWN snapshots
+ * (`-d 1`) with their user-hold count, newest first by createtxg (ZFS's own
+ * order). `-Hp`: tab-separated, `userrefs` an exact integer — the columns the
+ * snapshot schedule inventory reads live (services/snapshot-schedules.ts).
+ */
+export function heldCountListArgs(dataset: string): string[] {
+  return ['list', '-t', 'snapshot', '-Hp', '-o', 'name,userrefs', '-S', 'createtxg', '-d', '1', '--', dataset]
+}
+
+/**
+ * A replication hold says the dataset is a target. `via` is how the tag was
+ * attributed: `local` / `peer` (this node computes the tag of a chain whose
+ * target is this dataset or a recursive root above it), `unattributed` (a
+ * chain this node cannot compute, a registered remote's or the legacy tag, on
+ * a read-only dataset no replication task on this node sends from with it).
+ */
+export interface ReplicaTargetFound {
+  replica: true
+  snapshot: string
+  tag: string
+  via: 'local' | 'peer' | 'unattributed'
+}
+
+/**
+ * What the replica-target predicate found: not a target (no replication hold
+ * says so), a target, or a read that failed (the sentence says which; never
+ * "not a target").
+ */
+export type ReplicaTargetRead = { replica: false } | ReplicaTargetFound | { unreadable: string }
+
+export interface ReplicaTargetInput {
+  /** The dataset (`pool/path`). */
+  dataset: string
+  /** Is the dataset read-only NOW (the fallback for a chain this node cannot compute)? */
+  readonly: boolean
+  /** This node's PVE name (`/etc/pve/.members`), read only when a replication tag is found; null off a cluster. */
+  nodename: () => Promise<string | null>
+  /** The replication task units (`anas-repl-*`), read only for a tag this node cannot compute. */
+  systemdDir?: string
+}
+
+/** `pool/a/b` → `['pool/a/b', 'pool/a', 'pool']`: the dataset and every ancestor. */
+function selfAndAncestors(dataset: string): string[] {
+  const out: string[] = []
+  const parts = dataset.split('/')
+  for (let i = parts.length; i > 0; i--)
+    out.push(parts.slice(0, i).join('/'))
+  return out
+}
+
+/**
+ * Is `dataset` the TARGET of a replication chain (repl.guard)? Stateless:
+ * read from ZFS holds and, only when needed, the cluster members file and the
+ * task units.
+ *
+ * A replication holds its base on BOTH sides (settleReplicationHolds), so a
+ * hold alone does not say "target". The tag does: `anas-repl-<hash(location,
+ * targetFull)>`. This node can compute the tag of every chain whose target is
+ * HERE — `local` (a replication within this node) and `peer:<this node>` (a
+ * peer in the cluster sending here) — for the dataset itself and for each
+ * ancestor (a recursive replication tags every child with its ROOT's tag,
+ * routes/replication.ts R7). A tag that matches is a target, whatever the
+ * dataset's state.
+ *
+ * A registered remote's chain is keyed by the name the SENDING node gave the
+ * remote, which this node cannot know; the legacy `anas-repl` tag names no
+ * chain at all. For those the fallback is: the dataset is read-only now (every
+ * first receive creates it `readonly=on`) AND no replication task on this node
+ * sends from it (or from a recursive root above it) with that tag (for the
+ * legacy tag: no task on this node sends from it at all) — a task here that
+ * derives the tag makes this the SOURCE side of that chain.
+ *
+ * Cost: one `zfs list` of the dataset's own snapshots (names and hold counts),
+ * then — only when some are held — ONE `zfs holds -H` over the newest
+ * {@link REPLICA_HELD_SNAPSHOT_CAP} held ones; the members file and the task
+ * list only when a replication tag is found that needs them.
+ *
+ * Known wrong answers: a SOURCE that is read-only and carries a replication
+ * hold no task on this node derives (an interactive one-shot replicate to any
+ * location, local, peer or remote; or the hold a removed or re-pointed task
+ * left behind) reads as a target, `via: 'unattributed'`, and the confirm says
+ * "looks like" for it; a target whose replication hold is on a
+ * snapshot older than the newest {@link REPLICA_HELD_SNAPSHOT_CAP} held ones,
+ * or whose fallback chain is also sent onward from here with the legacy tag,
+ * reads as not a target.
+ */
+export async function readReplicaTarget(executor: CommandExecutor, input: ReplicaTargetInput): Promise<ReplicaTargetRead> {
+  const { dataset } = input
+  let listed: { stdout: string, stderr: string, exitCode: number }
+  try {
+    listed = await executor.exec('/usr/sbin/zfs', heldCountListArgs(dataset))
+  }
+  catch (err) {
+    return { unreadable: `the snapshots of '${dataset}' could not be read: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  if (listed.exitCode !== 0)
+    return { unreadable: `the snapshots of '${dataset}' could not be read: ${listed.stderr.trim() || `exit ${listed.exitCode}`}` }
+  const held: string[] = []
+  for (const line of listed.stdout.split('\n')) {
+    const [name, userrefs] = line.trim().split('\t')
+    if (name?.startsWith(`${dataset}@`) && Number.parseInt(userrefs ?? '', 10) > 0)
+      held.push(name)
+  }
+  if (held.length === 0)
+    return { replica: false }
+  const read = held.slice(0, REPLICA_HELD_SNAPSHOT_CAP)
+  const holds = await readLocalHoldsChecked(executor, read)
+  if (!holds)
+    return { unreadable: `the holds on the snapshots of '${dataset}' could not be read` }
+  // Newest first, as listed: the first replication hold found is the one named.
+  const found: { snapshot: string, tag: string }[] = []
+  for (const snapshot of read) {
+    for (const tag of holds.get(snapshot) ?? []) {
+      if (isReplicationHoldTag(tag))
+        found.push({ snapshot, tag })
+    }
+  }
+  if (found.length === 0)
+    return { replica: false }
+
+  // 1) A tag this node computes for a chain whose target is here.
+  const nodename = await input.nodename()
+  const computed = new Map<string, 'local' | 'peer'>()
+  for (const name of selfAndAncestors(dataset)) {
+    computed.set(replicationHoldTag({ kind: 'local' }, name), 'local')
+    if (nodename)
+      computed.set(replicationHoldTag({ kind: 'peer', name: nodename }, name), 'peer')
+  }
+  for (const f of found) {
+    const via = computed.get(f.tag)
+    if (via)
+      return { replica: true, snapshot: f.snapshot, tag: f.tag, via }
+  }
+
+  // 2) The fallback, for a tag this node cannot compute: read-only now, and
+  //    no task on this node sends from here with it. A task list that could
+  //    not be read in full cannot say "no task" — unreadable, not a guess.
+  if (!input.readonly)
+    return { replica: false }
+  const { tasks, complete } = await readAllTasksChecked(input.systemdDir ?? DEFAULT_SYSTEMD_DIR)
+    .catch(() => ({ tasks: [], complete: false }))
+  if (!complete)
+    return { unreadable: 'the replication task list could not be read in full' }
+  const lineage = new Set(selfAndAncestors(dataset))
+  const sendsFromHere = tasks
+    .map(task => ({ task, ds: resolveTaskDatasets(task) }))
+    .filter(({ task, ds }) => ds.sourceFull === dataset || (task.recursive === true && lineage.has(ds.sourceFull)))
+  for (const f of found) {
+    const sent = f.tag === LEGACY_REPLICATION_HOLD_TAG
+      ? sendsFromHere.length > 0
+      : sendsFromHere.some(({ task, ds }) => replicationHoldTag(task.target.location, ds.targetFull) === f.tag)
+    if (!sent)
+      return { replica: true, snapshot: f.snapshot, tag: f.tag, via: 'unattributed' }
+  }
+  return { replica: false }
 }
 
 /** One side of a replication, for the hold settle step. */

@@ -823,6 +823,17 @@
     ANAS.datasets.loadSnapshotsForNode = function (node, tree, dsNode, force) {
         return loadSnapshotsForNode(node, tree, dsNode, force);
     };
+    // repl.guard: for repl-guard.harness.mjs (the edit dialog's confirm, and
+    // the snapshot rename and destroy refusals surfacing the daemon's sentence).
+    ANAS.datasets.openEdit = function (node, tree, rec) {
+        return openEdit(node, tree, rec);
+    };
+    ANAS.datasets.submitRenameSnapshot = function (win, node, ctx, onDone) {
+        return submitRenameSnapshot(win, node, ctx, onDone);
+    };
+    ANAS.datasets.runDestroySnapshot = function (node, ctx, onDone) {
+        return runDestroySnapshot(node, ctx, onDone);
+    };
 
     // ---- Selection + button state -----------------------------------------
 
@@ -2375,12 +2386,17 @@
                     return;
                 }
 
-                ANAS.runJob({
+                // repl.guard: through confirmAndRun — the daemon asks to
+                // confirm turning read-only off on a replication target (409
+                // + code, its sentence as the headline); every other edit is
+                // answered 202 and runs exactly as runJob ran it.
+                ANAS.confirmAndRun({
                     node: node,
                     method: 'put',
                     path: datasetPath(pool, fullName),
                     body: { properties: changed },
                     view: win,
+                    confirmHeadline: true,
                     failTitle: 'Update failed',
                     successMsg: t('Dataset properties updated') + ': ' + fullName,
                     onComplete: function () {
@@ -3225,7 +3241,9 @@
     // ---- Destroy snapshot (story 5.6) -------------------------------------
     //
     // Not confirmation-gated by the daemon (removes a recovery point, not live
-    // data): a plain Ext.Msg.confirm then a plain DELETE.
+    // data): a plain Ext.Msg.confirm then a plain DELETE. A HELD snapshot is
+    // refused by the daemon (repl.guard) naming each hold: runJob's failure
+    // alert carries that sentence, encoded.
 
     function runDestroySnapshot(node, ctx, onDone) {
         ANAS.runJob({

@@ -8,6 +8,7 @@ import type { Advisory, Gate, GuardSpec, ObjectView, Refusal } from '../safety/g
 import type { AccessObject, AccessService, SetAccessPlan } from '../services/access.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
+import type { ReplicaTargetRead } from '../services/replication-holds.js'
 import type { Transport } from '../services/replication-transport.js'
 import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, DestroyDatasetQuery, lunGrowGuidance, PoolName, RenameSnapshotRequest, reservedDatasetSegment, RollbackSnapshotQuery, SetAccessRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { parseExports } from '../parsers/exports.js'
@@ -26,7 +27,8 @@ import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom
 import { targetTpgs } from '../services/iscsi.js'
 import { mountTargetGate, swapStageGate } from '../services/mounts.js'
 import { loadPveFootprint, ownershipRefusal, pveDescendantsUnlistedMessage, pveManagedRefusal, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
-import { describeHolds, readLocalHoldsChecked } from '../services/replication-holds.js'
+import { describeHolds, isReplicationHoldTag, readLocalHoldsChecked, readReplicaTarget } from '../services/replication-holds.js'
+import { defaultMembersFile, readMembers } from '../services/replication-transport.js'
 import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 import { createReplicationHandlers } from './replication.js'
@@ -53,6 +55,43 @@ const TXG_RE = /^\d+$/
  */
 export const DATASET_DESTROY_PRESENTATION_ONLY: Record<string, string> = {}
 export const SNAPSHOT_ROLLBACK_PRESENTATION_ONLY: Record<string, string> = {}
+/**
+ * repl.guard: the property edit's confirm (readonly on -> off on a replication
+ * target) signs every field: `properties` is what the job sets.
+ * `repl-guard.test.ts` pins the list.
+ */
+export const DATASET_SET_PRESENTATION_ONLY: Record<string, string> = {}
+
+/**
+ * repl.guard item 1: the confirm a replication TARGET's `readonly` on -> off
+ * gets — the facts captured on ZFS 2.4.2 (the fullreview captures
+ * `zfs-written-replica.zfs2.4.2.txt`): a read-only replica is not changed by
+ * reading, listing or snapshotting; a writable one is changed by a write and
+ * by a read while atime is on; an incremental receive into a changed target
+ * is refused; setting read-only back on does not undo a change.
+ *
+ * Every receive passes `-o readonly=on` (repl.drift), so the confirm says the
+ * next run that sends undoes this edit. The remove-the-task line does not say
+ * "first": in a failover the sending node is down, and the receive into a
+ * changed target is refused either way (operator ruling 2026-11-15).
+ * `via: 'unattributed'` is a hold no task on this node derives: the dataset
+ * may be a read-only source of a one-shot replicate, so the headline states
+ * the two facts that were read.
+ */
+export function replicaTargetConfirm(dataset: string, mark: { snapshot: string, tag: string, via?: 'local' | 'peer' | 'unattributed' }): { message: string, warnings: string[] } {
+  return {
+    message: mark.via === 'unattributed'
+      ? `'${dataset}' looks like a replication target: it is read-only and replication holds one of its snapshots. While it is read-only nothing changes it.`
+      : `'${dataset}' is a replication target. While it is read-only nothing changes it.`,
+    warnings: [
+      `Once it is not read-only, any write to it changes it, and so does any read of a file on it while access-time updates (atime) are on.`,
+      `Replication into it then stops until the target is rolled back to the last replicated snapshot, which discards what was written. Turning read-only back on does not undo a change already made.`,
+      `The next replication run that sends into it sets it read-only again.`,
+      `To keep this copy as the live dataset, remove the replication task that sends into it, on the sending node; until then its runs into this dataset fail.`,
+      `It carries the replication hold ${mark.tag} on '${mark.snapshot}'.`,
+    ],
+  }
+}
 
 /**
  * A pool's dataset list could not be READ (`zfs list` exited non-zero) —
@@ -391,9 +430,16 @@ export async function datasetRoutes(
      * for the legacy hold migration. Defaults to the units' own default.
      */
     systemdDir?: string
+    /**
+     * PVE's cluster members file (`/etc/pve/.members`): this node's name, from
+     * which the replica-target predicate computes the hold tag of a peer chain
+     * sending here (repl.guard). Defaults to the transport's own default.
+     */
+    membersFile?: string
   },
 ) {
   const { executor, jobQueue, confirmStore, transport } = opts
+  const membersFile = opts.membersFile ?? defaultMembersFile()
   const iscsiPaths = opts.iscsiPaths ?? {}
   const access = opts.accessService ?? createAccessService({ executor, iscsiPaths })
 
@@ -859,11 +905,23 @@ export async function datasetRoutes(
     const held = swept.filter(name => (holds.get(name) ?? []).length > 0)
     if (held.length === 0)
       return null
-    const named: string[] = []
-    for (const name of held)
-      named.push(`${name} ${(await describeHolds(holds.get(name)!, opts.systemdDir)).join(', ')}`)
     return conflict(`A recursive destroy of '${o.name}' is refused: it would destroy held snapshots, `
-      + `and ZFS stops at a held snapshot only after destroying the unheld ones — nothing was done. ${named.join('; ')}.`, 'snapshot-held')
+      + `and ZFS stops at a held snapshot only after destroying the unheld ones — nothing was done. ${await namedHolds(held, holds)}.`, 'snapshot-held')
+  }
+
+  /**
+   * The ONE way a refusal names held snapshots (nf.3 D11): `<snapshot> held
+   * by <holder>` per snapshot ({@link describeHolds}: the replication task, the
+   * legacy tag, or anyone else's tag), joined with `; `. The recursive
+   * destroy, the forced rollback and the snapshot destroy (repl.guard) say
+   * "held" with it.
+   */
+  async function namedHolds(held: string[], holds: Map<string, string[]>): Promise<string> {
+    const named: string[] = []
+    const nodename = (await readMembers(membersFile).catch(() => null))?.nodename ?? null
+    for (const name of held)
+      named.push(`${name} ${(await describeHolds(holds.get(name)!, opts.systemdDir, { dataset: name.split('@')[0], nodename })).join(', ')}`)
+    return named.join('; ')
   }
 
   /**
@@ -1086,11 +1144,8 @@ export async function datasetRoutes(
     const held = swept.filter(name => (holds.get(name) ?? []).length > 0)
     if (held.length === 0)
       return null
-    const named: string[] = []
-    for (const name of held)
-      named.push(`${name} ${(await describeHolds(holds.get(name)!, opts.systemdDir)).join(', ')}`)
     return conflict(`A forced rollback of '${o.dataset}' to '${o.snap}' is refused: it would destroy held snapshots, `
-      + `and ZFS stops at a held snapshot only after destroying the newer unheld ones — nothing was done. ${named.join('; ')}.`, 'snapshot-held')
+      + `and ZFS stops at a held snapshot only after destroying the newer unheld ones — nothing was done. ${await namedHolds(held, holds)}.`, 'snapshot-held')
   }
 
   /**
@@ -1233,6 +1288,73 @@ export async function datasetRoutes(
     }
   }
 
+  /** The holds on ONE snapshot, once per guard run; null when `zfs holds` did not answer. */
+  function snapshotHolds(o: SnapshotObject, reads: GuardReads): Promise<Map<string, string[]> | null> {
+    return reads.once(`holds:${o.snapName}`, () => readLocalHoldsChecked(executor, [o.snapName]))
+  }
+
+  /**
+   * repl.guard item 2: a snapshot carrying a REPLICATION hold is not renamed.
+   * Replication matches snapshots by NAME (services/replication-tree.ts
+   * `decideBase` compares the source's and the target's names): renamed on
+   * either side, the common snapshot is gone from the chain's view, and the
+   * next run may report the target as diverged. A hold does not stop
+   * `zfs rename` (docs/probes/wave2-node/out/r6-zfs-partial.log: a rename with a
+   * held snapshot exits 0 and the hold stays on it), so this gate is the
+   * only thing that does. Any other tag (a backup's, an operator's) does not
+   * refuse: nothing ANAS runs matches those by name.
+   *
+   * ZFS itself identifies a snapshot by its guid, which a rename keeps.
+   * Matching replication's common snapshot by guid instead of by name would
+   * make a rename harmless and remove the need for this gate (a future
+   * identity story; not built here).
+   *
+   * Fail closed (the wave's rule: a read that failed never reads as "no hold"
+   * where the consequence is losing a chain): holds that cannot be read refuse.
+   * In both doors: the job re-reads before `zfs rename`.
+   */
+  const snapshotRenameHoldGate: Gate<SnapshotObject> = async (o, reads) => {
+    const holds = await snapshotHolds(o, reads)
+    if (!holds) {
+      return conflict(`Could not read the holds on '${o.snapName}' — refusing the rename: replication finds its common snapshot by name, `
+        + 'and a replication base renamed cuts its chain. Nothing was renamed.', 'snapshot-holds-unreadable')
+    }
+    const tags = (holds.get(o.snapName) ?? []).filter(isReplicationHoldTag)
+    if (tags.length === 0)
+      return null
+    const nodename = (await readMembers(membersFile).catch(() => null))?.nodename ?? null
+    const holders = (await describeHolds(tags, opts.systemdDir, { dataset: o.dataset, nodename })).join(', ')
+    return conflict(`Renaming '${o.snapName}' is refused: it is ${holders}. Replication into or from '${o.dataset}' finds its common snapshot by this name; `
+      + 'renamed, the next run cannot see it and may report the target as diverged. Nothing was renamed. '
+      + `To rename it anyway, release ${tags.length > 1 ? 'those holds' : 'that hold'} first (zfs release <tag> ${o.snapName}): `
+      + 'the snapshot is then no longer protected from retention, and the chain may need a full send.', 'snapshot-held')
+  }
+
+  /**
+   * repl.guard item 3: a HELD snapshot is not destroyed — ZFS refuses it with
+   * a bare "dataset is busy" (`zfs-hold(8)`: EBUSY) that names nothing. Read
+   * before the destroy and refused 409 with the D11 naming
+   * ({@link namedHolds}), plus what a replication hold means. A hold placed
+   * between this read and the destroy still meets ZFS's own refusal (the job
+   * fails with its text, nothing destroyed).
+   *
+   * A holds read that FAILS passes: the consequence of going on is ZFS's own
+   * refusal of a held snapshot, never a lost one, and refusing would block an
+   * unheld destroy on a read hiccup.
+   */
+  const snapshotDestroyHoldGate: Gate<SnapshotObject> = async (o, reads) => {
+    const holds = await snapshotHolds(o, reads)
+    const tags = holds?.get(o.snapName) ?? []
+    if (!holds || tags.length === 0)
+      return null
+    const replication = tags.some(isReplicationHoldTag)
+      ? ' Replication depends on this snapshot: it is the common snapshot the next incremental send starts from; '
+      + 'released and destroyed, the chain needs a full send.'
+      : ''
+    return conflict(`Destroying '${o.snapName}' is refused: ZFS does not destroy a held snapshot — nothing was done. `
+      + `${await namedHolds([o.snapName], holds)}.${replication}`, 'snapshot-held')
+  }
+
   /**
    * The spec of a verb on ONE existing snapshot that needs nothing but the
    * dataset's ownership: rename and destroy (pvepool.1: an owned dataset's
@@ -1250,12 +1372,18 @@ export async function datasetRoutes(
    * receiver gets the OLD name (F2) — so there is no ZFS busy refusal to lean
    * on, and a shared key would let a mover's incremental base be renamed under
    * it. (docs/WAVE3-DESIGN.md §4.2)
+   *
+   * repl.guard: each verb carries its HOLD gate — a rename refuses a snapshot
+   * a replication holds, a destroy refuses any held snapshot by name.
    */
   function snapshotOwnedSpec(operation: 'zfs.rename' | 'zfs.destroy', fullName: string, snap: string): GuardSpec<SnapshotObject> {
     return {
       operation,
       object: snapshotView(fullName, snap),
-      gates: [ownedGate<SnapshotObject>(o => o.dataset)],
+      gates: [
+        ownedGate<SnapshotObject>(o => o.dataset),
+        operation === 'zfs.rename' ? snapshotRenameHoldGate : snapshotDestroyHoldGate,
+      ],
       locks: (o, _bound, reads) => datasetClaims(reads, [[o.dataset, operation === 'zfs.rename' ? 'exclusive' : 'shared']]),
     }
   }
@@ -1808,6 +1936,34 @@ export async function datasetRoutes(
     return updateProperties(poolName, wildcard, request, reply)
   })
 
+  /**
+   * repl.guard item 1's reads, for a request that sets `readonly=off`: is the
+   * dataset read-only NOW (the pool listing does not carry `readonly`; one
+   * `zfs get`, the captured `-Hp -o property,value,source` shape), and if so,
+   * is it a replication target ({@link readReplicaTarget})? Already writable:
+   * `{ replica: false }` with nothing more read.
+   */
+  async function readOnlyToWritableReplica(fullName: string): Promise<ReplicaTargetRead> {
+    let r: { stdout: string, stderr: string, exitCode: number }
+    try {
+      r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'property,value,source', 'readonly', '--', fullName])
+    }
+    catch (err) {
+      return { unreadable: `the readonly property of '${fullName}' could not be read: ${err instanceof Error ? err.message : String(err)}` }
+    }
+    const [property, value] = (r.stdout.split('\n')[0] ?? '').split('\t')
+    if (r.exitCode !== 0 || property !== 'readonly' || (value !== 'on' && value !== 'off'))
+      return { unreadable: `the readonly property of '${fullName}' could not be read: ${r.stderr.trim() || `exit ${r.exitCode}`}` }
+    if (value === 'off')
+      return { replica: false }
+    return readReplicaTarget(executor, {
+      dataset: fullName,
+      readonly: true,
+      nodename: async () => (await readMembers(membersFile))?.nodename ?? null,
+      ...(opts.systemdDir ? { systemdDir: opts.systemdDir } : {}),
+    })
+  }
+
   async function updateProperties(
     poolName: string,
     path: string,
@@ -1883,6 +2039,37 @@ export async function datasetRoutes(
             return { error: { code: 'CONFLICT', reason: verdict.refusal.reason, message: verdict.refusal.message } }
           }
           servedGrow = servedLunIdentity(held.targetIqn, lun, verdict.device)
+        }
+      }
+    }
+
+    // repl.guard item 1: turning `readonly` from on to off on a replication
+    // TARGET is confirmed (409 + X-Anas-Confirm-Code), never refused — a
+    // failover needs exactly this edit. Asked LAST, so a refused request never
+    // offers a confirm, and ONLY for this transition: an edit that does not
+    // set readonly=off runs no extra command; one that does reads readonly
+    // (and, when it is on, the snapshots' holds) and, on anything but a
+    // replication target, answers exactly as before. This guard is a
+    // COURTESY, not a gate: a predicate read that fails neither blocks nor
+    // confirms — the edit goes ahead as it did before the guard existed, and
+    // the failure is logged.
+    // The confirm signs the whole request and the dataset's name; the job
+    // does not re-ask (nothing it could find changes what was confirmed).
+    if (props.readonly === false) {
+      const replica = await readOnlyToWritableReplica(fullName)
+      if ('unreadable' in replica) {
+        request.log.warn({ dataset: fullName, reason: replica.unreadable }, `repl.guard: could not tell whether '${fullName}' is a replication target (${replica.unreadable}); readonly=off proceeds unconfirmed`)
+      }
+      else if (replica.replica) {
+        const confirm = replicaTargetConfirm(fullName, replica)
+        if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+          validated: { dataset: fullName, properties: bodyParsed.data.properties },
+          address: ['dataset'],
+          presentationOnly: DATASET_SET_PRESENTATION_ONLY,
+          message: confirm.message,
+          warnings: [...confirm.warnings, ...warnings],
+        })) {
+          return reply
         }
       }
     }
@@ -2337,7 +2524,8 @@ export async function datasetRoutes(
 
     // Story cr.37: the snapshot exists and its dataset is not PVE's
     // (pvepool.1: an OWNED dataset's snapshots are PVE's to manage) — at the
-    // route and again in the job before `zfs rename`.
+    // route and again in the job before `zfs rename`. repl.guard: and it
+    // carries no replication hold (replication matches snapshots by name).
     const spec = snapshotOwnedSpec('zfs.rename', fullName, snap)
     const pre = await guardCheck(spec)
     if ('refusal' in pre)
@@ -2378,7 +2566,8 @@ export async function datasetRoutes(
     // Story cr.37: the snapshot exists and its dataset is not PVE's
     // (pvepool.1: a guest volume's snapshots are PVE's to destroy, and a
     // storage root's are taken and kept by PVE itself) — at the route and
-    // again in the job before `zfs destroy`.
+    // again in the job before `zfs destroy`. repl.guard: and it is not held
+    // (refused naming each hold, where ZFS would answer "dataset is busy").
     const spec = snapshotOwnedSpec('zfs.destroy', fullName, snap)
     const pre = await guardCheck(spec)
     if ('refusal' in pre)

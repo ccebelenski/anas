@@ -367,6 +367,19 @@ describe('nf.3 D11 — readLocalHoldsChecked and describeHolds (the forced-rollb
       'held by replication (the shared tag from before per-chain tags): anas-repl',
       'held by \'keep\'',
     ])
+    // repl.guard review: the tag a PEER derives for a replication into this
+    // dataset (or an ancestor, for a recursive one) is named as sent here from
+    // another node; the same tag with no node name, or for another dataset,
+    // keeps the generic sentence.
+    const peer = replicationHoldTag({ kind: 'peer', name: 'pve-b' }, 'tank/replica')
+    assert.deepEqual(await describeHolds([peer], dir, { dataset: 'tank/replica/child', nodename: 'pve-b' }), [
+      `held by a replication sent here from another cluster node (its task is on that node): ${peer}`,
+    ])
+    for (const here of [{ dataset: 'tank/replica', nodename: null }, { dataset: 'tank/other', nodename: 'pve-b' }, { dataset: 'tank/replica', nodename: 'pve-c' }]) {
+      assert.deepEqual(await describeHolds([peer], dir, here), [
+        `held by a replication no task names (an interactive replicate, or a removed task): ${peer}`,
+      ])
+    }
     // An unreadable task store only loses the task's name, never the hold.
     assert.deepEqual(await describeHolds([TAG_A], join(dir, 'missing')), [
       `held by a replication no task names (an interactive replicate, or a removed task): ${TAG_A}`,
