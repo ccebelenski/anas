@@ -1,0 +1,8 @@
+Starting scrub on devid 1
+scrub done for c23ac643-61e9-4793-8b43-daa096ffb5ef
+Scrub started:    Sat Nov 14 19:02:42 2026
+Status:           finished
+Duration:         0:00:00
+Total to scrub:   20.34MiB
+Rate:             20.34MiB/s
+Error summary:    no errors found

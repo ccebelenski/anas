@@ -8,7 +8,7 @@ import type {
 import type { MirrorReconcileEvidence, MirrorReconcilePool } from '../ahr-mirror-reconcile.js'
 import type { ChunkItem, SelfhealContext } from '../selfheal-map.js'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
@@ -19,6 +19,8 @@ import {
   assertNoMdRepair,
   MIRROR_COMPARE_RATE_BYTES_S,
   MIRROR_RECONCILE_RATE_BYTES_S,
+  MIRROR_ROW_WRITE_SECONDS,
+  MIRROR_SCRUB_PASSES,
   mirrorGuardedExecutor,
   mirrorReconcileEvidence,
   mirrorReconcileWarnings,
@@ -35,6 +37,22 @@ const fixtures = join(__dirname, '../../fixtures/selfheal')
 
 function fixture(name: string): string {
   return readFileSync(join(fixtures, name), 'utf-8')
+}
+
+/** A member's role directory under md's sysfs (`rd0`, `rd1`, ...). */
+const ROLE_DIR_RE = /^rd\d+$/
+
+/**
+ * A real kernel publishes `rd<n>/bad_blocks` for every member it holds — an
+ * EMPTY file when md has recorded no range. The captured sysfs fixtures predate
+ * F8 and do not carry it, and since cr3 (AHR-HEAL-L9) a list that cannot be
+ * read is "unknown", never "clean". So the fake publishes what the kernel does.
+ */
+function seedEmptyBadBlocks(sys: string): void {
+  for (const entry of readdirSync(sys)) {
+    if (ROLE_DIR_RE.test(entry))
+      writeFileSync(join(sys, entry, 'bad_blocks'), '\n')
+  }
 }
 
 /**
@@ -62,10 +80,6 @@ function fixture(name: string): string {
 // carries md's 1 MiB data offset (the raid1 sysfs fixture's `rd<n>/offset`).
 
 const DATA_OFFSET = 2048 * 512
-/** Bytes of the band arm B walks: six 4 KiB rows. */
-const SPAN = 6 * BLOCK_BYTES
-/** `rd<n>/size` is in KiB and is already net of the data offset. */
-const SPAN_KIB = String(SPAN / 1024)
 
 /** A DATA chunk covering LV 4096…12287 — rows 0 and 12288 are free space. */
 const DATA_CHUNK: ChunkItem = {
@@ -131,6 +145,11 @@ class FakeMirror implements CommandExecutor {
   onScrub: ((md: FakeMirror, pass: number) => void) | null = null
   private scrubPasses = 0
 
+  /** The csum tree root `dump-tree -r` names — the seeded leaf unless a case moves it. */
+  csumRoot = CSUM_LEAF
+  /** Called on every direct read, before it is served — a case can change the disks mid-run. */
+  onRead: ((md: FakeMirror, device: string, offset: number) => void) | null = null
+
   /** `mismatch_cnt` each successive check leaves behind. The last repeats. */
   mismatchQueue = ['0']
   private checks = 0
@@ -143,7 +162,16 @@ class FakeMirror implements CommandExecutor {
   private left = 0
   private reads = 0
 
-  constructor() {
+  /** Bytes of the band arm B walks (cr3: a case can widen it). */
+  readonly span: number
+  /** The chunk tree `dump-tree -t 3` prints (cr3: a case can replace it). */
+  readonly chunks: ChunkItem[]
+  /** A device byte range whose direct read fails (a URE), for cr3 AHR-HEAL-L12. */
+  unreadable: { device: string, offset: number } | null = null
+
+  constructor(options?: { rows?: number, chunks?: ChunkItem[] }) {
+    this.span = (options?.rows ?? 6) * BLOCK_BYTES
+    this.chunks = options?.chunks ?? [DATA_CHUNK, META_CHUNK]
     this.root = mkdtempSync(join(tmpdir(), 'anas-mirror-'))
     this.sys = join(this.root, 'sys/block/md127/md')
     this.mountpoint = join(this.root, 'mnt')
@@ -157,9 +185,10 @@ class FakeMirror implements CommandExecutor {
       mkdirSync(dirname(path), { recursive: true })
       writeFileSync(path, `${line.slice(eq + 1)}\n`)
     }
+    seedEmptyBadBlocks(this.sys)
     // A band arm B can walk end to end in six rows.
-    this.set('rd0/size', SPAN_KIB)
-    this.set('rd1/size', SPAN_KIB)
+    this.set('rd0/size', String(this.span / 1024))
+    this.set('rd1/size', String(this.span / 1024))
     this.set('mismatch_cnt', '128')
     this.set('last_sync_action', 'check')
     this.set('sync_completed', '48 / 48')
@@ -204,7 +233,7 @@ class FakeMirror implements CommandExecutor {
       name: 'tank',
       mountpoint: this.mountpoint,
       mounted: true,
-      arrays: [{ band: 2, device: '/dev/md127', heightBytes: SPAN, members: ['/dev/loop0', '/dev/loop1'] }],
+      arrays: [{ band: 2, device: '/dev/md127', heightBytes: this.span, members: ['/dev/loop0', '/dev/loop1'] }],
     }
   }
 
@@ -221,7 +250,7 @@ class FakeMirror implements CommandExecutor {
       mountpoint: this.mountpoint,
       srcDevice: this.srcDevice,
       bands: [selfhealBand(
-        { startSector: 0, lengthSectors: SPAN / 512, major: 9, minor: 127, offsetSector: 0 },
+        { startSector: 0, lengthSectors: this.span / 512, major: 9, minor: 127, offsetSector: 0 },
         {
           device: '/dev/md127',
           kernel: 'md127',
@@ -323,7 +352,20 @@ class FakeMirror implements CommandExecutor {
         ].join('\n'))
       }
       if (args[2] === '-t' && args[3] === '3')
-        return ok(chunkDump())
+        return ok(chunkDump(this.chunks))
+      // cr3 AHR-HEAL-H3: a row about to be WRITTEN is arbitrated again with
+      // the tree roots read fresh and no cached csum items, so the fake
+      // answers the walk the way btrfs-progs would: `-r` names the csum root
+      // (the leaf the rig seeds on the LV), and `-b` of it prints its item.
+      if (args[2] === '-r')
+        return ok(`chunk tree: 1 level 0\nchecksum tree key (CSUM_TREE ROOT_ITEM 0) ${this.csumRoot} level 0\n`)
+      if (args[2] === '-b' && Number(args[3]) === CSUM_LEAF && this.csumRoot === CSUM_LEAF) {
+        return ok([
+          `leaf ${CSUM_LEAF} items 1 free space 0 generation 9 owner CSUM_TREE`,
+          `\titem 0 key (EXTENT_CSUM EXTENT_CSUM ${DATA_CHUNK.logical}) itemoff 0 itemsize 8`,
+          '',
+        ].join('\n'))
+      }
       if (args[2] === '-b') {
         // A csum-tree walk that lands on a leaf with no items: the honest
         // answer for a logical byte btrfs stored no checksum for.
@@ -357,6 +399,11 @@ class FakeMirror implements CommandExecutor {
     const of = args1.find(a => a.startsWith('if='))?.slice(3) ?? ''
     const skip = Number(args1.find(a => a.startsWith('skip='))?.slice(5) ?? 0)
     const count = Number(args1.find(a => a.startsWith('count='))?.slice(6) ?? 0)
+    this.onRead?.(this, of, skip * BLOCK_BYTES)
+    if (this.unreadable && this.unreadable.device === of
+      && this.unreadable.offset >= skip * BLOCK_BYTES && this.unreadable.offset < (skip + count) * BLOCK_BYTES) {
+      return { leftExitCode: 1, rightExitCode: 0, leftStderr: `dd: error reading '${of}': Input/output error`, rightStderr: '', stdout: '' }
+    }
     const source = this.deviceOf(of)
     if (!source)
       return { leftExitCode: 1, rightExitCode: 0, leftStderr: `unexpected read of ${of}`, rightStderr: '', stdout: '' }
@@ -371,13 +418,13 @@ class FakeMirror implements CommandExecutor {
 }
 
 /** The chunk tree, as `dump-tree -t 3` prints it. */
-function chunkDump(): string {
+function chunkDump(chunks: readonly ChunkItem[]): string {
   const item = (index: number, chunk: ChunkItem): string => [
     `\titem ${index} key (FIRST_CHUNK_TREE CHUNK_ITEM ${chunk.logical}) itemoff 0 itemsize 80`,
     `\t\tlength ${chunk.length} owner 2 stripe_len 65536 type ${chunk.type}`,
     ...chunk.stripes.map((offset, i) => `\t\t\tstripe ${i} devid 1 offset ${offset}`),
   ].join('\n')
-  return `${['leaf 1 items 2 free space 0 generation 9 owner CHUNK_TREE', item(0, DATA_CHUNK), item(1, META_CHUNK)].join('\n')}\n`
+  return `${[`leaf 1 items ${chunks.length} free space 0 generation 9 owner CHUNK_TREE`, ...chunks.map((c, i) => item(i, c))].join('\n')}\n`
 }
 
 /** The csum item covering both DATA rows, as the run's cache would hold it. */
@@ -529,14 +576,23 @@ describe('logicalForMdByte — the chain, run backwards', () => {
     },
   )
 
+  // The chunks below sit INSIDE this segment's LV range (LV sectors 8192 to
+  // 9216). cr3 AHR-HEAL-L10: the inverse hop now refuses an md byte the
+  // segment does not map, and the module-level chunks (LV 4096 onward) sit
+  // below this segment entirely — the md bytes these cases used to pass were
+  // NEGATIVE, a byte no md array has.
+  const SEG_LV = 8192 * 512
+  const SEG_DATA: ChunkItem = { ...DATA_CHUNK, deviceOffset: SEG_LV + BLOCK_BYTES, stripes: [SEG_LV + BLOCK_BYTES] }
+  const SEG_META: ChunkItem = { ...META_CHUNK, deviceOffset: SEG_LV + 4 * BLOCK_BYTES, stripes: [SEG_LV + 4 * BLOCK_BYTES, SEG_LV + 64 * BLOCK_BYTES] }
+
   it('is the exact inverse of the forward hop, dm offset and chunk delta included', () => {
     // Forward: logical → LV byte through the chunk delta, LV byte → md byte
     // through the segment. The segment here starts at LV sector 8192 and maps
     // onto md sector 2048, so the two offsets do NOT cancel.
-    const logical = DATA_CHUNK.logical + BLOCK_BYTES
-    const lvByte = logical - DATA_CHUNK.logical + DATA_CHUNK.deviceOffset
+    const logical = SEG_DATA.logical + BLOCK_BYTES
+    const lvByte = logical - SEG_DATA.logical + SEG_DATA.deviceOffset
     const mdByte = lvByte - 8192 * 512 + 2048 * 512
-    const back = logicalForMdByte(mdByte, band, [DATA_CHUNK])
+    const back = logicalForMdByte(mdByte, band, [SEG_DATA])
     assert.equal(back?.logical, logical)
     assert.equal(back?.lvByte, lvByte)
     assert.equal(back?.chunk.type, 'DATA|single')
@@ -544,15 +600,43 @@ describe('logicalForMdByte — the chain, run backwards', () => {
   })
 
   it('answers null for an md byte in no chunk at all — that is free space, not an error', () => {
-    assert.equal(logicalForMdByte(2048 * 512, band, [DATA_CHUNK]), null)
-    assert.equal(logicalForMdByte(0, band, [DATA_CHUNK]), null, 'and for one below the segment')
+    assert.equal(logicalForMdByte(2048 * 512, band, [SEG_DATA]), null)
+    assert.equal(logicalForMdByte(0, band, [SEG_DATA]), null, 'and for one below the segment')
   })
 
   it('finds the SECOND copy of a DUP metadata chunk, and says which copy it is', () => {
-    const lvByte = META_CHUNK.stripes[1] + BLOCK_BYTES
-    const back = logicalForMdByte(lvByte - 8192 * 512 + 2048 * 512, band, [META_CHUNK])
+    const lvByte = SEG_META.stripes[1] + BLOCK_BYTES
+    const back = logicalForMdByte(lvByte - 8192 * 512 + 2048 * 512, band, [SEG_META])
     assert.equal(back?.copy, 1)
-    assert.equal(back?.logical, META_CHUNK.logical + BLOCK_BYTES)
+    assert.equal(back?.logical, SEG_META.logical + BLOCK_BYTES)
+  })
+
+  it('cr3 AHR-HEAL-L10: an md byte the segment does not map is not mapped through it', () => {
+    // The old arithmetic, run on a byte below the segment's md range, landed
+    // on the module chunk at LV 8192 — a logical byte nothing put there.
+    const lvOfModuleRow = DATA_CHUNK.deviceOffset + BLOCK_BYTES
+    const outside = lvOfModuleRow - 8192 * 512 + 2048 * 512
+    assert.ok(outside < 2048 * 512, 'the probe byte is outside the segment')
+    assert.equal(logicalForMdByte(outside, band, [DATA_CHUNK]), null)
+    // And one past its end.
+    assert.equal(logicalForMdByte((2048 + 1024) * 512, band, [SEG_DATA]), null)
+  })
+
+  it('cr3 AHR-HEAL-L10: an EXPANDED band — two segments on one md — maps each byte through its own segment', () => {
+    // Segment 1: LV sectors 0..1023 → md sectors 2048..3071. Segment 2 (the
+    // lvextend after an expansion): LV sectors 16384..17407 → md sectors
+    // 3072..4095. A row in segment 2 placed with segment 1's arithmetic lands
+    // 7 MiB away in the LV.
+    const geometry = band.geometry!
+    const seg1 = selfhealBand({ startSector: 0, lengthSectors: 1024, major: 9, minor: 127, offsetSector: 2048 }, geometry)
+    const seg2 = selfhealBand({ startSector: 16384, lengthSectors: 1024, major: 9, minor: 127, offsetSector: 3072 }, geometry)
+    const chunk2: ChunkItem = { ...DATA_CHUNK, deviceOffset: 16384 * 512, stripes: [16384 * 512] }
+    const mdByte = 3072 * 512 + BLOCK_BYTES
+    const back = logicalForMdByte(mdByte, [seg1, seg2], [DATA_CHUNK, chunk2])
+    assert.equal(back?.lvByte, 16384 * 512 + BLOCK_BYTES)
+    assert.equal(back?.logical, chunk2.logical + BLOCK_BYTES)
+    // The first segment alone does not map that byte at all, and says so.
+    assert.equal(logicalForMdByte(mdByte, seg1, [DATA_CHUNK, chunk2]), null)
   })
 })
 
@@ -1048,5 +1132,403 @@ describe('reconcileMirrorBand — arm B', () => {
     await run()
     const repairs = md.calls.filter(c => c.args.some(a => String(a).includes('--action=repair')))
     assert.deepEqual(repairs, [], 'the executor never saw an md repair')
+  })
+})
+
+/**
+ * cr3 (the 2026-11-14 review, AHR-HEAL-H2/H3/L9/L12): arm B held to the
+ * repair engine's standard. Each case below is the review's probe, run on this
+ * file's rig: it FAILED before the fix (a rotten row written over the good
+ * one, a stale row written over new live data, a URE that threw the whole run
+ * away) and passes after it.
+ */
+describe('reconcileMirrorBand — arm B at the repair engine\'s standard (cr3)', () => {
+  let md: FakeMirror
+
+  const setup = (rig: FakeMirror): void => {
+    md = rig
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = md.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(md.root, 'run')
+    forgetIssuedChecks()
+    md.mismatchQueue = ['128', '0']
+  }
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+    md.cleanup()
+  })
+
+  const run = async (extra = {}) => reconcileMirrorBand(md, md.pool(), 2, {
+    ...FAST,
+    evidence: () => PROVEN,
+    context: md.context(),
+    scrubPasses: 1,
+    ...extra,
+  })
+
+  it('H2: a DUP node\'s two copies are decided apart — copy 1\'s rotten row is never written over its good one', async () => {
+    // One 16 KiB node, DUP: copy 0 at rows 4..7, copy 1 at rows 8..11, both
+    // inside the walk. Copy 0 is rotten on leg 1, copy 1 on leg 0 — the same
+    // LOGICAL node, opposite winners. A verdict cached by logical alone wrote
+    // leg 0's rotten copy-1 row onto both legs and reported `reconciled`.
+    const dup: ChunkItem = { logical: META_CHUNK.logical, length: NODE_BYTES, deviceOffset: 4 * BLOCK_BYTES, stripes: [4 * BLOCK_BYTES, 8 * BLOCK_BYTES], type: 'METADATA|DUP' }
+    setup(new FakeMirror({ rows: 12, chunks: [DATA_CHUNK, dup] }))
+    for (const leg of md.legs)
+      makeNode(NODE_A).copy(leg, DATA_OFFSET + 8 * BLOCK_BYTES)
+    const good = Buffer.from(md.at(1, 8 * BLOCK_BYTES))
+    md.rot(1, 4 * BLOCK_BYTES, 0xB1)
+    md.rot(0, 8 * BLOCK_BYTES, 0xA0)
+
+    const result = await run()
+    assert.equal(result.outcome, 'reconciled', result.reason)
+    assert.deepEqual(result.rowsWritten, { leg0: 1, leg1: 1 }, 'each copy won by the leg whose copy passes AT THAT LOCATION')
+    assert.ok(md.at(0, 8 * BLOCK_BYTES).equals(good), 'copy 1 holds the GOOD bytes on leg 0 again')
+    assert.ok(md.at(1, 8 * BLOCK_BYTES).equals(good), 'and leg 1 was never overwritten with the rot')
+    assert.ok(md.at(0, 4 * BLOCK_BYTES).equals(md.at(1, 4 * BLOCK_BYTES)), 'copy 0 agrees too')
+  })
+
+  it('H3: a row the filesystem rewrote after the comparison is NOT written — the old row never lands on new live data', async () => {
+    // Leg 1 rotten at the DATA row; leg 0 holds the old good bytes. Between
+    // the window read and the write, btrfs frees the extent, commits, reuses
+    // the space and writes NEW data there through md (both legs).
+    setup(new FakeMirror())
+    md.rot(1, BLOCK_BYTES, 0xB1)
+    let fired = false
+    md.onRead = (rig, device) => {
+      if (!fired && device === rig.srcDevice) {
+        fired = true
+        rig.legs[0].fill(0x77, DATA_OFFSET + BLOCK_BYTES, DATA_OFFSET + 2 * BLOCK_BYTES)
+        rig.legs[1].fill(0x77, DATA_OFFSET + BLOCK_BYTES, DATA_OFFSET + 2 * BLOCK_BYTES)
+      }
+    }
+    const result = await run()
+    assert.ok(fired, 'the race was staged')
+    assert.deepEqual(result.rowsWritten, { leg0: 0, leg1: 0 }, 'nothing was written')
+    assert.equal(result.undecidedRows, 1)
+    assert.deepEqual(md.at(0, BLOCK_BYTES), Buffer.alloc(BLOCK_BYTES, 0x77), 'the new live data stands on leg 0')
+    assert.deepEqual(md.at(1, BLOCK_BYTES), Buffer.alloc(BLOCK_BYTES, 0x77), 'and on leg 1')
+  })
+
+  it('H3: the row is arbitrated AGAIN against the csum tree as it is now — a csum the run cached is not enough to write', async () => {
+    // The legs still hold what was compared, but the csum tree has moved on:
+    // the extent was freed, and the fresh walk finds no checksum for the row.
+    setup(new FakeMirror())
+    md.rot(1, BLOCK_BYTES, 0xB1)
+    md.csumRoot = 999424
+    const result = await run()
+    assert.deepEqual(result.rowsWritten, { leg0: 0, leg1: 0 })
+    assert.equal(result.undecidedRows, 1)
+    assert.deepEqual(md.at(1, BLOCK_BYTES), Buffer.alloc(BLOCK_BYTES, 0xB1), 'left exactly as it was')
+    assert.ok(md.calls.some(c => c.command === '/usr/bin/btrfs' && c.args.includes('-r')), 'the tree roots were read fresh')
+  })
+
+  it('L12: one unreadable sector in a window costs that ROW, not the run — every other row is still decided, one result, one notification', async () => {
+    setup(new FakeMirror())
+    md.rot(1, BLOCK_BYTES, 0xEE)
+    // A URE on leg 1 at row 0 (free space): the 4 MiB window read fails.
+    md.unreadable = { device: '/dev/loop1', offset: DATA_OFFSET }
+    const result = await run()
+    assert.equal(result.outcome, 'reconciled', result.reason)
+    assert.equal(result.rowsCompared, 6)
+    assert.equal(result.undecidedRows, 1, 'the unreadable row is set aside')
+    assert.deepEqual(result.rowsWritten, { leg0: 1, leg1: 0 }, 'the rotten row next to it was still arbitrated and written')
+    assert.deepEqual(md.at(1, BLOCK_BYTES), Buffer.alloc(BLOCK_BYTES, 0x11))
+    assert.equal(md.notifications.length, 1)
+  })
+
+  it('D3 in arm B: a row whose CHECKSUM cannot be read is undecided — never the restore sentence', async () => {
+    setup(new FakeMirror())
+    md.mismatchQueue = ['128', '128']
+    md.rot(1, BLOCK_BYTES, 0xEE)
+    // Both copies of the csum leaf fail their own checksum: copy 0 is rotten
+    // on the LV, copy 1 (1000 rows in) was never written.
+    md.rot(0, CSUM_LEAF_LV, 0xCC)
+    const result = await run()
+    assert.equal(result.outcome, 'residual')
+    assert.equal(result.unresolvedRows, 0)
+    assert.equal(result.undecidedRows, 1)
+    assert.deepEqual(result.rowsWritten, { leg0: 0, leg1: 0 })
+    assert.doesNotMatch(result.reason ?? '', /restoring from backup/)
+    assert.match(result.reason ?? '', /nothing about them is a reason to restore/)
+  })
+
+  it('L9: a leg whose bad-block list cannot be read is refused — unknown is not clean', async () => {
+    setup(new FakeMirror())
+    rmSync(join(md.sys, 'rd1/bad_blocks'))
+    const result = await run()
+    assert.equal(result.outcome, 'refused')
+    assert.equal(result.reasonCode, 'array-busy')
+    assert.match(result.reason ?? '', /bad-block list of \/dev\/loop1 could not be read/)
+    assert.deepEqual(md.actions(), [], 'md was never asked to do anything')
+  })
+
+  it('W2: a member failing DURING arm B stops it at the next write — the array is re-checked before every row, not once', async () => {
+    setup(new FakeMirror())
+    md.rot(1, BLOCK_BYTES, 0xEE)
+    md.rot(0, 2 * BLOCK_BYTES, 0xEE)
+    // md loses a leg while the SECOND row is being arbitrated again (its
+    // fresh tree-roots read): after the first row's write, before the second's.
+    const exec = md.exec.bind(md)
+    let roots = 0
+    md.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/bin/btrfs' && args[2] === '-r' && ++roots === 2)
+        md.set('degraded', '1')
+      return exec(command, args)
+    }
+    const result = await run()
+    assert.equal(result.outcome, 'residual', result.reason)
+    assert.equal(result.reasonCode, 'array-busy')
+    assert.match(result.reason ?? '', /array state changed during arm B: .*now degraded/)
+    assert.equal(result.rowsWritten.leg0 + result.rowsWritten.leg1, 1, 'the row written before the failure, and no other')
+    assert.deepEqual(md.at(0, 2 * BLOCK_BYTES), Buffer.alloc(BLOCK_BYTES, 0xEE), 'the second row was never written')
+  })
+
+  it('W2: a bad block md records on a leg DURING arm A refuses arm B — the geometry is read again before the first write', async () => {
+    setup(new FakeMirror())
+    md.rot(1, BLOCK_BYTES, 0xEE)
+    md.onScrub = rig => rig.set('rd1/bad_blocks', '2056 8')
+    const result = await run()
+    assert.equal(result.outcome, 'refused')
+    assert.equal(result.reasonCode, 'bad-blocks-present')
+    assert.deepEqual(result.rowsWritten, { leg0: 0, leg1: 0 })
+    assert.deepEqual(md.at(1, BLOCK_BYTES), Buffer.alloc(BLOCK_BYTES, 0xEE), 'nothing written')
+  })
+})
+
+/**
+ * cr3 review items 2 and 3 — the reviewer's probes P4a, P4b and P8, kept. The
+ * per-row re-read used to run BEFORE the fresh arbitration, leaving the whole
+ * fresh tree walk (seconds) unguarded; and the metadata path wrote bytes from
+ * a separate read rather than the bytes it had arbitrated.
+ */
+describe('reconcileMirrorBand — the order around each arm-B write (cr3 review items 2, 3)', () => {
+  let md: FakeMirror
+  beforeEach(() => {
+    md = new FakeMirror()
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = md.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(md.root, 'run')
+    forgetIssuedChecks()
+    md.mismatchQueue = ['128', '0']
+  })
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+    md.cleanup()
+  })
+  const run = async () => reconcileMirrorBand(md, md.pool(), 2, { ...FAST, evidence: () => PROVEN, context: md.context(), scrubPasses: 1 })
+  const newData = (rig: FakeMirror): void => {
+    rig.legs[0].fill(0x77, DATA_OFFSET + BLOCK_BYTES, DATA_OFFSET + 2 * BLOCK_BYTES)
+    rig.legs[1].fill(0x77, DATA_OFFSET + BLOCK_BYTES, DATA_OFFSET + 2 * BLOCK_BYTES)
+  }
+
+  it('P4a: new live data that lands while the FRESH roots are read is never overwritten', async () => {
+    md.rot(1, BLOCK_BYTES, 0xB1)
+    const exec = md.exec.bind(md)
+    let fired = false
+    md.exec = async (command: string, args: string[]) => {
+      if (!fired && command === '/usr/bin/btrfs' && args[2] === '-r') {
+        fired = true
+        newData(md)
+      }
+      return exec(command, args)
+    }
+    const result = await run()
+    assert.ok(fired)
+    assert.deepEqual(result.rowsWritten, { leg0: 0, leg1: 0 })
+    assert.deepEqual(md.at(0, BLOCK_BYTES), Buffer.alloc(BLOCK_BYTES, 0x77))
+    assert.deepEqual(md.at(1, BLOCK_BYTES), Buffer.alloc(BLOCK_BYTES, 0x77))
+  })
+
+  it('P4b: new live data that lands at the fresh csum-LEAF read is never overwritten', async () => {
+    md.rot(1, BLOCK_BYTES, 0xB1)
+    let srcReads = 0
+    md.onRead = (rig, device) => {
+      if (device === rig.srcDevice && ++srcReads === 2)
+        newData(rig)
+    }
+    const result = await run()
+    assert.equal(srcReads >= 2, true)
+    assert.deepEqual(result.rowsWritten, { leg0: 0, leg1: 0 })
+    assert.deepEqual(md.at(1, BLOCK_BYTES), Buffer.alloc(BLOCK_BYTES, 0x77))
+  })
+
+  it('the re-read of both legs is the LAST read before the write — after the fresh arbitration and the array re-check', async () => {
+    md.rot(1, BLOCK_BYTES, 0xB1)
+    await run()
+    const seq = md.calls.map(c => c.command === '/usr/bin/btrfs'
+      ? `btrfs ${c.args[2]}`
+      : c.command === '/usr/bin/dd' ? (c.args.some(a => a.startsWith('of=')) ? 'write' : `read ${c.args.find(a => a.startsWith('if='))}`) : c.command)
+    const write = seq.indexOf('write')
+    assert.ok(write > 0)
+    assert.deepEqual(seq.slice(write - 2, write + 1), ['read if=/dev/loop0', 'read if=/dev/loop1', 'write'], seq.slice(write - 8, write + 1).join(' | '))
+    assert.ok(seq.slice(0, write).lastIndexOf('btrfs -r') < write - 2, 'the fresh walk ran before the re-read')
+  })
+
+  it('P8 (item 3): a METADATA row whose fresh node does not hold the compared bytes is not written, even if the row reads back as compared', async () => {
+    md.rot(0, 4 * BLOCK_BYTES, 0xEE)
+    const before = [Buffer.from(md.legs[0]), Buffer.from(md.legs[1])]
+    let n = 0
+    let landed = false
+    md.onRead = (rig, device, offset) => {
+      if (offset !== DATA_OFFSET + 4 * BLOCK_BYTES)
+        return
+      if (device === '/dev/loop1' && ++n === 2) {
+        // The fresh arbitration's read of leg 1's node: a NEW valid node.
+        const fresh = makeNode(NODE_A, b => b.fill(0x99, 200, 400))
+        fresh.copy(rig.legs[0], DATA_OFFSET + 4 * BLOCK_BYTES)
+        fresh.copy(rig.legs[1], DATA_OFFSET + 4 * BLOCK_BYTES)
+        landed = true
+        return
+      }
+      if (device === '/dev/loop0' && landed) {
+        // ...and by the last re-read the disks hold what was compared again.
+        before[0].copy(rig.legs[0])
+        before[1].copy(rig.legs[1])
+        landed = false
+      }
+    }
+    const result = await run()
+    assert.ok(n >= 2)
+    assert.deepEqual(result.rowsWritten, { leg0: 0, leg1: 0 }, 'the arbitrated node slice was not the compared row')
+    assert.equal(result.undecidedRows, 1)
+  })
+})
+
+describe('reconcileMirrorBand — a write that reports a failure after it was issued (cr3 review item 6)', () => {
+  let md: FakeMirror
+  beforeEach(() => {
+    md = new FakeMirror()
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = md.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(md.root, 'run')
+    forgetIssuedChecks()
+    md.mismatchQueue = ['128', '0']
+  })
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+    md.cleanup()
+  })
+
+  it('ends residual, one result and one notification, and never says nothing was written', async () => {
+    md.rot(1, BLOCK_BYTES, 0xB1)
+    const exec = md.exec.bind(md)
+    md.exec = async (command: string, args: string[]) => {
+      const r = await exec(command, args)
+      if (command === '/usr/bin/dd' && args.some(a => a.startsWith('of=/dev/md127')))
+        return { stdout: '', stderr: 'dd: fsync failed: Input/output error', exitCode: 1 }
+      return r
+    }
+    const result = await reconcileMirrorBand(md, md.pool(), 2, { ...FAST, evidence: () => PROVEN, context: md.context(), scrubPasses: 1 })
+    assert.equal(result.outcome, 'residual')
+    assert.match(result.reason ?? '', /may have landed/)
+    assert.doesNotMatch(result.reason ?? '', /Nothing was written/)
+    assert.equal(md.notifications.length, 1)
+  })
+})
+
+describe('reconcileMirrorBand — an arm-A scrub pass whose verdict cannot be read (cr3 review item 7)', () => {
+  let md: FakeMirror
+  beforeEach(() => {
+    md = new FakeMirror()
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = md.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(md.root, 'run')
+    forgetIssuedChecks()
+  })
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+    md.cleanup()
+  })
+
+  it('refuses `scrub-unproven` with one result and one notification, nothing written', async () => {
+    const exec = md.exec.bind(md)
+    md.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/bin/btrfs' && args[0] === 'scrub' && args[1] === 'start') {
+        md.calls.push({ command, args })
+        return { stdout: '', stderr: 'ERROR: scrub failed', exitCode: 1 }
+      }
+      return exec(command, args)
+    }
+    const result = await reconcileMirrorBand(md, md.pool(), 2, { ...FAST, evidence: () => PROVEN, context: md.context() })
+    assert.equal(result.outcome, 'refused')
+    assert.equal(result.reasonCode, 'scrub-unproven')
+    assert.equal(md.notifications.length, 1)
+    assert.deepEqual(md.actions(), [])
+  })
+})
+
+describe('mirrorReconcileEvidence — a scrub whose checksum pass has no verdict (cr3 second review item 2)', () => {
+  it('is no proof: refused `scrub-unproven`', () => {
+    const job = { id: 'job-3', operation: 'ahr.scrub', status: 'completed', createdAt: '2026-11-14T00:00:00.000Z', result: { scrubbed: 'tank', btrfsErrors: null, checkedArrays: 1, btrfsUnproven: 'btrfs scrub on \'tank\' was aborted', parityMismatches: [{ band: 'tank-r2', bandIndex: 2, mismatchCnt: 128, level: 'raid1' }] } } as unknown as Job
+    const evidence = mirrorReconcileEvidence('tank', job, 2)
+    assert.equal(evidence.ok, false)
+    assert.equal(evidence.ok ? null : evidence.code, 'scrub-unproven')
+  })
+})
+
+/**
+ * cr3 second review items 6 and 7 — arm B's estimate counts the per-row cost
+ * of every row it expects to write, and a run that stops after writing says
+ * WHICH rows it wrote.
+ */
+describe('reconcileMirrorBand — what arm B costs and what it wrote (cr3 second review items 6, 7)', () => {
+  it('item 6: the gate\'s arm-B estimate adds rows × the per-row cost, rows from the evidence mismatch_cnt', () => {
+    const array = { band: 2, device: '/dev/md/tank-r2', heightBytes: 20 * 1024 * 1024, members: 2 }
+    const without = mirrorReconcileWarnings('tank', array, null)
+    const withRows = mirrorReconcileWarnings('tank', array, null, MIRROR_SCRUB_PASSES, 80_000)
+    const line = withRows.find(w => w.startsWith('Arm B runs only if'))!
+    // 80,000 sectors counted = 10,000 differing 4 KiB rows; each written row
+    // costs a fresh tree walk, two re-reads, a write: up to MIRROR_ROW_WRITE_SECONDS.
+    assert.match(line, /10000 differing 4 KiB row\(s\)/)
+    assert.match(line, new RegExp(`up to ${MIRROR_ROW_WRITE_SECONDS} s each`))
+    assert.notDeepEqual(withRows, without)
+  })
+
+  it('item 6: the run\'s own estimate line uses the compare rate and the per-row cost', async () => {
+    const md = new FakeMirror()
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = md.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(md.root, 'run')
+    forgetIssuedChecks()
+    md.mismatchQueue = ['128', '0']
+    try {
+      md.rot(1, BLOCK_BYTES, 0xB1)
+      const progress: string[] = []
+      await reconcileMirrorBand(md, md.pool(), 2, { ...FAST, evidence: () => PROVEN, context: md.context(), scrubPasses: 1, updateProgress: m => progress.push(m) })
+      const line = progress.find(p => p.startsWith('arm B: comparing both legs'))!
+      assert.match(line, /16 differing 4 KiB row\(s\) expected/)
+    }
+    finally {
+      delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+      delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+      md.cleanup()
+    }
+  })
+
+  it('item 7: a run that stops after writing names the md bytes it wrote', async () => {
+    const md = new FakeMirror()
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = md.root
+    process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(md.root, 'run')
+    forgetIssuedChecks()
+    md.mismatchQueue = ['128', '128']
+    try {
+      md.rot(1, BLOCK_BYTES, 0xB1)
+      md.rot(1, 2 * BLOCK_BYTES, 0xB2)
+      const exec = md.exec.bind(md)
+      let roots = 0
+      md.exec = async (command: string, args: string[]) => {
+        if (command === '/usr/bin/btrfs' && args[2] === '-r' && ++roots === 2)
+          md.set('degraded', '1')
+        return exec(command, args)
+      }
+      const result = await reconcileMirrorBand(md, md.pool(), 2, { ...FAST, evidence: () => PROVEN, context: md.context(), scrubPasses: 1 })
+      assert.equal(result.outcome, 'residual')
+      assert.deepEqual(result.writtenAt, [BLOCK_BYTES])
+      assert.match(result.reason ?? '', /rows written at md byte\(s\) 4096/)
+    }
+    finally {
+      delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+      delete process.env.ANAS_SELFHEAL_RUNTIME_DIR
+      md.cleanup()
+    }
   })
 })

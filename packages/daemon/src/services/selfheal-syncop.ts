@@ -57,9 +57,50 @@ export function hasIssuedCheck(kernel: string): boolean {
   return issuedChecks.has(kernel)
 }
 
+/**
+ * The `sync_max` value this daemon last NARROWED an array's window to, by
+ * kernel name (cr3 AHR-HEAL-H4). The one fact that lets a cleanup tell "the
+ * one-stripe window this run left" from a window someone else set: under a
+ * foreign recovery or resync, `sync_max` is widened back to `max` only while it
+ * still reads exactly this value. Not persisted, never consulted as a fact
+ * about the array — `sync_max` itself is re-read every time (Principle 11).
+ */
+const narrowedWindows = new Map<string, string>()
+
+/** Record that this run just wrote `sync_max` to this value on this array. */
+export function markWindowNarrowed(kernel: string, syncMax: string): void {
+  narrowedWindows.set(kernel, syncMax)
+}
+
+/** The `sync_max` this run last narrowed this array to, or null. */
+export function narrowedSyncMax(kernel: string): string | null {
+  return narrowedWindows.get(kernel) ?? null
+}
+
+/** The window is md's own again (or no longer ours to put back). */
+export function forgetWindowNarrowed(kernel: string): void {
+  narrowedWindows.delete(kernel)
+}
+
+/**
+ * The foreign md operations a widened `sync_max` may release (cr3
+ * AHR-HEAL-H4): a recovery and a resync, the two md parks at `sync_max`. Never
+ * `reshape` (mdadm's backup-file reshape drives `sync_max` itself), never a
+ * check or repair (not ours, and widening resumes them over the whole band),
+ * never `frozen`, never an unreadable state. The ONE list both widen writes
+ * (the repair's cleanup and the daemon-start reconcile) consult.
+ */
+const WIDEN_UNDER_ACTIONS = new Set(['recover', 'resync'])
+
+/** May `sync_max` be widened under this `sync_action`? @see WIDEN_UNDER_ACTIONS */
+export function mayWidenSyncMaxUnder(action: string | null): boolean {
+  return action !== null && WIDEN_UNDER_ACTIONS.has(action)
+}
+
 /** Tests only: start from a clean slate between cases. */
 export function forgetIssuedChecks(): void {
   issuedChecks.clear()
+  narrowedWindows.clear()
 }
 
 /**

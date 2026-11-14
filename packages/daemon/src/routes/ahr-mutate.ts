@@ -24,7 +24,7 @@ import { ahrNameOccupancy, isIntentStaleForPool } from '../services/ahr-identity
 import { defaultAhrIntentDir, readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, fmtBytes, fmtKnownBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
 import { foreignProgramHook, foreignProgramRefusal } from '../services/ahr-mdadm-conf.js'
-import { mirrorReconcileArray, mirrorReconcileArrayRefusal, mirrorReconcileEvidence, mirrorReconcileWarnings, reconcileMirrorBand } from '../services/ahr-mirror-reconcile.js'
+import { MIRROR_SCRUB_PASSES, mirrorReconcileArray, mirrorReconcileArrayRefusal, mirrorReconcileEvidence, mirrorReconcileWarnings, reconcileMirrorBand } from '../services/ahr-mirror-reconcile.js'
 import { parityRewriteArray, parityRewriteArrayRefusal, parityRewriteEvidence, parityRewriteWarnings, rewriteBandParity } from '../services/ahr-parity-rewrite.js'
 import { ahrLvPath, ahrMountBase } from '../services/ahr-paths.js'
 import { repairAhrFiles } from '../services/ahr-repair.js'
@@ -1788,7 +1788,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       address: ['name', 'band'],
       presentationOnly: AHR_MIRROR_RECONCILE_PRESENTATION_ONLY,
       message: `Reconciling mirror band r${band} of AHR pool '${name}' makes its two legs agree again (md counted ${proof.mismatchCnt} disagreeing unit(s) there, and the pool's last checksum scrub was clean)`,
-      warnings: [...mirrorReconcileWarnings(name, array, pool.capacity.usedBytes), ...reconcileLunWarnings(mirrorHeld)],
+      warnings: [...mirrorReconcileWarnings(name, array, pool.capacity.usedBytes, MIRROR_SCRUB_PASSES, proof.mismatchCnt), ...reconcileLunWarnings(mirrorHeld)],
     })) {
       return reply
     }

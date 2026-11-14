@@ -1204,6 +1204,16 @@ export const AhrScrubResult = z.object({
    * simply leaves it off.
    */
   metadataCorrected: AhrMetadataCorrected.optional(),
+  /**
+   * The btrfs checksum pass delivered NO verdict this run could read (cr3,
+   * ahr-heal second review item 2): it did not run (a scrub was already
+   * running, or btrfs refused), was canceled, or its status named no state.
+   * The reason, verbatim. When set, `btrfsErrors: null` is NOT "clean": phase
+   * 1's fields are as measured, phase 2 is unproven. Optional and additive —
+   * an older panel ignores it; the evidence readers of Rewrite parity and
+   * Reconcile mirror refuse a result that carries it.
+   */
+  btrfsUnproven: z.string().optional(),
 })
 export type AhrScrubResult = z.infer<typeof AhrScrubResult>
 

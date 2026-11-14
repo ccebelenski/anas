@@ -23,10 +23,13 @@ import {
   mismatchCount,
   parseBtrfsScrubStatus,
   parseCorrectedRead,
+  parseScrubStamp,
   parseScrubWarning,
   parseUnattributedScrubError,
+  readCorrectedReads,
   runningAhrCheck,
   scrubAhrPool,
+  ScrubVerdictUnknownError,
 } from '../ahr-scrub.js'
 import { mismatchCntArgs } from '../scrub-schedules.js'
 import { forgetIssuedChecks, hasIssuedCheck, ownsSyncOp } from '../selfheal-syncop.js'
@@ -77,10 +80,22 @@ function pool(mountpoint = MOUNTPOINT): AhrPool {
   })
 }
 
+/**
+ * `Scrub started:` in btrfs-progs' own format, stamped NOW: since cr3 (review
+ * item 7) a `finished` status stamped before the pass began describes an
+ * earlier pass, and the fixed date this helper used to print would be one.
+ */
+function scrubStamp(when = new Date()): string {
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${days[when.getUTCDay()]} ${months[when.getUTCMonth()]} ${String(when.getUTCDate()).padStart(2, ' ')} ${p(when.getUTCHours())}:${p(when.getUTCMinutes())}:${p(when.getUTCSeconds())} ${when.getUTCFullYear()}`
+}
+
 function scrubStatus(status: string, opts?: { percent?: string, summary?: string }): string {
   return [
     'UUID:             11111111-2222-3333-4444-555555555555',
-    'Scrub started:    Wed Jul 23 10:00:00 2026',
+    `Scrub started:    ${scrubStamp()}`,
     `Status:           ${status}`,
     'Duration:         0:00:04',
     ...(opts?.percent ? [`Bytes scrubbed:   721.09MiB  (${opts.percent}%)`] : ['Total to scrub:   6.66GiB']),
@@ -1014,10 +1029,48 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     }
   })
 
-  it('aborted btrfs scrub fails the job', async () => {
+  it('cr3: does NOT write the window of a band whose sync_action cannot be read — an unreadable state licenses no write', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'anas-scrub-knobs-'))
+    const sys = join(root, 'sys/block/md127/md')
+    mkdirSync(sys, { recursive: true })
+    writeFileSync(join(sys, 'sync_min'), '6272\n')
+    writeFileSync(join(sys, 'sync_max'), '6400\n')
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = root
+
+    try {
+      const executor = baseExecutor()
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+      // md127's sync_action does not read at all.
+      executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/sync_action'], result: { stdout: '', stderr: 'cat: Input/output error', exitCode: 1 } })
+      executor.addFixture({ command: '/usr/bin/cat', args: mismatchCntArgs('md127'), result: { stdout: '0\n', stderr: '', exitCode: 0 } })
+
+      const progress: string[] = []
+      const result = await liveScrubPass(executor, scrubAhrPool(executor, pool(), m => progress.push(m), { pollIntervalMs: 1, mismatchDelayMs: 1, checkStartTimeoutMs: 20 }))
+
+      assert.equal(readFileSync(join(sys, 'sync_min'), 'utf-8').trim(), '6272', 'sync_min untouched')
+      assert.equal(readFileSync(join(sys, 'sync_max'), 'utf-8').trim(), '6400', 'sync_max untouched')
+      assert.equal(checkIssuedAt(executor, '/dev/md/t2-r1'), -1, 'no check was issued into the bounded window')
+      assert.ok(result.bandsSkipped?.some(b => b.band === 't2-r1' && /sync_action could not be read/.test(b.reason)), JSON.stringify(result.bandsSkipped))
+    }
+    finally {
+      delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('an aborted btrfs scrub is an UNPROVEN checksum pass: the job completes with a warning, never clean', async () => {
+    // cr3 second review item 2 (the coordinator's decision): it used to FAIL
+    // the job and drop phase 1's verdicts with it.
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: scrubStatus('aborted'), stderr: '', exitCode: 0 } })
-    await assert.rejects(scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }), /aborted/)
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    assert.match(result.btrfsUnproven ?? '', /aborted/)
+    assert.equal(result.btrfsErrors, null)
+    const warn = executor.calls.filter(c => c.command === '/usr/bin/perl').at(-1)!
+    assert.equal(warn.args[2], 'warning')
+    assert.match(warn.args[4], /not a clean bill/)
   })
 
   it('refuses an unmounted pool', async () => {
@@ -1750,6 +1803,29 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
 
     const result = await liveScrubPass(e, scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.findings?.[0].path, F1)
+  })
+
+  it('cr3: a pool whose layout could not be read (subvolLayout null) reports the finding unidentified — never a top-level path, never probed', async () => {
+    const e = baseExecutor()
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], live: {} })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=1' }), stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/realpath', args: ['/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/journalctl', result: { stdout: journal([GT3_LINES[0]]), stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/btrfs', args: ['inspect-internal', 'subvolid-resolve', '256', MOUNTPOINT], result: { stdout: '@data\n', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/stat', args: ['-c', '%s', F1], result: { stdout: '4194304\n', stderr: '', exitCode: 0 } })
+    e.addFixture({ command: '/usr/bin/dd', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // No findmnt fixture (127), and the pool's own reading is null.
+    const unknown = { ...pool(), subvolLayout: null } as unknown as AhrPool
+
+    const result = await liveScrubPass(e, scrubAhrPool(e, unknown, () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
+    const finding = result.findings?.[0]
+    assert.ok(finding)
+    assert.notEqual(finding.path, F1)
+    assert.notEqual(finding.path, `${MOUNTPOINT}/@data/f1.bin`)
+    assert.equal(finding.unidentified, true)
+    assert.match(finding.reason ?? '', /mount state could not be read/)
+    assert.ok(!e.calls.some(c => c.command === '/usr/bin/dd'), 'nothing was probed at a guessed path')
   })
 })
 
@@ -2551,5 +2627,249 @@ describe('corrected metadata reads (selfheal.12, GT-20)', () => {
     assert.deepEqual(parsed.metadataCorrected, { count: 2, devices: ['/dev/mapper/gtsh-data'] })
     const legacy = AhrScrubResult.parse({ scrubbed: 't2', btrfsErrors: null, checkedArrays: 2 })
     assert.equal(legacy.metadataCorrected, undefined)
+  })
+})
+
+describe('readCorrectedReads — a journal neither read could take (cr3)', () => {
+  it('rejects rather than answering zero corrected reads', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/journalctl', result: { stdout: '', stderr: 'Failed to open journal: Permission denied', exitCode: 1 } })
+    executor.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
+    await assert.rejects(readCorrectedReads(executor, pool(), new Date()), /Permission denied/)
+  })
+})
+
+/**
+ * cr3 review item 7 — the review's `probes/scrubpass.mts`, kept. A pass whose
+ * verdict could not be read used to read as CLEAN, and a clean pass is what
+ * licenses the parity rewrite's `mdadm --action=repair`.
+ */
+describe('btrfsScrubPass — fails CLOSED (cr3 review item 7)', () => {
+  interface R { stdout: string, stderr: string, exitCode: number }
+  const fake = (start: R, status: R) => ({
+    async exec(_cmd: string, args: string[]) {
+      if (args[1] === 'start')
+        return start
+      if (args[1] === 'status')
+        return status
+      return { stdout: '', stderr: 'unexpected', exitCode: 127 }
+    },
+    async pipeline() {
+      throw new Error('not used')
+    },
+    async execToStream() {
+      throw new Error('not used')
+    },
+  }) as unknown as MockExecutor
+  const ok = (stdout: string): R => ({ stdout, stderr: '', exitCode: 0 })
+  /** btrfs-progs' own stamp format (`%a %b %e %H:%M:%S %Y`), for a time this pass covers. */
+  const stamp = (when: Date): string => {
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    const p = (n: number): string => String(n).padStart(2, '0')
+    return `${days[when.getUTCDay()]} ${months[when.getUTCMonth()]} ${String(when.getUTCDate()).padStart(2, ' ')} ${p(when.getUTCHours())}:${p(when.getUTCMinutes())}:${p(when.getUTCSeconds())} ${when.getUTCFullYear()}`
+  }
+  const finished = (started: string, summary = 'no errors found'): string =>
+    `UUID:             1111\nScrub started:    ${started}\nStatus:           finished\nDuration:         0:00:04\nError summary:    ${summary}\n`
+
+  it('"no stats available" (no Status line) is a pass with no verdict, never clean', async () => {
+    await assert.rejects(btrfsScrubPass(fake(ok(''), ok('UUID:             1111\n\tno stats available\n')), '/mnt', 'tank', () => {}, 1), ScrubVerdictUnknownError)
+  })
+
+  it('an EMPTY status is no verdict', async () => {
+    await assert.rejects(btrfsScrubPass(fake(ok(''), ok('')), '/mnt', 'tank', () => {}, 1), ScrubVerdictUnknownError)
+  })
+
+  it('`scrub start` exiting 1 means the scrub did not run — the previous pass\'s clean status is not this pass\'s', async () => {
+    const start = { stdout: '', stderr: 'ERROR: scrubbing /mnt failed for device id 1: ret=-1, errno=30 (Read-only file system)', exitCode: 1 }
+    await assert.rejects(btrfsScrubPass(fake(start, ok(finished('Mon Nov 10 03:00:00 2026'))), '/mnt', 'tank', () => {}, 1), /did not run/)
+  })
+
+  it('`scrub start` exiting 3 is ERRORS FOUND, whatever the status text says', async () => {
+    const legacy = 'scrub status for 1111\n\tscrub started at Fri Nov 14 10:00:00 2026 and finished after 00:00:04\n\ttotal bytes scrubbed: 1.00GiB with 5 errors\n'
+    const r = await btrfsScrubPass(fake({ stdout: '', stderr: '', exitCode: 3 }, ok(legacy)), '/mnt', 'tank', () => {}, 1)
+    assert.notEqual(r.btrfsErrors, null)
+    assert.match(r.btrfsErrors ?? '', /uncorrectable/)
+  })
+
+  it('any other exit code is "could not tell"', async () => {
+    await assert.rejects(btrfsScrubPass(fake({ stdout: '', stderr: '', exitCode: 2 }, ok(finished(stamp(new Date())))), '/mnt', 'tank', () => {}, 1), ScrubVerdictUnknownError)
+  })
+
+  it('a `finished` status from BEFORE this pass began describes another pass, not this one', async () => {
+    await assert.rejects(btrfsScrubPass(fake(ok(''), ok(finished('Mon Nov 10 03:00:00 2025'))), '/mnt', 'tank', () => {}, 1), /earlier pass/)
+  })
+
+  it('control: exit 0 and `Status: finished` stamped inside this pass is clean', async () => {
+    const r = await btrfsScrubPass(fake(ok(''), ok(finished(stamp(new Date())))), '/mnt', 'tank', () => {}, 1)
+    assert.equal(r.btrfsErrors, null)
+  })
+})
+
+/**
+ * cr3 second review item 1 — the verdict is THIS pass's own, and no stamp is
+ * read in the daemon's zone. `btrfs scrub start -B` prints the pass's own
+ * summary when it returns (`scrub %s for %s`, then the same `Scrub started:` /
+ * `Status:` / `Error summary:` block `scrub status` prints — the format
+ * strings of btrfs-progs v7.1 on this box); a status read that remains runs
+ * with TZ=UTC and LC_ALL=C and its stamp is parsed as UTC.
+ */
+describe('btrfsScrubPass — this pass\'s own verdict, zone-free (cr3 second review item 1)', () => {
+  interface R { stdout: string, stderr: string, exitCode: number }
+  interface Call { args: string[], env?: Record<string, string> }
+  const fake = (start: R, status: R, calls: Call[] = []) => ({
+    async exec(_cmd: string, args: string[], opts?: { env?: Record<string, string> }) {
+      calls.push({ args, ...(opts?.env ? { env: opts.env } : {}) })
+      if (args[1] === 'start')
+        return start
+      if (args[1] === 'status')
+        return status
+      return { stdout: '', stderr: 'unexpected', exitCode: 127 }
+    },
+    async pipeline() {
+      throw new Error('not used')
+    },
+    async execToStream() {
+      throw new Error('not used')
+    },
+  }) as unknown as MockExecutor
+  const ok = (stdout: string): R => ({ stdout, stderr: '', exitCode: 0 })
+  /** The captured stamp format (`routes/__tests__/scrub.test.ts`: `Fri Nov  6 00:36:16 2026`), in UTC. */
+  const utcStamp = (when: Date): string => {
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    const p = (n: number): string => String(n).padStart(2, '0')
+    return `${days[when.getUTCDay()]} ${months[when.getUTCMonth()]} ${String(when.getUTCDate()).padStart(2, ' ')} ${p(when.getUTCHours())}:${p(when.getUTCMinutes())}:${p(when.getUTCSeconds())} ${when.getUTCFullYear()}`
+  }
+  const block = (stamp: string, summary = 'no errors found'): string =>
+    `Scrub started:    ${stamp}\nStatus:           finished\nDuration:         0:00:04\nTotal to scrub:   1.00GiB\nRate:             256.00MiB/s\nError summary:    ${summary}\n`
+  const withTz = async <T>(tz: string, fn: () => Promise<T>): Promise<T> => {
+    const before = process.env.TZ
+    process.env.TZ = tz
+    try {
+      return await fn()
+    }
+    finally {
+      if (before === undefined)
+        delete process.env.TZ
+      else process.env.TZ = before
+    }
+  }
+
+  it('-B\'s own summary IS the verdict: the status file is not read for it', async () => {
+    const calls: Call[] = []
+    const start = ok(`Starting scrub on devid 1\nscrub done for 1111\n${block(utcStamp(new Date()), 'csum=2')}`)
+    const r = await btrfsScrubPass(fake(start, ok('UUID:             1111\n\tno stats available\n'), calls), '/mnt', 'tank', () => {}, 1)
+    assert.equal(r.btrfsErrors, 'csum=2')
+  })
+
+  it('a pass -B reports CANCELED has no verdict', async () => {
+    const start = ok(`Starting scrub on devid 1\nscrub canceled for 1111\n${block(utcStamp(new Date()))}`)
+    await assert.rejects(btrfsScrubPass(fake(start, ok(block(utcStamp(new Date())))), '/mnt', 'tank', () => {}, 1), ScrubVerdictUnknownError)
+  })
+
+  it('runs start AND status with TZ=UTC and LC_ALL=C', async () => {
+    const calls: Call[] = []
+    await btrfsScrubPass(fake(ok(''), ok(`UUID:             1111\n${block(utcStamp(new Date()))}`), calls), '/mnt', 'tank', () => {}, 1)
+    for (const c of calls.filter(c => c.args[0] === 'scrub'))
+      assert.deepEqual({ TZ: c.env?.TZ, LC_ALL: c.env?.LC_ALL }, { TZ: 'UTC', LC_ALL: 'C' }, c.args.join(' '))
+  })
+
+  for (const tz of ['Asia/Tokyo', 'America/New_York', 'Europe/Berlin']) {
+    it(`a just-finished pass is clean whatever the daemon's zone (${tz})`, async () => {
+      const r = await withTz(tz, () => btrfsScrubPass(fake(ok(''), ok(`UUID:             1111\n${block(utcStamp(new Date()))}`)), '/mnt', 'tank', () => {}, 1))
+      assert.equal(r.btrfsErrors, null)
+    })
+  }
+
+  for (const tz of ['America/New_York', 'Europe/Berlin', 'UTC']) {
+    it(`parseScrubStamp reads the captured format as UTC across both DST edges (daemon zone ${tz})`, async () => {
+      await withTz(tz, async () => {
+        assert.equal(parseScrubStamp('Fri Nov  6 00:36:16 2026'), Date.UTC(2026, 10, 6, 0, 36, 16))
+        // New York's fall-back hour (01:30 happens twice locally) and Berlin's
+        // (02:30 on 2026-10-25): as UTC there is exactly one instant each.
+        assert.equal(parseScrubStamp('Sun Nov  1 01:30:00 2026'), Date.UTC(2026, 10, 1, 1, 30, 0))
+        assert.equal(parseScrubStamp('Sun Oct 25 02:30:00 2026'), Date.UTC(2026, 9, 25, 2, 30, 0))
+        // ...and the spring-forward hour that does not exist locally.
+        assert.equal(parseScrubStamp('Sun Mar  8 02:30:00 2026'), Date.UTC(2026, 2, 8, 2, 30, 0))
+        assert.equal(parseScrubStamp('not a stamp'), null)
+      })
+    })
+  }
+
+  it('"Scrub is already running." gets its own sentence, never "run Scrub again"', async () => {
+    const start = { stdout: '', stderr: 'ERROR: Scrub is already running.\nTo cancel use \'btrfs scrub cancel /mnt\'.\n', exitCode: 1 }
+    await assert.rejects(btrfsScrubPass(fake(start, ok('')), '/mnt', 'tank', () => {}, 1), (e: unknown) => {
+      assert.ok(e instanceof ScrubVerdictUnknownError)
+      assert.match(e.message, /a btrfs scrub was already running on \/mnt/)
+      assert.doesNotMatch(e.message, /[Ss]crub again/)
+      return true
+    })
+  })
+})
+
+/**
+ * cr3 second review item 2 (coordinator's decision): a scrub JOB whose
+ * checksum pass has no readable verdict COMPLETES with a warning. What phase 1
+ * read is reported as measured; phase 2 is reported unproven with its reason;
+ * nothing reads clean.
+ */
+describe('scrubAhrPool — a checksum pass with no verdict (cr3 second review item 2)', () => {
+  it('completes, keeps phase 1\'s parity mismatch, reports phase 2 unproven, and never calls the data clean', async () => {
+    const executor = cleanCounters(baseExecutor(), 'md126')
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], result: { stdout: '', stderr: 'ERROR: Scrub is already running.\n', exitCode: 1 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('running', { percent: '12.00' }), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/sys/block/md127/md/mismatch_cnt'], result: { stdout: '8\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], results: [
+      { stdout: mdstat([{ kernel: 'md127', checkPercent: 10 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126', checkPercent: 55 }]), stderr: '', exitCode: 0 },
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+    ] })
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    assert.deepEqual(result.parityMismatches?.map(p => p.band), ['t2-r1'], 'phase 1 as measured')
+    assert.match(result.btrfsUnproven ?? '', /already running/)
+    const warns = executor.calls.filter(c => c.command === '/usr/bin/perl')
+    const last = warns.at(-1)!
+    assert.equal(last.args[2], 'warning')
+    assert.match(last.args[4], /already running/)
+    assert.ok(!warns.some(w => /found no corrupt files|Every file's checksum passes/.test(w.args[4])), 'never the clean-data parity arm')
+  })
+})
+
+/**
+ * The captured `btrfs scrub start -B` output (PVE 9, btrfs-progs v6.14, loop
+ * device, 2026-11-14 — `fixtures/ahr/btrfs-scrub-start-B.PROVENANCE.md`),
+ * through the verdict path, with no status file to fall back on.
+ */
+describe('btrfsScrubPass — over the CAPTURED `start -B` output', () => {
+  const ahrFixture = (name: string): string => readFileSync(join(__dirname, '../../fixtures/ahr', name), 'utf-8')
+  const fake = (start: { stdout: string, stderr: string, exitCode: number }) => ({
+    async exec(_cmd: string, args: string[]) {
+      if (args[1] === 'start')
+        return start
+      // No status file: the verdict must come from -B itself.
+      return { stdout: '', stderr: 'ERROR: failed to read status: No such file or directory', exitCode: 1 }
+    },
+    async pipeline() {
+      throw new Error('not used')
+    },
+    async execToStream() {
+      throw new Error('not used')
+    },
+  }) as unknown as MockExecutor
+
+  it('captured clean pass (rc 0): proven clean from -B\'s own `scrub done` verdict', async () => {
+    const r = await btrfsScrubPass(fake({ stdout: ahrFixture('btrfs-scrub-start-B-clean.stdout.txt'), stderr: '', exitCode: 0 }), '/mnt', 'tank', () => {}, 1)
+    assert.equal(r.btrfsErrors, null)
+  })
+
+  it('captured already-running refusal (rc 1, stdout empty): the already-running sentence, read from STDERR', async () => {
+    const start = { stdout: '', stderr: ahrFixture('btrfs-scrub-start-B-already-running.stderr.txt'), exitCode: 1 }
+    await assert.rejects(btrfsScrubPass(fake(start), '/mnt', 'tank', () => {}, 1), (e: unknown) => {
+      assert.ok(e instanceof ScrubVerdictUnknownError)
+      assert.match(e.message, /a btrfs scrub was already running on \/mnt/)
+      return true
+    })
   })
 })

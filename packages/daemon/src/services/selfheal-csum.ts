@@ -1,6 +1,6 @@
 import type { CommandExecutor } from '../executor/types.js'
 import type { SelfhealContext } from './selfheal-map.js'
-import { csumItemKey, findLeaf } from './selfheal-btree.js'
+import { csumItemKey, findLeaf, readTreeRoots, SelfhealTreeError } from './selfheal-btree.js'
 import { BLOCK_BYTES, readDirect } from './selfheal-io.js'
 import { chunkStripeOffsets, coveringChunk, SelfhealMapError } from './selfheal-map.js'
 
@@ -282,6 +282,18 @@ export async function findStoredCsumEntry(
   return findCsumEntry(ctx.csums, logical)
 }
 
+/** The tree roots as they are NOW — a fresh lookup's starting point. */
+async function readFreshRoots(executor: CommandExecutor, device: string): Promise<SelfhealContext['roots']> {
+  try {
+    return await readTreeRoots(executor, device)
+  }
+  catch (error) {
+    if (error instanceof SelfhealTreeError)
+      throw new CsumUnreadableError(`this file's checksum could not be read reliably: the tree roots could not be re-read (${error.message}). Nothing is known about the data block itself: do NOT restore from backup on the strength of this.`)
+    throw error
+  }
+}
+
 /**
  * The stored crc32c for one logical byte, read through the LV.
  *
@@ -303,8 +315,33 @@ export async function readStoredCsum(
   executor: CommandExecutor,
   ctx: SelfhealContext,
   logical: number,
+  options?: { fresh?: boolean },
 ): Promise<number | null> {
-  const location = await findStoredCsumEntry(executor, ctx, logical)
+  // `fresh` (cr3 AHR-HEAL-H3): the run's caches were filled at its start, and
+  // a mirror reconcile runs for DAYS. The csum tree is copy-on-write — every
+  // commit moves its root and the leaves under it, and a leaf freed by one
+  // commit still reads back intact (and passes `verifyNode`, which checks only
+  // its crc and its bytenr) until something reuses its space. A row about to
+  // be WRITTEN is arbitrated against the tree as it is NOW: the roots are read
+  // again and the walk starts with no cached items.
+  const lookup: SelfhealContext = options?.fresh
+    ? { ...ctx, roots: await readFreshRoots(executor, ctx.srcDevice), csums: [] }
+    : ctx
+  let location: CsumEntryLocation | null
+  try {
+    location = await findStoredCsumEntry(executor, lookup, logical)
+  }
+  catch (error) {
+    // cr3 AHR-HEAL-H1 (B) / D3 — the CSUM TREE could not be walked to this
+    // byte's leaf. btrfs-progs verifies every block `dump-tree -b` reads and
+    // fails the command when a node does not pass (both DUP copies bad is
+    // D3's own case). That is a verdict about the checksum, never about the
+    // data block: it carries the code that keeps the words "restore from
+    // backup" away from it.
+    if (error instanceof SelfhealTreeError)
+      throw new CsumUnreadableError(`this file's checksum could not be read reliably: the checksum tree could not be walked to logical byte ${logical} (${error.message}). Nothing is known about the data block itself: do NOT restore from backup on the strength of this.`)
+    throw error
+  }
   if (!location)
     return null
   const chunk = await coveringChunk(executor, ctx, location.item.leaf)

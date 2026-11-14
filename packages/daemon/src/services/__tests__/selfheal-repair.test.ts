@@ -8,13 +8,14 @@ import type {
 } from '../../executor/types.js'
 import type { SelfhealRepairOptions } from '../selfheal-repair.js'
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { SelfhealOutcome } from '@anas/shared'
+import { SELFHEAL_ARRAY_REBUILDS_ROT, SELFHEAL_BAD_BLOCKS_PRESENT, SELFHEAL_CSUM_UNREADABLE, SELFHEAL_NO_CHECKSUM, SELFHEAL_RUN_STOPPED, SELFHEAL_WRITE_UNCONFIRMED, SelfhealOutcome } from '@anas/shared'
+import { repairAhrFiles } from '../ahr-repair.js'
 import { withTopLevelMount } from '../ahr-snapshots.js'
 import { crc32c, NODE_BYTES } from '../selfheal-csum.js'
 import { chunkForLogical, geometryFromAttributes, locateLogicalIn, memberOffsetOn, parseChunkItems, parseDmTable, parseMdDetailExport, selfhealBand } from '../selfheal-map.js'
@@ -31,14 +32,31 @@ import {
   restoreSyncKnobs,
   SELFHEAL_SNAPSHOT_PREFIX,
   SelfhealRunError,
+  sweepSelfhealPins,
 } from '../selfheal-repair.js'
-import { forgetIssuedChecks, hasIssuedCheck, markCheckIssued } from '../selfheal-syncop.js'
+import { forgetIssuedChecks, hasIssuedCheck, markCheckIssued, markWindowNarrowed } from '../selfheal-syncop.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixtures = join(__dirname, '../../fixtures/selfheal')
 
 function fixture(name: string): string {
   return readFileSync(join(fixtures, name), 'utf-8')
+}
+
+/** A member's role directory under md's sysfs (`rd0`, `rd1`, ...). */
+const ROLE_DIR_RE = /^rd\d+$/
+
+/**
+ * A real kernel publishes `rd<n>/bad_blocks` for every member it holds — an
+ * EMPTY file when md has recorded no range. The captured sysfs fixtures predate
+ * F8 and do not carry it, and since cr3 (AHR-HEAL-L9) a list that cannot be
+ * read is "unknown", never "clean". So the fake publishes what the kernel does.
+ */
+function seedEmptyBadBlocks(sys: string): void {
+  for (const entry of readdirSync(sys)) {
+    if (ROLE_DIR_RE.test(entry))
+      writeFileSync(join(sys, entry, 'bad_blocks'), '\n')
+  }
 }
 
 const BS = 4096
@@ -179,6 +197,7 @@ class FakeNode implements CommandExecutor {
       mkdirSync(dirname(path), { recursive: true })
       writeFileSync(path, `${line.slice(eq + 1)}\n`)
     }
+    seedEmptyBadBlocks(this.sys)
     writeFileSync(join(this.sys, 'mismatch_cnt'), `${this.precheckMismatch}\n`)
     writeFileSync(join(this.sys, 'sync_completed'), '999999 / 407552\n')
     // A SECOND band, so a multi-band pool can be staged: a different array with
@@ -194,6 +213,7 @@ class FakeNode implements CommandExecutor {
       writeFileSync(path, `${line.slice(eq + 1)}\n`)
     }
     writeFileSync(join(band2, 'sync_completed'), '999999 / 405504\n')
+    seedEmptyBadBlocks(band2)
 
     const siblings = [1, 2, 3, 5].map(i => filler(i))
     this.members.set(MEMBERS[1], siblings[0])
@@ -430,6 +450,7 @@ class FakeMirror implements CommandExecutor {
     writeFileSync(join(this.sys, 'rd1/offset'), `${FakeMirror.OFFSETS[1] / 512}\n`)
     writeFileSync(join(this.sys, 'mismatch_cnt'), '8\n')
     writeFileSync(join(this.sys, 'sync_completed'), '999999 / 129024\n')
+    seedEmptyBadBlocks(this.sys)
 
     const junk = Buffer.alloc(BS, 0xAB)
     const bad = options?.corruptLeg ?? 0
@@ -672,11 +693,13 @@ describe('selfheal repair — a corrupt block on a RAID5 member', () => {
       'pin',
       'resolve',
       'reverify',
+      // cr3 AHR-HEAL-L7: the read-back guard runs straight after the
+      // re-verify, before any knob moves or any verdict is possible.
+      'guard',
       'precheck',
       'rmw',
       'reconstruct',
       'arbitrate',
-      'guard',
       'write',
       'postcheck',
       'coldread',
@@ -774,7 +797,10 @@ describe('selfheal repair — a block in the second band of the pool', () => {
   it('REFUSES a pool whose segment is not on an md array at all', async () => {
     node.dmTableLv = '0 2031616 linear 9:200 2560\n'
     const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
-    assert.equal(outcome.outcome, 'unrepairable')
+    // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+    // restore-advising `unrepairable`.
+    assert.equal(outcome.outcome, 'not-examined')
+    assert.equal(outcome.reasonCode, SELFHEAL_RUN_STOPPED)
     assert.match(outcome.reason, /^refused: .*is not an md array/)
     assert.equal(node.wroteThroughMd, null)
     assert.deepEqual(outcome.steps.map(s => s.name), ['gates'], 'nothing past the gates ran')
@@ -892,6 +918,7 @@ describe('selfheal repair — a compressed blob straddling two bands', () => {
         writeFileSync(path, `${line.slice(eq + 1)}\n`)
       }
       writeFileSync(join(sys, 'sync_completed'), syncCompleted)
+      seedEmptyBadBlocks(sys)
     }
 
     /** The geometry the engine itself will read — built from the same captures. */
@@ -1051,6 +1078,19 @@ describe('selfheal repair — a compressed blob straddling two bands', () => {
     assert.equal(blob.knob('md127', 'sync_max'), 'max')
   })
 
+  it('cr3 second review 5(a): TWO bad sectors in one blob says ANAS did not try, never that the array cannot rebuild them', async () => {
+    // A second sector of the blob rotten too (sector 1, on band 1's mirror).
+    const second = blob.locations[1]
+    for (const leg of second.mirrors)
+      blob.disk.set(`${second.geometry.members[leg]}@${memberOffsetOn(second.geometry, second, leg)}`, Buffer.alloc(BS, 0xAB))
+    blob.disk.set(`${second.geometry.device}@${second.mdByte}`, Buffer.alloc(BS, 0xAB))
+    const outcome = await repairBlock(blob, { mountpoint: blob.mountpoint, file: blob.file, block: 0 }, OPTIONS)
+    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    assert.match(outcome.reason, /ANAS reconstructs one sector per run and did not attempt/)
+    assert.match(outcome.reason, /whether the array could rebuild them was not tested/)
+    assert.equal(blob.wroteTo, null)
+  })
+
   it('re-verifies every sector through ITS OWN band\'s members', async () => {
     await repairBlock(blob, { mountpoint: blob.mountpoint, file: blob.file, block: 0 }, OPTIONS)
     const reads = blob.calls
@@ -1082,7 +1122,10 @@ describe('selfheal repair — the verdicts that write nothing', () => {
     node.members.set(MEMBERS[4], Buffer.alloc(BS, 0x5A)) // a second damaged block
     const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
     assert.equal(outcome.outcome, 'unrepairable')
-    assert.match(outcome.reason, /more than one block of this stripe is damaged/)
+    // cr3 second review 5(a): what ANAS tried, what it did not, and no claim
+    // that the array cannot rebuild the block.
+    assert.match(outcome.reason, /no reconstruction ANAS tries matches the stored csum/)
+    assert.match(outcome.reason, /was not shown unable to rebuild this block/)
     assert.equal(node.wroteThroughMd, null)
     assertKnobsRestored()
   })
@@ -1090,7 +1133,10 @@ describe('selfheal repair — the verdicts that write nothing', () => {
   it('REFUSES while the array is degraded', async () => {
     node.setKnob('degraded', '1')
     const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
-    assert.equal(outcome.outcome, 'unrepairable')
+    // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+    // restore-advising `unrepairable`.
+    assert.equal(outcome.outcome, 'not-examined')
+    assert.equal(outcome.reasonCode, SELFHEAL_RUN_STOPPED)
     assert.match(outcome.reason, /^refused: .*is degraded/)
     assert.equal(node.wroteThroughMd, null)
     assert.equal(node.deleted.length, 0, 'nothing was pinned')
@@ -1107,7 +1153,10 @@ describe('selfheal repair — the verdicts that write nothing', () => {
       process.env.ANAS_SELFHEAL_KERNEL_ROOT = fresh.root
       fresh.setKnob(key, value)
       const outcome = await repairBlock(fresh, { mountpoint: fresh.mountpoint, file: fresh.file, block: 300 }, OPTIONS)
-      assert.equal(outcome.outcome, 'unrepairable', `${key}=${value}`)
+      // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+      // restore-advising `unrepairable`.
+      assert.equal(outcome.outcome, 'not-examined', `${key}=${value}`)
+      assert.equal(outcome.reasonCode, SELFHEAL_RUN_STOPPED)
       assert.match(outcome.reason, pattern)
       fresh.cleanup()
     }
@@ -1117,7 +1166,10 @@ describe('selfheal repair — the verdicts that write nothing', () => {
   it('REFUSES while a pvmove is moving the extents under the pool', async () => {
     node.dmTableAll = `pvmove0: 0 2031616 mirror core 2 1024 nosync 2 9:127 0 9:128 0\n${node.dmTableAll}`
     const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
-    assert.equal(outcome.outcome, 'unrepairable')
+    // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+    // restore-advising `unrepairable`.
+    assert.equal(outcome.outcome, 'not-examined')
+    assert.equal(outcome.reasonCode, SELFHEAL_RUN_STOPPED)
     assert.match(outcome.reason, /^refused: a pvmove is in flight \(pvmove0\)/)
     assert.equal(node.wroteThroughMd, null)
   })
@@ -1157,7 +1209,10 @@ describe('selfheal repair — md takes an operation of its own mid-repair', () =
       } },
     )
 
-    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+    // restore-advising `unrepairable`.
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, SELFHEAL_RUN_STOPPED)
     assert.match(outcome.reason, /^array state changed mid-repair: /)
     assert.match(outcome.reason, /is now degraded \(1 member missing\)/)
     assert.match(outcome.reason, /nothing written$/)
@@ -1313,7 +1368,10 @@ describe('selfheal repair — a member md kicked after the gates', () => {
         rmSync(join(node.sys, 'rd3'), { recursive: true, force: true })
       } },
     )
-    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+    // restore-advising `unrepairable`.
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, SELFHEAL_RUN_STOPPED)
     assert.match(outcome.reason, /md has kicked \/dev\/loop3 out of \/dev\/md127 since this repair started/)
     assert.match(outcome.reason, /a RAID5 reconstruction needs every other member/)
     assert.equal(node.wroteThroughMd, null)
@@ -1431,10 +1489,17 @@ describe('selfheal repair — md\'s cached view versus the member rows (GT-23)',
       // itself, so neither verdict can be claimed: a reconstruction would just
       // rebuild the bad bytes, and `above-md` is a claim md's own count denies.
       const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+      // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+      // restore-advising `unrepairable`.
+      // cr3 review item 1 (E05e): the block WAS examined — it fails its
+      // checksum, and the parity group agrees with the failing bytes. No rerun
+      // changes that: its own `unrepairable` code, and the sentence says so.
       assert.equal(outcome.outcome, 'unrepairable')
-      assert.match(outcome.reason, /md and the direct read disagree about this stripe; nothing written/)
+      assert.equal(outcome.reasonCode, SELFHEAL_ARRAY_REBUILDS_ROT)
+      assert.match(outcome.reason, /fails its stored checksum, and the parity reconstruction of this row gives back the same failing bytes/)
       assert.match(outcome.reason, /counts 8 mismatch\(es\)/)
-      assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+      assert.match(outcome.reason, /running the repair again will not change that/)
+      assert.match(outcome.reason, /Restore the file from a backup if one exists/)
       assert.equal(node.wroteThroughMd, null)
       assertKnobsRestored()
     })
@@ -1466,7 +1531,7 @@ describe('selfheal repair — md\'s cached view versus the member rows (GT-23)',
       // The XOR candidate cannot match the stored csum with a junk P row, so
       // this run never reaches the write — which is the point of arbitrating.
       assert.equal(outcome.outcome, 'unrepairable')
-      assert.match(outcome.reason, /more than one block of this stripe is damaged/)
+      assert.match(outcome.reason, /no reconstruction ANAS tries matches the stored csum/)
       assert.equal(node.wroteThroughMd, null)
     })
   })
@@ -1762,7 +1827,10 @@ describe('selfheal repair — pinning a §12 pool', () => {
       { mountpoint: node.mountpoint, file: node.file, block: 300, pool: pool() },
       options(),
     )
-    assert.equal(outcome.outcome, 'unrepairable')
+    // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+    // restore-advising `unrepairable`.
+    assert.equal(outcome.outcome, 'not-examined')
+    assert.equal(outcome.reasonCode, SELFHEAL_RUN_STOPPED)
     assert.match(outcome.reason, /^refused: the top-level mount for pool 'tank' is already held/)
     assert.equal(node.created.length, 0, 'nothing was pinned')
     assert.equal(node.wroteThroughMd, null)
@@ -2075,9 +2143,12 @@ describe('selfheal repair — RAID6 with both syndromes agreeing with the rot (G
 
   it('REFUSES rather than claiming above-md when md counts the stripe anyway', async () => {
     const outcome = await repairBlock(r6, { mountpoint: r6.mountpoint, file: r6.file, block: 300 }, OPTIONS)
+    // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+    // restore-advising `unrepairable`.
+    // cr3 review item 1 (E05e on RAID6).
     assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
-    assert.match(outcome.reason, /md and the direct read disagree about this stripe; nothing written/)
-    assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+    assert.equal(outcome.reasonCode, SELFHEAL_ARRAY_REBUILDS_ROT)
+    assert.match(outcome.reason, /the parity reconstruction of this row gives back the same failing bytes/)
     assert.equal(r6.wroteThroughMd, null)
   })
 })
@@ -2098,7 +2169,12 @@ describe('selfheal repair — every mirror leg fails the csum (F4)', () => {
   function use(options: { bothLegsBad?: boolean, legsDiffer?: boolean }): void {
     beforeEach(() => {
       forgetIssuedChecks()
-      mirror = new FakeMirror(options)
+      // md serves a mirror read from one of its LEGS, and every leg here holds
+      // rot (0xAB on leg 0 in both shapes). cr3 AHR-HEAL-L7 runs the read-back
+      // guard before this branch too, and it proves exactly that: a fake md
+      // serving bytes NO leg holds is a mapping that does not describe the
+      // array, and the guard (rightly) refuses to diagnose it.
+      mirror = new FakeMirror({ ...options, mdServes: 'bad' })
       process.env.ANAS_SELFHEAL_KERNEL_ROOT = mirror.root
       process.env.ANAS_SELFHEAL_RUNTIME_DIR = join(mirror.root, 'run')
     })
@@ -2127,9 +2203,13 @@ describe('selfheal repair — every mirror leg fails the csum (F4)', () => {
     it('mismatch_cnt > 0 over legs that hold the SAME bytes: md and the direct read disagree (GT-23)', async () => {
       mirror.setKnob('mismatch_cnt', '6')
       const outcome = await repairBlock(mirror, { mountpoint: mirror.mountpoint, file: mirror.file, block: 300 }, OPTIONS)
+      // cr3 AHR-HEAL-H1: no verdict was reached, so the run-stopped bucket, never the
+      // restore-advising `unrepairable`.
+      // cr3 review item 1 (E04f4): every leg holds the same failing bytes.
       assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
-      assert.match(outcome.reason, /md and the direct read disagree about this stripe; nothing written/)
-      assert.ok(!/[Rr]estore/.test(outcome.reason), outcome.reason)
+      assert.equal(outcome.reasonCode, SELFHEAL_ARRAY_REBUILDS_ROT)
+      assert.match(outcome.reason, /fails its stored checksum, and every mirror leg holds the same failing bytes/)
+      assert.match(outcome.reason, /running the repair again will not change that/)
       assert.equal(mirror.wroteThroughMd, null)
     })
   })
@@ -2323,5 +2403,468 @@ describe('selfheal repair — a block the mapping could not reach (F3)', () => {
     assert.equal(outcome.outcome, 'not-examined', outcome.reason)
     assert.equal(outcome.reasonCode, 'band-unreadable')
     assert.equal(staged.wroteThroughMd, null)
+  })
+})
+
+/**
+ * cr3 AHR-HEAL-H1 — the review's two probes, kept. Every failure that is not a
+ * verdict used to end "unrepairable — restore this file from backup": a block
+ * ALREADY WRITTEN with arbitrated bytes whose post-check did not settle, and a
+ * block whose csum leaf btrfs-progs could not read at all (D3's own case).
+ */
+class PostcheckHangNode extends FakeNode {
+  readonly notes: string[][] = []
+  override async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
+    if (command === '/usr/bin/perl') {
+      this.notes.push(args.slice(2))
+      return { stdout: '', stderr: '', exitCode: 0 }
+    }
+    const r = await super.exec(command, args, opts)
+    const target = args.find(a => a.startsWith('of='))?.slice(3) ?? ''
+    if (command === '/usr/bin/dd' && target !== '' && target !== '/dev/null') {
+      // After the write md marks the band's next check `delayed` behind
+      // another band's recovery: the post-check never reaches its window end.
+      this.setKnob('sync_completed', 'delayed')
+    }
+    return r
+  }
+}
+
+class CsumLeafUnreadableNode extends FakeNode {
+  readonly notes: string[][] = []
+  override async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
+    if (command === '/usr/bin/perl') {
+      this.notes.push(args.slice(2))
+      return { stdout: '', stderr: '', exitCode: 0 }
+    }
+    // Both DUP copies of the csum leaf fail their own checksum: btrfs-progs'
+    // `read_tree_block` refuses it and `dump-tree -b` exits non-zero.
+    if (command === '/usr/bin/btrfs' && args[1] === 'dump-tree' && args[2] === '-b' && TREE_LEAVES[Number(args[3])] === 'dump-tree-csum.txt')
+      return { stdout: '', stderr: `checksum verify failed on ${args[3]} wanted 0x1 found 0x2\nchecksum verify failed on ${args[3]} wanted 0x1 found 0x3\nERROR: failed to read tree block ${args[3]}`, exitCode: 1 }
+    return super.exec(command, args, opts)
+  }
+}
+
+function flatPool(): AhrPool {
+  return { name: 'gtsh', mountpoint: node.mountpoint, mounted: true, subvolLayout: false, arrays: [] } as unknown as AhrPool
+}
+
+describe('selfheal repair — a post-check that does not settle AFTER the write (cr3 AHR-HEAL-H1 A)', () => {
+  useNode(() => new PostcheckHangNode())
+
+  it('the engine calls the written block REPAIRED with the confirmation skipped', async () => {
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, { ...OPTIONS, checkTimeoutSeconds: 1 })
+    assert.ok(node.wroteThroughMd?.equals(HEALTHY), 'the arbitrated bytes went through md')
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.match(outcome.postcheckSkipped ?? '', /did not settle within 1s/)
+    assert.match(outcome.reason, /the block was written and matches its checksum/)
+    assert.doesNotMatch(outcome.reason, /[Rr]estore/)
+    assertKnobsRestored()
+  })
+
+  it('the job counts it repaired, and the notification never says restore', async () => {
+    const result = await repairAhrFiles(node, flatPool(), [{ path: node.file, blocks: [300] }], () => {}, {
+      repairOptions: { ...OPTIONS, checkTimeoutSeconds: 1 },
+      lunHeld: async () => null,
+    })
+    assert.deepEqual({ repaired: result.repaired, unrepairable: result.unrepairable }, { repaired: 1, unrepairable: 0 })
+    const body = (node as PostcheckHangNode).notes.at(-1)?.[2] ?? ''
+    assert.doesNotMatch(body, /restore this file from backup/)
+  })
+
+  it('an INJECTED abort after the write stays an abort, and carries what was written', async () => {
+    await assert.rejects(
+      repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, {
+        ...OPTIONS,
+        beforeStep: (name) => {
+          if (name === 'postcheck')
+            throw new Error('injected before postcheck')
+        },
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof SelfhealRunError)
+        assert.match(error.written ?? '', /block 300 reconstructed from/)
+        return true
+      },
+    )
+  })
+})
+
+describe('selfheal repair — a csum leaf btrfs-progs cannot read (cr3 AHR-HEAL-H1 B, D3)', () => {
+  useNode(() => new CsumLeafUnreadableNode())
+
+  it('is `csum-unreadable` — nothing written, and the job never advises a restore', async () => {
+    const result = await repairAhrFiles(node, flatPool(), [{ path: node.file, blocks: [300] }], () => {}, { repairOptions: OPTIONS, lunHeld: async () => null })
+    assert.equal(node.wroteThroughMd, null)
+    const block = result.files[0].blocks[0]
+    assert.equal(block.outcome, 'unrepairable')
+    assert.equal(block.reasonCode, SELFHEAL_CSUM_UNREADABLE)
+    const body = (node as CsumLeafUnreadableNode).notes.at(-1)?.[2] ?? ''
+    assert.doesNotMatch(body, /restore this file from backup/)
+    assert.match(body, /checksum could not be read reliably/)
+  })
+})
+
+/**
+ * cr3 AHR-HEAL-L7 — the read-back guard answers BEFORE any knob moves and
+ * before any verdict is possible. A mapping the array does not agree with
+ * used to reach the pre-check (and `above-md`, or "more than one block of this
+ * stripe is damaged. Restore from backup") first.
+ */
+describe('selfheal repair — the read-back guard runs straight after the re-verify (cr3 AHR-HEAL-L7)', () => {
+  useNode(() => new FakeNode({ aboveMd: true }))
+
+  it('a mapping md does not agree with is NOT-EXAMINED before the pre-check — never above-md', async () => {
+    // md serves bytes the member does not hold at the mapped offset.
+    node.mdBlock = Buffer.alloc(BS, 0x5A)
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, 'unresolvable')
+    assert.deepEqual(outcome.steps.map(s => s.name), ['gates', 'pin', 'resolve', 'reverify', 'guard'])
+    assert.equal(node.wroteThroughMd, null)
+    assert.equal(node.knob('sync_max'), 'max', 'no bounded check was ever narrowed')
+    assertKnobsRestored()
+  })
+})
+
+/**
+ * cr3 AHR-HEAL-M6 — a FLAT pool's pin is the subvolume that holds the file.
+ * `btrfs subvolume snapshot -r <mountpoint>` does not recurse (GT-52/55): a
+ * file in a nested subvolume was neither pinned nor in the snapshot the cold
+ * read looked in, and the ENOENT there read as "still reads back with an
+ * error" — `unrepairable` over a block that had just been written correctly.
+ */
+class NestedSubvolNode extends FakeNode {
+  readonly sub: string
+  constructor() {
+    super()
+    this.sub = join(this.mountpoint, 'vm')
+    mkdirSync(join(this.sub, 'disks'), { recursive: true })
+  }
+
+  override async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
+    if (command === '/usr/bin/btrfs' && args[0] === 'inspect-internal' && args[1] === 'rootid') {
+      // The mountpoint is the top level (subvolume 5); `vm` and everything
+      // under it is subvolume 256 — the captured file tree.
+      const path = args.at(-1) ?? ''
+      return { stdout: path === this.sub || path.startsWith(`${this.sub}/`) ? '256\n' : '5\n', stderr: '', exitCode: 0 }
+    }
+    return super.exec(command, args, opts)
+  }
+}
+
+describe('selfheal repair — a file in a nested subvolume of a FLAT pool (cr3 AHR-HEAL-M6)', () => {
+  useNode(() => new NestedSubvolNode())
+
+  it('pins the subvolume that holds the file, not the mountpoint', async () => {
+    const nested = node as NestedSubvolNode
+    const file = join(nested.sub, 'disks', 'f1.bin')
+    writeFileSync(file, '')
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file, block: 300 }, OPTIONS)
+    const snap = node.calls.find(c => c.command === '/usr/bin/btrfs' && c.args[0] === 'subvolume' && c.args[1] === 'snapshot')
+    assert.equal(snap?.args.at(-2), nested.sub, 'the nested subvolume was snapshotted')
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    // The cold read went through the snapshot, at the path relative to `vm`.
+    const pinRoot = `if=${join(node.mountpoint, 'anas-selfheal-')}`
+    const read = node.calls.find(c => c.command === '/usr/bin/dd' && c.args.some(a => a.startsWith(pinRoot)))
+    assert.match(read?.args.find(a => a.startsWith('if=')) ?? '', /anas-selfheal-\d+\/disks\/f1\.bin$/)
+  })
+})
+
+describe('selfheal repair — a cold read whose path is not in the snapshot (cr3 AHR-HEAL-M6)', () => {
+  useNode(() => new FakeNode())
+
+  it('is a read that could not be taken — the written block is REPAIRED with the cold read skipped, never "still reads back with an error"', async () => {
+    const missing = node as FakeNode & { exec: FakeNode['exec'] }
+    const original = missing.exec.bind(missing)
+    missing.exec = async (command, args, opts) => {
+      if (command === '/usr/bin/stat' && (args.at(-1) ?? '').startsWith(join(node.mountpoint, 'anas-selfheal-')))
+        return { stdout: '', stderr: 'stat: cannot statx: No such file or directory', exitCode: 1 }
+      return original(command, args, opts)
+    }
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    assert.equal(outcome.outcome, 'repaired', outcome.reason)
+    assert.match(outcome.reason, /cold read skipped: .*is not in the pin snapshot/)
+  })
+})
+
+/**
+ * cr3 review (items 1, 4, 5, 6) — the reviewer's probes RP1–RP4, kept.
+ */
+class NotifyingNode extends FakeNode {
+  readonly notes: string[][] = []
+  override async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
+    if (command === '/usr/bin/perl') {
+      this.notes.push(args.slice(2))
+      return { stdout: '', stderr: '', exitCode: 0 }
+    }
+    return super.exec(command, args, opts)
+  }
+}
+
+describe('selfheal repair — the parity row agrees with the failing block (cr3 review item 1, E05e, RP3)', () => {
+  useNode(() => new NotifyingNode({ aboveMd: true }))
+
+  it('is UNREPAIRABLE `array-rebuilds-rot` on every run — never "wait and run again"', async () => {
+    for (const run of [1, 2]) {
+      forgetIssuedChecks()
+      node.setKnob('mismatch_cnt', '8')
+      const result = await repairAhrFiles(node, flatPool(), [{ path: node.file, blocks: [300] }], () => {}, { repairOptions: OPTIONS, lunHeld: async () => null })
+      const block = result.files[0].blocks[0]
+      assert.equal(block.outcome, 'unrepairable', `run ${run}`)
+      assert.equal(block.reasonCode, SELFHEAL_ARRAY_REBUILDS_ROT)
+      const body = (node as NotifyingNode).notes.at(-1)?.[2] ?? ''
+      assert.doesNotMatch(body, /run the repair again/i)
+      assert.match(body, /every copy the array holds of this block gives the same failing bytes/)
+      assert.match(body, /restore this file from a backup if one exists/)
+      assert.equal(node.wroteThroughMd, null)
+    }
+  })
+})
+
+describe('selfheal repair — md records a bad block DURING the run (cr3 review item 4, RP4)', () => {
+  useNode(() => new FakeNode())
+
+  it('re-reads rd<n>/bad_blocks at the reconstruction: the member is absent for the row and nothing is written', async () => {
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, {
+      ...OPTIONS,
+      beforeStep: (name) => {
+        if (name === 'rmw')
+          writeFileSync(join(node.sys, 'rd1/bad_blocks'), '6368 8\n')
+      },
+    })
+    assert.equal(outcome.outcome, 'unrepairable', outcome.reason)
+    assert.equal(outcome.reasonCode, SELFHEAL_BAD_BLOCKS_PRESENT)
+    assert.equal(node.wroteThroughMd, null)
+  })
+
+  it('a list that stops being readable during the run is refused too', async () => {
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, {
+      ...OPTIONS,
+      beforeStep: (name) => {
+        if (name === 'rmw')
+          rmSync(join(node.sys, 'rd2/bad_blocks'))
+      },
+    })
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, 'band-unreadable')
+    assert.equal(node.wroteThroughMd, null)
+  })
+})
+
+describe('selfheal repair — a confirmation that never ran reaches the job (cr3 review item 5, RP1)', () => {
+  useNode(() => new PostcheckHangNode())
+
+  it('the block carries postcheckSkipped, the run is not clean, and the notification says to re-scrub', async () => {
+    const result = await repairAhrFiles(node, flatPool(), [{ path: node.file, blocks: [300] }], () => {}, {
+      repairOptions: { ...OPTIONS, checkTimeoutSeconds: 1 },
+      lunHeld: async () => null,
+    })
+    const block = result.files[0].blocks[0]
+    assert.equal(block.outcome, 'repaired')
+    assert.match(block.postcheckSkipped ?? '', /did not settle/)
+    const note = (node as PostcheckHangNode).notes.at(-1) ?? []
+    assert.equal(note[0], 'warning', 'an unconfirmed repair is not a clean run')
+    assert.match(note[2] ?? '', /re-scrub the pool to confirm/i)
+  })
+})
+
+class DdFailsAfterLanding extends FakeNode {
+  override async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
+    const r = await super.exec(command, args, opts)
+    const target = args.find(a => a.startsWith('of='))?.slice(3) ?? ''
+    if (command === '/usr/bin/dd' && target !== '' && target !== '/dev/null')
+      return { stdout: '', stderr: 'dd: fsync failed for \'/dev/md127\': Input/output error', exitCode: 1 }
+    return r
+  }
+}
+
+describe('selfheal repair — the write reports a failure after it was issued (cr3 review item 6, RP2)', () => {
+  useNode(() => new DdFailsAfterLanding())
+
+  it('never says "nothing written": the bytes may have landed, and the next scrub decides', async () => {
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300 }, OPTIONS)
+    assert.ok(node.wroteThroughMd?.equals(HEALTHY), 'the fake landed the bytes before dd failed')
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, SELFHEAL_WRITE_UNCONFIRMED)
+    assert.doesNotMatch(outcome.reason, /nothing written|Nothing was written/)
+    assert.match(outcome.reason, /may have landed/)
+    // cr3 second review 5(c): the advice is the job's sentence, said once —
+    // the engine's reason states what happened.
+    assert.doesNotMatch(outcome.reason, /next scrub|run the repair again/)
+    assertKnobsRestored()
+  })
+})
+
+/**
+ * cr3 AHR-HEAL-H4 — the widen-only write under a FOREIGN operation (the
+ * review's ruling on GT-19(d)): `sync_max=max` ONLY under recover/resync and
+ * ONLY when `sync_max` still reads exactly the value THIS run wrote; never
+ * `sync_min`, never `idle`.
+ */
+describe('selfheal repair — this run\'s one-stripe window under a foreign recovery (cr3 AHR-HEAL-H4)', () => {
+  useNode(() => new FakeNode())
+
+  const narrowed = (action: string, max = '6400'): void => {
+    node.setKnob('sync_action', action)
+    node.setKnob('sync_min', '6272')
+    node.setKnob('sync_max', max)
+  }
+
+  for (const action of ['recover', 'resync']) {
+    it(`under ${action}: sync_max is widened to max, sync_min and sync_action are left as md has them`, async () => {
+      markWindowNarrowed('md127', '6400')
+      narrowed(action)
+      const note = await restoreSyncKnobs(raid5Geometry())
+      assert.equal(node.knob('sync_max'), 'max')
+      assert.equal(node.knob('sync_min'), '6272')
+      assert.equal(node.knob('sync_action'), action)
+      assert.match(note ?? '', /sync_max widened to max/)
+    })
+  }
+
+  it('under reshape: nothing is written', async () => {
+    markWindowNarrowed('md127', '6400')
+    narrowed('reshape')
+    await restoreSyncKnobs(raid5Geometry())
+    assert.equal(node.knob('sync_max'), '6400')
+  })
+
+  it('a sync_max that is not the value this run wrote is not this run\'s to widen', async () => {
+    markWindowNarrowed('md127', '6400')
+    narrowed('recover', '6528')
+    await restoreSyncKnobs(raid5Geometry())
+    assert.equal(node.knob('sync_max'), '6528')
+  })
+
+  it('with no record of a narrowing (another run, a restart) nothing is written', async () => {
+    narrowed('recover')
+    await restoreSyncKnobs(raid5Geometry())
+    assert.equal(node.knob('sync_max'), '6400')
+  })
+
+  it('the bounded check records the window it wrote, so a recovery that replaces it mid-check is widened', async () => {
+    node.setKnob('sync_completed', '0 / 407552')
+    const geo = raid5Geometry()
+    const timer = setTimeout(() => node.setKnob('sync_action', 'recover'), 50)
+    try {
+      await assert.rejects(() => boundedWindowCheck(node, geo, 49, OPTIONS), ForeignSyncOpError)
+    }
+    finally {
+      clearTimeout(timer)
+    }
+    assert.equal(node.knob('sync_max'), '6400', 'the poll itself writes nothing under the foreign op')
+    await restoreSyncKnobs(geo)
+    assert.equal(node.knob('sync_max'), 'max')
+    assert.equal(node.knob('sync_min'), '6272', 'sync_min untouched')
+    assert.equal(node.knob('sync_action'), 'recover')
+  })
+})
+
+/**
+ * cr3 second review item 3 — the H4 widen is gated on `reshape_position`
+ * reading `none` and on `sync_action`, both re-read AFTER `sync_max` and
+ * immediately before the write; every other state writes nothing.
+ */
+describe('selfheal repair — the H4 widen\'s gates (cr3 second review item 3)', () => {
+  useNode(() => new FakeNode())
+
+  const narrowed = (action: string | null): void => {
+    markWindowNarrowed('md127', '6400')
+    if (action === null)
+      rmSync(join(node.sys, 'sync_action'))
+    else
+      node.setKnob('sync_action', action)
+    node.setKnob('sync_min', '6272')
+    node.setKnob('sync_max', '6400')
+  }
+
+  for (const action of ['frozen', 'check', 'repair', null]) {
+    it(`under ${action ?? 'an UNREADABLE sync_action'}: nothing is written`, async () => {
+      narrowed(action)
+      await restoreSyncKnobs(raid5Geometry())
+      assert.equal(node.knob('sync_max'), '6400')
+      assert.equal(node.knob('sync_min'), '6272')
+    })
+  }
+
+  it('a recovery while reshape_position is not `none` writes nothing', async () => {
+    narrowed('recover')
+    node.setKnob('reshape_position', '1024')
+    await restoreSyncKnobs(raid5Geometry())
+    assert.equal(node.knob('sync_max'), '6400')
+  })
+
+  it('a recovery whose reshape_position cannot be read writes nothing', async () => {
+    narrowed('recover')
+    rmSync(join(node.sys, 'reshape_position'))
+    const note = await restoreSyncKnobs(raid5Geometry())
+    assert.equal(node.knob('sync_max'), '6400')
+    assert.match(note ?? '', /reshape_position/)
+  })
+})
+
+/**
+ * cr3 second review 5(a) — a block with NO stored checksum now. A scrub can
+ * only name a block whose checksum failed, so the finding is stale (the file
+ * changed since) or the file keeps no checksums: never "restore".
+ */
+class NoCsumNode extends FakeNode {
+  readonly notes: string[][] = []
+  override async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
+    if (command === '/usr/bin/perl') {
+      this.notes.push(args.slice(2))
+      return { stdout: '', stderr: '', exitCode: 0 }
+    }
+    if (command === '/usr/bin/btrfs' && args[1] === 'dump-tree' && args[2] === '-b' && TREE_LEAVES[Number(args[3])] === 'dump-tree-csum.txt')
+      return { stdout: `leaf ${args[3]} items 0 free space 16283 generation 9 owner CSUM_TREE\n`, stderr: '', exitCode: 0 }
+    return super.exec(command, args, opts)
+  }
+}
+
+describe('selfheal repair — a block with no stored checksum now (cr3 second review 5(a))', () => {
+  useNode(() => new NoCsumNode())
+
+  it('is not-examined `no-checksum`: the finding is stale or the file keeps no checksums — scrub again, never restore', async () => {
+    const result = await repairAhrFiles(node, flatPool(), [{ path: node.file, blocks: [300] }], () => {}, { repairOptions: OPTIONS, lunHeld: async () => null })
+    const block = result.files[0].blocks[0]
+    assert.equal(block.outcome, 'not-examined', block.reason)
+    assert.equal(block.reasonCode, SELFHEAL_NO_CHECKSUM)
+    assert.doesNotMatch(block.reason, /[Rr]estore/)
+    const body = (node as NoCsumNode).notes.at(-1)?.[2] ?? ''
+    assert.doesNotMatch(body, /restore this file from backup/)
+    assert.match(body, /[Ss]crub again/)
+    assert.equal(node.wroteThroughMd, null)
+  })
+})
+
+/**
+ * cr3 (from the AHR core lane): `AhrPool.subvolLayout === null` means the
+ * kernel mount table could not be read. The repair does not guess which pin
+ * shape the pool takes (a flat in-place snapshot, or `@snapshots`): it stops
+ * before any pin or write.
+ */
+describe('selfheal repair — a pool whose layout could not be read (subvolLayout null)', () => {
+  useNode(() => new FakeNode())
+
+  it('is not-examined / run-stopped before anything is pinned or written', async () => {
+    const pool = { name: 'tank', mountpoint: node.mountpoint, mounted: true, subvolLayout: null, arrays: [] } as unknown as AhrPool
+    const outcome = await repairBlock(node, { mountpoint: node.mountpoint, file: node.file, block: 300, pool }, OPTIONS)
+    assert.equal(outcome.outcome, 'not-examined', outcome.reason)
+    assert.equal(outcome.reasonCode, SELFHEAL_RUN_STOPPED)
+    assert.match(outcome.reason, /mount state of pool 'tank' could not be read/)
+    assert.deepEqual(outcome.steps.map(s => s.name), ['gates'])
+    assert.equal(node.created.length, 0, 'nothing pinned')
+    assert.ok(!node.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'snapshot'))
+    assert.equal(node.wroteThroughMd, null)
+  })
+
+  it('the transient-snapshot sweep does not guess either', async () => {
+    mkdirSync(join(node.mountpoint, `${SELFHEAL_SNAPSHOT_PREFIX}1700000000`))
+    const pool = { name: 'tank', mountpoint: node.mountpoint, mounted: true, subvolLayout: null, arrays: [] } as unknown as AhrPool
+    const sweep = await sweepSelfhealPins(node, pool, node.mountpoint)
+    assert.deepEqual(sweep.swept, [])
+    assert.deepEqual(node.deleted, [])
+    assert.match(sweep.errors.join(' '), /mount state of pool 'tank' could not be read/)
   })
 })

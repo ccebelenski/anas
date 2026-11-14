@@ -777,9 +777,18 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/sbin/pvremove', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/mkfs.btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/update-initramfs', result: { stdout: '', stderr: '', exitCode: 0 } })
-    // Scrub: command-only btrfs fallback (empty status → finished, clean); the
-    // exact `filesystem usage` fixture above still wins. realpath resolves the
+    // Scrub: `btrfs scrub status` answers a FINISHED, clean pass — since cr3
+    // (ahr-heal review item 7) a status with no `Status:` line is a pass with
+    // no verdict, never "clean", so the dev pool's scrub says what a real one
+    // does (no `Scrub started:` stamp: a fixed one would read as an earlier
+    // pass). Every other btrfs verb keeps the command-only fallback; the exact
+    // `filesystem usage` fixture above still wins. realpath resolves the
     // /dev/md/<name> symlink for the check-wait; perl is the PVE notifier.
+    mock.addFixture({
+      command: '/usr/bin/btrfs',
+      argsMatch: args => args[0] === 'scrub' && args[1] === 'status',
+      result: { stdout: 'UUID:             00000000-0000-0000-0000-000000000000\nStatus:           finished\nDuration:         0:00:01\nError summary:    no errors found\n', stderr: '', exitCode: 0 },
+    })
     mock.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
     // cr3 (handed): `realpath -e -- <mountpoint>` (the wave's mountpoint checks)
     // resolves the two seeded mountpoints to themselves, ahead of the

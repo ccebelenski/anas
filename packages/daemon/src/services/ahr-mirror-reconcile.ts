@@ -15,12 +15,15 @@ import {
   btrfsScrubPass,
   lastSyncAction,
   mismatchCount,
+  ScrubVerdictUnknownError,
 } from './ahr-scrub.js'
 import { pveNotify } from './pve-notify.js'
 import { crc32c, csumHex, CsumUnreadableError, NODE_BYTES, readStoredCsum, verifyNode } from './selfheal-csum.js'
 import { BLOCK_BYTES, MD_DEFAULT_SYNC_MAX, MD_DEFAULT_SYNC_MIN, readDirect, readMdAttrOrNull, sleep, writeDirect } from './selfheal-io.js'
 import {
+  badBlocksUnknownRefusal,
   bandBadBlocks,
+  bandBadBlocksUnknown,
   logicalForMdByte,
   memberOffsetOn,
   placeMdByte,
@@ -151,6 +154,41 @@ export const MIRROR_RECONCILE_RATE_BYTES_S = 60 * 1024 * 1024
  * is told the number before they agree to it.
  */
 export const MIRROR_COMPARE_RATE_BYTES_S = 20 * 1024 * 1024
+
+/**
+ * The cost of ONE written row in arm B, in seconds — a ceiling (cr3 second
+ * review item 6). Each row about to be written costs a fresh arbitration (a
+ * `dump-tree -r`, a csum-tree walk of tree-depth `dump-tree -b` spawns and the
+ * leaf read, or a node read per leg), `preWriteRefusal`, a re-read of both legs
+ * and the `dd` write: 6 + tree-depth process spawns, measured by the review at
+ * 0.5–4 s for the fresh walk alone. 4 s is the ceiling the estimate uses.
+ */
+export const MIRROR_ROW_WRITE_SECONDS = 4
+
+/** md counts mismatches in 512-byte sectors; a 4 KiB row is this many. */
+const SECTORS_PER_ROW = BLOCK_BYTES / 512
+
+/** How many result md bytes `writtenAt` carries before it stops listing (cr3 item 7). */
+const WRITTEN_AT_LIMIT = 64
+
+/**
+ * Rows arm B expects to write, from md's `mismatch_cnt` (sectors) — the
+ * evidence the run stands on. Null when no count is known.
+ */
+function expectedRows(mismatchCnt: number | null): number | null {
+  return mismatchCnt === null ? null : Math.ceil(mismatchCnt / SECTORS_PER_ROW)
+}
+
+/**
+ * Arm B's estimate (cr3 second review item 6): reading both legs at the
+ * compare rate, plus every expected row at the per-row ceiling.
+ *
+ *   seconds = heightBytes / MIRROR_COMPARE_RATE_BYTES_S
+ *           + ceil(mismatch_cnt / 8) × MIRROR_ROW_WRITE_SECONDS
+ */
+function armBSeconds(heightBytes: number, mismatchCnt: number | null): number {
+  return heightBytes / MIRROR_COMPARE_RATE_BYTES_S + (expectedRows(mismatchCnt) ?? 0) * MIRROR_ROW_WRITE_SECONDS
+}
 
 /** One band of a pool, as much of it as this verb needs. */
 export interface MirrorReconcileArray {
@@ -310,6 +348,9 @@ const MismatchRow = z.object({
 })
 const ScrubEvidenceShape = z.object({
   btrfsErrors: z.string().nullable().optional(),
+  // cr3 second review item 2: a scrub whose checksum pass has no verdict is
+  // no proof that the data is intact.
+  btrfsUnproven: z.string().optional(),
   findings: z.array(z.unknown()).optional(),
   parityMismatches: z.array(MismatchRow).optional(),
 })
@@ -356,6 +397,13 @@ export function mirrorReconcileEvidence(
       ok: false,
       code: 'no-mirror-mismatch',
       reason: `the last completed scrub of AHR pool '${poolName}' (job ${job.id}) did not report a result the mirror reconcile can read`,
+    }
+  }
+  if (parsed.data.btrfsUnproven !== undefined) {
+    return {
+      ok: false,
+      code: 'scrub-unproven',
+      reason: `the last scrub of AHR pool '${poolName}' (job ${job.id}) has no checksum verdict: ${parsed.data.btrfsUnproven}. The mirror reconcile stands on a checksum pass that found nothing, and this one proved nothing. Scrub the pool again`,
     }
   }
   if (parsed.data.btrfsErrors != null || (parsed.data.findings?.length ?? 0) > 0) {
@@ -479,6 +527,11 @@ export async function mirrorReconcileArrayRefusal(geo: MdGeometry): Promise<Mirr
   }
   if (bandBadBlocks(geo).length > 0)
     return { reason: mirrorBadBlocksRefusal(geo), code: 'bad-blocks-present' }
+  // cr3 AHR-HEAL-L9 — a leg whose bad-block list could not be read is not a
+  // leg known to be free of recorded bad blocks. 'array-busy' is the code the
+  // route already gives a band it could not read.
+  if (bandBadBlocksUnknown(geo).length > 0)
+    return { reason: badBlocksUnknownRefusal(geo), code: 'array-busy' }
   const refusal = await arrayRefusal(geo)
   if (refusal)
     return { reason: refusal, code: 'array-busy' }
@@ -519,14 +572,19 @@ export function mirrorReconcileWarnings(
   array: MirrorReconcileArray,
   poolUsedBytes: number | null = null,
   passes: number = MIRROR_SCRUB_PASSES,
+  mismatchCnt: number | null = null,
 ): string[] {
   const perLeg = array.heightBytes / MIRROR_COMPARE_RATE_BYTES_S
+  const rows = expectedRows(mismatchCnt)
+  const rowCost = rows === null
+    ? ''
+    : ` Each row it writes costs a fresh arbitration, a re-read of both legs and the write, up to ${MIRROR_ROW_WRITE_SECONDS} s each: the evidence counts ${rows} differing 4 KiB row(s), so the whole of arm B is about ${approximateDuration(armBSeconds(array.heightBytes, mismatchCnt))}`
   const scrub = poolUsedBytes !== null && poolUsedBytes > 0
     ? `${gib(poolUsedBytes)} of data per pass, ≈${approximateDuration(poolUsedBytes / MIRROR_RECONCILE_RATE_BYTES_S)} each`
     : 'a duration this node could not estimate'
   return [
     `Arm A runs an ordinary btrfs checksum scrub of pool '${poolName}', up to ${passes} times (${scrub}), with a whole-band md check after each. A scrub that meets the rot heals the band through md by itself; md's read-balance decides whether it does, and repeating the pass is the only way to raise the odds`,
-    `Arm B runs only if the mismatch survives arm A, and it is the long one. It reads BOTH legs of band r${array.band} in full — ${gib(array.heightBytes)} per leg, about ${approximateDuration(perLeg)} — and compares them row by row. That rate is ANAS's own read path rather than the disks': measured at 26 MiB/s per leg on a live pool, and estimated here at 20 MiB/s so the number is a ceiling on the wait`,
+    `Arm B runs only if the mismatch survives arm A, and it is the long one. It reads BOTH legs of band r${array.band} in full — ${gib(array.heightBytes)} per leg, about ${approximateDuration(perLeg)} — and compares them row by row. That rate is ANAS's own read path rather than the disks': measured at 26 MiB/s per leg on a live pool, and estimated here at 20 MiB/s so the number is a ceiling on the wait.${rowCost}`,
     `Each differing 4 KiB row is decided by the checksum btrfs stored for it, and the leg that matches is written back through md to both legs. A row with NO checksum is left exactly as it is: free space, a hand-set NOCOW (chattr +C) file, or a preallocated range. ANAS creates none of those and cannot see into one it did not create, so they are counted and reported, never guessed at`,
     `A row where NEITHER leg matches is never written. It is reported as a residual, and the file it belongs to needs restoring from backup`,
     `The pool stays ONLINE and undegraded throughout. No leg is failed, removed or re-added, so there is no single-copy window — which is the whole difference between this and doing it by hand with mdadm`,
@@ -539,10 +597,15 @@ export function mirrorReconcileWarnings(
 //  btrfs scrub error counts (arm A's progress)
 // ---------------------------------------------------------------------------
 
-/** `Corrected:` / `Uncorrectable:` of a finished `btrfs scrub status`. */
+/**
+ * `Corrected:` / `Uncorrectable:` of a finished `btrfs scrub status`.
+ *
+ * Null when the status could not be read at all (cr3): a count nobody read is
+ * unknown, never zero — and zero is the number arm A acts on.
+ */
 export interface ScrubErrorCounts {
-  corrected: number
-  uncorrectable: number
+  corrected: number | null
+  uncorrectable: number | null
 }
 
 /**
@@ -565,7 +628,7 @@ export function parseScrubErrorCounts(text: string): ScrubErrorCounts {
 /** Read the finished pass's counts off `btrfs scrub status <mountpoint>`. */
 async function scrubErrorCounts(executor: CommandExecutor, mountpoint: string): Promise<ScrubErrorCounts> {
   const r = await executor.exec(BTRFS, ['scrub', 'status', mountpoint])
-  return r.exitCode === 0 ? parseScrubErrorCounts(r.stdout) : { corrected: 0, uncorrectable: 0 }
+  return r.exitCode === 0 ? parseScrubErrorCounts(r.stdout) : { corrected: null, uncorrectable: null }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,21 +698,42 @@ function legOffset(geo: MdGeometry, mdByte: number, leg: number): number {
   return memberOffsetOn(geo, location, leg)
 }
 
-/** How one differing row was decided. */
+/**
+ * How one differing row was decided.
+ *
+ * `unresolved` and `undecided` are both "not written", and they are NOT the
+ * same sentence (cr3 AHR-HEAL-H3/L12). `unresolved` is a verdict about the
+ * data — every leg was read and none of them is what btrfs stored — and a
+ * restore is the action left. `undecided` is no verdict at all: the checksum
+ * could not be read (D3), both legs matched it, a leg could not be read there,
+ * or the row changed under the run. Restore advice over it would overwrite
+ * data nothing has shown to be bad.
+ */
 type RowVerdict
   = | { kind: 'won', leg: number, detail: string }
     | { kind: 'free-space' }
     | { kind: 'unchecked', detail: string }
     | { kind: 'unresolved', detail: string }
+    | { kind: 'undecided', detail: string }
 
 /** Everything arm B carries between rows of one run. */
 interface CompareState {
   ctx: SelfhealContext
-  band: SelfhealBand
+  /**
+   * EVERY dm segment of the pool that lands on this md array (cr3
+   * AHR-HEAL-L10): an expanded band carries several, and an md byte is mapped
+   * back through the one that contains it.
+   */
+  bands: readonly SelfhealBand[]
   chunks: readonly ChunkItem[]
   geo: MdGeometry
   legs: number[]
-  /** node logical bytenr → the leg whose copy of that node passed, or null. */
+  /**
+   * md byte of a metadata node's first row → the verdict on THAT copy of the
+   * node (cr3 AHR-HEAL-H2). Keyed by where the node SITS, never by its btrfs
+   * logical: a DUP chunk holds the same logical node at two md offsets, and
+   * the two copies rot independently.
+   */
   nodes: Map<number, RowVerdict>
 }
 
@@ -665,8 +749,9 @@ async function decideRow(
   state: CompareState,
   mdByte: number,
   rows: Map<number, Buffer>,
+  fresh = false,
 ): Promise<RowVerdict> {
-  const back = logicalForMdByte(mdByte, state.band, state.chunks)
+  const back = logicalForMdByte(mdByte, state.bands, state.chunks)
   if (back === null)
     return { kind: 'free-space' }
   if (back.logical % BLOCK_BYTES !== 0) {
@@ -676,7 +761,7 @@ async function decideRow(
     }
   }
   if (CHUNK_TYPE_TREE_RE.test(back.chunk.type))
-    return decideTreeRow(executor, state, mdByte, back.logical)
+    return decideTreeRow(executor, state, mdByte, back.logical, rows, fresh)
   if (!CHUNK_TYPE_DATA_RE.test(back.chunk.type)) {
     return {
       kind: 'unchecked',
@@ -686,12 +771,14 @@ async function decideRow(
 
   let stored: number | null
   try {
-    stored = await readStoredCsum(executor, state.ctx, back.logical)
+    stored = await readStoredCsum(executor, state.ctx, back.logical, { fresh })
   }
   catch (error) {
+    // D3 — the CHECKSUM could not be read. Nothing is known about the row, so
+    // it is undecided, never the restore-advising `unresolved` (cr3).
     if (error instanceof CsumUnreadableError) {
       return {
-        kind: 'unresolved',
+        kind: 'undecided',
         detail: `btrfs logical ${back.logical}: ${error.message}`,
       }
     }
@@ -715,7 +802,7 @@ async function decideRow(
     // collision, or a csum tree that does not describe this row. Either way
     // nothing here picks a winner, and writing one would be a coin flip.
     return {
-      kind: 'unresolved',
+      kind: 'undecided',
       detail: `btrfs logical ${back.logical}: both legs match the stored checksum ${csumHex(stored)} while holding different bytes. Nothing here can say which is the file`,
     }
   }
@@ -741,17 +828,32 @@ async function decideTreeRow(
   state: CompareState,
   mdByte: number,
   logical: number,
+  rows: Map<number, Buffer>,
+  fresh = false,
 ): Promise<RowVerdict> {
   const within = logical % NODE_BYTES
   const nodeLogical = logical - within
-  const cached = state.nodes.get(nodeLogical)
+  const nodeMdByte = mdByte - within
+  // cr3 AHR-HEAL-H2 — the cache is keyed by the node's md byte: the verdict
+  // on copy 0 of a DUP node says nothing about copy 1, which sits at another
+  // md offset and rots on its own. A `fresh` decision (the one taken right
+  // before a write) never reads the cache and never fills it.
+  const cached = fresh ? undefined : state.nodes.get(nodeMdByte)
   if (cached)
     return cached
 
-  const nodeMdByte = mdByte - within
   const verdict = await ((async (): Promise<RowVerdict> => {
+    // The node is verified AT THE LOCATION BEING WRITTEN: its first md byte
+    // must map back to this very node, through the same segment and the same
+    // copy as the row. A node that straddles a segment boundary, or a skewed
+    // chunk, is not one this verb arbitrates.
+    const head = logicalForMdByte(nodeMdByte, state.bands, state.chunks)
+    const row = logicalForMdByte(mdByte, state.bands, state.chunks)
+    if (head === null || row === null || head.logical !== nodeLogical || head.copy !== row.copy || head.chunk.logical !== row.chunk.logical)
+      return { kind: 'undecided', detail: `metadata node ${nodeLogical}: its first row at md byte ${nodeMdByte} does not map back to the same node and copy, so the node cannot be read whole at this location` }
     const passing: number[] = []
     const details: string[] = []
+    const nodes = new Map<number, Buffer>()
     for (const leg of state.legs) {
       let bytes: Buffer
       try {
@@ -761,22 +863,33 @@ async function decideTreeRow(
         details.push(`${state.geo.members[leg]}: ${error instanceof Error ? error.message : String(error)}`)
         continue
       }
+      nodes.set(leg, bytes)
       const check = verifyNode(bytes, nodeLogical)
       details.push(`${state.geo.members[leg]}: ${check.detail}`)
       if (check.ok)
         passing.push(leg)
     }
-    if (passing.length === 1)
+    if (passing.length === 1) {
+      // cr3 review item 3 — what is WRITTEN is the compared row, so in the
+      // decision taken right before a write the node that vouched for itself
+      // must hold exactly those bytes at this row. A node that changed between
+      // the comparison and this read proves nothing about them.
+      const slice = (nodes.get(passing[0]) as Buffer).subarray(within, within + BLOCK_BYTES)
+      if (fresh && !slice.equals(rows.get(passing[0]) as Buffer))
+        return { kind: 'undecided', detail: `metadata node ${nodeLogical}: the copy on ${state.geo.members[passing[0]]} that passes its own checksum no longer holds the compared bytes at md byte ${mdByte}` }
       return { kind: 'won', leg: passing[0], detail: `metadata node ${nodeLogical}: ${details.join('; ')}` }
+    }
     if (passing.length === 0)
       return { kind: 'unresolved', detail: `metadata node ${nodeLogical}: no leg's copy passes its own checksum (${details.join('; ')})` }
     // Two valid nodes claiming the same bytenr: one of them is a stale but
     // internally consistent write. Nothing on this node says which generation
     // the trees actually point at, and guessing would corrupt the filesystem.
-    return { kind: 'unresolved', detail: `metadata node ${nodeLogical}: both legs hold a node that passes its own checksum while the bytes differ (${details.join('; ')})` }
+    // No verdict about the data either way — undecided, never restore (cr3).
+    return { kind: 'undecided', detail: `metadata node ${nodeLogical}: both legs hold a node that passes its own checksum while the bytes differ (${details.join('; ')})` }
   })())
 
-  state.nodes.set(nodeLogical, verdict)
+  if (!fresh)
+    state.nodes.set(nodeMdByte, verdict)
   return verdict
 }
 
@@ -787,13 +900,16 @@ async function decideTreeRow(
 /** Where the run stopped, with everything it learned up to that point. */
 interface RunState {
   arm: 'scrub' | 'compare'
-  passes: { corrected: number, mismatchAfter: number | null }[]
+  passes: { corrected: number | null, mismatchAfter: number | null }[]
   rowsCompared: number
   rowsDiffering: number
   rowsWritten: { leg0: number, leg1: number }
+  /** md bytes of the rows written, the first WRITTEN_AT_LIMIT of them (cr3 item 7). */
+  writtenAt: number[]
   freeSpaceRows: number
   uncheckedRows: number
   unresolvedRows: number
+  undecidedRows: number
   mismatchBefore: number | null
   mismatchAfter: number | null
   scrubMs: number
@@ -826,9 +942,11 @@ export async function reconcileMirrorBand(
     rowsCompared: 0,
     rowsDiffering: 0,
     rowsWritten: { leg0: 0, leg1: 0 },
+    writtenAt: [],
     freeSpaceRows: 0,
     uncheckedRows: 0,
     unresolvedRows: 0,
+    undecidedRows: 0,
     mismatchBefore: null,
     mismatchAfter: null,
     scrubMs: 0,
@@ -849,6 +967,13 @@ export async function reconcileMirrorBand(
     array: string | null,
     extra: Partial<AhrMirrorReconcileResult> = {},
   ): Promise<AhrMirrorReconcileResult> => {
+    // cr3 second review item 7: a run that stops after writing says WHICH
+    // rows it wrote (bounded; the count says how many more).
+    const wroteTotal = state.rowsWritten.leg0 + state.rowsWritten.leg1
+    if (outcome !== 'reconciled' && wroteTotal > 0 && extra.reason !== undefined) {
+      const more = wroteTotal - state.writtenAt.length
+      extra = { ...extra, reason: `${extra.reason}. The rows written at md byte(s) ${state.writtenAt.join(', ')}${more > 0 ? ` and ${more} more` : ''}` }
+    }
     const result = AhrMirrorReconcileResultSchema.parse({
       pool: pool.name,
       band,
@@ -861,6 +986,8 @@ export async function reconcileMirrorBand(
       freeSpaceRows: state.freeSpaceRows,
       uncheckedRows: state.uncheckedRows,
       unresolvedRows: state.unresolvedRows,
+      undecidedRows: state.undecidedRows,
+      ...(state.writtenAt.length > 0 ? { writtenAt: state.writtenAt } : {}),
       mismatchBefore: state.mismatchBefore,
       mismatchAfter: state.mismatchAfter,
       outcome,
@@ -922,7 +1049,7 @@ export async function reconcileMirrorBand(
   if (conflict)
     return finish('refused', array.device, { reason: conflict, reasonCode: 'job-active' })
 
-  const geo = await readMdGeometry(guarded, array.device)
+  let geo = await readMdGeometry(guarded, array.device)
   const busy = await mirrorReconcileArrayRefusal(geo)
   if (busy)
     return finish('refused', array.device, { reason: busy.reason, reasonCode: busy.code })
@@ -961,10 +1088,26 @@ export async function reconcileMirrorBand(
       await regate('refused', `re-checked before arm A pass ${pass}`)
     progress(`arm A, pass ${pass}/${passes}: btrfs checksum scrub of pool '${pool.name}'. A scrub that meets the rot heals the band through md`)
     const scrubStart = Date.now()
-    const ran = await btrfsScrubPass(guarded, pool.mountpoint, pool.name, progress, opts.pollIntervalMs ?? AHR_SCRUB_POLL_MS)
+    let ran: Awaited<ReturnType<typeof btrfsScrubPass>>
+    try {
+      ran = await btrfsScrubPass(guarded, pool.mountpoint, pool.name, progress, opts.pollIntervalMs ?? AHR_SCRUB_POLL_MS)
+    }
+    catch (error) {
+      // cr3 review item 7 — a pass with no readable verdict: the run stops
+      // with one result and one notification rather than a bare failure.
+      if (!(error instanceof ScrubVerdictUnknownError))
+        throw error
+      state.scrubMs += Date.now() - scrubStart
+      return finish('refused', array.device, {
+        reason: `arm A, pass ${pass}: the btrfs scrub's verdict could not be read (${error.message}). Nothing was written`,
+        reasonCode: 'scrub-unproven',
+      })
+    }
     const counts = await scrubErrorCounts(guarded, pool.mountpoint)
     state.scrubMs += Date.now() - scrubStart
-    if (counts.uncorrectable > 0 && lost === null) {
+    if (counts.uncorrectable === null)
+      progress(`arm A, pass ${pass}: btrfs scrub status could not be read after the pass, so its corrected and uncorrectable counts are unknown`)
+    if (counts.uncorrectable !== null && counts.uncorrectable > 0 && lost === null) {
       // NOT a refusal, and this is the one place this verb differs from the
       // parity rewrite. That verb aborts on any finding because md repair would
       // BLESS the rot; this one writes nothing it cannot prove, so a file
@@ -982,9 +1125,11 @@ export async function reconcileMirrorBand(
       lost = { btrfsErrors: ran.btrfsErrors, ...(findings ? { findings } : {}) }
       progress(`arm A, pass ${pass}: btrfs reported ${counts.uncorrectable} uncorrectable error(s)${findings?.length ? ` (${findings.map(f => f.path).join(', ')})` : ''}. Those rows have no good copy on either leg and will be reported, never written. The rest of the band is still reconciled`)
     }
-    progress(counts.corrected > 0
-      ? `arm A, pass ${pass}: btrfs corrected ${counts.corrected} block(s) through md — md served the good leg and the write went to both`
-      : `arm A, pass ${pass}: the scrub corrected nothing. md served a leg that satisfies every checksum`)
+    if (counts.corrected !== null) {
+      progress(counts.corrected > 0
+        ? `arm A, pass ${pass}: btrfs corrected ${counts.corrected} block(s) through md — md served the good leg and the write went to both`
+        : `arm A, pass ${pass}: the scrub corrected nothing. md served a leg that satisfies every checksum`)
+    }
 
     const checkStart = Date.now()
     progress(`arm A, pass ${pass}: whole-band md check on ${label}. md counts legs that disagree, so this is what says whether the band is done`)
@@ -1002,6 +1147,8 @@ export async function reconcileMirrorBand(
     state.mismatchAfter = checked.mismatch
     if (checked.mismatch === 0)
       return finish('reconciled', array.device)
+    // Only a count that was READ as zero says the scrub made no progress; an
+    // unreadable one says nothing, and the next pass runs (cr3).
     if (counts.corrected === 0) {
       // The scrub had nothing to correct and md still counts disagreeing legs:
       // md is not serving the rotten leg, and running the same pass again is
@@ -1026,6 +1173,28 @@ export async function reconcileMirrorBand(
   const conflictNow = opts.jobConflict?.()
   if (conflictNow)
     return finish('refused', array.device, { reason: `${conflictNow} (re-checked before arm B)`, reasonCode: 'job-active' })
+  // cr3 W2 — the geometry is read AGAIN here, not reused from submit. Arm A
+  // can be hours, and md can record bad blocks on a leg in that time without
+  // failing it (a write error on a member with a bad-block log), or the band
+  // can be re-enumerated under its stable name. Everything arm B reads and
+  // writes is placed from THIS reading.
+  let geoNow: MdGeometry
+  try {
+    geoNow = await readMdGeometry(guarded, array.device)
+  }
+  catch (error) {
+    return finish('refused', array.device, {
+      reason: `${array.device} could not be read again before arm B: ${error instanceof Error ? error.message : String(error)}. Nothing was written`,
+      reasonCode: 'array-busy',
+    })
+  }
+  if (geoNow.kernel !== geo.kernel) {
+    return finish('refused', array.device, {
+      reason: `${array.device} is ${geoNow.kernel} now and was ${geo.kernel} when this run started — the band was re-assembled under it. Nothing was written`,
+      reasonCode: 'array-busy',
+    })
+  }
+  geo = geoNow
   let busyNow: MirrorReconcileRefusal | null = await mirrorReconcileArrayRefusal(geo)
   if (!busyNow) {
     const preWrite = await preWriteRefusal(geo)
@@ -1036,8 +1205,9 @@ export async function reconcileMirrorBand(
     return finish('refused', array.device, { reason: `${busyNow.reason}. Nothing was written`, reasonCode: busyNow.code })
 
   const ctx = opts.context ?? await resolveContext(guarded, pool.mountpoint)
-  const bandCtx = ctx.bands.find(b => b.geometry?.kernel === geo.kernel)
-  if (!bandCtx || bandCtx.geometry === null) {
+  // EVERY segment on this array (cr3 AHR-HEAL-L10), in LV order.
+  const bandCtxs = ctx.bands.filter(b => b.geometry?.kernel === geo.kernel)
+  if (bandCtxs.length === 0) {
     return finish('refused', array.device, {
       reason: `band r${band} (${array.device}) is not one of the dm segments under pool '${pool.name}' — the reverse mapping from an md byte to a btrfs logical byte has no segment to run through, so no row can be arbitrated. Nothing was written`,
       reasonCode: 'array-busy',
@@ -1065,31 +1235,76 @@ export async function reconcileMirrorBand(
     })
   }
   const window = Math.max(BLOCK_BYTES, Math.floor((opts.compareWindowBytes ?? MIRROR_COMPARE_WINDOW_BYTES) / BLOCK_BYTES) * BLOCK_BYTES)
-  const compareState: CompareState = { ctx, band: bandCtx, chunks, geo, legs, nodes: new Map() }
+  const compareState: CompareState = { ctx, bands: bandCtxs, chunks, geo, legs, nodes: new Map() }
   const notes: string[] = []
   const compareStart = Date.now()
+  const noteOf = (detail: string): void => {
+    if (notes.length < 10)
+      notes.push(detail)
+  }
+  const undecided = (detail: string): void => {
+    state.undecidedRows++
+    noteOf(detail)
+  }
 
-  progress(`arm B: comparing both legs of ${label} row by row — ${gib(spanBytes)} per leg, about ${approximateDuration(spanBytes / MIRROR_RECONCILE_RATE_BYTES_S)}`)
+  /** One leg's row, read on its own — the path a window that would not read falls back to. */
+  const readRow = async (leg: number, mdByte: number): Promise<Buffer> =>
+    readDirect(guarded, geo.members[leg] as string, legOffset(geo, mdByte, leg), BLOCK_BYTES)
+
+  // cr3 second review item 6: the compare rate (not arm A's scrub rate) plus
+  // every row the evidence says will be written, at the per-row ceiling.
+  const rowsExpected = expectedRows(state.mismatchBefore)
+  progress(`arm B: comparing both legs of ${label} row by row — ${gib(spanBytes)} per leg${rowsExpected !== null ? `, ${rowsExpected} differing 4 KiB row(s) expected` : ''}, about ${approximateDuration(armBSeconds(spanBytes, state.mismatchBefore))}`)
   for (let base = 0; base < spanBytes; base += window) {
     const length = Math.min(window, spanBytes - base)
+    // cr3 AHR-HEAL-L12 — one unreadable sector anywhere in a 4 MiB window
+    // used to throw out of the whole run: no result, no notification, and a
+    // band with a single URE could never be reconciled. A window that will not
+    // read is read again row by row, and only the rows a leg cannot serve are
+    // set aside — undecided, never written, named in the result.
     const legBytes = new Map<number, Buffer>()
-    for (const leg of legs)
-      legBytes.set(leg, await readDirect(guarded, geo.members[leg] as string, legOffset(geo, base, leg), length))
-    const first = legBytes.get(legs[0]) as Buffer
+    let windowRead = true
+    for (const leg of legs) {
+      try {
+        legBytes.set(leg, await readDirect(guarded, geo.members[leg] as string, legOffset(geo, base, leg), length))
+      }
+      catch {
+        windowRead = false
+        break
+      }
+    }
     for (let at = 0; at < length; at += BLOCK_BYTES) {
       state.rowsCompared++
+      const mdByte = base + at
       const rows = new Map<number, Buffer>()
-      for (const leg of legs)
-        rows.set(leg, (legBytes.get(leg) as Buffer).subarray(at, at + BLOCK_BYTES))
+      let unreadable: string | null = null
+      for (const leg of legs) {
+        if (windowRead) {
+          rows.set(leg, (legBytes.get(leg) as Buffer).subarray(at, at + BLOCK_BYTES))
+          continue
+        }
+        try {
+          rows.set(leg, await readRow(leg, mdByte))
+        }
+        catch (error) {
+          unreadable = `${geo.members[leg]}: ${error instanceof Error ? error.message : String(error)}`
+          break
+        }
+      }
+      if (unreadable !== null) {
+        // Not counted as DIFFERING: nothing says it does.
+        undecided(`md byte ${mdByte}: a leg could not be read there (${unreadable})`)
+        continue
+      }
+      const first = rows.get(legs[0]) as Buffer
       let differs = false
       for (const leg of legs.slice(1)) {
-        if (!first.subarray(at, at + BLOCK_BYTES).equals(rows.get(leg) as Buffer))
+        if (!first.equals(rows.get(leg) as Buffer))
           differs = true
       }
       if (!differs)
         continue
       state.rowsDiffering++
-      const mdByte = base + at
       const verdict = await decideRow(guarded, compareState, mdByte, rows)
       if (verdict.kind === 'free-space') {
         state.freeSpaceRows++
@@ -1097,22 +1312,84 @@ export async function reconcileMirrorBand(
       }
       if (verdict.kind === 'unchecked') {
         state.uncheckedRows++
-        if (notes.length < 10)
-          notes.push(verdict.detail)
+        noteOf(verdict.detail)
         continue
       }
       if (verdict.kind === 'unresolved') {
         state.unresolvedRows++
-        if (notes.length < 10)
-          notes.push(verdict.detail)
+        noteOf(verdict.detail)
         continue
       }
-      await writeDirect(guarded, array.device, mdByte, rows.get(verdict.leg) as Buffer)
-      if (verdict.leg === 0)
+      if (verdict.kind === 'undecided') {
+        undecided(verdict.detail)
+        continue
+      }
+
+      // cr3 AHR-HEAL-H3, ordered as the review asked (items 2, 3) so that the
+      // unguarded window before this write is ONE dd spawn:
+      //  1. arbitrate AGAIN with no cache — fresh tree roots, a fresh csum
+      //     walk, the node re-read (seconds on a real pool) — against the
+      //     bytes that were compared; a metadata node must hold those very
+      //     bytes at this row;
+      //  2. re-check the array (`preWriteRefusal`);
+      //  3. re-read both legs LAST and require they still hold the compared
+      //     bytes — then write exactly those bytes.
+      const again = await decideRow(guarded, compareState, mdByte, rows, true)
+      if (again.kind !== 'won' || again.leg !== verdict.leg) {
+        undecided(`md byte ${mdByte}: arbitrated again immediately before the write, the row no longer decides for ${geo.members[verdict.leg]} (${again.kind === 'free-space' ? 'it is free space now' : again.detail}), so nothing was written`)
+        continue
+      }
+      // The array itself, at the same last instant (cr3 W2 — the repair
+      // engine's `preWriteRefusal` before EVERY write, not once before a
+      // compare that runs for days): a member that failed or a rebuild md
+      // started since stops arm B, with what it wrote so far reported.
+      const changed = await preWriteRefusal(geo)
+      if (changed) {
+        state.compareMs = Date.now() - compareStart
+        const wrote = state.rowsWritten.leg0 + state.rowsWritten.leg1
+        return finish(wrote > 0 ? 'residual' : 'refused', array.device, {
+          reason: `array state changed during arm B: ${changed}. ${wrote > 0 ? `${wrote} row(s) were written before it did; the band is unproven` : 'Nothing was written'}`,
+          reasonCode: 'array-busy',
+        })
+      }
+      let freshRows: Map<number, Buffer> | null = new Map()
+      for (const leg of legs) {
+        try {
+          freshRows.set(leg, await readRow(leg, mdByte))
+        }
+        catch {
+          freshRows = null
+          break
+        }
+      }
+      if (freshRows === null) {
+        undecided(`md byte ${mdByte}: a leg could not be read again immediately before the write, so nothing was written`)
+        continue
+      }
+      if (legs.some(leg => !(freshRows.get(leg) as Buffer).equals(rows.get(leg) as Buffer))) {
+        undecided(`md byte ${mdByte}: the row changed between the comparison and the write (the filesystem wrote there), so nothing was written`)
+        continue
+      }
+      try {
+        await writeDirect(guarded, array.device, mdByte, rows.get(again.leg) as Buffer)
+      }
+      catch (error) {
+        // cr3 review item 6, on this verb: the write was ISSUED and reported a
+        // failure — the row may have landed. Neither "nothing written" nor
+        // "reconciled": the run stops, unproven, and says so.
+        state.compareMs = Date.now() - compareStart
+        const wrote = state.rowsWritten.leg0 + state.rowsWritten.leg1
+        return finish('residual', array.device, {
+          reason: `the write of md byte ${mdByte} through ${array.device} was issued and reported a failure (${error instanceof Error ? error.message : String(error)}); that row may have landed or may not, after ${wrote} row(s) written before it. The verifying check did not run, so the band is unproven: the next scrub decides`,
+        })
+      }
+      if (again.leg === 0)
         state.rowsWritten.leg0++
       else
         state.rowsWritten.leg1++
-      progress(`arm B: md byte ${mdByte} — ${verdict.detail}; written through md to both legs`)
+      if (state.writtenAt.length < WRITTEN_AT_LIMIT)
+        state.writtenAt.push(mdByte)
+      progress(`arm B: md byte ${mdByte} — ${again.detail}; written through md to both legs`)
     }
     const done = Math.min(base + length, spanBytes)
     progress(`arm B: ${gib(done)} of ${gib(spanBytes)} per leg compared (${state.rowsDiffering} differing row(s), ${state.rowsWritten.leg0 + state.rowsWritten.leg1} written)`)
@@ -1134,19 +1411,24 @@ export async function reconcileMirrorBand(
   state.mismatchAfter = finalCheck.mismatch
 
   const residualNote = notes.length > 0 ? ` First rows: ${notes.join('; ')}` : ''
+  // The undecided rows' own sentence (cr3): they carry NO verdict about the
+  // data, so they never share the restore sentence the unresolved rows earn.
+  const undecidedNote = state.undecidedRows > 0
+    ? ` ${state.undecidedRows} differing row(s) could not be arbitrated for a reason that says nothing about their data (the checksum could not be read, both legs matched it, a leg could not be read there, or the row changed while it was compared). They were NOT written, and nothing about them is a reason to restore anything: run the reconcile again once the cause has passed.`
+    : ''
   if (state.unresolvedRows > 0) {
     return finish('residual', array.device, {
-      reason: `${state.unresolvedRows} row(s) of ${label} could not be arbitrated: neither leg satisfies the checksum btrfs stored for them. Those rows were NOT written, and ${label} still counts ${state.mismatchAfter ?? 'an unreadable number of'} mismatch(es). The files they belong to need restoring from backup.${residualNote}`,
+      reason: `${state.unresolvedRows} row(s) of ${label} could not be arbitrated: neither leg satisfies the checksum btrfs stored for them. Those rows were NOT written, and ${label} still counts ${state.mismatchAfter ?? 'an unreadable number of'} mismatch(es). The files they belong to need restoring from backup.${undecidedNote}${residualNote}`,
     })
   }
   if (state.mismatchAfter === null) {
     return finish('residual', array.device, {
-      reason: `arm B wrote ${state.rowsWritten.leg0 + state.rowsWritten.leg1} row(s), but ${geo.device}'s mismatch_cnt could not be read afterwards. The band is not proven`,
+      reason: `arm B wrote ${state.rowsWritten.leg0 + state.rowsWritten.leg1} row(s), but ${geo.device}'s mismatch_cnt could not be read afterwards. The band is not proven.${undecidedNote}`,
     })
   }
   if (state.mismatchAfter > 0) {
     return finish('residual', array.device, {
-      reason: `${label} still counts ${state.mismatchAfter} mismatch(es) after arm B compared every row of both legs and wrote ${state.rowsWritten.leg0 + state.rowsWritten.leg1}. ${state.uncheckedRows > 0 ? `${state.uncheckedRows} differing row(s) had no checksum to arbitrate them and were left exactly as they are, which is the likely remainder. ` : ''}Look at the disks before running this again.${residualNote}`,
+      reason: `${label} still counts ${state.mismatchAfter} mismatch(es) after arm B compared every row of both legs and wrote ${state.rowsWritten.leg0 + state.rowsWritten.leg1}. ${state.uncheckedRows > 0 ? `${state.uncheckedRows} differing row(s) had no checksum to arbitrate them and were left exactly as they are, which is the likely remainder. ` : ''}${state.undecidedRows > 0 ? '' : 'Look at the disks before running this again.'}${undecidedNote}${residualNote}`,
     })
   }
   return finish('reconciled', array.device)

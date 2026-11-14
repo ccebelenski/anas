@@ -1,9 +1,10 @@
 import type { AhrPool, SelfhealOutcome, SelfhealOutcomeKind, SelfhealReasonCode } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { AhrRepairRequest, AhrRepairResult, SELFHEAL_CSUM_UNREADABLE } from '@anas/shared'
+import { AhrRepairRequest, AhrRepairResult, SELFHEAL_CSUM_UNREADABLE, SELFHEAL_RUN_STOPPED, SELFHEAL_WRITE_UNCONFIRMED } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { repairAhrFiles } from '../ahr-repair.js'
+import { SelfhealRunError } from '../selfheal-repair.js'
 
 /**
  * The repair JOB (story selfheal.6) — the engine is faked here on purpose.
@@ -84,7 +85,7 @@ describe('AHR repair job — the four honest counts (review R9)', () => {
     assert.equal(b8.reason, 'verdict for 8')
   })
 
-  it('a block the engine THROWS on is unrepairable with the error text — the job carries on', async () => {
+  it('a block the engine THROWS on before its write is run-stopped with the error text, never unrepairable — the job carries on', async () => {
     const exec = executor()
     const seen: number[] = []
     const result = await repairAhrFiles(
@@ -104,10 +105,52 @@ describe('AHR repair job — the four honest counts (review R9)', () => {
 
     assert.deepEqual(seen, [1, 2, 3], 'the blocks after the failure still got their attempt')
     assert.equal(result.repaired, 2)
-    assert.equal(result.unrepairable, 1)
+    // cr3 AHR-HEAL-H1: a thrown block decided nothing — run-stopped, never
+    // the bucket that advises a restore.
+    assert.equal(result.unrepairable, 0)
+    assert.equal(result.notExamined, 1)
     const bad = result.files[0].blocks.find(b => b.block === 2)!
-    assert.equal(bad.outcome, 'unrepairable')
+    assert.equal(bad.outcome, 'not-examined')
+    assert.equal(bad.reasonCode, SELFHEAL_RUN_STOPPED)
     assert.equal(bad.reason, 'btrfs tree walk died')
+  })
+
+  it('cr3 AHR-HEAL-H1: a block the engine threw on AFTER its write is REPAIRED with the confirmation skipped — never a restore', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [7] }],
+      () => {},
+      {
+        repair: async () => {
+          throw new SelfhealRunError('injected before postcheck', [], { cleanupErrors: [] }, {
+            written: '/a.bin block 7 reconstructed from the XOR of the other 5 members of stripe 49 and verified against the stored csum 0x01020304',
+          })
+        },
+      },
+    )
+    assert.equal(result.repaired, 1)
+    assert.equal(result.unrepairable, 0)
+    const block = result.files[0].blocks[0]
+    assert.equal(block.outcome, 'repaired')
+    assert.match(block.reason, /the run stopped before its confirmation \(injected before postcheck\)/)
+    assert.doesNotMatch(notification(exec)!.body, /restore this file from backup/)
+  })
+
+  it('cr3 AHR-HEAL-H1: a block the engine threw on BEFORE its write is never told to restore', async () => {
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [7] }],
+      () => {},
+      { repair: async () => { throw new SelfhealRunError('cannot pin /mnt: snapshot failed', [], { cleanupErrors: [] }) } },
+    )
+    const body = notification(exec)!.body
+    assert.doesNotMatch(body, /restore this file from backup/)
+    assert.match(body, /stopped before it reached a verdict \(cannot pin \/mnt: snapshot failed\)/)
+    assert.match(body, /run the repair again/)
   })
 
   it('runs strictly one block at a time, in the order they were asked for', async () => {
@@ -796,5 +839,26 @@ describe('AHR repair job — corrected metadata reads in its own window (selfhea
       blocks: 0,
     })
     assert.equal(legacy.metadataCorrected, undefined)
+  })
+})
+
+describe('AHR repair job — the sentences a repeat and an unconfirmed write get (cr3 second review 5(b)(c))', () => {
+  it('run-stopped says what a REPEAT of the same reason means', async () => {
+    const exec = executor()
+    await repairAhrFiles(exec, pool(), [{ path: '/a.bin', blocks: [7] }], () => {}, {
+      repair: async () => outcome('/a.bin', 7, 'not-examined', 'read /dev/loop3 @4308992: dd exit 1: Input/output error', SELFHEAL_RUN_STOPPED),
+    })
+    const body = notification(exec)!.body
+    assert.match(body, /If a second run stops with the same reason, it will not pass by waiting/)
+  })
+
+  it('write-unconfirmed gives its advice ONCE', async () => {
+    const exec = executor()
+    await repairAhrFiles(exec, pool(), [{ path: '/a.bin', blocks: [7] }], () => {}, {
+      repair: async () => outcome('/a.bin', 7, 'not-examined', 'the write of /a.bin block 7 through /dev/md127 at md byte 4096 was issued and then reported a failure (dd: fsync failed). The arbitrated bytes may have landed or may not.', SELFHEAL_WRITE_UNCONFIRMED),
+    })
+    const body = notification(exec)!.body
+    assert.equal(body.match(/next scrub/g)?.length, 1, body)
+    assert.equal(body.match(/reason to restore/g)?.length, 1, body)
   })
 })

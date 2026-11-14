@@ -65,10 +65,14 @@ async function poolFor(executor: CommandExecutor, mountpoint: string): Promise<M
     if (band.geometry === null)
       throw new Error(`band ${index + 1} (${band.device}): ${band.error ?? 'its geometry could not be read'}`)
     const sectors = await memberDataSectors(band.geometry)
+    // cr3: a band whose data size could not be read is not a band of size 0 —
+    // the height is what every estimate the run prints is computed from.
+    if (sectors === null)
+      throw new Error(`band ${index + 1} (${band.device}): no member reports a readable rd<n>/size, so the band's height is unknown`)
     arrays.push({
       band: index + 1,
       device: band.geometry.device,
-      heightBytes: (sectors ?? 0) * 512,
+      heightBytes: sectors * 512,
       members: band.geometry.members.filter(m => m !== null),
     })
   }
@@ -164,6 +168,8 @@ function sidecar(result: ReturnType<typeof AhrMirrorReconcileResultSchema.parse>
     free_space_rows: result.freeSpaceRows,
     unchecked_rows: result.uncheckedRows,
     unresolved_rows: result.unresolvedRows,
+    // cr3 (AHR-HEAL-H3/L12): rows set aside with NO verdict about their data.
+    undecided_rows: result.undecidedRows,
     mismatch_before: result.mismatchBefore,
     mismatch_after: result.mismatchAfter,
     reason_code: result.reasonCode ?? null,

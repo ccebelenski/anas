@@ -153,6 +153,26 @@ interface BtrfsScrubStatus {
 }
 
 const STATUS_RE = /^Status:\s+(\S+)/m
+/** `Scrub started:    Fri Nov 14 10:00:00 2026` — when the pass the status describes began. */
+const SCRUB_STARTED_RE = /^Scrub started:\s+(\S.*)$/m
+/**
+ * `scrub done for <fsid>` / `scrub canceled for <fsid>` — the line `btrfs scrub
+ * start -B` prints when THIS pass returns, before the same stats block `scrub
+ * status` prints (btrfs-progs' `scrub %s for %s`, v7.1 format strings).
+ */
+const SCRUB_DONE_RE = /^scrub (done|canceled|cancelled) for \S+/m
+/** btrfs-progs' `%c` stamp in the C locale: `Fri Nov  6 00:36:16 2026`. */
+const SCRUB_STAMP_RE = /^[A-Z][a-z]{2} ([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/
+const STAMP_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+/** `Scrub is already running.` — btrfs-progs' refusal when another scrub holds the filesystem. */
+const SCRUB_ALREADY_RUNNING_RE = /already running/i
+/**
+ * Every `btrfs scrub` this module runs is pinned to UTC and the C locale (cr3
+ * second review item 1): the stamps btrfs-progs prints are zone-less local
+ * time, and a stamp read in a zone other than the one it was printed in — or
+ * across a DST edge — is an instant nobody can name.
+ */
+const SCRUB_ENV: Record<string, string> = { TZ: 'UTC', LC_ALL: 'C' }
 const PERCENT_RE = /^Bytes scrubbed:.*\(([\d.]+)%\)/m
 const ERROR_SUMMARY_RE = /^Error summary:\s+(\S.*)$/m
 const DEV_PREFIX_RE = /^\/dev\//
@@ -164,6 +184,21 @@ export function parseBtrfsScrubStatus(text: string): BtrfsScrubStatus {
     percent: PERCENT_RE.test(text) ? Number.parseFloat(text.match(PERCENT_RE)![1]) : null,
     errorSummary: text.match(ERROR_SUMMARY_RE)?.[1].trim() ?? null,
   }
+}
+
+/**
+ * A btrfs-progs `Scrub started:` stamp, read as UTC — which it is, because
+ * every scrub command here runs with TZ=UTC (cr3 second review item 1). Null
+ * for anything that is not the C-locale `%c` shape.
+ */
+export function parseScrubStamp(text: string): number | null {
+  const m = SCRUB_STAMP_RE.exec(text.trim())
+  if (!m)
+    return null
+  const month = STAMP_MONTHS.indexOf(m[1])
+  if (month < 0)
+    return null
+  return Date.UTC(Number(m[6]), month, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]))
 }
 
 /** A clean btrfs error summary (`no errors found`). */
@@ -820,7 +855,7 @@ export function findingPath(
  * option), the pool's own `subvolLayout` stands in: it is that same reading,
  * one hop earlier.
  */
-async function mountedSubvolume(executor: CommandExecutor, pool: AhrPool): Promise<string> {
+async function mountedSubvolume(executor: CommandExecutor, pool: AhrPool): Promise<string | null> {
   try {
     const r = await executor.exec(FINDMNT, [...AHR_SCRUB_FINDMNT_ARGS, pool.mountpoint])
     if (r.exitCode === 0) {
@@ -833,7 +868,13 @@ async function mountedSubvolume(executor: CommandExecutor, pool: AhrPool): Promi
   catch {
     // fall through to the pool's own reading
   }
-  return pool.subvolLayout ? SUBVOL_DATA : ''
+  // cr3 (from the AHR core lane): the pool's own reading, compared
+  // EXPLICITLY — null means the kernel mount table could not be read, and is
+  // returned as "unknown", never as the top level a falsy test would make it.
+  const layout = (pool as { subvolLayout?: boolean | null }).subvolLayout
+  if (layout === null)
+    return null
+  return layout === true ? SUBVOL_DATA : ''
 }
 
 /**
@@ -1109,6 +1150,21 @@ async function buildFindings(
       findings.push({ path: group.path, subvolume, inode: group.inode, stripes: group.stripes, badBlocks: [], missing: true })
       continue
     }
+    if (mounted === null) {
+      // The mounted subvolume is unknown, so where this file is on the node
+      // is unknown: reported filesystem-relative, unidentified, never probed
+      // at a guessed path.
+      findings.push({
+        path: [subvolume, group.path.replace(LEADING_SLASH_RE, '')].filter(p => p !== '').join('/'),
+        subvolume,
+        inode: group.inode,
+        stripes: group.stripes,
+        badBlocks: [],
+        unidentified: true,
+        reason: `the pool's mount state could not be read, so where this file is on the node is unknown`,
+      })
+      continue
+    }
     const where = findingPath(pool.mountpoint, mounted, subvolume, group.path)
     updateProgress(`Attributing scrub errors: ${i + 1}/${groups.length} (${where.path})`)
     // Outside the mounted tree (a snapshot under `@snapshots`, §12): real, and
@@ -1255,6 +1311,11 @@ export async function readCorrectedReads(
     // Same fallback as the attribution: no PCRE2 means the whole window is
     // read rather than nothing being read at all.
     r = await executor.exec(JOURNALCTL, scrubJournalArgs(journalSince(since), { grep: false }))
+    // cr3 — a window neither read could take is not a window with nothing in
+    // it. The callers already catch and leave the count out; they now do so
+    // because the journal said nothing, not because a failure read as zero.
+    if (r.exitCode !== 0)
+      throw new Error(r.stderr.trim() || `journalctl exited ${r.exitCode}`)
   }
   const device = await poolDmName(executor, pool)
   return correctedReadsFromMessages(kernelJournalMessages(r.stdout), device)
@@ -1371,6 +1432,21 @@ function firstErrorLine(err: unknown): string {
   return (err instanceof Error ? err.message : String(err)).trim().split('\n')[0] ?? ''
 }
 
+/**
+ * A btrfs scrub pass whose verdict could not be read for THIS pass (cr3 review
+ * item 7): `scrub start` did not run it (exit 1), exited with a code that says
+ * nothing (anything but 0 or 3), or its status names no state, describes an
+ * earlier pass, or never reached `finished`. Never clean: a clean pass is the
+ * parity rewrite's licence for `mdadm --action=repair`, and that verb refuses
+ * on this (`scrub-unproven`).
+ */
+export class ScrubVerdictUnknownError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ScrubVerdictUnknownError'
+  }
+}
+
 /** One btrfs scrub pass over a filesystem — the scrub's phase 2, on its own. */
 export interface BtrfsScrubPass {
   /**
@@ -1416,12 +1492,17 @@ export async function btrfsScrubPass(
   // `finished` while the child is still up.
   let commandSettled = false
   let spawnError: unknown
+  let started: { exitCode: number, stdout: string, stderr: string } | null = null
   const pass = executor.exec(BTRFS, ['scrub', 'start', '-B', mountpoint], {
     timeoutMs: null,
     longRunning: 'btrfs scrub: a verify pass over the whole filesystem, hours to days on a large pool',
+    env: SCRUB_ENV,
   })
   pass.then(
-    () => { commandSettled = true },
+    (r) => {
+      started = { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr }
+      commandSettled = true
+    },
     (err: unknown) => {
       spawnError = err
       commandSettled = true
@@ -1439,7 +1520,7 @@ export async function btrfsScrubPass(
     // line, sleep the interval like any other poll, keep waiting for the
     // COMMAND — the verdict comes from the final read below.
     try {
-      const st = parseBtrfsScrubStatus((await run(executor, BTRFS, ['scrub', 'status', mountpoint])).stdout)
+      const st = parseBtrfsScrubStatus(await readScrubStatus(executor, mountpoint))
       if (st.status === 'running')
         updateProgress(`btrfs scrub running${st.percent !== null ? ` (${st.percent.toFixed(1)}%)` : ''}`)
     }
@@ -1460,6 +1541,39 @@ export async function btrfsScrubPass(
   // this check.
   if (spawnError !== undefined)
     throw spawnError instanceof Error ? spawnError : new Error(String(spawnError))
+  // cr3 review item 7 — the START command's exit says whether this pass ran
+  // at all: btrfs-progs exits 1 when the scrub could not be run (the status
+  // file then still describes the PREVIOUS pass, clean or not), 3 when it ran
+  // and met uncorrectable errors, 0 when it ran. Anything else says nothing.
+  const startResult = started as { exitCode: number, stdout: string, stderr: string } | null
+  const startExit = startResult?.exitCode ?? null
+  const startOut = startResult?.stdout ?? ''
+  const startErr = startResult?.stderr.trim() ?? ''
+  if (startExit === 1 && SCRUB_ALREADY_RUNNING_RE.test(`${startErr}\n${startOut}`)) {
+    // The one refusal with a cause the operator can see: a scrub the job did
+    // not start holds the filesystem. Its own sentence, never "scrub again".
+    throw new ScrubVerdictUnknownError(`btrfs refused to start this pass on '${label}': a btrfs scrub was already running on ${mountpoint} (one started by hand, or by another tool). This run's checksum pass did not happen, and that scrub's result is not this one's: its progress is in 'btrfs scrub status ${mountpoint}'`)
+  }
+  if (startExit === 1)
+    throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}' did not run: btrfs scrub start exited 1${startErr ? ` (${firstErrorLine(startErr)})` : ''}`)
+  if (startExit !== 0 && startExit !== 3)
+    throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}': btrfs scrub start exited ${startExit ?? 'with no exit code'}${startErr ? ` (${firstErrorLine(startErr)})` : ''}, which does not say whether the pass ran`)
+  // cr3 second review item 1 — THIS pass's own verdict, from the command that
+  // ran it: `-B` prints `scrub done for <fsid>` (or `canceled`) and then the
+  // pass's stats block when it returns. That is this pass by construction —
+  // no stamp to compare, and no dependence on the status file under
+  // /var/lib/btrfs, which btrfs-progs keeps going without when it cannot
+  // write it ("status recording disabled"). The status read below is the
+  // fallback for a `-B` that printed nothing (`-q`, an older format).
+  const own = SCRUB_DONE_RE.exec(startOut)
+  if (own !== null && own[1] !== 'done')
+    throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}': btrfs scrub start reported the pass ${own[1]}, so it has no verdict`)
+  const ownSummary = own !== null ? parseBtrfsScrubStatus(startOut).errorSummary : null
+  if (own !== null && ownSummary !== null) {
+    if (startExit === 3)
+      return { startedAt, btrfsErrors: isCleanSummary(ownSummary) ? 'uncorrectable errors (btrfs scrub start exited 3)' : ownSummary }
+    return { startedAt, btrfsErrors: isCleanSummary(ownSummary) ? null : ownSummary }
+  }
   // Verdict from ONE final read — RETRIED while it lags (#81): the status
   // file can still read `running` for a moment after `-B` returned, and a
   // read that throws would lose the verdict of a scrub that finished fine.
@@ -1470,9 +1584,11 @@ export async function btrfsScrubPass(
   // phase 2's attribution, not a failure.
   const verdictAttempts = 3
   let attemptResult: { verdict?: BtrfsScrubStatus, error?: unknown } = {}
+  let lastStatusText = ''
   for (let attempt = 1; attempt <= verdictAttempts; attempt++) {
     try {
-      const v = parseBtrfsScrubStatus((await run(executor, BTRFS, ['scrub', 'status', mountpoint])).stdout)
+      lastStatusText = await readScrubStatus(executor, mountpoint)
+      const v = parseBtrfsScrubStatus(lastStatusText)
       attemptResult = { verdict: v }
       if (v.status !== 'running')
         break
@@ -1483,18 +1599,44 @@ export async function btrfsScrubPass(
     if (attempt < verdictAttempts)
       await sleep(pollIntervalMs)
   }
+  // Exit 3 IS the verdict: errors were found, whatever the status text says
+  // (or whether it could be read at all).
+  if (startExit === 3) {
+    const summary = attemptResult.verdict?.errorSummary ?? null
+    return { startedAt, btrfsErrors: isCleanSummary(summary) ? 'uncorrectable errors (btrfs scrub start exited 3)' : summary }
+  }
   if (attemptResult.verdict === undefined)
-    throw new Error(`btrfs scrub on '${label}' finished but its status could not be read: ${firstErrorLine(attemptResult.error)}`)
+    throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}' finished but its status could not be read: ${firstErrorLine(attemptResult.error)}`)
   const verdict = attemptResult.verdict
   if (verdict.status === 'aborted')
-    throw new Error(`btrfs scrub on '${label}' was aborted${isCleanSummary(verdict.errorSummary) ? '' : ` (${verdict.errorSummary})`}`)
-  // finished — or no Status line at all (nothing to report): done either way.
-  if (verdict.status === 'finished' || verdict.status === null)
+    throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}' was aborted${isCleanSummary(verdict.errorSummary) ? '' : ` (${verdict.errorSummary})`}`)
+  if (verdict.status === 'finished') {
+    // The status describes the LAST pass; it must be THIS one. A stamp from
+    // before this pass began (seconds are floored, so a 2 s margin) is
+    // another pass's verdict. A status with no stamp is taken on the start
+    // command's exit 0 alone.
+    // The stamp was printed under TZ=UTC and is read as UTC (cr3 second review
+    // item 1): no daemon zone and no DST edge takes part.
+    const stampText = SCRUB_STARTED_RE.exec(lastStatusText)?.[1]?.trim() ?? null
+    const stampMs = stampText === null ? null : parseScrubStamp(stampText)
+    if (stampMs !== null && stampMs < startedAt.getTime() - 2000)
+      throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}': the status read after this pass describes an earlier pass (started ${stampText}), not this one`)
     return { startedAt, btrfsErrors: isCleanSummary(verdict.errorSummary) ? null : verdict.errorSummary }
-  // The command returned but the pass has no verdict (scrub.r1): a signal
-  // reached the child some other way, it crashed, or the status says
-  // something we do not know — the pass is NOT complete, say so plainly.
-  throw new Error(`btrfs scrub on '${label}' ended without finishing (status: ${verdict.status})`)
+  }
+  // No `Status:` line at all ("no stats available", an empty or unknown
+  // format), or a state that is not `finished`: the pass has no verdict this
+  // run can read — never "nothing to report" (cr3 review item 7).
+  throw new ScrubVerdictUnknownError(verdict.status === null
+    ? `btrfs scrub on '${label}' returned, but its status names no state, so the pass has no verdict this run can read`
+    : `btrfs scrub on '${label}' ended without finishing (status: ${verdict.status})`)
+}
+
+/** `btrfs scrub status`, pinned to UTC and the C locale; throws on a non-zero exit like `run`. */
+async function readScrubStatus(executor: CommandExecutor, mountpoint: string): Promise<string> {
+  const r = await executor.exec(BTRFS, ['scrub', 'status', mountpoint], { env: SCRUB_ENV })
+  if (r.exitCode !== 0)
+    throw new Error(r.stderr.trim() || `${BTRFS} scrub exited ${r.exitCode}`)
+  return r.stdout
 }
 
 /**
@@ -1593,6 +1735,16 @@ export async function scrubAhrPool(
         const syncMax = await readSyncValue(kernelName, 'sync_max')
         const syncMin = await readSyncValue(kernelName, 'sync_min')
         if ((syncMax !== null && syncMax !== MD_DEFAULT_SYNC_MAX) || (syncMin !== null && syncMin !== MD_DEFAULT_SYNC_MIN)) {
+          // cr3 — "idle (just proven)" was not proven when `sync_action` could
+          // not be read: the wait helper above lets an unreadable attribute
+          // through (there is nothing to wait on), but an unreadable attribute
+          // must never license a WRITE (D2, `isIdleAction`'s own rule). The
+          // window is written only over a band md SAID is idle.
+          if (!isIdleSyncAction(busy)) {
+            updateProgress(`${label} was not checked. Its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and md's sync_action could not be read, so nothing proves the band idle enough to restore it`)
+            bandsSkipped.push({ band: label, reason: `its sync window is bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} and sync_action could not be read, so the window was not restored` })
+            continue
+          }
           const widened = await restoreSyncWindow(kernelName)
           if (widened) {
             updateProgress(`${label}: sync window was bounded to ${syncMin ?? '?'}..${syncMax ?? '?'} (an interrupted repair left it there). It was restored to ${MD_DEFAULT_SYNC_MIN}..${MD_DEFAULT_SYNC_MAX} before issuing the check`)
@@ -1841,7 +1993,24 @@ export async function scrubAhrPool(
 
   // --- Phase 2/2: btrfs checksum scrub ----------------------------------------
   updateProgress('phase 2/2: btrfs checksum scrub')
-  const { startedAt, btrfsErrors } = await btrfsScrubPass(executor, pool.mountpoint, name, updateProgress, interval)
+  // cr3 second review item 2 (the coordinator's decision): a checksum pass
+  // with no readable verdict does not throw phase 1 away. The job COMPLETES;
+  // phase 1 is reported as measured; phase 2 is reported unproven with its
+  // reason, and nothing about it reads clean. (The parity rewrite and the
+  // mirror reconcile still REFUSE on it: they act on the verdict.)
+  const phase2Start = new Date()
+  let startedAt = phase2Start
+  let btrfsErrors: string | null = null
+  let unproven: string | null = null
+  try {
+    ({ startedAt, btrfsErrors } = await btrfsScrubPass(executor, pool.mountpoint, name, updateProgress, interval))
+  }
+  catch (error) {
+    if (!(error instanceof ScrubVerdictUnknownError))
+      throw error
+    unproven = error.message
+    updateProgress(`phase 2/2: the checksum pass has no verdict: ${unproven}`)
+  }
 
   // --- Attribution: which files, which blocks (selfheal.3) -------------------
   // Runs AFTER phase 1 by construction now — its probe reads are tiny, but §4's
@@ -1888,6 +2057,7 @@ export async function scrubAhrPool(
     ...(parityMismatches.length > 0 ? { parityMismatches } : {}),
     ...(btrfsErrors !== null ? { errorsReported: countErrorSummary(btrfsErrors) } : {}),
     ...(metadataCorrected ? { metadataCorrected } : {}),
+    ...(unproven !== null ? { btrfsUnproven: unproven } : {}),
     ...attribution,
   })
 
@@ -1904,7 +2074,20 @@ export async function scrubAhrPool(
   const parity = result.parityMismatches ?? []
   const skipped = result.bandsSkipped ?? []
   const correctedSuffix = metadataCorrected ? `\n\n${metadataCorrectedSentence(metadataCorrected)}` : ''
-  if (btrfsErrors !== null) {
+  if (unproven !== null) {
+    // ONE warning, and never the clean-data parity arm: nothing in this run
+    // proved the files' checksums.
+    const phase1 = parity.length > 0
+      ? ` md counted parity mismatches on ${parity.map(p => `${p.band} (${p.mismatchCnt})`).join(', ')}; with no checksum verdict this run cannot say whether that rot is in parity or in data.`
+      : ''
+    await pveNotify(
+      executor,
+      'warning',
+      'AHR scrub: the checksum pass has no verdict',
+      `The btrfs checksum pass of pool '${pool.name}' has no verdict: ${unproven}. Phase 1 (md parity) is reported as measured.${phase1} Nothing in this run proved the files' checksums, so this is not a clean bill.${skippedSection(result.bandsSkipped)}${correctedSuffix}`,
+    )
+  }
+  else if (btrfsErrors !== null) {
     await pveNotify(executor, 'warning', 'AHR scrub found errors', findingsBody(pool, btrfsErrors, result) + correctedSuffix)
     if (parity.length > 0 && findings.length === 0)
       await pveNotify(executor, 'warning', parityTitle(parity), parityBody(pool, parity, false) + correctedSuffix)

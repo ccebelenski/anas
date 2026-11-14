@@ -1,6 +1,6 @@
 import type { CommandExecutor } from '../executor/types.js'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { basename } from 'node:path'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { basename, join } from 'node:path'
 import process from 'node:process'
 
 /**
@@ -36,6 +36,7 @@ import process from 'node:process'
 const DD = '/usr/bin/dd'
 const BASE64 = '/usr/bin/base64'
 const SYNC = '/usr/bin/sync'
+const STAT = '/usr/bin/stat'
 
 /** btrfs sector / md page unit. Everything in the engine is a multiple of this. */
 export const BLOCK_BYTES = 4096
@@ -186,7 +187,14 @@ export async function writeDirect(
 
   const runtimeDir = selfhealRuntimeDir()
   await mkdir(runtimeDir, { recursive: true })
-  const staged = `${runtimeDir}/selfheal-write-${process.pid}-${byteOffset}.bin`
+  // A directory of its OWN per call (cr3 AHR-HEAL-L11). The name used to be
+  // `<pid>-<byteOffset>`, and two long-lane jobs on different pools — a repair
+  // and a mirror reconcile, say — writing the same md byte offset at the same
+  // moment would each have staged into the other's file: one pool's 4 KiB
+  // written through the OTHER pool's md device. `mkdtemp` makes the name
+  // unique by construction rather than by coincidence.
+  const stageDir = await mkdtemp(join(runtimeDir, 'selfheal-write-'))
+  const staged = join(stageDir, 'payload.bin')
   try {
     await writeFile(staged, data)
     const r = await executor.exec(DD, [
@@ -203,7 +211,7 @@ export async function writeDirect(
       throw new Error(`write ${device} @${byteOffset}: dd exit ${r.exitCode}: ${r.stderr.trim()}`)
   }
   finally {
-    await rm(staged, { force: true }).catch(() => {})
+    await rm(stageDir, { recursive: true, force: true }).catch(() => {})
   }
 }
 
@@ -229,6 +237,37 @@ export async function probeFileBlock(
     'status=none',
   ])
   return r.exitCode === 0
+}
+
+/**
+ * What one cold read of a file block found (cr3 AHR-HEAL-M6).
+ *
+ *  - `ok`      the block read.
+ *  - `bad`     the file is there and the read FAILED — on a btrfs file read
+ *              with O_DIRECT that is the checksum refusing the block (GT-9a).
+ *  - `missing` the path is not there at all, so nothing was read. A snapshot
+ *              does not recurse into a nested subvolume (GT-52/55), and a file
+ *              inside one is simply absent from it: that is a read that could
+ *              not be taken, never a block that failed.
+ */
+export type FileBlockProbe = 'ok' | 'bad' | 'missing'
+
+/**
+ * {@link probeFileBlock}, with "the path is not there" told apart from "the
+ * block did not read".
+ *
+ * The existence question is asked of `stat` — a structured exit code — rather
+ * than read out of dd's error text.
+ */
+export async function probeFileBlockState(
+  executor: CommandExecutor,
+  path: string,
+  block: number,
+): Promise<FileBlockProbe> {
+  const there = await executor.exec(STAT, ['-c', '%i', '--', path])
+  if (there.exitCode !== 0)
+    return 'missing'
+  return (await probeFileBlock(executor, path, block)) ? 'ok' : 'bad'
 }
 
 /** `sync` + `drop_caches=3`. The cold read is worthless without it. */

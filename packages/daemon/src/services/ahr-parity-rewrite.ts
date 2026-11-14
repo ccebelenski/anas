@@ -11,11 +11,12 @@ import {
   btrfsScrubPass,
   lastSyncAction,
   mismatchCount,
+  ScrubVerdictUnknownError,
   syncAction,
 } from './ahr-scrub.js'
 import { pveNotify } from './pve-notify.js'
 import { MD_DEFAULT_SYNC_MAX, MD_DEFAULT_SYNC_MIN, readMdAttrOrNull, sleep } from './selfheal-io.js'
-import { bandBadBlocks, readMdGeometry } from './selfheal-map.js'
+import { badBlocksUnknownRefusal, bandBadBlocks, bandBadBlocksUnknown, readMdGeometry } from './selfheal-map.js'
 import { arrayRefusal, preWriteRefusal, restoreSyncKnobs } from './selfheal-repair.js'
 import { foreignOpNote, isIdleSyncAction, markCheckIssued, ownsSyncOp, retireCheckIssued } from './selfheal-syncop.js'
 
@@ -245,6 +246,9 @@ const ParityMismatchRow = z.object({
 })
 const ScrubEvidenceShape = z.object({
   btrfsErrors: z.string().nullable().optional(),
+  // cr3 second review item 2: a scrub whose checksum pass has no verdict is
+  // no proof that the data is intact.
+  btrfsUnproven: z.string().optional(),
   findings: z.array(z.unknown()).optional(),
   parityMismatches: z.array(ParityMismatchRow).optional(),
 })
@@ -318,6 +322,13 @@ export function parityRewriteEvidence(
       ok: false,
       code: 'no-parity-mismatch',
       reason: `the last completed scrub of AHR pool '${poolName}' (job ${job.id}) did not report a result the parity rewrite can read`,
+    }
+  }
+  if (evidence.data.btrfsUnproven !== undefined) {
+    return {
+      ok: false,
+      code: 'scrub-unproven',
+      reason: `the last scrub of AHR pool '${poolName}' (job ${job.id}) has no checksum verdict: ${evidence.data.btrfsUnproven}. The parity rewrite stands on a checksum pass that found nothing, and this one proved nothing. Scrub the pool again`,
     }
   }
   if (evidence.data.btrfsErrors != null || (evidence.data.findings?.length ?? 0) > 0) {
@@ -443,6 +454,12 @@ export async function parityRewriteArrayRefusal(geo: MdGeometry): Promise<Parity
   // reconstruct (F8).
   if (bandBadBlocks(geo).length > 0)
     return { reason: badBlocksRefusal(geo), code: 'bad-blocks-present' }
+  // cr3 AHR-HEAL-L9 — a member whose bad-block list could not be read is not
+  // a member known to have none, and a whole-band repair over a row md cannot
+  // read recomputes parity from it. 'array-busy' is the code the route already
+  // gives a band it could not read.
+  if (bandBadBlocksUnknown(geo).length > 0)
+    return { reason: badBlocksUnknownRefusal(geo), code: 'array-busy' }
   const refusal = await arrayRefusal(geo)
   if (refusal)
     return { reason: refusal, code: 'array-busy' }
@@ -651,7 +668,7 @@ export async function rewriteBandParity(
   if (conflict)
     return finish('refused', array.device, { reason: conflict, reasonCode: 'job-active' })
 
-  const geo = await readMdGeometry(executor, array.device)
+  let geo = await readMdGeometry(executor, array.device)
   const busy = await parityRewriteArrayRefusal(geo)
   if (busy)
     return finish('refused', array.device, { reason: busy.reason, reasonCode: busy.code })
@@ -662,7 +679,22 @@ export async function rewriteBandParity(
   // the pass that makes "the data is intact" a statement about NOW.
   progress(`phase 1/3: fresh btrfs checksum scrub of pool '${pool.name}'. Any finding aborts the run before md is touched`)
   const scrubStart = Date.now()
-  const pass = await btrfsScrubPass(executor, pool.mountpoint, pool.name, progress, opts.pollIntervalMs ?? AHR_SCRUB_POLL_MS)
+  let pass: Awaited<ReturnType<typeof btrfsScrubPass>>
+  try {
+    pass = await btrfsScrubPass(executor, pool.mountpoint, pool.name, progress, opts.pollIntervalMs ?? AHR_SCRUB_POLL_MS)
+  }
+  catch (error) {
+    // cr3 review item 7 — a pass whose verdict could not be read proves
+    // nothing about the data, and the data being intact is the ONLY licence
+    // for md's repair. Refused, with one result and one notification.
+    if (!(error instanceof ScrubVerdictUnknownError))
+      throw error
+    state.scrubMs = Date.now() - scrubStart
+    return finish('refused', array.device, {
+      reason: `refused: the fresh btrfs scrub's verdict could not be read (${error.message}). Nothing proves the data intact, so md was not handed the repair. Nothing was written`,
+      reasonCode: 'scrub-unproven',
+    })
+  }
   state.scrubMs = Date.now() - scrubStart
   if (pass.btrfsErrors !== null) {
     let findings: AhrScrubFinding[] | undefined
@@ -694,6 +726,28 @@ export async function rewriteBandParity(
   const conflictNow = opts.jobConflict?.()
   if (conflictNow)
     return finish('refused', array.device, { reason: `${conflictNow} (re-checked immediately before the md write)`, reasonCode: 'job-active' })
+  // cr3 W8 — the geometry is read AGAIN at the last instant, not reused from
+  // submit: the fresh scrub is hours, and md records bad blocks on a member
+  // that hit a write error without failing it — exactly the rows a whole-band
+  // repair must not recompute parity from. The band must also still be the
+  // array this run started on.
+  let geoNow: MdGeometry
+  try {
+    geoNow = await readMdGeometry(executor, array.device)
+  }
+  catch (error) {
+    return finish('refused', array.device, {
+      reason: `${array.device} could not be read again immediately before the md write: ${error instanceof Error ? error.message : String(error)}. Nothing was written`,
+      reasonCode: 'array-busy',
+    })
+  }
+  if (geoNow.kernel !== geo.kernel) {
+    return finish('refused', array.device, {
+      reason: `${array.device} is ${geoNow.kernel} now and was ${geo.kernel} when this run started — the band was re-assembled under it. Nothing was written`,
+      reasonCode: 'array-busy',
+    })
+  }
+  geo = geoNow
   let busyNow: ParityRewriteRefusal | null = await parityRewriteArrayRefusal(geo)
   if (!busyNow) {
     const preWrite = await preWriteRefusal(geo)

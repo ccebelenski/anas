@@ -175,31 +175,87 @@ export function parseBadBlocks(text: string | null): BadBlockRange[] | null {
 }
 
 /**
+ * Which coordinates a member's `rd<n>/bad_blocks` prints its ranges in.
+ *
+ *  - `data-relative` — sector 0 is the first sector of the member's DATA AREA,
+ *    so the member's `rd<n>/offset` comes off before the comparison. This is
+ *    what the engine has assumed since F8.
+ *  - `absolute` — sector 0 is the first sector of the member DEVICE (the
+ *    2026-11-14 review's reading of md: `rdev_set_badblocks` adds
+ *    `rdev->data_offset` before recording, `is_badblock` adds it before
+ *    looking, and `bad_blocks` prints the stored value raw).
+ *
+ * NEITHER is ground truth yet (cr3 AHR-HEAL-M5): no capture backs the
+ * decision tree's leaf H5. The constant stays at the value the engine has
+ * always used until the capture named in `selfheal-map.test.ts`
+ * ("md bad-block coordinates — the capture decides") is taken; that test turns
+ * RED against the wrong value, and the fix is this one line.
+ */
+export type BadBlockCoordinates = 'data-relative' | 'absolute'
+
+/** @see BadBlockCoordinates — UNSETTLED, pending the capture (cr3 AHR-HEAL-M5). */
+export const MD_BAD_BLOCKS_COORDINATES: BadBlockCoordinates = 'data-relative'
+
+/**
  * Does the member in `role` carry a recorded bad-block range over the byte span
  * `[offset, offset + length)` of its own device?
  *
- * The member's `bad_blocks` are recorded in sectors RELATIVE TO ITS DATA
- * OFFSET — md's own `rdev->badblocks` are in the data area's coordinates, which
- * is why the member's `rd<n>/offset` comes off before the comparison.
+ * `null` when the member's list could not be read (cr3 AHR-HEAL-L9). An
+ * unreadable list used to answer FALSE — "clean" — on the reasoning that a
+ * kernel without the file would otherwise refuse every repair. Every kernel
+ * AHR runs on publishes `rd<n>/bad_blocks` for every member it holds, so an
+ * unreadable one is a read that failed, and a read that failed never reads as
+ * clean: each caller turns the null into a refusal that says it did not know.
  *
- * An unreadable list answers FALSE: refusing every repair on a kernel that does
- * not publish the file would be worse than the gap it closes, and the two
- * places that act on this (the reconstruction plan and the parity-rewrite
- * refusal) each say what they did and did not know.
+ * The coordinates are {@link MD_BAD_BLOCKS_COORDINATES}'s; the parameter exists
+ * so the test that the capture settles can hold both readings side by side.
  */
 export function memberHasBadBlock(
   geo: MdGeometry,
   role: number,
   memberOffset: number,
   lengthBytes: number = BLOCK_BYTES,
-): boolean {
+  coordinates: BadBlockCoordinates = MD_BAD_BLOCKS_COORDINATES,
+): boolean | null {
   const ranges = geo.badBlocks[role]
-  if (!ranges || ranges.length === 0)
+  if (ranges === null || ranges === undefined)
+    return null
+  if (ranges.length === 0)
     return false
-  const dataOffset = geo.dataOffsets[role] ?? 0
-  const first = Math.floor((memberOffset - dataOffset) / 512)
-  const last = Math.floor((memberOffset - dataOffset + lengthBytes - 1) / 512)
+  const base = coordinates === 'absolute' ? 0 : geo.dataOffsets[role]
+  if (!Number.isFinite(base))
+    return null
+  const first = Math.floor((memberOffset - base) / 512)
+  const last = Math.floor((memberOffset - base + lengthBytes - 1) / 512)
   return ranges.some(r => first <= r.startSector + r.lengthSectors - 1 && last >= r.startSector)
+}
+
+/**
+ * The PRESENT members whose bad-block list could not be read (cr3
+ * AHR-HEAL-L9) — the band-wide twin of {@link memberHasBadBlock}'s null.
+ *
+ * The parity rewrite and the mirror reconcile refuse a band with recorded bad
+ * blocks; a band whose lists they could not read is not a band they know to be
+ * free of them, so it is refused too, with its own sentence. An ABSENT role
+ * (a failed or removed member) has nothing to read and is not counted here —
+ * the degraded gates answer for it.
+ */
+export function bandBadBlocksUnknown(geo: MdGeometry): { role: number, device: string }[] {
+  const out: { role: number, device: string }[] = []
+  for (let role = 0; role < geo.raidDisks; role++) {
+    const device = geo.members[role]
+    if (device === null || device === undefined)
+      continue
+    if (geo.badBlocks[role] === null || geo.badBlocks[role] === undefined)
+      out.push({ role, device })
+  }
+  return out
+}
+
+/** The sentence a band with unreadable bad-block lists is refused with (cr3 AHR-HEAL-L9). */
+export function badBlocksUnknownRefusal(geo: MdGeometry): string {
+  const named = bandBadBlocksUnknown(geo).map(c => c.device).join(', ')
+  return `${geo.device}: the md bad-block list of ${named} could not be read, so nothing says md can read every row of that member. A band ANAS cannot ask about is not one it treats as clean. Read /sys/block/${geo.kernel}/md/rd<n>/bad_blocks and try again`
 }
 
 /** Every role whose bad-block list is non-empty, with the ranges it holds. */
@@ -1068,7 +1124,20 @@ export function geometryFromAttributes(
   const badBlocks: (BadBlockRange[] | null)[] = []
   for (let i = 0; i < raidDisks; i++) {
     const offset = attributes[`rd${i}/offset`]
-    dataOffsets.push(offset === null || offset === undefined ? 0 : Number(offset) * 512)
+    // cr3 AHR-HEAL-L8 — an unreadable data offset is not offset 0. Every read
+    // and the one write the engine makes is placed at `dataOffset + payload`,
+    // and a member whose offset this node could not read would have been read
+    // (and, through the read-back guard's comparison, written) a whole data
+    // offset away from the bytes md placed there. A PRESENT member's offset is
+    // a fact the band needs; without it the band is unreadable. An ABSENT
+    // role's offset is nobody's fact: NaN, so any arithmetic that reaches it
+    // fails loudly (readDirect refuses a non-multiple of 4 KiB) instead of
+    // landing on sector 0.
+    const present = members[i] !== null && members[i] !== undefined
+    const sectors = offset === null || offset === undefined || !INTEGER_RE.test(offset) ? null : Number(offset)
+    if (sectors === null && present)
+      throw new SelfhealMapError(`${device}: rd${i}/offset of member ${members[i]} could not be read${offset ? ` ('${offset}')` : ''} — every byte on that member is placed relative to it, and an offset this node does not know is not 0`, 'band-unreadable')
+    dataOffsets.push(sectors === null ? Number.NaN : sectors * 512)
     // `undefined` (the caller never read the attribute) and `null` (it read and
     // found nothing there) are both "this node does not know", and neither is
     // "the member is clean" — see {@link parseBadBlocks}.
@@ -1301,10 +1370,23 @@ export interface LogicalForMdByte {
  */
 export function logicalForMdByte(
   mdByte: number,
-  band: SelfhealBand,
+  band: SelfhealBand | readonly SelfhealBand[],
   chunks: readonly ChunkItem[],
 ): LogicalForMdByte | null {
-  const seg = band.segment
+  // cr3 AHR-HEAL-L10 — ONE md array can carry SEVERAL dm segments (AHR
+  // expansion `lvextend`s onto the same band again), each mapping its own md
+  // range to its own LV range. The md byte is placed through the segment whose
+  // md range CONTAINS it, never through whichever segment came first: the
+  // first segment's arithmetic applied to a byte of the second lands on an
+  // unrelated LV byte, and the row is then arbitrated against a stranger. An
+  // md byte inside no segment is not part of the LV at all — btrfs has never
+  // written there, which is free space, the same answer as a byte in no chunk.
+  const bands = Array.isArray(band) ? band as readonly SelfhealBand[] : [band as SelfhealBand]
+  const seg = bands
+    .map(b => b.segment)
+    .find(s => mdByte >= s.offsetSector * 512 && mdByte < (s.offsetSector + s.lengthSectors) * 512)
+  if (!seg)
+    return null
   const lvByte = mdByte + seg.startSector * 512 - seg.offsetSector * 512
   if (lvByte < 0)
     return null

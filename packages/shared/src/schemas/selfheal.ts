@@ -94,11 +94,42 @@ export const SELFHEAL_CSUM_UNREADABLE = 'csum-unreadable'
  *   the read-back guard's own failure: the mapping and the array disagree.
  * - `inode-changed` — the file at the path is not the file the scrub examined
  *   (the finding's inode and the live `stat` disagree). Nothing was pinned.
+ * - `run-stopped` — the run stopped BEFORE IT REACHED A VERDICT, and before it
+ *   wrote anything (cr3 AHR-HEAL-H1): a gate refused (the array was degraded
+ *   or busy), md changed the array under the run (a member kicked, a foreign
+ *   sync operation, a state change at the last instant before the write), md
+ *   and the direct member read disagreed about the stripe, or an error stopped
+ *   the run (a tree walk, a member read, the pin, a bounded check that would
+ *   not settle). The block may have been READ; nothing about it was decided.
+ *   Restoring the file on the strength of this would overwrite data nothing
+ *   has proven bad — the advice is to run the repair again once the cause in
+ *   the reason has passed.
  *
  * `csum-unreadable` stays what it always was: an `unrepairable` qualifier, not
  * a `not-examined` one. There the block WAS read; what could not be read is the
  * checksum that would arbitrate it.
  */
+/** `run-stopped`'s ONE spelling (cr3 AHR-HEAL-H1), imported by its producers and its consumer. */
+export const SELFHEAL_RUN_STOPPED = 'run-stopped'
+
+/**
+ * `write-unconfirmed` (cr3 review item 6) — the write through md was ISSUED and
+ * reported a failure (`dd` exited non-zero, a failed fsync), so the arbitrated
+ * bytes may or may not have landed. The one `not-examined` code of which
+ * "nothing was written" is NOT known to be true: the next scrub decides, and a
+ * block it still names is repaired again. Never a reason to restore.
+ */
+export const SELFHEAL_WRITE_UNCONFIRMED = 'write-unconfirmed'
+
+/**
+ * `no-checksum` (cr3 second review 5(a)) — btrfs stores NO checksum for this
+ * block now. A scrub names only blocks whose checksum failed, so the finding
+ * is stale (the file changed since that scrub) or the file keeps no checksums
+ * (NOCOW, a preallocated range, `nodatasum`). Nothing can arbitrate a
+ * reconstruction; nothing was written; scrub again. Never a reason to restore.
+ */
+export const SELFHEAL_NO_CHECKSUM = 'no-checksum'
+
 export const SELFHEAL_NOT_EXAMINED_REASONS = [
   'inline-extent',
   'hole',
@@ -106,6 +137,9 @@ export const SELFHEAL_NOT_EXAMINED_REASONS = [
   'band-unreadable',
   'unresolvable',
   'inode-changed',
+  SELFHEAL_RUN_STOPPED,
+  SELFHEAL_WRITE_UNCONFIRMED,
+  SELFHEAL_NO_CHECKSUM,
 ] as const
 export type SelfhealNotExaminedReason = typeof SELFHEAL_NOT_EXAMINED_REASONS[number]
 
@@ -117,9 +151,23 @@ export type SelfhealNotExaminedReason = typeof SELFHEAL_NOT_EXAMINED_REASONS[num
  */
 export const SELFHEAL_BAD_BLOCKS_PRESENT = 'bad-blocks-present'
 
+/**
+ * `array-rebuilds-rot` (cr3 review item 1) — an `unrepairable` qualifier. The
+ * block WAS read and fails its stored checksum, and every copy the array holds
+ * of that row gives back the same failing bytes: the parity group (P, and Q on
+ * RAID6) agrees with them, or every mirror leg holds them, while md's bounded
+ * check counts a mismatch elsewhere in its window. The array cannot rebuild
+ * the block and no rerun changes that. The file is damaged at this block
+ * unless the checksum record itself is what is wrong: restore it from a backup
+ * if one exists. Carried so the advice can say WHY, distinct from a block whose
+ * reconstruction merely failed arbitration.
+ */
+export const SELFHEAL_ARRAY_REBUILDS_ROT = 'array-rebuilds-rot'
+
 export const SelfhealReasonCode = z.enum([
   SELFHEAL_CSUM_UNREADABLE,
   SELFHEAL_BAD_BLOCKS_PRESENT,
+  SELFHEAL_ARRAY_REBUILDS_ROT,
   ...SELFHEAL_NOT_EXAMINED_REASONS,
 ])
 export type SelfhealReasonCode = z.infer<typeof SelfhealReasonCode>
@@ -404,6 +452,13 @@ export const AhrRepairBlockOutcome = z.object({
    * post-check that read it; the job rolls them up into `parityResiduals`.
    */
   parityResidual: SelfhealParityResidual.optional(),
+  /**
+   * The block was WRITTEN with bytes arbitrated against its stored checksum,
+   * and the confirmation after the write (post-check, cold read) did not run
+   * (cr3 review item 5). Carried from the engine's outcome; a run with such a
+   * block is not a clean run, and a re-scrub confirms it.
+   */
+  postcheckSkipped: z.string().optional(),
 })
 export type AhrRepairBlockOutcome = z.infer<typeof AhrRepairBlockOutcome>
 
@@ -543,6 +598,11 @@ export const AhrParityRewriteReasonCode = z.enum([
   'pool-not-mounted',
   'not-a-parity-band',
   'bad-blocks-present',
+  // cr3 review item 7: the fresh btrfs scrub's verdict could not be read as
+  // `finished` for THIS pass (it did not run, it describes an earlier pass, or
+  // its status names no state). Nothing proves the data intact, so md is not
+  // handed the repair.
+  'scrub-unproven',
 ])
 export type AhrParityRewriteReasonCode = z.infer<typeof AhrParityRewriteReasonCode>
 
@@ -670,13 +730,19 @@ export const AhrMirrorReconcileReasonCode = z.enum([
   'foreign-sync-op',
   'no-such-band',
   'pool-not-mounted',
+  // cr3 review item 7: an arm-A btrfs scrub pass whose verdict could not be read.
+  'scrub-unproven',
 ])
 export type AhrMirrorReconcileReasonCode = z.infer<typeof AhrMirrorReconcileReasonCode>
 
 /** One arm-A pass: what the btrfs scrub corrected, and what md counted after it. */
 export const AhrMirrorReconcilePass = z.object({
-  /** `corrected_errors` of that btrfs scrub pass — every one of them is progress. */
-  corrected: z.number().int().nonnegative(),
+  /**
+   * `corrected_errors` of that btrfs scrub pass — every one of them is
+   * progress. Null when `btrfs scrub status` could not be read after the pass
+   * (cr3): a count nobody read is unknown, never zero.
+   */
+  corrected: z.number().int().nonnegative().nullable(),
   /**
    * `mismatch_cnt` of the whole-band md check that followed the pass, or null
    * when the counter could not be read. Never reported as 0 when unknown.
@@ -724,6 +790,12 @@ export type AhrMirrorReconcileDurations = z.infer<typeof AhrMirrorReconcileDurat
  *    arbitrate with. Skipped, never written.
  *  - `unresolvedRows` — both legs failed. Nothing written, and the band's
  *    residual is reported rather than hidden.
+ *  - `undecidedRows` (cr3 AHR-HEAL-H3/L12) — the row could not be arbitrated
+ *    for a reason that says NOTHING about its data: the checksum that would
+ *    arbitrate it could not be read (D3), both legs matched it, a leg could
+ *    not be read there at all, or the row changed between the comparison and
+ *    the write. Never written, and — unlike `unresolvedRows` — never a reason
+ *    to restore anything.
  */
 export const AhrMirrorReconcileResult = z.object({
   /** The AHR pool the band belongs to. */
@@ -749,6 +821,13 @@ export const AhrMirrorReconcileResult = z.object({
   freeSpaceRows: z.number().int().nonnegative().default(0),
   uncheckedRows: z.number().int().nonnegative().default(0),
   unresolvedRows: z.number().int().nonnegative().default(0),
+  undecidedRows: z.number().int().nonnegative().default(0),
+  /**
+   * The md bytes of the rows arm B wrote, the first 64 of them (cr3 second
+   * review item 7); `rowsWritten` says how many there were in all. Absent
+   * when nothing was written, and from an older daemon.
+   */
+  writtenAt: z.array(z.number().int().nonnegative()).optional(),
   mismatchBefore: z.number().int().nonnegative().nullable(),
   mismatchAfter: z.number().int().nonnegative().nullable(),
   outcome: AhrMirrorReconcileOutcome,

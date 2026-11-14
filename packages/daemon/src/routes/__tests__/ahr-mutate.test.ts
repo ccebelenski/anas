@@ -249,27 +249,29 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     assert.ok(!mock.calls.some(c => c.command === '/usr/bin/perl' && c.args[3] === 'AHR scrub failed'))
   })
 
-  it('POST /v1/ahr/:name/scrub — a failed scrub sends ONE warning notification and keeps the original error', async () => {
+  it('POST /v1/ahr/:name/scrub — an aborted checksum pass COMPLETES the job unproven: ONE warning, never clean', async () => {
     const mock = (server as unknown as { executor: MockExecutor }).executor
-    // scrub.r1 made a non-zero `scrub start -B` exit a FINDING, not a failure,
-    // so the failure here is the one both stories agree on: the final status
-    // read says the pass was aborted.
+    // cr3 (ahr-heal second review item 2, the coordinator's decision): a
+    // checksum pass with no readable verdict no longer FAILS the job and drops
+    // phase 1 — the job completes, phase 1 as measured, phase 2 unproven.
     mock.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', '/mnt/anas-ahr/ahr0'], result: { stdout: 'UUID: 1111\nStatus:           aborted\nError summary:    no errors found\n', stderr: '', exitCode: 0 } })
 
     const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, res.json().job.id)
-    assert.equal(job.status, 'failed')
-    // The ORIGINAL error is what fails the job — the notify never masks it.
-    assert.match(job.error?.message ?? '', /^btrfs scrub on 'ahr0' was aborted$/)
-    // The failure still names its pool — this is what makes it visible.
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const result = job.result as { btrfsErrors: unknown, btrfsUnproven?: string, bandsChecked?: string[] }
+    assert.equal(result.btrfsErrors, null)
+    assert.equal(result.btrfsUnproven, 'btrfs scrub on \'ahr0\' was aborted')
+    assert.deepEqual(result.bandsChecked, ['ahr0-r1', 'ahr0-r2'], 'phase 1 as measured')
     assert.deepEqual(job.detail, { pool: 'ahr0' })
 
     const notifies = mock.calls.filter(c => c.command === '/usr/bin/perl')
     assert.equal(notifies.length, 1, JSON.stringify(notifies))
     assert.equal(notifies[0].args[2], 'warning')
-    assert.equal(notifies[0].args[3], 'AHR scrub failed')
-    assert.equal(notifies[0].args[4], `AHR scrub on pool 'ahr0' failed: btrfs scrub on 'ahr0' was aborted. The pool was not fully verified. Run Scrub again once the cause has passed.`)
+    assert.equal(notifies[0].args[3], 'AHR scrub: the checksum pass has no verdict')
+    assert.match(notifies[0].args[4], /was aborted/)
+    assert.match(notifies[0].args[4], /not a clean bill/)
   })
 })
 
@@ -1067,12 +1069,15 @@ describe('POST /v1/ahr/:name/parity-rewrite', () => {
       'rd0/offset': '2048',
       'rd0/size': '1044992',
       'rd0/state': 'in_sync',
+      'rd0/bad_blocks': '',
       'rd1/offset': '2048',
       'rd1/size': '1044992',
       'rd1/state': 'in_sync',
+      'rd1/bad_blocks': '',
       'rd2/offset': '2048',
       'rd2/size': '1044992',
       'rd2/state': 'in_sync',
+      'rd2/bad_blocks': '',
     }
     for (const [key, value] of Object.entries(knobs))
       await writeFile(join(sys, key), `${value}\n`)
@@ -1383,9 +1388,11 @@ describe('POST /v1/ahr/:name/mirror-reconcile', () => {
       'rd0/offset': '2048',
       'rd0/size': '523200',
       'rd0/state': 'in_sync',
+      'rd0/bad_blocks': '',
       'rd1/offset': '2048',
       'rd1/size': '523200',
       'rd1/state': 'in_sync',
+      'rd1/bad_blocks': '',
     }
     for (const [key, value] of Object.entries(knobs))
       await writeFile(join(sys, key), `${value}\n`)

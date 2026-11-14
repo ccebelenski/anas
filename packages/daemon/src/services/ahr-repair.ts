@@ -1,13 +1,13 @@
 import type { AhrArray, AhrMetadataCorrected, AhrPool, AhrRepairBlockOutcome, AhrRepairFile, AhrRepairFileOutcome, AhrRepairResult, AhrScrubParityMismatch, IscsiHeldByLun } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { SelfhealRepairOptions } from './selfheal-repair.js'
-import { AhrRepairResult as AhrRepairResultSchema, SELFHEAL_CSUM_UNREADABLE } from '@anas/shared'
+import { AhrRepairResult as AhrRepairResultSchema, SELFHEAL_ARRAY_REBUILDS_ROT, SELFHEAL_CSUM_UNREADABLE, SELFHEAL_NO_CHECKSUM, SELFHEAL_RUN_STOPPED, SELFHEAL_WRITE_UNCONFIRMED } from '@anas/shared'
 // One window reader, one sentence: the scrub owns them and the repair reuses
 // them rather than growing second copies (single source of truth).
 import { metadataCorrectedSentence, readCorrectedReads } from './ahr-scrub.js'
 import { heldByLunOnce } from './iscsi-held.js'
 import { pveNotify } from './pve-notify.js'
-import { repairBlock } from './selfheal-repair.js'
+import { repairBlock, SelfhealRunError } from './selfheal-repair.js'
 
 /**
  * The Repair-from-parity JOB (story selfheal.6) — the operator-triggered half
@@ -38,11 +38,17 @@ import { repairBlock } from './selfheal-repair.js'
  * saves and restores those knobs around its own run, which is only sound while
  * exactly one run is in flight.
  *
- * **A thrown block is `unrepairable`, never a failed job.** The engine returns
- * all four verdicts and throws only on an internal failure. If block 3 of 50
- * dies on a btrfs lookup, the other 49 still deserve their attempt — the error
- * text becomes that block's reason and the job carries on. The job fails only
- * if something outside the per-block loop does.
+ * **A thrown block is never a failed job — and never restore advice** (cr3
+ * AHR-HEAL-H1). The engine returns its verdicts and throws only on an internal
+ * failure. If block 3 of 50 dies on a btrfs lookup, the other 49 still deserve
+ * their attempt — the error text becomes that block's reason and the job
+ * carries on. What the thrown block IS depends on the phase the engine reached:
+ * past the write it is `repaired` with the confirmation skipped (the bytes
+ * that went through md were arbitrated against the stored csum first); before
+ * it, `not-examined` / `run-stopped` — nothing was written and nothing was
+ * decided. It used to be `unrepairable`, the one bucket that says "restore
+ * this file from backup". The job fails only if something outside the
+ * per-block loop does.
  */
 
 /** The engine call this job makes — injectable so a test can fake the verdicts. */
@@ -88,6 +94,17 @@ const ABOVE_MD_SENTENCE = 'parity already agreed with the bad data. This implica
 const RESTORE_FILE_SENTENCE = 'restore this file from backup'
 const CSUM_UNREADABLE_SENTENCE = 'the file\'s checksum could not be read reliably. '
   + 'Re-scrub after the metadata is repaired. A btrfs scrub repairs metadata copies'
+
+/**
+ * `array-rebuilds-rot` (cr3 review item 1): the block was read, fails its
+ * checksum, and every copy the array holds of it gives the same bytes. A
+ * restore IS the advice — with the reason, and "if one exists", because a
+ * rerun cannot change it and the checksum record itself may be what is wrong.
+ */
+const ARRAY_REBUILDS_ROT_CAUSE = 'every copy the array holds of this block gives the same failing bytes, '
+  + 'so the array cannot rebuild it and running the repair again will not change that. '
+  + 'The file is damaged at this block unless the checksum record itself is what is wrong'
+const ARRAY_REBUILDS_ROT_SENTENCE = `${ARRAY_REBUILDS_ROT_CAUSE}: restore this file from a backup if one exists`
 
 function lunRestoreSentence(held: IscsiHeldByLun): string {
   return `this block backs iSCSI LUN ${held.targetIqn}/${held.index}. Restore the LUN image `
@@ -146,11 +163,33 @@ const NOT_EXAMINED_ADVICE: Record<string, string> = {
   'band-unreadable': 'the band\'s md geometry can be read again: the array was not answering when the lookup ran',
   'unresolvable': 'the mapping and the array agree again. Nothing about this block was established',
   'inode-changed': 'a fresh scrub has named the file that is at this path now. The file the finding describes is not the file at that path',
+  [SELFHEAL_RUN_STOPPED]: 'the cause in the reason has passed (the array is idle and complete, the lookup or read that failed answers again). Then run the repair again',
+  [SELFHEAL_WRITE_UNCONFIRMED]: 'the next scrub: if it still names this block, run the repair again',
+  [SELFHEAL_NO_CHECKSUM]: 'Scrub again: a block that still fails its checksum is named again, and a file with no checksums is never named',
 }
 
 /** The not-examined bucket's sentence for one block, with its own reason. */
 function notExaminedSentence(reasonCode: string | undefined, reason: string): string {
   const advice = (reasonCode && NOT_EXAMINED_ADVICE[reasonCode]) ?? NOT_EXAMINED_ADVICE.unresolvable
+  // `run-stopped` (cr3 AHR-HEAL-H1): the block may have been READ — the run
+  // stopped before a verdict, which is a different sentence from "never
+  // looked at", and it ends in running the repair again, not in a re-scrub.
+  // `write-unconfirmed` (cr3 review item 6): the write was issued and failed
+  // to confirm — "nothing was written" is exactly the sentence it must not get.
+  if (reasonCode === SELFHEAL_WRITE_UNCONFIRMED) {
+    return `${reason} Wait for ${advice}.`
+  }
+  // `no-checksum` (cr3 second review 5(a)): a stale finding or a file with no
+  // checksums — the advice is a scrub, never a restore.
+  if (reasonCode === SELFHEAL_NO_CHECKSUM)
+    return `${reason} ${advice}.`
+  if (reasonCode === SELFHEAL_RUN_STOPPED) {
+    return `the repair of this block stopped before it reached a verdict (${reason}). `
+      + `Nothing was written, and this is not a verdict on the file's bytes. Wait until ${advice}. `
+      // cr3 second review 5(b): `run-stopped` also covers causes waiting does
+      // not cure — say what a repeat means.
+      + 'If a second run stops with the same reason, it will not pass by waiting: the cause is the one named (a member that cannot be read, a btrfs tree btrfs-progs cannot walk, a snapshot that cannot be taken) and it needs looking at directly.'
+  }
   return `this block could not be examined: ${reasonCode ?? 'unresolvable'} (${reason}). `
     + `Nothing was written, and nothing is known about this file's bytes. Re-scrub after ${advice}.`
 }
@@ -193,6 +232,7 @@ function repairBody(
   result: AhrRepairResult,
   unrepairableFiles: { path: string, advice: string }[],
   notExaminedFiles: { path: string, advice: string }[],
+  unconfirmedFiles: { path: string, count: number }[] = [],
 ): string {
   const head = `Repair from parity on AHR pool '${pool}': `
     + `${result.repaired} repaired, ${result.unrepairable} unrepairable, `
@@ -223,11 +263,23 @@ function repairBody(
     const advice = notExaminedFiles.slice(0, NOTIFY_FILE_LIMIT).map(f => `  ${f.path}: ${f.advice}`)
     if (notExaminedFiles.length > NOTIFY_FILE_LIMIT)
       advice.push(`  …and ${notExaminedFiles.length - NOTIFY_FILE_LIMIT} more`)
-    tail.push('Blocks that could not be EXAMINED were not written, and nothing is known about their bytes. '
-      + `This is neither a clean bill of health nor a reason to restore:\n${advice.join('\n')}`)
+    const anyUnconfirmed = result.files.some(f => f.blocks.some(b => b.reasonCode === SELFHEAL_WRITE_UNCONFIRMED))
+    tail.push(`${anyUnconfirmed
+      ? 'Blocks below reached no verdict. Those that could not be EXAMINED were not written; a block whose write could not be confirmed may have been. '
+      : 'Blocks that could not be EXAMINED were not written, and nothing is known about their bytes. '
+    }This is neither a clean bill of health nor a reason to restore:\n${advice.join('\n')}`)
   }
   if (result.aboveMd > 0)
     tail.push(`Blocks diagnosed above md were not written: ${ABOVE_MD_SENTENCE}.`)
+  // cr3 review item 5 — written with bytes proven against the stored
+  // checksum, but the confirmation after the write never ran.
+  if (unconfirmedFiles.length > 0) {
+    const lines = unconfirmedFiles.slice(0, NOTIFY_FILE_LIMIT).map(f => `  ${f.path}: ${f.count} block(s)`)
+    if (unconfirmedFiles.length > NOTIFY_FILE_LIMIT)
+      lines.push(`  ...and ${unconfirmedFiles.length - NOTIFY_FILE_LIMIT} more`)
+    tail.push('Blocks were written with bytes proven against their stored checksum, but the confirmation after the write '
+      + `(post-check, cold read) did not complete. Re-scrub the pool to confirm them:\n${lines.join('\n')}`)
+  }
   // selfheal.12 — metadata (DUP) copies btrfs corrected from their mirror
   // during THIS run's window. Said here like every other fact the run
   // discovered, and only when the count is above zero.
@@ -282,6 +334,8 @@ export async function repairAhrFiles(
   const unrepairableFiles: { path: string, advice: string }[] = []
   /** Per-file "what could not be examined, and why" (seventh pass, F3). */
   const notExaminedFiles: { path: string, advice: string }[] = []
+  /** Per-file count of blocks written whose confirmation never ran (cr3 review item 5). */
+  const unconfirmedFiles: { path: string, count: number }[] = []
   /**
    * Bands a repaired block left a parity/Q mismatch on (F2), by band label —
    * many blocks of one file live on one band, and the operator rewrites the
@@ -328,6 +382,8 @@ export async function repairAhrFiles(
           reason: outcome.reason,
           ...(outcome.reasonCode ? { reasonCode: outcome.reasonCode } : {}),
           ...(outcome.parityResidual ? { parityResidual: outcome.parityResidual } : {}),
+          // cr3 review item 5: the confirmation that did not run rides the block.
+          ...(outcome.postcheckSkipped ? { postcheckSkipped: outcome.postcheckSkipped } : {}),
         }
         // F2 — the residual is a fact about the BAND, rolled up so the result
         // can hand it on in the shape the Scrubs parity indicator and Rewrite
@@ -350,10 +406,21 @@ export async function repairAhrFiles(
         }
       }
       catch (error) {
-        // The engine threw rather than reaching a verdict. That block cannot be
-        // proven repaired, so it is unrepairable — with the error as its reason,
-        // and the remaining blocks still get their attempt.
-        entry = { block, outcome: 'unrepairable', reason: errorText(error) }
+        // The engine threw rather than reaching a verdict (cr3 AHR-HEAL-H1).
+        // Classified by PHASE, and never into the restore bucket: a run that
+        // had written its block wrote bytes proven against the stored csum, so
+        // it is `repaired` with the confirmation skipped; a run that had not
+        // reached the write decided nothing about the block. The remaining
+        // blocks still get their attempt either way.
+        const written = error instanceof SelfhealRunError ? error.written : null
+        entry = written !== null
+          ? {
+              block,
+              outcome: 'repaired',
+              reason: `${written} — the block was written and matches its checksum; the run stopped before its confirmation (${errorText(error)}). Re-scrub to confirm parity.`,
+              postcheckSkipped: errorText(error),
+            }
+          : { block, outcome: 'not-examined', reason: errorText(error), reasonCode: SELFHEAL_RUN_STOPPED }
       }
       // `mapping-abort` counts AS ITSELF (review R9) — it is not a repair, but
       // it is the opposite of `unrepairable`: the block was not corrupt at the
@@ -373,6 +440,9 @@ export async function repairAhrFiles(
       blocks.push(entry)
     }
     outcomes.push({ path: file.path, blocks })
+    const unconfirmed = blocks.filter(b => b.outcome === 'repaired' && b.postcheckSkipped !== undefined).length
+    if (unconfirmed > 0)
+      unconfirmedFiles.push({ path: file.path, count: unconfirmed })
     // Advice classification (D10), once per file that needs it. LUN-ness is a
     // property of the FILE (its blocks all live in the image); csum-unreadable
     // is per BLOCK — a file whose unrepairable blocks ALL carry the code gets
@@ -408,13 +478,19 @@ export async function repairAhrFiles(
       const held = await lunHeld(file.path)
       const allCsumUnreadable = unrepairableBlocks
         .every(b => b.reasonCode === SELFHEAL_CSUM_UNREADABLE)
+      // cr3 review item 1: every unrepairable block of the file is one the
+      // array rebuilds as the same failing bytes — the restore says why.
+      const allRebuildRot = unrepairableBlocks
+        .every(b => b.reasonCode === SELFHEAL_ARRAY_REBUILDS_ROT)
       unrepairableFiles.push({
         path: file.path,
         advice: allCsumUnreadable
           ? (held ? csumUnreadableLunSentence(held) : CSUM_UNREADABLE_SENTENCE)
-          : held
-            ? lunRestoreSentence(held)
-            : RESTORE_FILE_SENTENCE,
+          : allRebuildRot
+            ? (held ? `${lunRestoreSentence(held)}, if one exists: ${ARRAY_REBUILDS_ROT_CAUSE}` : ARRAY_REBUILDS_ROT_SENTENCE)
+            : held
+              ? lunRestoreSentence(held)
+              : RESTORE_FILE_SENTENCE,
       })
     }
   }
@@ -459,13 +535,20 @@ export async function repairAhrFiles(
   // warning when any block ended unrepaired.
   // A parity residual is NOT a clean run either: the block is repaired, and the
   // band md counts mismatching stripes on still needs Rewrite parity.
-  const clean = unrepairable === 0 && aboveMd === 0 && mappingAbort === 0
-    && notExamined === 0 && residuals.size === 0
+  // cr3 review item 5: a block written whose confirmation never ran is not
+  // a clean run either — the notification is a warning and says re-scrub.
+  const unconfirmedCount = unconfirmedFiles.reduce((n, f) => n + f.count, 0)
+  const unrepaired = unrepairable + aboveMd + mappingAbort + notExamined
+  const clean = unrepaired === 0 && residuals.size === 0 && unconfirmedCount === 0
   await pveNotify(
     executor,
     clean ? 'info' : 'warning',
-    clean ? 'AHR repair from parity completed' : 'AHR repair from parity left blocks unrepaired',
-    repairBody(pool.name, result, unrepairableFiles, notExaminedFiles),
+    clean
+      ? 'AHR repair from parity completed'
+      : unrepaired === 0 && residuals.size === 0
+        ? 'AHR repair from parity completed; re-scrub to confirm'
+        : 'AHR repair from parity left blocks unrepaired',
+    repairBody(pool.name, result, unrepairableFiles, notExaminedFiles, unconfirmedFiles),
   )
 
   return result

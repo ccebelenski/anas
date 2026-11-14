@@ -382,3 +382,64 @@ describe('selfheal reconcile — mdcheck re-enabled under ANAS ownership (preset
     }
   })
 })
+
+/**
+ * cr3 AHR-HEAL-H4 (built on the review's reading of GT-19(d)). A repair killed
+ * mid-check leaves `sync_max` bounded to ONE STRIPE; when md then takes a
+ * recovery or a resync onto the band, md parks it at `sync_max` and nothing
+ * widens it. The daemon-start walk now writes `sync_max=max` — the widening
+ * GT-19(d) shows md accepts during `recover` — but ONLY under recover/resync,
+ * ONLY when the window has exactly the shape the repair engine writes (one
+ * chunk of a parity band, 128 sectors of a mirror), and never `sync_min`
+ * (EBUSY mid-recovery) and never `idle`.
+ */
+describe('selfheal reconcile — a one-stripe window under a recovery or resync (cr3 AHR-HEAL-H4)', () => {
+  for (const action of ['recover', 'resync']) {
+    describe(`under ${action}`, () => {
+      use(() => new FakeNode([{ kernel: 'md127', knobs: { ...killedMidRepair(), chunk_size: '65536', reshape_position: 'none', sync_action: action } }]))
+
+      it('widens sync_max ONLY: sync_min and sync_action are md\'s', async () => {
+        const report = await reconcileSelfhealState(node, { pools: [pool(node)] })
+        assert.equal(node.knob('md127', 'sync_max'), 'max')
+        assert.equal(node.knob('md127', 'sync_min'), '6272', 'sync_min is EBUSY mid-recovery and never written')
+        assert.equal(node.knob('md127', 'sync_action'), action, 'no idle')
+        assert.ok(report.restored.some(r => r.startsWith('tank-r1: sync_max widened to max under') && r.includes(action)), report.restored.join(' | '))
+      })
+    })
+  }
+
+  describe('under reshape', () => {
+    use(() => new FakeNode([{ kernel: 'md127', knobs: { ...killedMidRepair(), chunk_size: '65536', sync_action: 'reshape' } }]))
+    it('writes nothing: a backup-file reshape drives sync_max itself', async () => {
+      await reconcileSelfhealState(node, { pools: [pool(node)] })
+      assert.equal(node.knob('md127', 'sync_max'), '6400')
+      assert.equal(node.knob('md127', 'sync_min'), '6272')
+    })
+  })
+
+  describe('a window that is not the engine\'s shape', () => {
+    use(() => new FakeNode([{ kernel: 'md127', knobs: { ...killedMidRepair(), sync_max: '9000', chunk_size: '65536', sync_action: 'recover' } }]))
+    it('is not ours to widen: left alone and reported', async () => {
+      const report = await reconcileSelfhealState(node, { pools: [pool(node)] })
+      assert.equal(node.knob('md127', 'sync_max'), '9000')
+      assert.equal(report.skipped.length, 1)
+    })
+  })
+})
+
+describe('selfheal reconcile — the H4 widen\'s reshape gate (cr3 second review item 3)', () => {
+  describe('reshape_position not none', () => {
+    use(() => new FakeNode([{ kernel: 'md127', knobs: { ...killedMidRepair(), chunk_size: '65536', sync_action: 'recover', reshape_position: '2048' } }]))
+    it('writes nothing', async () => {
+      await reconcileSelfhealState(node, { pools: [pool(node)] })
+      assert.equal(node.knob('md127', 'sync_max'), '6400')
+    })
+  })
+  describe('reshape_position unreadable', () => {
+    use(() => new FakeNode([{ kernel: 'md127', knobs: { ...killedMidRepair(), chunk_size: '65536', sync_action: 'recover' } }]))
+    it('writes nothing', async () => {
+      await reconcileSelfhealState(node, { pools: [pool(node)] })
+      assert.equal(node.knob('md127', 'sync_max'), '6400')
+    })
+  })
+})

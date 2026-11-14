@@ -117,8 +117,8 @@ const SCRUB_WITH_MISMATCHES = {
 
 /** md's sysfs for one band (the ahr-mutate suite's shapes for r1 and r2). */
 const SYSFS: Record<string, Record<string, string>> = {
-  md127: { 'level': 'raid5', 'chunk_size': '524288', 'layout': '2', 'raid_disks': '3', 'sync_action': 'idle', 'last_sync_action': 'check', 'sync_min': '0', 'sync_max': 'max', 'sync_completed': '2089984 / 2089984', 'mismatch_cnt': '8', 'degraded': '0', 'array_state': 'clean', 'reshape_position': 'none', 'rd0/offset': '2048', 'rd0/size': '1044992', 'rd0/state': 'in_sync', 'rd1/offset': '2048', 'rd1/size': '1044992', 'rd1/state': 'in_sync', 'rd2/offset': '2048', 'rd2/size': '1044992', 'rd2/state': 'in_sync' },
-  md126: { 'level': 'raid1', 'chunk_size': '0', 'layout': '0', 'raid_disks': '2', 'sync_action': 'idle', 'last_sync_action': 'check', 'sync_min': '0', 'sync_max': 'max', 'sync_completed': '1046400 / 1046400', 'mismatch_cnt': '128', 'degraded': '0', 'array_state': 'clean', 'reshape_position': 'none', 'rd0/offset': '2048', 'rd0/size': '523200', 'rd0/state': 'in_sync', 'rd1/offset': '2048', 'rd1/size': '523200', 'rd1/state': 'in_sync' },
+  md127: { 'level': 'raid5', 'chunk_size': '524288', 'layout': '2', 'raid_disks': '3', 'sync_action': 'idle', 'last_sync_action': 'check', 'sync_min': '0', 'sync_max': 'max', 'sync_completed': '2089984 / 2089984', 'mismatch_cnt': '8', 'degraded': '0', 'array_state': 'clean', 'reshape_position': 'none', 'rd0/offset': '2048', 'rd0/size': '1044992', 'rd0/state': 'in_sync', 'rd0/bad_blocks': '', 'rd1/offset': '2048', 'rd1/size': '1044992', 'rd1/state': 'in_sync', 'rd1/bad_blocks': '', 'rd2/offset': '2048', 'rd2/size': '1044992', 'rd2/state': 'in_sync', 'rd2/bad_blocks': '' },
+  md126: { 'level': 'raid1', 'chunk_size': '0', 'layout': '0', 'raid_disks': '2', 'sync_action': 'idle', 'last_sync_action': 'check', 'sync_min': '0', 'sync_max': 'max', 'sync_completed': '1046400 / 1046400', 'mismatch_cnt': '128', 'degraded': '0', 'array_state': 'clean', 'reshape_position': 'none', 'rd0/offset': '2048', 'rd0/size': '523200', 'rd0/state': 'in_sync', 'rd0/bad_blocks': '', 'rd1/offset': '2048', 'rd1/size': '523200', 'rd1/state': 'in_sync', 'rd1/bad_blocks': '' },
 }
 
 /** A command that acts on the pool: an md sync action, a btrfs scrub start, a repair's snapshot or write. */
@@ -183,6 +183,13 @@ describe('cr.38 session B — scrub, repair, parity rewrite and mirror reconcile
     executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
     executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs(MOUNTPOINT), result: mockFixtures.ahrBtrfsUsage() })
+    // cr3 (ahr-heal second review item 2): a scrub whose checksum pass has no
+    // verdict now COMPLETES (unproven) instead of failing, and would become
+    // the newest proof the band verbs read. These cases are about locks and
+    // gates, not scrub verdicts: the scrub here cannot start (a spawn
+    // failure), which fails its job exactly as the 127 it used to get did, so
+    // the seeded proof stays the newest.
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', '-B', MOUNTPOINT], throws: new Error('spawn /usr/bin/btrfs ENOENT') })
     // D12 confinement: the mountpoint and the pool's LV resolve, the FILE sits on that LV.
     executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', MOUNTPOINT], result: result(`${MOUNTPOINT}\n`) })
     executor.addFixture({ command: '/usr/bin/realpath', args: ['-e', '/dev/ahr0/ahr0-vol'], result: result('/dev/dm-9\n') })

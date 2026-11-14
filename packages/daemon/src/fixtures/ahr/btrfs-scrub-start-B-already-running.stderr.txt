@@ -1,0 +1,3 @@
+ERROR: Scrub is already running.
+To cancel use 'btrfs scrub cancel <mnt>'.
+To see the status use 'btrfs scrub status [-d] <mnt>'

@@ -7,7 +7,7 @@ import type {
 } from '../../executor/types.js'
 import type { ParityRewriteEvidence, ParityRewritePool } from '../ahr-parity-rewrite.js'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
@@ -28,6 +28,22 @@ const fixtures = join(__dirname, '../../fixtures/selfheal')
 
 function fixture(name: string): string {
   return readFileSync(join(fixtures, name), 'utf-8')
+}
+
+/** A member's role directory under md's sysfs (`rd0`, `rd1`, ...). */
+const ROLE_DIR_RE = /^rd\d+$/
+
+/**
+ * A real kernel publishes `rd<n>/bad_blocks` for every member it holds — an
+ * EMPTY file when md has recorded no range. The captured sysfs fixtures predate
+ * F8 and do not carry it, and since cr3 (AHR-HEAL-L9) a list that cannot be
+ * read is "unknown", never "clean". So the fake publishes what the kernel does.
+ */
+function seedEmptyBadBlocks(sys: string): void {
+  for (const entry of readdirSync(sys)) {
+    if (ROLE_DIR_RE.test(entry))
+      writeFileSync(join(sys, entry, 'bad_blocks'), '\n')
+  }
 }
 
 const MIB = 1024 * 1024
@@ -63,6 +79,8 @@ class FakeMd implements CommandExecutor {
   foreignAfter: { op: 'repair' | 'check', reads: number, action: string } | null = null
   /** Exit code `mdadm --action=<x>` returns (a band md refuses). */
   mdadmExit = 0
+  /** Called when the fresh btrfs scrub starts — md can change the band during it (cr3 W8). */
+  onScrub: ((md: FakeMd) => void) | null = null
 
   private running: string | null = null
   private left = 0
@@ -85,6 +103,7 @@ class FakeMd implements CommandExecutor {
       mkdirSync(dirname(path), { recursive: true })
       writeFileSync(path, `${line.slice(eq + 1)}\n`)
     }
+    seedEmptyBadBlocks(this.sys)
     this.set('mismatch_cnt', '8')
     this.set('last_sync_action', 'check')
     this.set('sync_completed', '407552 / 407552')
@@ -168,8 +187,10 @@ class FakeMd implements CommandExecutor {
       return ok(fixture(`mdadm-detail-export-${this.level}.txt`))
     }
     if (command === '/usr/bin/btrfs') {
-      if (args[1] === 'start')
+      if (args[1] === 'start') {
+        this.onScrub?.(this)
         return ok()
+      }
       return ok([
         'UUID:             11111111-2222-3333-4444-555555555555',
         'Status:           finished',
@@ -636,6 +657,23 @@ describe('rewrite parity — a member with recorded bad blocks (F8)', () => {
     const result = await rewriteBandParity(md, md.pool(), 1, { ...FAST, evidence: () => PROVEN })
     assert.equal(result.outcome, 'rewritten', result.reason)
   })
+
+  it('cr3 AHR-HEAL-L9: a member whose bad-block list CANNOT BE READ is refused too — unknown is not clean', async () => {
+    rmSync(join(md.sys, 'rd4/bad_blocks'))
+    const result = await rewriteBandParity(md, md.pool(), 1, { ...FAST, evidence: () => PROVEN })
+    assert.equal(result.outcome, 'refused')
+    assert.equal(result.reasonCode, 'array-busy')
+    assert.match(result.reason ?? '', /bad-block list of \/dev\/loop4 could not be read/)
+    assert.deepEqual(md.actions(), [], 'no repair and no check were issued')
+  })
+
+  it('cr3 W8: bad blocks md records on a member DURING the fresh scrub stop the repair — the geometry is read again at the last instant', async () => {
+    md.onScrub = rig => rig.set('rd2/bad_blocks', '6368 8')
+    const result = await rewriteBandParity(md, md.pool(), 1, { ...FAST, evidence: () => PROVEN })
+    assert.equal(result.outcome, 'refused')
+    assert.equal(result.reasonCode, 'bad-blocks-present')
+    assert.deepEqual(md.actions(), [], 'md was never handed the repair')
+  })
 })
 
 /**
@@ -716,5 +754,59 @@ describe('parityRewriteEvidence — a repair job as the proof (F2)', () => {
     const answer = parityRewriteEvidence('tank', [undefined, undefined], 1)
     assert.equal(answer.ok, false)
     assert.equal(answer.ok === false && answer.code, 'no-parity-mismatch')
+  })
+})
+
+describe('rewrite parity — a fresh scrub whose verdict cannot be read (cr3 review item 7)', () => {
+  let md: FakeMd
+  beforeEach(() => {
+    forgetIssuedChecks()
+    md = new FakeMd()
+    process.env.ANAS_SELFHEAL_KERNEL_ROOT = md.root
+  })
+  afterEach(() => {
+    delete process.env.ANAS_SELFHEAL_KERNEL_ROOT
+    md.cleanup()
+  })
+
+  it('a scrub that did not run (start exit 1) REFUSES `scrub-unproven` — md is never handed the repair', async () => {
+    const exec = md.exec.bind(md)
+    md.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/bin/btrfs' && args[1] === 'start') {
+        md.calls.push({ command, args })
+        return { stdout: '', stderr: 'ERROR: scrubbing failed: Read-only file system', exitCode: 1 }
+      }
+      return exec(command, args)
+    }
+    const result = await rewriteBandParity(md, md.pool(), 1, { ...FAST, evidence: () => PROVEN })
+    assert.equal(result.outcome, 'refused')
+    assert.equal(result.reasonCode, 'scrub-unproven')
+    assert.match(result.reason ?? '', /did not run/)
+    assert.deepEqual(md.actions(), [], 'no repair and no check were issued')
+    assert.equal(md.notifications.length, 1)
+  })
+
+  it('a status that names no state REFUSES too — "nothing to report" is not clean', async () => {
+    const exec = md.exec.bind(md)
+    md.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/bin/btrfs' && args[1] === 'status') {
+        md.calls.push({ command, args })
+        return { stdout: 'UUID:             1111\n\tno stats available\n', stderr: '', exitCode: 0 }
+      }
+      return exec(command, args)
+    }
+    const result = await rewriteBandParity(md, md.pool(), 1, { ...FAST, evidence: () => PROVEN })
+    assert.equal(result.outcome, 'refused')
+    assert.equal(result.reasonCode, 'scrub-unproven')
+    assert.deepEqual(md.actions(), [])
+  })
+})
+
+describe('parityRewriteEvidence — a scrub whose checksum pass has no verdict (cr3 second review item 2)', () => {
+  it('is no proof: refused `scrub-unproven`', () => {
+    const job = { id: 'job-3', operation: 'ahr.scrub', status: 'completed', createdAt: '2026-11-14T00:00:00.000Z', result: { scrubbed: 'tank', btrfsErrors: null, checkedArrays: 1, btrfsUnproven: 'btrfs scrub on \'tank\' was aborted', parityMismatches: [{ band: 'tank-r1', bandIndex: 1, mismatchCnt: 8, level: 'raid5' }] } } as unknown as Job
+    const evidence = parityRewriteEvidence('tank', job, 1)
+    assert.equal(evidence.ok, false)
+    assert.equal(evidence.ok ? null : evidence.code, 'scrub-unproven')
   })
 })

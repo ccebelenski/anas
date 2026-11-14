@@ -14,8 +14,8 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { AhrSnapshotOptions } from './ahr-snapshots.js'
 import type { MdGeometry, MemberLocation, ResolvedBlock, SelfhealContext } from './selfheal-map.js'
 import { readdir, stat } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
-import { SELFHEAL_BAD_BLOCKS_PRESENT } from '@anas/shared'
+import { dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
+import { SELFHEAL_ARRAY_REBUILDS_ROT, SELFHEAL_BAD_BLOCKS_PRESENT, SELFHEAL_NO_CHECKSUM, SELFHEAL_RUN_STOPPED, SELFHEAL_WRITE_UNCONFIRMED } from '@anas/shared'
 import {
   createAhrSnapshot,
   deleteAhrSnapshot,
@@ -31,7 +31,7 @@ import {
   dropCaches,
   MD_DEFAULT_SYNC_MAX,
   MD_DEFAULT_SYNC_MIN,
-  probeFileBlock,
+  probeFileBlockState,
   readDirect,
   readDiscard,
   readMdAttr,
@@ -43,6 +43,7 @@ import {
 import {
   memberHasBadBlock,
   memberOffsetOn,
+  parseBadBlocks,
   parseDmTable,
   resolveBlock,
   resolveContext,
@@ -52,8 +53,12 @@ import {
 } from './selfheal-map.js'
 import {
   foreignOpNote,
+  forgetWindowNarrowed,
   isIdleSyncAction,
   markCheckIssued,
+  markWindowNarrowed,
+  mayWidenSyncMaxUnder,
+  narrowedSyncMax,
   ownsSyncOp,
   retireCheckIssued,
 } from './selfheal-syncop.js'
@@ -212,14 +217,23 @@ export interface SelfhealRepairOptions {
 
 /** An engine run that ended in something other than one of the four verdicts. */
 export class SelfhealRunError extends Error {
+  /**
+   * The repaired-block sentence when the run stopped AFTER the block was
+   * written (cr3 AHR-HEAL-H1), or null when nothing was. A caller that turns
+   * this error into an outcome reads it first: "nothing was written" is false
+   * of a run that got past the write, whatever stopped it afterwards.
+   */
+  readonly written: string | null
+
   constructor(
     message: string,
     readonly steps: SelfhealStep[],
     readonly diagnostics: SelfhealDiagnostics,
-    options?: { cause?: unknown },
+    options?: { cause?: unknown, written?: string | null },
   ) {
-    super(message, options)
+    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined)
     this.name = 'SelfhealRunError'
+    this.written = options?.written ?? null
   }
 }
 
@@ -242,6 +256,28 @@ const FINDMNT = '/usr/bin/findmnt'
 
 /** Leading slashes of a `subvolid-resolve` answer. */
 const LEADING_SLASH_RE = /^\/+/
+
+/**
+ * A pool's layout, read EXPLICITLY (cr3, from the AHR core lane):
+ * `subvolLayout` becomes `boolean | null` there, null when the kernel mount
+ * table could not be read. `true` is §12, `false` is flat, `undefined` (an
+ * older shape) is flat as it always was, and null is UNKNOWN — never the flat
+ * layout a falsy test would read it as (which would put the pin inside the
+ * mountpoint instead of `@snapshots`).
+ */
+export function poolLayout(pool: AhrPool | null | undefined): 'subvol' | 'flat' | 'unknown' {
+  const v = (pool as { subvolLayout?: boolean | null } | null | undefined)?.subvolLayout
+  if (v === true)
+    return 'subvol'
+  if (v === null)
+    return 'unknown'
+  return 'flat'
+}
+
+/** The sentence a repair and a sweep stop with on an unknown layout. */
+function unknownLayoutSentence(pool: AhrPool): string {
+  return `the mount state of pool '${pool.name}' could not be read, so it is not known whether its snapshots live in @snapshots or inside the mountpoint`
+}
 
 /** Prefix of the engine's transient snapshots — its own sweep, nobody else's. */
 export const SELFHEAL_SNAPSHOT_PREFIX = 'anas-selfheal-'
@@ -428,6 +464,9 @@ export async function boundedWindowCheck(
   const high = (stripe + 1) * per
   await writeMdAttr(geo.sys, 'sync_min', String(low))
   await writeMdAttr(geo.sys, 'sync_max', String(high))
+  // cr3 AHR-HEAL-H4: what this run narrowed the window to, so a cleanup under
+  // a foreign recovery can tell its own one-stripe window from anyone else's.
+  markWindowNarrowed(geo.kernel, String(high))
   await writeMdAttr(geo.sys, 'sync_action', 'check')
   // From here on `idle` may be written to this array — and only from here on.
   markCheckIssued(geo.kernel)
@@ -498,9 +537,13 @@ export async function boundedWindowCheck(
  * aborted the rebuild (D2).
  *
  * So: our own check is widened and ended as before; an idle array is simply
- * restored; a FOREIGN operation is left completely untouched and the returned
- * sentence says which one it is. The daemon-start reconciliation
- * (`selfheal-reconcile.ts`) is what puts the window back once md is finished.
+ * restored; under a FOREIGN operation `sync_min` and `sync_action` are never
+ * written, and `sync_max` is written in exactly one case — a recovery or a
+ * resync over the one-stripe window THIS run narrowed, widened to `max` (cr3
+ * AHR-HEAL-H4, see {@link widenUnderForeignOp}); everything else is left as
+ * md has it and the returned sentence says which operation it was. The
+ * daemon-start reconciliation (`selfheal-reconcile.ts`) puts the rest of the
+ * window back once md is finished.
  *
  * ## The trailing pair, and the token (sixth pass, N11)
  *
@@ -525,11 +568,12 @@ export async function restoreSyncKnobs(geo: MdGeometry): Promise<string | null> 
     // so the token goes too — keeping it is what let a later foreign check
     // read as ours (N3).
     retireCheckIssued(geo.kernel)
-    return `${geo.device}: sync_min/sync_max left as they are — ${foreignOpNote(geo.device, own.action)}`
+    return widenUnderForeignOp(geo, own.action)
   }
   if (own.owned) {
     try {
       await writeMdAttr(geo.sys, 'sync_max', MD_DEFAULT_SYNC_MAX)
+      forgetWindowNarrowed(geo.kernel)
       await writeMdAttr(geo.sys, 'sync_action', 'idle')
     }
     catch (error) {
@@ -550,18 +594,73 @@ export async function restoreSyncKnobs(geo: MdGeometry): Promise<string | null> 
   // milliseconds since the read at the top of this function.
   const after = await ownsSyncOp(geo.kernel, () => readSyncAction(geo))
   if (!isIdleSyncAction(after.action)) {
-    notes.push(`${geo.device}: sync_min/sync_max left as they are — ${foreignOpNote(geo.device, after.action)}`)
+    notes.push(await widenUnderForeignOp(geo, after.action))
     return notes.join('; ')
   }
   for (const [attr, value] of [['sync_min', MD_DEFAULT_SYNC_MIN], ['sync_max', MD_DEFAULT_SYNC_MAX]] as const) {
     try {
       await writeMdAttr(geo.sys, attr, value)
+      if (attr === 'sync_max')
+        forgetWindowNarrowed(geo.kernel)
     }
     catch (error) {
       notes.push(`${geo.device}: ${attr} not restored to ${value}: ${errorText(error)}`)
     }
   }
   return notes.length > 0 ? notes.join('; ') : null
+}
+
+/**
+ * md is running an operation of its own over a window THIS run narrowed (cr3
+ * AHR-HEAL-H4). The premise — md parks a recovery or a resync at `sync_max`,
+ * so a rebuild onto a spare left at this run's one-stripe value never gets
+ * past it — is UNCAPTURED (from md's `md_do_sync` as recalled, not seen on a
+ * node). GT-19(d), verbatim: "`echo max > sync_max` during `recover`:
+ * accepted (rc=0; the value was already `max`, no observable effect)". It
+ * shows md ACCEPTS the write during a recovery; it did NOT show a parked
+ * recovery released by it. The write is built on the review's ruling, and
+ * the node probe (the cr3 report) settles both halves.
+ *
+ * So, and ONLY so: `sync_max` must still read exactly the value this run
+ * wrote, and — re-read AFTER that, immediately before the write —
+ * `sync_action` must read `recover` or `resync` ({@link mayWidenSyncMaxUnder})
+ * and `reshape_position` must read `none` (unreadable is not `none`). Then
+ * `sync_max` is widened to `max`. `sync_min` is never written (EBUSY
+ * mid-recovery, GT-19(d)) and `idle` is never written; the daemon-start
+ * reconcile or the scrub puts `sync_min` back once md is idle.
+ *
+ * The narrowed-window record is KEPT on every early return but one (frozen,
+ * reshape, a check or repair, an unreadable state): it is only ever consulted
+ * together with an exact re-read of `sync_max`, so keeping it cannot license
+ * a write over a window that is no longer this run's — and forgetting it would
+ * throw away the only proof the window IS this run's. The one exception is
+ * `sync_max` reading something else: the window is provably no longer ours,
+ * and the record goes. Returns the cleanup note.
+ */
+async function widenUnderForeignOp(geo: MdGeometry, action: string | null): Promise<string> {
+  const left = `${geo.device}: sync_min/sync_max left as they are — ${foreignOpNote(geo.device, action)}`
+  const ours = narrowedSyncMax(geo.kernel)
+  if (!mayWidenSyncMaxUnder(action) || ours === null)
+    return left
+  const now = await readMdAttrOrNull(geo.sys, 'sync_max')
+  if (now !== ours) {
+    // Not this run's window any more: nobody's but md's to change.
+    forgetWindowNarrowed(geo.kernel)
+    return left
+  }
+  // The state, re-read AFTER `sync_max` and immediately before the write.
+  const actionNow = await readSyncAction(geo)
+  const reshape = await readMdAttrOrNull(geo.sys, 'reshape_position')
+  if (!mayWidenSyncMaxUnder(actionNow) || reshape !== 'none')
+    return `${left}; sync_max not widened: sync_action now reads ${actionNow ?? 'unreadable'} and reshape_position ${reshape ?? 'unreadable'}`
+  try {
+    await writeMdAttr(geo.sys, 'sync_max', MD_DEFAULT_SYNC_MAX)
+  }
+  catch (error) {
+    return `${left}; sync_max could not be widened from this run's ${ours}: ${errorText(error)}`
+  }
+  forgetWindowNarrowed(geo.kernel)
+  return `${geo.device}: md is running ${actionNow}; sync_max widened to max from this run's one-stripe ${ours} so the ${actionNow} is not held there. sync_min was left as it is (md refuses it mid-${actionNow}); it is put back once md is idle`
 }
 
 // ---------------------------------------------------------------------------
@@ -877,7 +976,16 @@ export async function repairBlock(
   let current: SelfhealStep | null = null
 
   async function step(name: SelfhealStepName): Promise<void> {
-    await options?.beforeStep?.(name)
+    try {
+      await options?.beforeStep?.(name)
+    }
+    catch (error) {
+      // The hook is how a caller ABORTS the sequence (the suite's injected
+      // failures). It stays an abort — a SelfhealRunError — on either side of
+      // the write, and it carries `written` so the caller can still tell a run
+      // that wrote from one that did not (cr3 AHR-HEAL-H1).
+      throw new SelfhealRunError(errorText(error), steps, diagnostics, { cause: error, written })
+    }
     current = { name, ok: true }
     steps.push(current)
   }
@@ -919,10 +1027,19 @@ export async function repairBlock(
         fail('not-examined', `the file at ${file} is inode ${live}, not the inode ${request.inode} the scrub examined — this is not the file the finding describes. Nothing was written, and nothing is known about this file's bytes.`, 'inode-changed')
       }
     }
+    // cr3: a pool whose layout could not be read is not guessed at — the pin
+    // shape depends on it. `run-stopped`: nothing was looked at, and the
+    // repair runs once the mount table answers.
+    if (request.pool && poolLayout(request.pool) === 'unknown')
+      fail('not-examined', `refused: ${unknownLayoutSentence(request.pool)}. Nothing was pinned, examined or written.`, SELFHEAL_RUN_STOPPED)
     const context = await resolveContext(executor, mountpoint)
     const refusal = await gateRefusal(executor, context, request.pool ?? null, options)
+    // cr3 AHR-HEAL-H1 — a gate refusal is a block NOBODY LOOKED AT. It used to
+    // be `unrepairable`, the bucket whose advice is "restore this file from
+    // backup": advice to overwrite a file on the strength of an array that was
+    // busy at the time.
     if (refusal)
-      fail('unrepairable', `refused: ${refusal}`)
+      fail('not-examined', `refused: ${refusal}. Nothing was examined and nothing was written.`, SELFHEAL_RUN_STOPPED)
 
     // ---- pin ------------------------------------------------------------
     await step('pin')
@@ -952,6 +1069,27 @@ export async function repairBlock(
     await step('reverify')
     const verdict = await reverify(executor, pinned, resolved)
     diagnostics.badSectors = verdict.badSectors
+    if (verdict.abort && !verdict.abort.mirrorAllLegsFail)
+      fail(verdict.abort.kind, verdict.abort.reason, verdict.abort.code)
+
+    // ---- guard (cr3 AHR-HEAL-L7: straight after the re-verify) ------------
+    // F9 — the guard fires exactly when NOTHING about this file has been
+    // established: the md offset and the member offset do not describe the
+    // same bytes, so the sector the re-verify read may not even belong to this
+    // file. It used to run AFTER the pre-check and the arbitration, so a
+    // mapping error (a wrong data offset, say) reached `above-md` or "more than
+    // one block of this stripe is damaged. Restore from backup" first — a
+    // verdict about bytes nobody had shown to be this file's. Asked here, it
+    // answers before any knob moves and before any verdict is possible.
+    const guardTarget = resolved.sectors[verdict.badSectors[0]]
+    outcomeBand = guardTarget.geometry
+    diagnostics.mapping = mappingOf(resolved, verdict.badSectors[0])
+    await step('guard')
+    const guard = await readBackGuard(executor, guardTarget.geometry, guardTarget, verdict.corruptBytes)
+    note(guard.detail)
+    if (!guard.ok)
+      fail('not-examined', guard.detail, 'unresolvable')
+
     if (verdict.abort?.mirrorAllLegsFail) {
       // F4 — parallel construction with the parity band. Every leg holding the
       // SAME bad bytes is what through-md rot looks like on a mirror, and md's
@@ -982,7 +1120,11 @@ export async function repairBlock(
         fail('above-md', `${verdict.abort.reason} md's own bounded check over ${mirrorGeo.device} reports mismatch_cnt=0 and ${mirrorDirect.detail}, so the legs AGREE with each other and are both wrong — parity already agreed with the bad data, which implicates something other than the disks (memory, controller, software). Nothing was written.`)
       }
       if (mirrorAgreement === 'disagree') {
-        fail('unrepairable', `md and the direct read disagree about this stripe; nothing written. md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es) while ${mirrorDirect.detail}.`)
+        // cr3 review item 1 (E04f4) — the block WAS examined: it fails its
+        // checksum and every leg holds the same failing bytes. md counting a
+        // mismatch elsewhere in its window changes nothing about this row,
+        // and no rerun will: its own `unrepairable` code and sentence.
+        fail('unrepairable', arrayRebuildsRotSentence(file, request.block, 'mirror', mirrorDirect.detail, `md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es)`), SELFHEAL_ARRAY_REBUILDS_ROT)
       }
       if (mirrorAgreement === 'stale-cache') {
         diagnostics.staleCache = true
@@ -990,9 +1132,7 @@ export async function repairBlock(
       }
       fail('unrepairable', `${verdict.abort.reason} md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es) and ${mirrorDirect.detail}, so the legs disagree with each other and neither matches the stored csum. Restore ${file} from backup.`)
     }
-    if (verdict.abort)
-      fail(verdict.abort.kind, verdict.abort.reason, verdict.abort.code)
-    const target = resolved.sectors[verdict.badSectors[0]]
+    const target = guardTarget
     const geo = target.geometry
     // The band that is actually worked on — which is not necessarily the first
     // sector's when a compressed blob straddles a band boundary (F5).
@@ -1032,7 +1172,10 @@ export async function repairBlock(
       // acted on here: a reconstruction from a row whose parity already agrees
       // would just rebuild the bad bytes, and `above-md` is a claim md's own
       // count contradicts.
-      fail('unrepairable', `md and the direct read disagree about this stripe; nothing written. md's bounded check over stripe ${stripe} counts ${before} mismatch(es) while ${direct.detail}.`)
+      // cr3 review item 1 (E05e) — the block WAS examined: it fails its
+      // checksum and the parity group agrees with the failing bytes, so a
+      // reconstruction gives them back. That is the same answer on every run.
+      fail('unrepairable', arrayRebuildsRotSentence(file, request.block, 'parity', direct.detail, `md's bounded check over stripe ${stripe} counts ${before} mismatch(es)`), SELFHEAL_ARRAY_REBUILDS_ROT)
     }
     if (agreement === 'stale-cache') {
       // Exactly GT-23's shape: md answered from its cache, the members say
@@ -1064,19 +1207,30 @@ export async function repairBlock(
     // arbitration might not catch on RAID6 (the Q solve would be fed the wrong
     // syndrome). Such a member is ABSENT for this row, exactly as a kicked one
     // is — RAID5 then has nothing left, RAID6 still has the other syndrome.
-    const badBlocked = badBlockRoles(geo, target)
+    // cr3 review item 4 — md's bad-block lists are read AGAIN here, not taken
+    // from the resolve step: md records a range on a member that hit an error
+    // during this very run (the pre-check reads every member) without failing
+    // it, and that member must not be XORed in.
+    const liveGeo: MdGeometry = { ...geo, badBlocks: await readBadBlockLists(geo) }
+    const { roles: badBlocked, unknown: badBlocksUnread } = badBlockRoles(liveGeo, target, absent)
+    // cr3 AHR-HEAL-L9 — a member whose bad-block list could not be read is
+    // not a member known to be readable over this row. Nothing is decided on
+    // it: the band's facts could not be read, which is `band-unreadable`.
+    if (badBlocksUnread.length > 0) {
+      const names = badBlocksUnread.map(role => geo.members[role] ?? `role ${role}`).join(', ')
+      fail('not-examined', `the md bad-block list of ${names} on ${geo.device} could not be read, so nothing says md can read this row of that member. Nothing was written.`, 'band-unreadable')
+    }
     const plan = reconstructionPlan(geo, target, [...new Set([...absent, ...badBlocked])], verdict.goodMirrors)
     if (plan.refusal) {
-      fail(
-        'unrepairable',
-        badBlocked.length > 0
-          ? `${plan.refusal} ${badBlockNote(geo, badBlocked)}`
-          : plan.refusal,
-        badBlocked.length > 0 ? SELFHEAL_BAD_BLOCKS_PRESENT : undefined,
-      )
+      if (badBlocked.length > 0)
+        fail('unrepairable', `${plan.refusal} ${badBlockNote(liveGeo, badBlocked)}`, SELFHEAL_BAD_BLOCKS_PRESENT)
+      // cr3 AHR-HEAL-H1 — md kicked a member while this run was working: the
+      // array changed under it. That is a reason to run the repair again once
+      // md has rebuilt, never a reason to restore the file.
+      fail('not-examined', plan.refusal, SELFHEAL_RUN_STOPPED)
     }
     if (badBlocked.length > 0)
-      note(badBlockNote(geo, badBlocked))
+      note(badBlockNote(liveGeo, badBlocked))
     const candidates = await reconstruct(executor, geo, target, plan)
     if (candidates.length === 0)
       fail('unrepairable', `no candidate could be reconstructed for ${file} block ${request.block}`)
@@ -1098,20 +1252,10 @@ export async function repairBlock(
     }
     note(`${tried.join(' ')} stored=${csumHex(storedCsum)}`)
     if (!winner) {
-      fail('unrepairable', `no reconstruction matches the stored csum ${csumHex(storedCsum)} (tried ${tried.join(', ')}) — more than one block of this stripe is damaged. Restore ${file} from backup.`)
+      // cr3 second review 5(a): what ANAS tried and what it did not — never a
+      // claim that the array itself cannot rebuild the block.
+      fail('unrepairable', `no reconstruction ANAS tries matches the stored csum ${csumHex(storedCsum)} (tried ${tried.join(', ')}). ANAS rebuilds one missing block per stripe (RAID5: the XOR of the other members; RAID6: from P, then from Q alone); a second damaged block in this stripe would explain the miss, and a RAID6 solve for two damaged blocks is not attempted. Nothing was written. The array was not shown unable to rebuild this block; ANAS could not. If nothing else recovers it, restore ${file} from a backup if one exists.`)
     }
-
-    // ---- guard ----------------------------------------------------------
-    await step('guard')
-    const guard = await readBackGuard(executor, geo, target, corruptBytes)
-    note(guard.detail)
-    // F9 — the guard fires exactly when NOTHING about this file has been
-    // established: the md offset and the member offset do not describe the same
-    // bytes, so the sector the re-verify read may not even belong to this file.
-    // "Restore from backup" over that is advice to overwrite a file on no
-    // evidence at all.
-    if (!guard.ok)
-      fail('not-examined', guard.detail, 'unresolvable')
 
     // ---- write ----------------------------------------------------------
     // The gates are a re-check, not a one-time test (D2). Everything between
@@ -1121,9 +1265,27 @@ export async function repairBlock(
     // being rebuilt underneath it.
     await step('write')
     const changed = await preWriteRefusal(geo)
+    // cr3 AHR-HEAL-H1 — the array changed under the run: no verdict, and not
+    // the restore bucket.
     if (changed)
-      fail('unrepairable', `array state changed mid-repair: ${changed}, nothing written`)
-    await writeDirect(executor, geo.device, target.mdByte, winner.bytes)
+      fail('not-examined', `array state changed mid-repair: ${changed}, nothing written`, SELFHEAL_RUN_STOPPED)
+    // The read-back guard again, at the last instant (cr3 W1). It ran straight
+    // after the re-verify (L7), and the pre-check, the rmw knob and the
+    // reconstruction have taken real time since: the md block about to be
+    // overwritten must STILL be the bytes the member holds.
+    const still = await readBackGuard(executor, geo, target, corruptBytes)
+    if (!still.ok)
+      fail('not-examined', still.detail, 'unresolvable')
+    try {
+      await writeDirect(executor, geo.device, target.mdByte, winner.bytes)
+    }
+    catch (error) {
+      // cr3 review item 6 — the write was ISSUED and then reported a failure
+      // (a failed fsync is the usual shape). The bytes may have landed:
+      // "nothing written" is not known to be true, and neither is "repaired".
+      // The facts only; the job says what to do, once (cr3 second review 5(c)).
+      fail('not-examined', `the write of ${file} block ${request.block} through ${geo.device} at md byte ${target.mdByte} was issued and then reported a failure (${errorText(error)}). The arbitrated bytes, verified against the stored csum ${csumHex(storedCsum)}, may have landed or may not.`, SELFHEAL_WRITE_UNCONFIRMED)
+    }
     const repaired = `${file} block ${request.block} reconstructed from ${winner.detail} and verified against the stored csum ${csumHex(storedCsum)}`
     // F5 — from here on, "nothing written" is a FALSE sentence. The post-check
     // is a bounded md check over a 20 TB band's stripe: minutes, during which a
@@ -1224,7 +1386,29 @@ export async function repairBlock(
           { postcheckSkipped: error.message },
         )
       }
-      return outcome('unrepairable', `array state changed mid-repair: ${error.message}, nothing written`)
+      // cr3 AHR-HEAL-H1 — md changed the array under the run: no verdict.
+      return outcome('not-examined', `array state changed mid-repair: ${error.message}, nothing written`, SELFHEAL_RUN_STOPPED)
+    }
+    if (written !== null) {
+      // cr3 AHR-HEAL-H1 (A) — ANY failure after the write is classified by
+      // PHASE, not by its type. The block went through md and its bytes were
+      // arbitrated against the stored csum before they did; what failed is the
+      // CONFIRMATION (a post-check md marked `delayed` behind another band's
+      // recovery and never settled, a member read in the cold verify). Telling
+      // the operator to restore a file that was just written with proven bytes
+      // is how a restore from an older backup loses data — exactly F5's
+      // sentence, for every cause and not only a foreign sync op.
+      const stopped = steps.at(-1)
+      if (stopped) {
+        stopped.ok = false
+        stopped.detail = errorText(error)
+      }
+      return outcome(
+        'repaired',
+        `${written} — the block was written and matches its checksum; the confirmation after the write could not complete (${errorText(error)}). Re-scrub to confirm parity.`,
+        undefined,
+        { postcheckSkipped: errorText(error) },
+      )
     }
     if (error instanceof SelfhealMapError) {
       // F3 — a map failure is a block NOBODY LOOKED AT. `mapping-abort` asserts
@@ -1366,7 +1550,7 @@ async function gateRefusal(
   // pool's top level mounted across one pbc invocation) would make this repair
   // wait behind it, and a repair that silently blocks for hours is worse than one
   // that says why. Check before pinning rather than racing.
-  if (pool?.subvolLayout) {
+  if (pool && poolLayout(pool) === 'subvol') {
     const mnt = topLevelMountPath(pool, options?.ahrSnapshotOptions)
     if ((await executor.exec(FINDMNT, ['--mountpoint', mnt])).exitCode === 0)
       return `the top-level mount for pool '${pool.name}' is already held at ${mnt} — a backup or snapshot job is in flight. Repair needs that mount to itself; retry when the other job has finished`
@@ -1581,6 +1765,35 @@ async function nestedSubvolumeOf(
   throw new Error(`${file} resolves to '${resolved}', which is not under ${SUBVOL_DATA} — it is not in the pool's mounted tree`)
 }
 
+/**
+ * The mountpoint-relative path of the nested subvolume holding `file` on a
+ * FLAT pool (or a plain mountpoint), or null when the file is in the mounted
+ * subvolume itself (cr3 AHR-HEAL-M6).
+ *
+ * The §12 branch asks `subvolid-resolve` and reads the answer against `@data`;
+ * a flat mount has no such anchor, so the subvolume root is found by walking
+ * up from the file: the highest directory under the mountpoint that is still
+ * in the file's subvolume is that subvolume's root.
+ */
+async function flatNestedSubvolumeOf(
+  executor: CommandExecutor,
+  mountpoint: string,
+  file: string,
+): Promise<string | null> {
+  const fileId = await subvolumeIdOf(executor, file)
+  if (fileId === await subvolumeIdOf(executor, mountpoint))
+    return null
+  let root: string | null = null
+  for (let dir = dirname(file); dir.startsWith(`${mountpoint}/`); dir = dirname(dir)) {
+    if ((await subvolumeIdOf(executor, dir)) !== fileId)
+      break
+    root = dir
+  }
+  if (root === null)
+    throw new Error(`${file} is in subvolume ${fileId}, and no directory between it and ${mountpoint} is that subvolume's root`)
+  return relative(mountpoint, root)
+}
+
 /** Take the transient pin, sweeping any leftover of a crashed earlier run first. */
 async function takePin(
   executor: CommandExecutor,
@@ -1593,7 +1806,7 @@ async function takePin(
   const name = `${SELFHEAL_SNAPSHOT_PREFIX}${Math.floor(Date.now() / 1000)}`
   const ahrOptions = options?.ahrSnapshotOptions
 
-  if (pool?.subvolLayout && pool.mounted) {
+  if (pool && poolLayout(pool) === 'subvol' && pool.mounted) {
     diagnostics.cleanupErrors.push(...(await sweepSelfhealPins(executor, pool, mountpoint, ahrOptions)).errors)
     const nested = await nestedSubvolumeOf(executor, pool, file)
     await createAhrSnapshot(executor, pool, name, noProgress, {
@@ -1611,13 +1824,19 @@ async function takePin(
           const path = join(top, SUBVOL_SNAPSHOTS, name, within)
           const bad: number[] = []
           for (const block of blocks) {
-            if (!(await probeFileBlock(executor, path, block)))
+            const read = await probeFileBlockState(executor, path, block)
+            // Not in the snapshot: a read that could not be taken (M6).
+            if (read === 'missing')
+              return { missing: path, bad: [] }
+            if (read === 'bad')
               bad.push(block)
           }
-          return bad
+          return { missing: null, bad }
         }, ahrOptions, options?.coldReadWaitMs)
+        if (held.ran && held.value.missing !== null)
+          return { ran: false, bad: [], reason: `${held.value.missing} is not in the pin snapshot, so nothing was read through it` }
         return held.ran
-          ? { ran: true, bad: held.value, reason: '' }
+          ? { ran: true, bad: held.value.bad, reason: '' }
           : { ran: false, bad: [], reason: `top-level mount busy (another job has held ${topLevelMountPath(pool, ahrOptions)} for the ${Math.round(held.waitedMs / 1000)}s this read waited)` }
       },
       destroy: async () => {
@@ -1629,17 +1848,29 @@ async function takePin(
   // Flat pool (or no pool): no @snapshots to put it in, so the snapshot goes
   // inside the mountpoint and is swept from there.
   diagnostics.cleanupErrors.push(...(await sweepSelfhealPins(executor, null, mountpoint, ahrOptions)).errors)
+  // cr3 AHR-HEAL-M6 — the §12 branch's rule, on a flat pool too: a read-only
+  // snapshot does NOT recurse into a nested subvolume (GT-52/55). Snapshotting
+  // the mountpoint left a file inside one UNPINNED between the resolve and the
+  // write, and absent from the snapshot the cold read then looked in. So the
+  // subvolume that actually holds the file is the one snapshotted.
+  const nested = await flatNestedSubvolumeOf(executor, mountpoint, file)
+  const source = nested ? join(mountpoint, nested) : mountpoint
   const path = join(mountpoint, name)
-  const r = await executor.exec(BTRFS, ['subvolume', 'snapshot', '-r', mountpoint, path])
+  const r = await executor.exec(BTRFS, ['subvolume', 'snapshot', '-r', source, path])
   if (r.exitCode !== 0)
     throw new Error(r.stderr.trim() || `btrfs subvolume snapshot exited ${r.exitCode}`)
-  const within = relative(mountpoint, file)
+  const within = relative(source, file)
   return {
     describe: path,
     coldRead: async (blocks) => {
       const bad: number[] = []
       for (const block of blocks) {
-        if (!(await probeFileBlock(executor, join(path, within), block)))
+        const read = await probeFileBlockState(executor, join(path, within), block)
+        // A path that is not in the snapshot is a read that could not be
+        // taken, never a block that failed (cr3 AHR-HEAL-M6).
+        if (read === 'missing')
+          return { ran: false, bad: [], reason: `${join(path, within)} is not in the pin snapshot, so nothing was read through it` }
+        if (read === 'bad')
           bad.push(block)
       }
       return { ran: true, bad, reason: '' }
@@ -1680,7 +1911,13 @@ export async function sweepSelfhealPins(
   const swept: string[] = []
   const errors: string[] = []
 
-  if (pool?.subvolLayout && pool.mounted) {
+  // cr3: an unknown layout is not the flat one — sweep nothing rather than
+  // guess where the transient snapshots are.
+  if (pool && poolLayout(pool) === 'unknown') {
+    errors.push(`transient snapshots of pool '${pool.name}' were not swept: ${unknownLayoutSentence(pool)}`)
+    return { swept, errors }
+  }
+  if (pool && poolLayout(pool) === 'subvol' && pool.mounted) {
     for (const stale of await listAhrSnapshots(executor, pool, ahrOptions)) {
       if (!stale.name.startsWith(SELFHEAL_SNAPSHOT_PREFIX))
         continue
@@ -1797,8 +2034,12 @@ async function reverify(
         badMirror,
         goodMirrors,
         abort: {
-          kind: 'unrepairable',
-          reason: `btrfs stored no checksum for logical byte ${location.logical} (a NOCOW file, a prealloc extent, or nodatasum) — there is nothing to arbitrate a reconstruction against. Restore ${resolved.file} from backup.`,
+          // cr3 second review 5(a): a scrub names only blocks whose checksum
+          // FAILED, so a block with none now is a stale finding or a file
+          // that keeps no checksums. Scrub again; never "restore".
+          kind: 'not-examined',
+          reason: `btrfs stores no checksum for logical byte ${location.logical} of ${resolved.file} now. A scrub names only blocks whose checksum failed, so the finding is stale (the file changed since that scrub) or the file keeps no checksums (NOCOW, a preallocated range, nodatasum). There is nothing to arbitrate a reconstruction against, and nothing was written.`,
+          code: SELFHEAL_NO_CHECKSUM,
         },
       }
     }
@@ -1858,7 +2099,8 @@ async function reverify(
       goodMirrors,
       abort: {
         kind: 'unrepairable',
-        reason: `${badSectors.length} on-disk sectors of one ${resolved.compressed ? 'compressed blob' : 'extent'} fail their stored csum (sectors ${badSectors.join(', ')}) — this cut reconstructs one sector at a time. Restore ${resolved.file} from backup.`,
+        // cr3 second review 5(a): what ANAS did not attempt, and why.
+        reason: `${badSectors.length} on-disk sectors of one ${resolved.compressed ? 'compressed blob' : 'extent'} of ${resolved.file} fail their stored csum (sectors ${badSectors.join(', ')}). ANAS reconstructs one sector per run and did not attempt several in one repair unit, so whether the array could rebuild them was not tested. Nothing was written. If nothing else recovers them, restore the file from a backup if one exists.`,
       },
     }
   }
@@ -2042,15 +2284,45 @@ async function reconstruct(
  * are allowed to differ). On RAID1 the legs are the roles, and the same test
  * answers for them.
  */
-function badBlockRoles(geo: MdGeometry, target: MemberLocation): number[] {
-  const out: number[] = []
+function badBlockRoles(geo: MdGeometry, target: MemberLocation, absent: readonly number[] = []): { roles: number[], unknown: number[] } {
+  const roles: number[] = []
+  const unknown: number[] = []
   for (let role = 0; role < geo.raidDisks; role++) {
-    if (geo.members[role] === null)
+    // A role md has kicked is absent for the plan already, and the kernel
+    // removed its rd<n> with it: its list is nobody's fact.
+    if (geo.members[role] === null || absent.includes(role))
       continue
-    if (memberHasBadBlock(geo, role, memberOffsetOn(geo, target, role)))
-      out.push(role)
+    const covered = memberHasBadBlock(geo, role, memberOffsetOn(geo, target, role))
+    // cr3 AHR-HEAL-L9 — null is "this node could not read the list", which
+    // the caller refuses on; it is never "clean".
+    if (covered === null)
+      unknown.push(role)
+    else if (covered)
+      roles.push(role)
   }
+  return { roles, unknown }
+}
+
+/** Every role's md bad-block list, read NOW (cr3 review item 4); null where it could not be read. */
+async function readBadBlockLists(geo: MdGeometry): Promise<MdGeometry['badBlocks']> {
+  const out: MdGeometry['badBlocks'] = []
+  for (let role = 0; role < geo.raidDisks; role++)
+    out.push(parseBadBlocks(await readMdAttrOrNull(geo.sys, `rd${role}/bad_blocks`)))
   return out
+}
+
+/**
+ * The `array-rebuilds-rot` sentence (cr3 review item 1) — what was read, and
+ * why a rerun cannot change it. The operator approves this wording.
+ */
+function arrayRebuildsRotSentence(file: string, block: number, shape: 'parity' | 'mirror', directDetail: string, mdDetail: string): string {
+  const copies = shape === 'parity'
+    ? 'the parity reconstruction of this row gives back the same failing bytes'
+    : 'every mirror leg holds the same failing bytes'
+  return `${file} block ${block} fails its stored checksum, and ${copies} (${directDetail}), while ${mdDetail} elsewhere in its window. `
+    + 'The array holds no other copy of this block, so it cannot rebuild it, and running the repair again will not change that. '
+    + 'The file is damaged at this block unless the checksum record itself is what is wrong. '
+    + 'Restore the file from a backup if one exists. Nothing was written.'
 }
 
 /** What to say about the bad-blocked members — the operator's own sentence. */

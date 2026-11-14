@@ -15,7 +15,7 @@ import {
   writeMdAttr,
 } from './selfheal-io.js'
 import { sweepSelfhealPins } from './selfheal-repair.js'
-import { isIdleSyncAction } from './selfheal-syncop.js'
+import { isIdleSyncAction, mayWidenSyncMaxUnder } from './selfheal-syncop.js'
 
 /**
  * Daemon-start reconciliation for the self-heal engine (design review
@@ -50,9 +50,12 @@ import { isIdleSyncAction } from './selfheal-syncop.js'
  *
  * ## What it will not touch
  *
- * A band md is mid-operation on keeps its `sync_min`/`sync_max` exactly as they
- * are and is REPORTED instead (D2 is the same rule from the other direction: a
- * recovery onto a spare is not ours to widen or interrupt). `rmw_level` and
+ * A band md is mid-operation on keeps `sync_min` and `sync_action` exactly as
+ * they are and is REPORTED (D2 from the other direction: nothing here
+ * interrupts or re-aims an operation md is running). `sync_max` is written
+ * under one such operation only — a recovery or a resync over a window with
+ * exactly the repair engine's one-stripe shape, widened to `max` (cr3
+ * AHR-HEAL-H4, gated as {@link reconcileBand} says). `rmw_level` and
  * `stripe_cache_size` are safe to set under a running op — they change how md
  * writes, never what it is doing — so those are restored regardless.
  */
@@ -225,6 +228,36 @@ export async function reconcileSelfhealState(
   return report
 }
 
+/** A bare non-negative integer. */
+const WINDOW_INTEGER_RE = /^\d+$/
+
+/**
+ * Is `sync_min..sync_max` exactly one window of the size the repair engine
+ * narrows to (`windowSectors` in selfheal-repair.ts: 128 sectors on RAID1, one
+ * chunk on RAID5/6), starting on a window boundary? Anything else — or a
+ * level or chunk size that cannot be read — is not proven to be the engine's.
+ */
+async function isEngineWindow(sys: string, syncMin: string | null, syncMax: string | null): Promise<boolean> {
+  if (syncMin === null || syncMax === null || !WINDOW_INTEGER_RE.test(syncMin) || !WINDOW_INTEGER_RE.test(syncMax))
+    return false
+  const level = await readMdAttrOrNull(sys, 'level')
+  let per: number
+  if (level === 'raid1') {
+    per = 128
+  }
+  else if (level === 'raid5' || level === 'raid6') {
+    const chunk = await readMdAttrOrNull(sys, 'chunk_size')
+    if (chunk === null || !WINDOW_INTEGER_RE.test(chunk) || Number(chunk) <= 0)
+      return false
+    per = Number(chunk) / 512
+  }
+  else {
+    return false
+  }
+  const min = Number(syncMin)
+  return Number(syncMax) - min === per && min % per === 0
+}
+
 /** One band's four knobs, read and put back where they are not md's own. */
 async function reconcileBand(
   executor: CommandExecutor,
@@ -243,7 +276,34 @@ async function reconcileBand(
   const windowNarrowed = (syncMax !== null && syncMax !== MD_DEFAULT_SYNC_MAX)
     || (syncMin !== null && syncMin !== MD_DEFAULT_SYNC_MIN)
   if (windowNarrowed) {
-    if (!isIdleSyncAction(action)) {
+    // cr3 AHR-HEAL-H4 — a recovery or a resync md may park at a one-stripe
+    // window a killed repair left (the parking is from md's source as
+    // recalled, not captured; see `widenUnderForeignOp`). No run of THIS
+    // process wrote it, so the proof that it is the engine's is its SHAPE:
+    // exactly one window of the engine's own size (one chunk of a parity
+    // band, 128 sectors of a mirror). Its cost when the shape coincides with
+    // someone else's window is I/O (a check runs on past it), never data.
+    //
+    // UNPROVEN: what md leaves in `sync_min` after a check interrupted by a
+    // member failure. If it is [high, high] (the review's expectation) this
+    // branch never fires for that case. The node probe records it: variant B
+    // with the daemon KILLED before the member is failed, reading
+    // sync_min/sync_max before and after.
+    //
+    // Gated like the repair's cleanup: `sync_action` (read above) must allow
+    // it, and — re-read AFTER `sync_max`, immediately before the write —
+    // `sync_action` again and `reshape_position === 'none'` (unreadable is not
+    // `none`). Never `sync_min` (EBUSY mid-recovery), never `idle`.
+    const shaped = mayWidenSyncMaxUnder(action) && await isEngineWindow(sys, syncMin, syncMax)
+    const actionNow = shaped ? await readMdAttrOrNull(sys, 'sync_action') : null
+    const reshape = shaped ? await readMdAttrOrNull(sys, 'reshape_position') : null
+    if (shaped && mayWidenSyncMaxUnder(actionNow) && reshape === 'none') {
+      await writeMdAttr(sys, 'sync_max', MD_DEFAULT_SYNC_MAX)
+      report.restored.push(
+        `${label}: sync_max widened to max under ${actionNow} (was ${syncMin ?? '?'}..${syncMax ?? '?'}: a killed repair's one-stripe window, which md parks a ${action} at). sync_min was left at ${syncMin ?? '?'}: md refuses it mid-${action}; the next pass puts it back once md is idle`,
+      )
+    }
+    else if (!isIdleSyncAction(action)) {
       // Widening `sync_max` under a running recovery resumes and then re-bounds
       // an operation that is not ours. Say what was found; the next pass, or
       // the scrub's own pre-issue check, puts it back once md is done.

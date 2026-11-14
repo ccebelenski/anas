@@ -60,6 +60,10 @@ function sidecar(
   return {
     outcome: outcome?.outcome ?? 'injected',
     reason: outcome?.reason ?? '',
+    // cr3 (AHR-HEAL-H1): the code that tells `run-stopped` from the other
+    // not-examined reasons, and the confirmation a written block skipped.
+    reason_code: outcome?.reasonCode ?? null,
+    postcheck_skipped: outcome?.postcheckSkipped ?? null,
     file: outcome?.file ?? null,
     block: outcome?.block ?? null,
     steps_done: steps.filter(s => s.ok).map(s => s.name),
