@@ -1,5 +1,5 @@
 import type { AhrPool } from '@anas/shared'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { LvmLv, LvmPv } from '../parsers/lvm-report.js'
 import type { DiskTree } from './ahr-expand-exec.js'
 import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
@@ -16,8 +16,9 @@ import {
 } from './ahr-cache-state.js'
 import { LVM_MIXED_BLOCK_ARGS, run } from './ahr-exec.js'
 import { readDiskTree } from './ahr-expand-exec.js'
-import { requirePoolVg } from './ahr-identity.js'
+import { readPoolBandCount, requirePoolVg } from './ahr-identity.js'
 import { isAhrMountReadOnly } from './ahr-topology.js'
+import { BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures } from './partition-device.js'
 import { pveNotify } from './pve-notify.js'
 import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 
@@ -68,6 +69,7 @@ const LVREMOVE = '/usr/sbin/lvremove'
 const LVCONVERT = '/usr/sbin/lvconvert'
 const LVS = '/usr/sbin/lvs'
 const LSBLK = '/usr/bin/lsblk'
+const BLKID = '/usr/sbin/blkid'
 
 /**
  * The lvm report flags these steps re-read LV state with. The topology
@@ -110,6 +112,176 @@ export interface CacheSlice {
 /** The first line of a command's stderr, for an error message. */
 function stderrHead(stderr: string): string {
   return stderr.trim().split('\n')[0]?.trim() ?? ''
+}
+
+/**
+ * What a labelled cache slice that is NOT a PV of the pool's VG carries
+ * (cr3 AHR-CORE-L11): `ours` — exit 0 with nothing but the partition's own
+ * PART_ENTRY_* keys (the captured blank shape), or only an LVM PV label (the
+ * leftover a died-and-returned cache device brings back, §13); `unreadable` —
+ * any other exit (exit 2 included) or a probe that could not run; otherwise
+ * the signature found, named for the operator (`TYPE=ext4`).
+ */
+async function leftoverSliceContent(executor: CommandExecutor, path: string): Promise<'ours' | 'unreadable' | string> {
+  let probe: ExecResult
+  try {
+    probe = await executor.exec(BLKID, ['-p', path])
+  }
+  catch {
+    return 'unreadable'
+  }
+  // Exit 2 is never "blank" on a PARTITION (cr3 review 4, `ahr-identity.ts`'s
+  // rule): a readable blank slice answers exit 0 with its PART_ENTRY_* keys;
+  // exit 2 with an error line is a device blkid could not open (the captured
+  // `Permission denied` shape), and exit 2 in silence is a path that is gone.
+  if (probe.exitCode !== BLKID_FOUND)
+    return 'unreadable'
+  const signatures = blkidContentSignatures(probe.stdout)
+  const type = signatures.find(sig => sig.startsWith('TYPE='))
+  if (signatures.length === 0 || type === 'TYPE=LVM2_member')
+    return 'ours'
+  return type ?? signatures[0]
+}
+
+/** `pvs` with the PV's own UUID — the identity LVM wrote into the device's label. */
+export const CACHE_PV_IDENTITY_ARGS = ['--reportformat', 'json', '--units', 'b', '--nosuffix', '-o', 'pv_name,pv_uuid,vg_name']
+/** The `UUID="..."` pair of `blkid -p` (never PTUUID or PART_ENTRY_UUID: `\b` before U). */
+const BLKID_UUID_RE = /\bUUID="([^"]*)"/
+/** The GPT partition NAME `blkid -p` reports beside the content keys. */
+const PART_ENTRY_NAME_RE = /\bPART_ENTRY_NAME="([^"]*)"/
+const UUID_DASHES_RE = /-/g
+
+/** An LVM UUID compared as LVM means it: dashes and case are presentation. */
+function lvmUuidKey(uuid: string): string {
+  return uuid.replace(UUID_DASHES_RE, '').toLowerCase()
+}
+
+/**
+ * The NAMED non-md PVs of the pool's VG that are not one of this pool's
+ * labelled cache slices (cr3 review2 3) — by `blkid -p`'s PART_ENTRY_NAME.
+ * A device that cannot be probed counts as not ours (it cannot be proven).
+ */
+export async function pvsNotOursInVg(executor: CommandExecutor, pool: string, inVg: LvmPv[]): Promise<string[]> {
+  const out: string[] = []
+  for (const pv of inVg.filter(p => p.name !== UNKNOWN_PV_NAME && !isMdPvName(p.name))) {
+    let label: string | null = null
+    try {
+      const probe = await executor.exec(BLKID, ['-p', pv.name])
+      label = probe.exitCode === BLKID_FOUND ? probe.stdout.match(PART_ENTRY_NAME_RE)?.[1] ?? null : null
+    }
+    catch {
+      label = null
+    }
+    if (label === null || matchCachePartitionLabel(pool, label) === null)
+      out.push(pv.name)
+  }
+  return out
+}
+
+/**
+ * Is THE cache device of this pool still here (cr3, the cache-event door)?
+ * Answered by IDENTITY, never by a GPT label: every non-md PV LVM records in
+ * the pool's VG (the cache PVs) must still be a device whose LVM label
+ * carries that PV's own UUID — `blkid -p` probes the label on the device
+ * itself, bypassing every cache. A label sweep answered "a `<pool>-cache<n>`
+ * slice exists somewhere": a stale slice left on an earlier cache disk (detach
+ * keeps the slice) hid the loss of the live one, and the pool served EIO.
+ *
+ * Ground truth (PVE 9, LVM 2.03.31, loop devices — `fixtures/ahr/
+ * pvs-uuid-missing-pv-row.json`, `blkid-p-lvm-pv.txt`): `pvs` exits 0 with a
+ * missing PV listed as `[unknown]` beside its `pv_uuid`, and `blkid -p` on a
+ * live PV prints `UUID=` in the same dashed form as `pv_uuid`.
+ *
+ *  - `missing`: an `[unknown]` PV while EVERY band already has its own named
+ *    md PV — counted by `poolBandCount` (arrays seen OR pinned: a band absent
+ *    from mdstat is still a band) — and every named non-md PV is this pool's
+ *    labelled cache slice; or a labelled cache PV whose device now probes
+ *    with no PV label or another PV's UUID;
+ *  - `present`: every cache PV probes as itself;
+ *  - `unknown`: anything else — pvs unreadable or timed out; the band count
+ *    unknown (mdadm.conf unreadable); a band without its named md PV; any
+ *    named non-md PV that is NOT one of this pool's labelled cache slices,
+ *    or whose device is gone so its label cannot be read (cr3 review2 3, the
+ *    coordinator's ruling: the unattended rungs act only on what ANAS made —
+ *    the recovery runs `vgreduce --removemissing`, which would drop an
+ *    operator's own missing PV record); a probe that could not SEE (exit 2
+ *    with an error line, exit 8, any other exit, a throw or a timeout). Unknown
+ *    runs nothing: this verdict drives an unattended `lvconvert --uncache`.
+ */
+export async function cacheDeviceVerdict(
+  executor: CommandExecutor,
+  pool: { name: string, bandCount: number | null },
+  opts: { timeoutMs?: number } = {},
+): Promise<{ verdict: 'present' | 'missing' | 'unknown', detail: string }> {
+  const budget = opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : undefined
+  let res: ExecResult
+  try {
+    res = await executor.exec(PVS, CACHE_PV_IDENTITY_ARGS, budget)
+  }
+  catch (err) {
+    return { verdict: 'unknown', detail: `pvs could not be read (${err instanceof Error ? err.message : String(err)})` }
+  }
+  if (res.exitCode !== 0)
+    return { verdict: 'unknown', detail: `pvs exited ${res.exitCode}${stderrHead(res.stderr) ? ` (${stderrHead(res.stderr)})` : ''}` }
+  let rows: { pv_name?: string, pv_uuid?: string, vg_name?: string }[]
+  try {
+    const root = JSON.parse(res.stdout) as { report?: { pv?: typeof rows }[] }
+    if (!Array.isArray(root.report))
+      return { verdict: 'unknown', detail: 'pvs answered without a report' }
+    rows = root.report.flatMap(section => section.pv ?? [])
+  }
+  catch {
+    return { verdict: 'unknown', detail: 'pvs answered output that is not JSON' }
+  }
+  const inVg = rows.filter(r => r.vg_name === pool.name && typeof r.pv_name === 'string')
+  const bandPvCount = inVg.filter(r => isMdPvName(r.pv_name!)).length
+
+  // Every NAMED non-md PV is probed once: its GPT label (PART_ENTRY_NAME, from
+  // the same `blkid -p` line) says whether ANAS made it a cache slice of this
+  // pool, its LVM label whether it is still that PV. cr3 review2 3 (the
+  // coordinator's ruling): the unattended rungs act ONLY on what ANAS made —
+  // a PV ANAS did not label, or one whose device is gone so its label cannot
+  // be read, makes the whole answer `unknown`.
+  let cacheMissing: string | null = null
+  let cachePvs = 0
+  for (const pv of inVg.filter(r => r.pv_name !== UNKNOWN_PV_NAME && !isMdPvName(r.pv_name!))) {
+    let probe: ExecResult
+    try {
+      probe = await executor.exec(BLKID, ['-p', pv.pv_name!], budget)
+    }
+    catch (err) {
+      return { verdict: 'unknown', detail: `blkid -p ${pv.pv_name} could not be read (${err instanceof Error ? err.message : String(err)})` }
+    }
+    if (probe.exitCode === BLKID_NOTHING && probe.stdout.trim() === '' && probe.stderr.trim() === '')
+      return { verdict: 'unknown', detail: `${pv.pv_name} is gone (blkid -p: exit 2, no output), so whether it was this pool's cache slice cannot be read` }
+    if (probe.exitCode !== BLKID_FOUND)
+      return { verdict: 'unknown', detail: `blkid -p ${pv.pv_name} could not see the device (exit ${probe.exitCode}${stderrHead(probe.stderr) ? `: ${stderrHead(probe.stderr)}` : ''})` }
+    const label = probe.stdout.match(PART_ENTRY_NAME_RE)?.[1] ?? null
+    if (label === null || matchCachePartitionLabel(pool.name, label) === null)
+      return { verdict: 'unknown', detail: `volume group '${pool.name}' holds ${pv.pv_name}, which is not one of this pool's cache slices — the unattended recovery acts only on what ANAS made` }
+    cachePvs++
+    if (typeof pv.pv_uuid !== 'string' || pv.pv_uuid === '')
+      return { verdict: 'unknown', detail: `pvs gave no UUID for ${pv.pv_name}` }
+    const uuid = probe.stdout.match(BLKID_UUID_RE)?.[1]
+    if (uuid === undefined || lvmUuidKey(uuid) !== lvmUuidKey(pv.pv_uuid))
+      cacheMissing = `${pv.pv_name} no longer carries the cache PV ${pv.pv_uuid} (${uuid === undefined ? 'no PV label' : `it is ${uuid}`})`
+  }
+  if (inVg.some(r => r.pv_name === UNKNOWN_PV_NAME)) {
+    // A missing row beside a cache slice that is still here is not the
+    // cache's: an operator's PV that vanished, never ANAS's to drop.
+    if (cachePvs > 0 && cacheMissing === null)
+      return { verdict: 'unknown', detail: `a PV of '${pool.name}' reads [unknown] while its cache slice is present — the missing one is not the cache` }
+    if (pool.bandCount === null)
+      return { verdict: 'unknown', detail: `a PV of '${pool.name}' reads [unknown], and the pool's band count could not be read (mdadm.conf)` }
+    return bandPvCount >= pool.bandCount
+      ? { verdict: 'missing', detail: `a PV of '${pool.name}' reads [unknown] while every band has its own named md PV` }
+      : { verdict: 'unknown', detail: `a PV of '${pool.name}' reads [unknown], and a band has no named md PV — it may be the band's, not the cache's` }
+  }
+  if (cacheMissing !== null)
+    return { verdict: 'missing', detail: cacheMissing }
+  if (cachePvs === 0)
+    return { verdict: 'unknown', detail: `volume group '${pool.name}' records no cache PV` }
+  return { verdict: 'present', detail: 'every cache PV probes as itself' }
 }
 
 /**
@@ -506,7 +678,15 @@ export async function dropMissingCachePv(
   if (missing.length === 0)
     return
   const bandPvCount = inVg.filter(p => isMdPvName(p.name)).length
-  const bandCount = pool.arrays.length
+  // cr3 review2 2: the bands the pins name count too (a band absent from
+  // mdstat is still a band); an unreadable conf is a doubt — no vgreduce.
+  const bandCount = await readPoolBandCount(pool.name, pool.arrays.length)
+  if (bandCount === null) {
+    throw new Error(
+      `the pool's band count could not be read (mdadm.conf), so a missing physical volume of '${pool.name}' cannot be told from a stopped band's — `
+      + `'vgreduce --removemissing' was not run. Check mdadm.conf, then detach the cache`,
+    )
+  }
   if (bandPvCount < bandCount) {
     throw new Error(
       `volume group '${pool.name}' is missing ${missing.length} physical volume${missing.length === 1 ? '' : 's'} `
@@ -648,15 +828,33 @@ export async function detachAhrCache(
   // a partition delete reaches, never a whole-disk zap.
   const pvsBefore = await readPvs(executor)
   const labelled = await findCacheSlices(executor, pool.name)
-  const slices = labelled.filter((slice) => {
+  const slices: CacheSlice[] = []
+  for (const slice of labelled) {
     const pv = pvsBefore.find(p => p.name === slice.kernelPath || p.name === slice.path)
     if (pv && pv.vgName !== null && pv.vgName !== pool.name) {
       updateProgress(`Leaving ${slice.diskId} alone: its '${pool.name}-cache${slice.ordinal}' slice belongs to volume group '${pv.vgName}', not this pool`)
       log(`ahr.cache pool=${pool.name} disk=${slice.diskId} status=skipped reason=pv-of-vg-${pv.vgName}`)
-      return false
+      continue
     }
-    return true
-  })
+    // cr3 AHR-CORE-L11: a labelled slice that is NOT a PV of this VG was
+    // wiped and deleted on its label alone. The label is a name; the content
+    // decides. A leftover of this pool's cache carries nothing or a stale LVM
+    // PV label — anything else (a filesystem, an md member, another
+    // signature) is someone's data on a slice that happens to wear the name,
+    // and a probe that could not be made is no licence either.
+    if (!pv || pv.vgName !== pool.name) {
+      const content = await leftoverSliceContent(executor, slice.path)
+      if (content !== 'ours') {
+        const why = content === 'unreadable'
+          ? 'its content could not be probed (blkid)'
+          : `it carries ${content}, not a leftover of this pool's cache`
+        updateProgress(`Leaving ${slice.diskId} alone: its '${pool.name}-cache${slice.ordinal}' slice is not in volume group '${pool.name}' and ${why}`)
+        log(`ahr.cache pool=${pool.name} disk=${slice.diskId} status=skipped reason=leftover-content-${content === 'unreadable' ? 'unreadable' : 'foreign'}`)
+        continue
+      }
+    }
+    slices.push(slice)
+  }
   const sliceDevices = new Set(slices.flatMap(s => [s.kernelPath, s.path]))
 
   // THE VG IS THE POOL'S, ON THE DISKS (cr.22, code review H6 finding 3) —
@@ -820,8 +1018,8 @@ export interface CacheRecoveryResult {
   uncached: boolean
   /** Whether the ghost PV was dropped from the VG. */
   vgReduced: boolean
-  /** The filesystem is btrfs-forced-readonly and needs the Remount verb. */
-  readOnly: boolean
+  /** The filesystem is btrfs-forced-readonly and needs the Remount verb; null = the mount table could not be read (cr3). */
+  readOnly: boolean | null
   /** How the device was named in the notification (by-id, slice label, null). */
   device: string | null
 }
@@ -898,7 +1096,21 @@ export async function recoverFailedAhrCache(
   // 2. Drop the ghost PV — behind the band guard, which is the whole reason
   //    this is a shared helper (an unassembled band reads `[unknown]` too).
   const inVg = (await readPvs(executor)).filter(p => p.vgName === pool.name)
-  const vgReduced = inVg.some(p => p.name === UNKNOWN_PV_NAME)
+  let vgReduced = inVg.some(p => p.name === UNKNOWN_PV_NAME)
+  // cr3 review2 3 (the coordinator's ruling): this recovery runs UNATTENDED
+  // (the udev and boot rungs), and `--removemissing` drops EVERY missing PV
+  // record. Beside a PV that is not one of this pool's labelled cache slices
+  // (an operator's own), it is never run here — that record is the operator's
+  // to drop, through Detach cache with them present. The uncache above
+  // already restored reads; the note below says what was left.
+  if (vgReduced) {
+    const foreign = await pvsNotOursInVg(executor, pool.name, inVg)
+    if (foreign.length > 0) {
+      vgReduced = false
+      updateProgress(`Left the missing physical-volume record in volume group '${pool.name}': the group also holds ${foreign.join(', ')}, which ANAS did not make — use Detach cache to finish`)
+      log(`ahr.cache pool=${pool.name} rung=recover status=vgreduce-skipped reason=pv-not-ours pvs=${foreign.join(',')}`)
+    }
+  }
   if (vgReduced)
     await dropMissingCachePv(executor, { pool, inVg, updateProgress, log })
 

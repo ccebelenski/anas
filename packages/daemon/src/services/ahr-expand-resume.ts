@@ -1,4 +1,4 @@
-import type { AhrCapacity, AhrExpansionIntent, AhrPool, AhrReplacePair, JobRef } from '@anas/shared'
+import type { AhrExpansionIntent, AhrPool, AhrPoolCapacity, AhrReplacePair, JobRef } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { Gate, GuardPass, GuardSpec } from '../safety/guard.js'
@@ -8,6 +8,7 @@ import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { isComposableDisk } from '@anas/shared'
 import { collectDisks } from '../routes/disks.js'
 import { guarded } from '../safety/guard.js'
+import { inventoryUnreadableMessage, isDiskStatusUnknown } from './ahr-disk-recheck.js'
 import { executeExpansion, executeReplace, haltWithFailure, projectExistingBands, pvCatchUpSteps, readDiskTree, syncCompletionSteps, syncingAhrBands, underSizedPvBands } from './ahr-expand-exec.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { ahrGuard, expansionStateRefusal, poolArrayUuids } from './ahr-guard.js'
@@ -38,8 +39,8 @@ import { kernelInfo } from './kernel-version.js'
 /** Projected before → after capacity plus the recomputed §2.3 plan. */
 export interface PlanBundle {
   plan: AhrExpansionPlan
-  before: AhrCapacity
-  after: AhrCapacity
+  before: AhrPoolCapacity
+  after: AhrPoolCapacity
   /**
    * Band math of the CURRENT layout — the `before` side of the ahrexpand.1
    * gain guard. `before.usableBytes` above is the LIVE volume, which is what
@@ -48,6 +49,11 @@ export interface PlanBundle {
   beforeUsableBytes: number
   /** Disk ids this plan brings INTO the pool (additions + the replacement). */
   introducedDiskIds: string[]
+  /**
+   * The same disks with the size the plan read for each (cr3, AHR-panel L7):
+   * the confirm names every disk whose contents the expansion overwrites.
+   */
+  introducedDisks: { id: string, usableBytes: number }[]
 }
 
 /**
@@ -91,9 +97,12 @@ export async function resolveApproved(
   pool: AhrPool,
   approvedIds: string[],
   requireAvailable: boolean,
-): Promise<{ approved: AhrLayoutDisk[], problems: string[] }> {
+): Promise<{ approved: AhrLayoutDisk[], problems: string[], unreadable: string[] }> {
   const approved: AhrLayoutDisk[] = []
   const problems: string[] = []
+  // cr3: disks whose inventory row could not be read — named in `problems`
+  // too (the resume paths report those), and returned for the route's 409.
+  const unreadable: string[] = []
   const needInventory = approvedIds.some(id => !pool.disks.some(d => d.id === id))
   const inventory = needInventory ? await collectDisks(executor, diskCache) : []
   for (const id of approvedIds) {
@@ -109,6 +118,11 @@ export async function resolveApproved(
     }
     if (!inv) {
       problems.push(`disk '${id}' not found in the inventory`)
+      continue
+    }
+    if (isDiskStatusUnknown(inv)) {
+      unreadable.push(id)
+      problems.push(inventoryUnreadableMessage([id]))
       continue
     }
     if (requireAvailable && !isComposableDisk(inv)) {
@@ -129,7 +143,7 @@ export async function resolveApproved(
     }
     approved.push({ id, usableBytes: inv.size, logicalSectorSize: inv.logicalSectorSize })
   }
-  return { approved, problems }
+  return { approved, problems, unreadable }
 }
 
 /** Project the pool, run the §2.3 planner, and shape before → after. */
@@ -161,10 +175,12 @@ export function computePlan(pool: AhrPool, approved: AhrLayoutDisk[], replaced: 
     plan.preview.bands,
   ))
   const before = pool.capacity
-  const after: AhrCapacity = {
+  // The live pool's used bytes carry over; when they are unknown (unmounted,
+  // or the usage read failed — cr3) so is the projected free figure.
+  const after: AhrPoolCapacity = {
     ...plan.preview.capacity,
     usedBytes: before.usedBytes,
-    freeBytes: Math.max(0, plan.preview.capacity.usableBytes - before.usedBytes),
+    freeBytes: before.usedBytes === null ? null : Math.max(0, plan.preview.capacity.usableBytes - before.usedBytes),
   }
   // A disk is INTRODUCED when no existing band already counts it as a member —
   // the replacement and every added disk, and nothing else. The zero-gain
@@ -177,6 +193,7 @@ export function computePlan(pool: AhrPool, approved: AhrLayoutDisk[], replaced: 
     after,
     beforeUsableBytes: existingLayoutUsableBytes(existingBands, pool.ahrType),
     introducedDiskIds: approved.filter(d => !members.has(d.id)).map(d => d.id),
+    introducedDisks: approved.filter(d => !members.has(d.id)).map(d => ({ id: d.id, usableBytes: d.usableBytes })),
   }
 }
 

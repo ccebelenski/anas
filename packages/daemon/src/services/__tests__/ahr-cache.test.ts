@@ -38,6 +38,10 @@ const CACHE_LABEL = `${POOL}-cache1`
 const CACHE_LV = `${POOL}-cache`
 const POOL_LV = `${POOL}-vol`
 const CACHE_PV_BYTES = 532676608
+/** `blkid -p` on a live LVM PV, captured on PVE 9 / LVM 2.03.31 (loop devices). */
+const BLKID_LIVE_PV = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/ahr/blkid-p-lvm-pv.txt'), 'utf8')
+/** `blkid -p` on a BLANK partition: exit 0, only PART_ENTRY_* keys (captured). */
+const BLKID_BLANK_PARTITION = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/zfs/blkid-p-blank-partition.txt'), 'utf8')
 const SLICE_BYTES = 535805440
 
 const LSBLK = '/usr/bin/lsblk'
@@ -120,6 +124,8 @@ class CacheWorld extends MockExecutor {
   partxBusyCalls = 0
   /** cr.50 review: the per-disk lsblk reads after `sgdisk -d` fail this many times (a udev storm) — readDiskTree null. */
   lsblkFailAfterSgdisk = 0
+  /** cr3 L11: what `blkid -p` reads on the slice (null = modelled: a PV label, or nothing). */
+  sliceProbe: ExecResult | null = null
   private sgdiskRan = false
 
   private ok(stdout = ''): ExecResult {
@@ -215,6 +221,16 @@ lrwxrwxrwx 1 root root 10 Sep 24 20:00 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT7-part1 
 lrwxrwxrwx 1 root root  9 Sep 24 20:00 ${CACHE_DISK} -> ../../sdd
 lrwxrwxrwx 1 root root 10 Sep 24 20:00 ${CACHE_DISK}-part1 -> ../../sdd1
 `)
+      case '/usr/sbin/blkid':
+        if (this.sliceProbe !== null)
+          return this.sliceProbe
+        // The slice as blkid reads it: the captured live-PV line (PVE 9, LVM
+        // 2.03.31) when it carries a PV label, else the captured BLANK
+        // partition shape (exit 0, only PART_ENTRY_* keys); a slice that is
+        // gone answers exit 2 in silence (util-linux 2.41).
+        if (!this.slice)
+          return { stdout: '', stderr: '', exitCode: 2 }
+        return this.ok(this.pv ? `/dev/sdd1: ${BLKID_LIVE_PV}` : BLKID_BLANK_PARTITION)
       case PVS:
         return this.ok(this.pvsJson())
       case LVS:
@@ -513,6 +529,31 @@ describe('cache-detach — the step sequence (ahrcache.1, §13/GT-20/GT-22)', ()
     assert.deepEqual(result.released, [CACHE_DISK])
   })
 
+  // cr3 AHR-CORE-L11: a labelled slice that is NOT a PV of the pool's VG was
+  // wiped and deleted on its label alone. Its content decides now.
+  it('cr3 L11: a leftover-labelled slice carrying a FILESYSTEM is left alone, said so', async () => {
+    const world = new CacheWorld()
+    world.slice = true
+    world.sliceProbe = { stdout: '/dev/sdd1: UUID="1111-2222" TYPE="ext4" PART_ENTRY_NAME="tank-cache1"\n', stderr: '', exitCode: 0 }
+    const progress: string[] = []
+    const result = await detachAhrCache(world, { pool: pool() }, m => progress.push(m))
+    assert.deepEqual(callsTo(world, WIPEFS), [])
+    assert.deepEqual(callsTo(world, SGDISK), [])
+    assert.deepEqual(result.released, [])
+    assert.ok(progress.some(m => m.includes('carries TYPE=ext4, not a leftover of this pool\'s cache')), progress.join(' | '))
+  })
+
+  it('cr3 L11: a leftover slice whose content cannot be probed is left alone — a failed read is no licence', async () => {
+    const world = new CacheWorld()
+    world.slice = true
+    // The captured shape (`ahr/blkid-p-permission-denied.stderr.txt`): exit 2
+    // WITH an error line — blkid could not open the slice.
+    world.sliceProbe = { stdout: '', stderr: readFileSync(join(import.meta.dirname, '../../fixtures/ahr/blkid-p-permission-denied.stderr.txt'), 'utf8'), exitCode: 2 }
+    const result = await detachAhrCache(world, { pool: pool() }, noop)
+    assert.deepEqual(callsTo(world, WIPEFS), [])
+    assert.deepEqual(result.released, [])
+  })
+
   it('a same-named slice that LVM counts in ANOTHER volume group is never touched (ident.3, audit #4)', async () => {
     // A `<pool>-cache1` slice that is a PV of `media` — a pool of the same
     // name moved in from another node. The label is a name; the VG is identity.
@@ -651,6 +692,23 @@ describe('cache-detach — the step sequence (ahrcache.1, §13/GT-20/GT-22)', ()
     const result = await recoverFailedAhrCache(own, { pool: pool() }, noop, { log: noop })
     assert.equal(result.uncached, true)
     assert.deepEqual(callsTo(own, VGREDUCE), [[...MIXED, '--removemissing', POOL]])
+  })
+
+  // cr3 review2 3 (the coordinator's ruling): the UNATTENDED recovery never
+  // runs `vgreduce --removemissing` beside a PV ANAS did not make — it would
+  // drop an operator's own missing-PV record with nobody present.
+  it('cr3 review2 3: the unattended recovery uncaches but never vgreduces beside an operator\'s PV', async () => {
+    const world = new CacheWorld()
+    world.cached = true
+    world.missingPv = true
+    world.extraPvRows = [{ pv_name: '/dev/sde1', vg_name: POOL, pv_size: '1073741824', pv_free: '1073741824', dev_size: '1073741824' }]
+    world.sliceProbe = { stdout: '/dev/sde1: UUID="1111" TYPE="ext4" PART_ENTRY_NAME="mydata"\n', stderr: '', exitCode: 0 }
+    const progress: string[] = []
+    const result = await recoverFailedAhrCache(world, { pool: pool() }, m => progress.push(m), { log: noop })
+    assert.equal(result.uncached, true)
+    assert.equal(result.vgReduced, false)
+    assert.deepEqual(callsTo(world, VGREDUCE), [])
+    assert.ok(progress.some(m => m.includes('ANAS did not make — use Detach cache to finish')), progress.join(' | '))
   })
 
   it('cr.22: no VG of the pool\'s name — a leftover slice is still handed back', async () => {

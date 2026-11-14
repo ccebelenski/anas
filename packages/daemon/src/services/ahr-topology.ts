@@ -3,10 +3,10 @@ import type {
   AhrArrayMember,
   AhrArraySync,
   AhrBandBrief,
-  AhrCapacity,
   AhrDisk,
   AhrDiskPartition,
   AhrExpansionIntent,
+  AhrPoolCapacity,
   AhrPoolState,
   ArrayLevel,
   ArrayState,
@@ -17,19 +17,20 @@ import type { DmStatusLine } from '../parsers/dmsetup.js'
 import type { MdadmDetailExport } from '../parsers/mdadm-detail.js'
 import type { MdstatArray } from '../parsers/mdstat.js'
 import { AhrPool, AhrPoolBrief } from '@anas/shared'
-import { btrfsUsageArgs, parseBtrfsUsage } from '../parsers/btrfs-usage.js'
+import { btrfsUsageArgs, parseBtrfsScrubStatusWord, parseBtrfsUsage } from '../parsers/btrfs-usage.js'
 import { parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { dmsetupStatusArgs, parseDmsetupStatus } from '../parsers/dmsetup.js'
-import { optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
-import { lvIsActive, lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
+import { optionsReadOnly, parseFindmnt, parseFindmntTable } from '../parsers/findmnt.js'
+import { isLvmReport, lvIsActive, lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { buildAhrCacheState, cacheFailedAdvisory, foreignVgPvAdvisory } from './ahr-cache-state.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
-import { canonicalMdUuid, isOwnedArray, pinnedUuids, poolPvNames, readMdadmConfDoc } from './ahr-identity.js'
+import { canonicalMdUuid, isOwnedArray, pinnedUuids, poolBandCount, poolPvNames, readMdadmConfDoc, readMdadmConfDocStrict } from './ahr-identity.js'
 import { readPoolIntent } from './ahr-intent.js'
 import { AHR_MIN_DISKS, floorToGranularity, isPvUnderSized } from './ahr-layout.js'
 import { isSubvolLayoutMount } from './ahr-snapshots.js'
+import { UDEVADM } from './udev-settle.js'
 
 /**
  * AHR pool topology reader (Epic 11 + AHR, docs/AHR-DESIGN.md §3/§5.3).
@@ -64,6 +65,9 @@ const PVS = '/usr/sbin/pvs'
 const BTRFS = '/usr/bin/btrfs'
 const FINDMNT = '/usr/bin/findmnt'
 const DMSETUP = '/usr/sbin/dmsetup'
+/** The short settle before the by-id listing's one retry (cr3 review 10). */
+const BY_ID_RETRY_SETTLE_ARGS = ['settle', '--timeout=5']
+const BY_ID_RETRY_SETTLE_BUDGET_MS = 10_000
 
 const MIB = 1024 ** 2
 
@@ -98,15 +102,43 @@ export const AHR_FINDMNT_ARGS = ['--json', '--real']
  * (GT-19), so the flag can arrive between loading the pool and finishing the
  * uncache, and it is the fact that decides what the operator is told.
  *
- * Fail-open: an unreadable mount table answers `false`. The alternative is a
- * notification claiming writes are stopped when they are not.
+ * Three-valued (cr3, 2026-11-14 review): `null` when the mount table could
+ * not be read — never `false`, which told the Remount verb a pool it could
+ * not see was writable again. Each caller says what unknown means for it.
  */
-export async function isAhrMountReadOnly(executor: CommandExecutor, mountpoint: string): Promise<boolean> {
+export async function isAhrMountReadOnly(executor: CommandExecutor, mountpoint: string): Promise<boolean | null> {
   const res = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
-  if (res.exitCode !== 0)
-    return false
+  if (res.exitCode !== 0 || parseFindmntTable(res.stdout) === null)
+    return null
   const mount = parseFindmnt(res.stdout).find(m => m.target === mountpoint)
   return mount ? optionsReadOnly(mount.options) : false
+}
+
+/** `btrfs scrub status <mountpoint>` — the btrfs half of "is a scrub running". */
+export function btrfsScrubStatusArgs(mountpoint: string): string[] {
+  return ['scrub', 'status', mountpoint]
+}
+
+/** The scrub-status read's own deadline: far above its real cost, well under a panel poll. */
+const BTRFS_SCRUB_STATUS_BUDGET_MS = 3000
+
+/**
+ * Is a btrfs scrub RUNNING on this mounted filesystem (cr3, handed by the
+ * AHR-panel review)? `true` / `false` from a status read that answered;
+ * `null` when it did not (non-zero exit, a throw) — unknown, never idle. A
+ * filesystem never scrubbed answers exit 0 with no `Status:` line: not
+ * running.
+ */
+async function readBtrfsScrubRunning(executor: CommandExecutor, mountpoint: string): Promise<boolean | null> {
+  try {
+    const r = await executor.exec(BTRFS, btrfsScrubStatusArgs(mountpoint), { timeoutMs: BTRFS_SCRUB_STATUS_BUDGET_MS })
+    if (r.exitCode !== 0)
+      return null
+    return parseBtrfsScrubStatusWord(r.stdout) === 'running'
+  }
+  catch {
+    return null
+  }
 }
 
 // ---- lsblk tree (raw) ------------------------------------------------------
@@ -160,6 +192,19 @@ const PART_NUMBER_RE = /(\d+)$/
  * this reader does, so the two can never disagree about which partitions of
  * which disk carry a pool's labels.
  */
+/**
+ * Did lsblk answer in its JSON tree shape (cr3)? `indexLsblk` reads garbage as
+ * an empty tree — zero partitions — so the topology checks the shape first.
+ */
+export function isLsblkTree(json: string): boolean {
+  try {
+    return Array.isArray((JSON.parse(json) as { blockdevices?: unknown }).blockdevices)
+  }
+  catch {
+    return false
+  }
+}
+
 export function indexLsblk(json: string): LsblkIndex {
   const index: LsblkIndex = { partsByKernel: new Map(), lvmByDmName: new Map() }
   let root: { blockdevices?: LsblkNode[] }
@@ -537,7 +582,7 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
   if (discovered.length === 0)
     return []
 
-  const [lsblkRes, byIdRes, vgsRes, lvsRes, pvsRes, findmntRes] = await Promise.all([
+  const [lsblkRes, byIdFirst, vgsRes, lvsRes, pvsRes, findmntRes] = await Promise.all([
     executor.exec(LSBLK, AHR_LSBLK_ARGS),
     executor.exec(LS, ['-la', '/dev/disk/by-id/']),
     executor.exec(VGS, VGS_ARGS),
@@ -548,19 +593,53 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     executor.exec(PVS, PVS_ARGS),
     executor.exec(FINDMNT, AHR_FINDMNT_ARGS),
   ])
+  // cr3 review 10: `ls -la` exits 1 when a link vanishes between its readdir
+  // and its lstat — udev churn while a disk is (re)partitioned, the very
+  // moment an expansion re-reads the topology at its reguard. One retry after
+  // a short settle; a second failure is unreadable like every other read.
+  let byIdRes = byIdFirst
+  if (byIdRes.exitCode !== 0) {
+    await executor.exec(UDEVADM, BY_ID_RETRY_SETTLE_ARGS, { timeoutMs: BY_ID_RETRY_SETTLE_BUDGET_MS }).catch(() => null)
+    byIdRes = await executor.exec(LS, ['-la', '/dev/disk/by-id/'])
+  }
 
+  // cr3 AHR-CORE-M5 / INVENTED-STATE-M4: every read the pools are built from
+  // is checked. A failed vgs read as "no VG" and fused the pool to `failed`
+  // ("LVM layer missing", a critical card) — or, with no mdadm.conf pin, made
+  // the pool VANISH; a failed by-id listing put kernel names where disk ids
+  // belong (destroy's disk locks); a failed lsblk read as zero partitions. A
+  // read that could not see raises the same unreadable error the md layer
+  // raises: the whole read is unavailable, never a pool built from it.
+  for (const [read, res, shapeOk] of [
+    [`lsblk ${AHR_LSBLK_ARGS.join(' ')}`, lsblkRes, () => isLsblkTree(lsblkRes.stdout)],
+    ['ls -la /dev/disk/by-id/', byIdRes, () => true],
+    ['vgs', vgsRes, () => isLvmReport(vgsRes.stdout, 'vg')],
+    ['lvs', lvsRes, () => isLvmReport(lvsRes.stdout, 'lv')],
+    ['pvs', pvsRes, () => isLvmReport(pvsRes.stdout, 'pv')],
+  ] as const) {
+    if (res.exitCode !== 0)
+      throw new AhrTopologyUnreadableError(read, res.exitCode, res.stderr)
+    if (!shapeOk())
+      throw new AhrTopologyUnreadableError(read, res.exitCode, 'the output is not in the expected shape')
+  }
   const lsblk = indexLsblk(lsblkRes.stdout)
   const byIdMap = parseDiskByIdListing(byIdRes.stdout)
   const vgs = parseVgsReport(vgsRes.stdout)
   const lvs = parseLvsReport(lvsRes.stdout)
   const pvs = parsePvsReport(pvsRes.stdout)
-  const mounts = parseFindmnt(findmntRes.stdout)
+  // INVENTED-STATE-H3: the mount table is the one read a pool can be described
+  // without — but then whether btrfs forced it READ-ONLY is unknown, and the
+  // pool never fuses to a verdict below that rung (state `unknown`,
+  // `mountedReadOnly` absent, an advisory naming the read).
+  const mountsKnown = findmntRes.exitCode === 0 && parseFindmntTable(findmntRes.stdout) !== null
+  const mounts = mountsKnown ? parseFindmnt(findmntRes.stdout) : []
 
   // The ANAS-managed mdadm.conf — an ARRAY pin (by UUID) is the ANAS-authored
   // ownership marker (§2.6, config-is-the-API). Read fail-open: an unreadable
   // conf means "no pins", which only ever makes ownership STRICTER (a pool
   // then needs its VG to be claimed) — never looser.
-  const mdadmConfDoc = await readMdadmConfDoc(mdadmConfPath)
+  const strictConfDoc = await readMdadmConfDocStrict(mdadmConfPath)
+  const mdadmConfDoc = strictConfDoc ?? await readMdadmConfDoc(mdadmConfPath)
 
   // Group arrays by pool, bands ascending.
   const byPool = new Map<string, DiscoveredArray[]>()
@@ -730,6 +809,9 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
         // The identity the pool is matched on (story ident.3) — what an
         // expansion intent records and a destroy confirm is bound to.
         ...(canonicalMdUuid(entry.detail.uuid) ? { uuid: canonicalMdUuid(entry.detail.uuid)! } : {}),
+        // md's own slot count (cr3): the rows above include spares, replace
+        // targets and failed members, so they are never the slot count.
+        ...(entry.mdstat.raidDevices !== null && entry.mdstat.raidDevices > 0 ? { raidDevices: entry.mdstat.raidDevices } : {}),
       }
     })
 
@@ -814,7 +896,7 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       poolName,
       lv,
       pvs,
-      bandCount: arrayEntries.length,
+      bandCount: poolBandCount(poolName, arrayEntries.length, strictConfDoc),
       partsByKernel: lsblk.partsByKernel,
       byIdMap,
       dmStatus,
@@ -861,20 +943,39 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       ?? (lsblk.lvmByDmName.get(dmName(poolName, lvName))?.mountpoint
         ? { target: lsblk.lvmByDmName.get(dmName(poolName, lvName))!.mountpoint!, source: mapperPath, fstype: 'btrfs', options: '' }
         : null)
-    const readonly = mount ? optionsReadOnly(mount.options) : false
+    // null = unknown: the mount came from lsblk because findmnt could not be
+    // read, and lsblk carries no options (INVENTED-STATE-H3).
+    const readonly: boolean | null = !mountsKnown && mount ? null : mount ? optionsReadOnly(mount.options) : false
     // §12 subvolume layout: read live from the mount's `subvol=` option — a
     // pool mounted `subvol=@data` carries the snapshot layout; a flat pool
     // (subvol=/, subvolid=5) or an unmounted pool does not. The mount is the
     // source of truth; nothing is precomputed or persisted (§5.3).
-    const subvolLayout = mount ? isSubvolLayoutMount(mount.options) : false
+    // cr3 review 3: unknown (null) when the mount came from lsblk because
+    // findmnt could not be read — lsblk carries no options, and `false` told
+    // the operator a snapshot-layout pool was a flat one to destroy.
+    const subvolLayout: boolean | null = !mountsKnown && mount ? null : mount ? isSubvolLayoutMount(mount.options) : false
     if (!mount)
       advisories.push(notMountedAdvisory(poolName))
+    if (!mountsKnown) {
+      advisories.push(`the kernel mount table could not be read (findmnt exited ${findmntRes.exitCode}) — whether '${poolName}' is mounted read-only is unknown`)
+    }
 
+    // The filesystem's usage — only a MOUNTED filesystem has one to read. A
+    // failed read is unknown (null), never 0 used / 0 free (cr3).
     let btrfs = null
+    let btrfsScrubRunning: boolean | null = false
     if (mount) {
       const usageRes = await executor.exec(BTRFS, btrfsUsageArgs(mount.target))
       if (usageRes.exitCode === 0)
         btrfs = parseBtrfsUsage(usageRes.stdout)
+      else
+        advisories.push(`the filesystem usage of '${poolName}' could not be read (btrfs filesystem usage exited ${usageRes.exitCode}) — used and free space are unknown`)
+      // Not asked while a band is CHECKING: the pool already fuses to
+      // `scrubbing` on md's own word, and the scrub route reads the btrfs pass
+      // only when no band checks (scrub.r2). Not read = null, never `false`.
+      btrfsScrubRunning = arrayEntries.some(e => e.mdstat.sync?.action === 'check')
+        ? null
+        : await readBtrfsScrubRunning(executor, mount.target)
     }
 
     // ---- Capacity (§3 — report what IS, GT-14: free space is READ) ----------
@@ -882,9 +983,12 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     const rawBytes = memberDisks.reduce((sum, d) => sum + d.usableBytes, 0)
     // usable = the actual block capacity the filesystem sits on (LV size; the
     // btrfs device size equals it when mounted) — never the band-math ideal.
-    const usableBytes = lv?.sizeBytes ?? btrfs?.deviceSizeBytes ?? 0
-    const usedBytes = btrfs?.usedBytes ?? 0
-    const freeBytes = btrfs?.freeEstimatedBytes ?? 0
+    // cr3: null when there is nothing to measure — no LV and no readable
+    // filesystem; used/free null when not mounted or the usage read failed.
+    // Never a placeholder 0.
+    const usableBytes = lv?.sizeBytes ?? btrfs?.deviceSizeBytes ?? null
+    const usedBytes = btrfs?.usedBytes ?? null
+    const freeBytes = btrfs?.freeEstimatedBytes ?? null
     // Redundancy overhead: what the member slices carry beyond each array's
     // net size (parity/mirror copies + md metadata) — from observed sizes.
     let redundancyOverheadBytes = 0
@@ -940,8 +1044,10 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
         + `resume or re-run the expansion to deliver it (the capacity is protected, just not yet usable)`,
       )
     }
-    const unprotectedWastedBytes = Math.max(0, rawBytes - usableBytes - redundancyOverheadBytes - pendingBytes)
-    const capacity: AhrCapacity = {
+    // With usable unknown the wasted remainder cannot be derived; it is not
+    // invented either — 0 claims nothing is wasted only when usable was read.
+    const unprotectedWastedBytes = usableBytes === null ? 0 : Math.max(0, rawBytes - usableBytes - redundancyOverheadBytes - pendingBytes)
+    const capacity: AhrPoolCapacity = {
       rawBytes,
       usableBytes,
       usedBytes,
@@ -1006,6 +1112,10 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     // outright — ranks above it.
     else if (offline)
       state = 'offline'
+    // INVENTED-STATE-H3: read-only is unknown — every verdict below this
+    // rung would be fused from a read that could not see.
+    else if (readonly === null)
+      state = 'unknown'
     else if (readonly)
       state = 'readonly'
     else if (anyDegraded)
@@ -1016,7 +1126,9 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       state = 'building'
     else if (anySync)
       state = 'rebuilding'
-    else if (anyCheck)
+    // The btrfs phase of a scrub (or one started outside ANAS): md says
+    // nothing about it, so the bands read idle (cr3, AHR-panel M3).
+    else if (anyCheck || btrfsScrubRunning === true)
       state = 'scrubbing'
     else state = 'healthy'
     // Keyed off the FUSED state, so the advisory exists exactly when the badge
@@ -1039,24 +1151,28 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       // `state`, whose precedence ladder lets `failed`/`offline` outrank
       // `readonly` — a UI gating the verb on the badge would hide it exactly
       // when a pool is read-only AND something else.
-      mountedReadOnly: readonly,
+      // Absent when the mount table could not be read (INVENTED-STATE-H3):
+      // the schema's "this daemon cannot tell me", never "writable".
+      ...(readonly !== null ? { mountedReadOnly: readonly } : {}),
       disks,
       arrays,
       vg: {
         name: poolName,
-        sizeBytes: vg?.sizeBytes ?? 0,
-        freeBytes: vg?.freeBytes ?? 0,
+        // null when the VG is not present (cr3) — never a placeholder 0.
+        sizeBytes: vg?.sizeBytes ?? null,
+        freeBytes: vg?.freeBytes ?? null,
         ...(vg?.uuid ? { uuid: vg.uuid } : {}),
       },
       lv: {
         name: lvName,
-        sizeBytes: lv?.sizeBytes ?? 0,
+        sizeBytes: lv?.sizeBytes ?? null,
       },
       capacity,
       state,
       subvolLayout,
       cache: cacheFacts.cache,
       advisories,
+      btrfsScrubRunning,
     }))
   }
 
@@ -1166,6 +1282,11 @@ export function buildAhrWarnings(pools: AhrPool[]): DashboardWarning[] {
       level = 'critical'
       clauses.push(AHR_READONLY_CLAUSE)
     }
+    // cr3 (INVENTED-STATE-H3): a pool whose state could not be decided is
+    // never silently healthy on the dashboard either.
+    else if (pool.state === 'unknown') {
+      clauses.push('is in an unknown state — the kernel mount table could not be read, so whether its filesystem is read-only is not known; see the Hybrid RAID view')
+    }
     else if (pool.state === 'degraded' && pool.arrays.some(a => a.state === 'degraded')) {
       clauses.push(`is degraded — ${degradedDetail(pool)}; replace the failed disk before a second failure`)
     }
@@ -1202,32 +1323,29 @@ export function buildAhrWarnings(pools: AhrPool[]): DashboardWarning[] {
  * unreadable mdstat / `--detail` — PROPAGATES as
  * {@link AhrTopologyUnreadableError} so the route marks the 'ahr' section
  * unavailable: a topology that could not be seen is never "no warnings"
- * (cr.35). Every other read error keeps its fail-open — one source's failure
- * never turns the dashboard into a 503 or a red section.
+ * (cr.35). Since cr3 every other error propagates too (the section reads
+ * unavailable, never "no warnings"); the dashboard stays a 200 either way.
  */
 export async function collectAhrWarnings(
   executor: CommandExecutor,
   intentDir?: string,
   decorate: AhrPoolDecorator = p => p,
 ): Promise<DashboardWarning[]> {
-  try {
-    const pools = await readAhrPools(executor)
-    const withIntents = await Promise.all(pools.map(async (pool): Promise<AhrPool> => {
-      try {
-        const { intent } = await readPoolIntent(pool, intentDir)
-        return decorate(withExpansionIntent(pool, intent))
-      }
-      catch {
-        return decorate(pool)
-      }
-    }))
-    return buildAhrWarnings(withIntents)
-  }
-  catch (err) {
-    if (err instanceof AhrTopologyUnreadableError)
-      throw err
-    return []
-  }
+  // cr3 review2 1: no error reads as "no warnings" — a node whose AHR read
+  // failed is not a healthy one. Every topology error propagates; the route
+  // marks the 'ahr' section unavailable. Only an intent file that cannot be
+  // read degrades — that one pool's halted-expansion card.
+  const pools = await readAhrPools(executor)
+  const withIntents = await Promise.all(pools.map(async (pool): Promise<AhrPool> => {
+    try {
+      const { intent } = await readPoolIntent(pool, intentDir)
+      return decorate(withExpansionIntent(pool, intent))
+    }
+    catch {
+      return decorate(pool)
+    }
+  }))
+  return buildAhrWarnings(withIntents)
 }
 
 // --- Dashboard pool briefs (story 11.13, AHR-DESIGN §10 revision) ------------
@@ -1252,12 +1370,17 @@ export function buildAhrPoolBriefs(pools: AhrPool[]): AhrPoolBrief[] {
     const sizeById = new Map(pool.disks.map(d => [d.id, d.sizeBytes]))
     const bands: AhrBandBrief[] = pool.arrays.map((array) => {
       // Redundant members only — a hot spare rides as a member row (memberState
-      // 'spare') but is not one of the array's data/parity slots.
-      const members = array.members.filter(m => m.memberState !== 'spare')
+      // 'spare') but is not one of the array's data/parity slots, and neither
+      // is an `mdadm --replace` target (`rebuilding`, mdstat `(R)`): the same
+      // rows the capacity math leaves out (cr3, handed by the AHR-panel review).
+      const members = array.members.filter(m => m.memberState !== 'spare' && m.memberState !== 'rebuilding')
       return {
         band: array.band,
         level: array.level,
-        memberCount: members.length,
+        // md's own slot count when mdstat carried it (cr3): during a spare
+        // failover the failed row and the row being rebuilt onto are both
+        // listed, and counting rows would read a raid5×4 as ×5.
+        memberCount: array.raidDevices ?? members.length,
         members: members.map(m => ({ id: m.disk, sizeBytes: sizeById.get(m.disk) ?? 0 })),
         // 11.19 — PURE PROJECTION: heightBytes/state/sync are already in hand on
         // the AhrArray this brief is derived from; they were simply dropped.
@@ -1273,9 +1396,14 @@ export function buildAhrPoolBriefs(pools: AhrPool[]): AhrPoolBrief[] {
     return AhrPoolBrief.parse({
       name: pool.name,
       state: pool.state,
-      usableBytes: pool.capacity.usableBytes,
-      // Used bytes are only trustworthy when btrfs usage was read (mounted).
-      ...(pool.mounted ? { usedBytes: pool.capacity.usedBytes } : {}),
+      // HANDED (cr3): the dashboard brief's usableBytes cannot say unknown yet
+      // (shared/schemas/dashboard.ts is another area's); a pool with no LV and
+      // no readable filesystem carries 0 here until it can, and the capacity
+      // card below skips usableBytes <= 0, so no percentage is invented from it.
+      usableBytes: pool.capacity.usableBytes ?? 0,
+      // Used bytes only when the pool is mounted and btrfs usage was READ
+      // (cr3: null = unknown).
+      ...(pool.mounted && pool.capacity.usedBytes !== null ? { usedBytes: pool.capacity.usedBytes } : {}),
       mountpoint: pool.mountpoint,
       mounted: pool.mounted,
       subvolLayout: pool.subvolLayout,
@@ -1326,25 +1454,18 @@ export function buildAhrCapacityWarnings(briefs: AhrPoolBrief[]): DashboardWarni
 }
 
 /**
- * Collect the dashboard AHR pool briefs from the live topology, fail-open for
- * ordinary read errors (mirrors {@link collectAhrWarnings} and every other
- * GET /v1/status source). The D12 topology-read failure PROPAGATES as
- * {@link AhrTopologyUnreadableError} so the route marks the 'ahrPools'
- * section unavailable — an empty Pools section must never read as "no AHR
- * pools" when the topology could not be seen (cr.35). Every other read error
- * still degrades this source to `[]`.
+ * Collect the dashboard AHR pool briefs from the live topology. EVERY error
+ * propagates (cr3 review2 1): the route marks the 'ahrPools' section
+ * unavailable for any throw, and an empty Pools section must never read as
+ * "no AHR pools" when the read failed — the typed
+ * {@link AhrTopologyUnreadableError} (cr.35) and any error this function does
+ * not specifically understand alike (a schema refusal, a failed read). Only
+ * a READABLE topology with no AHR arrays answers `[]`.
  */
 export async function collectAhrPoolBriefs(
   executor: CommandExecutor,
   mdadmConfPath?: string,
   decorate: AhrPoolDecorator = p => p,
 ): Promise<AhrPoolBrief[]> {
-  try {
-    return buildAhrPoolBriefs((await readAhrPools(executor, mdadmConfPath)).map(decorate))
-  }
-  catch (err) {
-    if (err instanceof AhrTopologyUnreadableError)
-      throw err
-    return []
-  }
+  return buildAhrPoolBriefs((await readAhrPools(executor, mdadmConfPath)).map(decorate))
 }

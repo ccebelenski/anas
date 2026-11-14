@@ -77,8 +77,12 @@ export function poolArrayUuids(pool: Pick<AhrPool, 'arrays'>): string[] {
  */
 export function expansionStateRefusal(pool: Pick<AhrPool, 'name' | 'state' | 'arrays'>): Refusal | null {
   const badArray = pool.arrays.find(a => a.state === 'degraded' || a.state === 'inactive' || a.state === 'failed')
-  if (!badArray && pool.state !== 'offline' && pool.state !== 'failed' && pool.state !== 'readonly')
+  if (!badArray && pool.state !== 'offline' && pool.state !== 'failed' && pool.state !== 'readonly' && pool.state !== 'unknown')
     return null
+  // cr3 (INVENTED-STATE-H3): a pool whose read-only flag could not be read is
+  // never reshaped on the strength of a read that did not see.
+  if (!badArray && pool.state === 'unknown')
+    return { status: 409, code: 'CONFLICT', message: `Cannot expand: pool '${pool.name}' is in an unknown state — the kernel mount table could not be read, so whether its filesystem is read-only is not known. Retry once it can be read. This refusal has no confirm bypass.` }
   const unreachable = pool.state === 'offline' || badArray?.state === 'inactive'
   const what = badArray
     ? `array ${pool.name}-r${badArray.band} is ${badArray.state}`

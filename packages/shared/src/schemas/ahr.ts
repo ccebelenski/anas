@@ -87,6 +87,15 @@ export type ArrayState = z.infer<typeof ArrayState>
  * as reduced-redundancy-but-functioning while the volume was in fact offline).
  */
 export const AhrPoolState = z.enum([
+  /**
+   * cr3 (2026-11-14 review, INVENTED-STATE-H3): a read the verdict depends on
+   * failed — the kernel mount table, so whether btrfs has forced the
+   * filesystem read-only cannot be known. Never fused to `healthy` from a
+   * read that could not see; the pool's advisories say which read. `failed`
+   * and `offline` still outrank it (their evidence was read). Additive: an
+   * older panel renders the word as given.
+   */
+  'unknown',
   'healthy',
   'building',
   'degraded',
@@ -227,6 +236,15 @@ export const AhrArray = z.object({
    * Optional for the version-skew ruling: an older daemon omits it.
    */
   uuid: MdUuid.optional(),
+  /**
+   * md's own count of the array's data/parity SLOTS — the `n` of mdstat's
+   * `[n/m]` (cr3, handed by the AHR-panel review). `members` lists ROWS: a
+   * hot spare `(S)`, an `mdadm --replace` target `(R)`, a failed `(F)` member
+   * and, during a spare failover, the spare being rebuilt onto (no marker at
+   * all) are rows too, so counting rows is never the slot count. Absent when
+   * mdstat carries no `[n/m]` (an inactive array) or on an older daemon.
+   */
+  raidDevices: z.number().int().positive().optional(),
 })
 export type AhrArray = z.infer<typeof AhrArray>
 
@@ -267,6 +285,25 @@ export const AhrCapacity = z.object({
 })
 export type AhrCapacity = z.infer<typeof AhrCapacity>
 
+/**
+ * A LIVE pool's capacity (cr3, 2026-11-14 review): {@link AhrCapacity} with
+ * the three filesystem figures able to say UNKNOWN. `null` means the read
+ * behind the figure could not be made — the pool is not mounted (no btrfs
+ * usage can be read), its usage read failed, or (usable) there is no LV and
+ * no mounted filesystem to measure. Never a placeholder `0`. Additive: every
+ * value an older daemon wrote still parses; an older panel renders null as
+ * blank. The planner's own previews keep {@link AhrCapacity} (always numbers).
+ */
+export const AhrPoolCapacity = AhrCapacity.extend({
+  /** Bytes available to the filesystem; null when there is no LV or mounted filesystem to read. */
+  usableBytes: z.number().int().nonnegative().nullable(),
+  /** Bytes in use on the filesystem; null when not mounted or the usage read failed. */
+  usedBytes: z.number().int().nonnegative().nullable(),
+  /** Bytes free on the filesystem; null when not mounted or the usage read failed. */
+  freeBytes: z.number().int().nonnegative().nullable(),
+})
+export type AhrPoolCapacity = z.infer<typeof AhrPoolCapacity>
+
 /** What kicked off an expansion. */
 export const AhrExpansionTrigger = z.enum(['add-disk', 'replace-disk'])
 export type AhrExpansionTrigger = z.infer<typeof AhrExpansionTrigger>
@@ -297,9 +334,9 @@ export const AhrExpansionIntent = z.object({
    */
   replacementDisk: DiskId.optional(),
   /** Capacity before the expansion (for the before → after presentation). */
-  before: AhrCapacity,
-  /** Reachable capacity after the expansion (never fresh-ideal capacity). */
-  after: AhrCapacity,
+  before: AhrPoolCapacity,
+  /** Reachable capacity after the expansion (never fresh-ideal capacity); used/free carry the live pool's (null when unknown). */
+  after: AhrPoolCapacity,
   state: AhrExpansionState,
   /**
    * The md UUIDs of the pool's band arrays when the intent was written (story
@@ -499,17 +536,20 @@ export const AhrPool = z.object({
   /** The one VG per pool (PVs are the md devices in band order). */
   vg: z.object({
     name: PoolName,
-    sizeBytes: z.number().int().nonnegative(),
-    freeBytes: z.number().int().nonnegative(),
+    /** VG size; null when the VG is not present (cr3: never a placeholder 0). */
+    sizeBytes: z.number().int().nonnegative().nullable(),
+    /** VG free space; null when the VG is not present. */
+    freeBytes: z.number().int().nonnegative().nullable(),
     /** LVM's VG UUID (story ident.3); absent when the VG is not present or on an older daemon. */
     uuid: z.string().min(1).optional(),
   }),
   /** The one LV (`<pool>-vol`) carrying the btrfs filesystem. */
   lv: z.object({
     name: z.string().min(1),
-    sizeBytes: z.number().int().nonnegative(),
+    /** LV size; null when the LV is not present (cr3: never a placeholder 0). */
+    sizeBytes: z.number().int().nonnegative().nullable(),
   }),
-  capacity: AhrCapacity,
+  capacity: AhrPoolCapacity,
   state: AhrPoolState,
   /**
    * Whether the pool carries the btrfs subvolume layout (§12): `@data`
@@ -520,8 +560,14 @@ export const AhrPool = z.object({
    * migration). Read live from the mount's `subvol=` option — the system is the
    * source of truth (§5.3); an unmounted pool cannot advertise the layout and
    * reports `false`.
+   *
+   * `null` (cr3 review 3): the kernel mount table could not be read, so the
+   * mount's `subvol=` option is unknown — never `false`, which told the
+   * operator a snapshot-layout pool "uses the pre-snapshot flat layout" and to
+   * destroy it. Comes with `state: 'unknown'`. Additive: an older panel reads
+   * null as falsy (no snapshot verbs), the safe side.
    */
-  subvolLayout: z.boolean(),
+  subvolLayout: z.boolean().nullable(),
   /**
    * The read cache (§13). Always present on a live read — `state: 'absent'`
    * with no devices when the pool has none. Optional in the SCHEMA for the
@@ -532,6 +578,18 @@ export const AhrPool = z.object({
   cache: AhrCache.optional(),
   /** Operator advisories (unlock hints, degraded-band guidance, …). */
   advisories: z.array(z.string()),
+  /**
+   * A btrfs checksum scrub is RUNNING on the pool's filesystem right now (cr3,
+   * handed by the AHR-panel review): phase 2 of the ANAS scrub, or one started
+   * outside ANAS — md says nothing about it, so the band arrays read idle.
+   * `true` running, `false` read and not running (or the pool is not mounted:
+   * no filesystem, no scrub), `null` unknown — the status read failed, or it
+   * was not asked because a band is CHECKING (the pool already reads
+   * `scrubbing` on md's word). Never idle from a read that was not made.
+   * Absent on an older daemon. A running one fuses the pool to
+   * `scrubbing` where the ladder would otherwise say `healthy`.
+   */
+  btrfsScrubRunning: z.boolean().nullable().optional(),
   /**
    * The live expansion intent when one exists (§6.2): 'running' → show the
    * job's progress; 'halted' → surface Resume/Abandon loudly. Absent when no
@@ -798,8 +856,8 @@ export type AhrExpansionZeroGain = z.infer<typeof AhrExpansionZeroGain>
  * meaning. `zeroGain` is present exactly when `usableGain` is 0.
  */
 export const AhrExpansionPlanResponse = z.object({
-  before: AhrCapacity,
-  after: AhrCapacity,
+  before: AhrPoolCapacity,
+  after: AhrPoolCapacity,
   steps: z.array(AhrExpansionStep),
   warnings: z.array(z.string()),
   /** The resulting band layout (the wizard's before → after bars). */

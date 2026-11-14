@@ -289,6 +289,8 @@ function buildExecutor(opts: { mdstat?: string, driveReplaceOf?: string, retireT
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...LSBLK_ARGS], result: { stdout: inventoryLsblkJson(), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: BY_ID_LISTING, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '2', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }, { vg_name: 'quad', pv_count: '1', lv_count: '1', vg_size: String(LV_QUAD_SIZE), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
+  // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+  executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-ao----', lv_size: String(LV_SIZE) }, { lv_name: 'quad-vol', vg_name: 'quad', lv_attr: '-wi-ao----', lv_size: String(LV_QUAD_SIZE) }] }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }, { target: '/mnt/anas-ahr/quad', source: '/dev/mapper/quad-quad--vol', fstype: 'btrfs', options: 'rw,relatime' }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: BTRFS_USAGE, stderr: '', exitCode: 0 } })
@@ -368,7 +370,7 @@ describe('AHR expansion routes (Epic 11.6)', () => {
         'lv-extend',
         'fs-grow',
       ])
-      assert.ok(data.after.usableBytes > data.before.usableBytes)
+      assert.ok(data.after.usableBytes !== null && data.before.usableBytes !== null && data.after.usableBytes > data.before.usableBytes)
       // The [3,4GiB] region has one disk → pending, stated concretely.
       assert.ok(data.after.pendingBytes > 0)
       assert.ok(data.warnings.some(w => w.includes('pending')))
@@ -586,6 +588,77 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/abandon', headers: IDENTITY_HEADERS })
       assert.equal(res.statusCode, 409)
       assert.match(res.json().error.message, /currently being driven/)
+    })
+  })
+
+  // cr3 AHR-CORE-M2 (review probe p4): the pool's OWN hot spare passed the
+  // "already a member" test (a spare is not a band member), resolved from the
+  // pool itself with no availability check, and the executor pulled the spare
+  // slice out of its band before the grow. Any disk the pool holds in another
+  // role is refused at every door that builds an approved set.
+  describe('cr3 M2: a disk the pool holds as a hot spare is never added or swapped in', () => {
+    // F (sdg) is quad's hot spare: one band-1 slice, (S) in md125.
+    const MDSTAT_SPARE = MDSTAT_BASE.replace('md125 : active raid5 sda1[3]', 'md125 : active raid5 sdg1[4](S) sda1[3]')
+    function withSpareTree(): void {
+      const tree = JSON.parse(ahrLsblkJson()) as { blockdevices: { name: string, children?: object[] }[] }
+      tree.blockdevices.find(d => d.name === 'sdg')!.children = [{ name: 'sdg1', type: 'part', size: B1_CLAMPED_2G, fstype: 'linux_raid_member', mountpoint: null, partlabel: 'quad-d5-b1', children: [] }]
+      executor.prependFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: { stdout: JSON.stringify(tree), stderr: '', exitCode: 0 } })
+    }
+
+    it('expand/plan with the spare in addDisks answers 400 naming it, with no mutation', async () => {
+      await build({ mdstat: MDSTAT_SPARE })
+      withSpareTree()
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand/plan', payload: { addDisks: [F] } })
+      assert.equal(res.statusCode, 400, res.body)
+      assert.match(res.json().error.message, new RegExp(`disk '${F}' is pool 'quad''s hot spare — detach it first`))
+      assert.deepEqual(mutatingCalls(executor), [])
+    })
+
+    it('expand with the spare answers 400 before any confirm', async () => {
+      await build({ mdstat: MDSTAT_SPARE })
+      withSpareTree()
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand', headers: IDENTITY_HEADERS, payload: { addDisks: [F] } })
+      assert.equal(res.statusCode, 400, res.body)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    })
+
+    // cr3 review 11: a member-role disk outside every band's membership (an
+    // INACTIVE band lists its members as (S) rows) was called a "hot spare".
+    it('cr3 review 11: the refusal names the disk\'s real role, never "hot spare" for a member', async () => {
+      await build({ mdstat: MDSTAT_INACTIVE })
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/plan', payload: { addDisks: [X] } })
+      assert.equal(res.statusCode, 400, res.body)
+      assert.ok(!res.json().error.message.includes('hot spare'), res.body)
+      assert.match(res.json().error.message, new RegExp(`disk '${X}' is pool 'tank''s member disk`))
+    })
+
+    it('replace onto the spare answers 400 (a spare is never promoted to a member by Replace)', async () => {
+      await build({ mdstat: MDSTAT_SPARE })
+      withSpareTree()
+      const res = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: IDENTITY_HEADERS, payload: { newDiskId: F } })
+      assert.equal(res.statusCode, 400, res.body)
+      assert.match(res.json().error.message, new RegExp(`replacement disk '${F}' is pool 'quad''s hot spare`))
+      assert.deepEqual(mutatingCalls(executor), [])
+    })
+  })
+
+  // cr3 (handed from the AHR-panel review, L7): the expansion confirm named no
+  // disk that the expansion writes over. Every introduced disk is named.
+  describe('cr3: the expand and replace confirms name every disk they overwrite', () => {
+    it('expand: the added disk is named first in the confirm warnings', async () => {
+      await build()
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand', headers: IDENTITY_HEADERS, payload: { addDisks: [W] } })
+      assert.equal(res.statusCode, 409, res.body)
+      const warnings: string[] = res.json().error.warnings
+      assert.match(warnings[0], new RegExp(`^${W} \\(4\\.01 GiB\\) will be partitioned for the pool: anything stored on it is permanently erased$`))
+      assert.equal(warnings.filter(w => w.includes('permanently erased')).length, 1, 'only the disk joining')
+    })
+
+    it('replace: the incoming disk is named', async () => {
+      await build()
+      const res = await server.inject({ method: 'POST', url: `/v1/ahr/tank/disk/${X}/replace`, headers: IDENTITY_HEADERS, payload: { newDiskId: W } })
+      assert.equal(res.statusCode, 409, res.body)
+      assert.ok((res.json().error.warnings as string[]).some(w => w.startsWith(`${W} (`) && w.includes('permanently erased')))
     })
   })
 

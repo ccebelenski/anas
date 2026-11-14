@@ -168,8 +168,8 @@ export const AhrPoolBrief = z.object({
   /** Mountpoint when mounted, else the LV device path (check `mounted`). */
   mountpoint: z.string(),
   mounted: z.boolean(),
-  /** Whether the pool carries the §12 @data/@snapshots subvolume layout. */
-  subvolLayout: z.boolean(),
+  /** Whether the pool carries the §12 @data/@snapshots subvolume layout; null = unknown (cr3: the mount table could not be read). */
+  subvolLayout: z.boolean().nullable(),
   /** Bands bottom-up, each with its RAID level + redundant members. */
   bands: z.array(AhrBandBrief),
   /** Hot spare disk(s) attached to the pool (labeled spare bay in the UI). */

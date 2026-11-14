@@ -18,7 +18,7 @@ import { LVM_MIXED_BLOCK_ARGS, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
 import { ahrDataOffsetArg, ahrDataOffsetBytes, planDiskPartitions } from './ahr-geometry.js'
 import { classifyRetiredPartitionWithReason, examineMember, mayZapRetiredDisk, readAhrPoolIdentity, requirePoolVg, retiredDiskKeptSentence } from './ahr-identity.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
-import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes, isPvUnderSized } from './ahr-layout.js'
+import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes, fmtKnownBytes, isPvUnderSized } from './ahr-layout.js'
 import { pinArrays } from './ahr-mdadm-conf.js'
 import { AHR_FINDMNT_ARGS, stripSubvolSuffix } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
@@ -347,25 +347,33 @@ async function resolveDiskNumber(executor: CommandExecutor, poolName: string, di
     if (m)
       return Number.parseInt(m[1], 10)
   }
+  // cr3 AHR-CORE-L10: a scan that could not see never reads as "no labels" —
+  // max 0 handed a joining disk `d1`, a label another member already carries.
+  // An unreadable or unparsable tree stops the step before sgdisk writes.
   let max = 0
   const r = await executor.exec(LSBLK, POOL_SCAN_LSBLK_ARGS)
-  if (r.exitCode === 0) {
-    try {
-      interface Node { partlabel?: string | null, children?: Node[] }
-      const walk = (node: Node): void => {
-        const m = node.partlabel?.match(re)
-        if (m)
-          max = Math.max(max, Number.parseInt(m[1], 10))
-        for (const child of node.children ?? [])
-          walk(child)
-      }
-      for (const dev of (JSON.parse(r.stdout) as { blockdevices?: Node[] }).blockdevices ?? [])
-        walk(dev)
-    }
-    catch {
-      // Fall through — max stays at the highest seen (0).
-    }
+  if (r.exitCode !== 0)
+    throw new Error(`cannot read the pool-wide partition labels (lsblk: ${r.stderr.trim().split('\n')[0] || `exit ${r.exitCode}`}) — the disk '${disk.kernel}' cannot be given a disk number that no other '${poolName}' disk carries; nothing was partitioned`)
+  interface Node { partlabel?: string | null, children?: Node[] }
+  let roots: Node[]
+  try {
+    const parsed = JSON.parse(r.stdout) as { blockdevices?: unknown }
+    if (!Array.isArray(parsed.blockdevices))
+      throw new Error('no blockdevices array')
+    roots = parsed.blockdevices as Node[]
   }
+  catch {
+    throw new Error(`the pool-wide partition label scan (lsblk) answered in an unexpected shape — the disk '${disk.kernel}' cannot be given a disk number that no other '${poolName}' disk carries; nothing was partitioned`)
+  }
+  const walk = (node: Node): void => {
+    const m = node.partlabel?.match(re)
+    if (m)
+      max = Math.max(max, Number.parseInt(m[1], 10))
+    for (const child of node.children ?? [])
+      walk(child)
+  }
+  for (const dev of roots)
+    walk(dev)
   return max + 1
 }
 
@@ -1355,7 +1363,7 @@ export async function executeExpansion(
     await ctx.hooks.reacquire()
   const { before, after } = input.intent
   const delivered = await readDeliveredUsableBytes(executor, ctx.pool)
-  if (delivered !== null && after.usableBytes - delivered > plannedCapacityMarginBytes(input.plan)) {
+  if (delivered !== null && after.usableBytes !== null && after.usableBytes - delivered > plannedCapacityMarginBytes(input.plan)) {
     const message
       = `the pool delivered ${fmtBytes(delivered)} of usable capacity but the plan projected `
         + `${fmtBytes(after.usableBytes)} — ${fmtBytes(after.usableBytes - delivered)} short. Every step reported `
@@ -1373,7 +1381,7 @@ export async function executeExpansion(
     executor,
     'info',
     `AHR expansion complete: ${pool.name}`,
-    `Usable capacity ${fmtBytes(before.usableBytes)} → ${fmtBytes(usableBytes)}${
+    `Usable capacity ${fmtKnownBytes(before.usableBytes)} → ${fmtKnownBytes(usableBytes)}${
       delivered === null ? ' (projected — the volume size could not be read)' : ''}.${
       pendingDelta > 0
         ? ` ${fmtBytes(after.pendingBytes)} is pending — physically present but locked until more disks cross the top band boundary (§5.2).`

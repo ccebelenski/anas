@@ -381,6 +381,27 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
     })
   })
 
+  // cr3 AHR-CORE-L10: the pool-wide label scan that numbers a joining disk
+  // used to read a FAILED lsblk as "no labels" — max 0, so the new disk was
+  // labelled d1, a number an existing member already carries.
+  describe('cr3 L10: an unreadable label scan stops the partition step before sgdisk', () => {
+    for (const [label, result] of [
+      ['lsblk exits non-zero', { stdout: '', stderr: 'lsblk: failed to access sysfs', exitCode: 32 }],
+      ['lsblk answers garbage', { stdout: 'not json', stderr: '', exitCode: 0 }],
+    ] as const) {
+      it(label, async () => {
+        const executor = world()
+        executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${W}`), result: { stdout: diskJson('sdt', SIZE_4G, []), stderr: '', exitCode: 0 } })
+        executor.addFixture({ command: LSBLK, args: ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL'], result })
+        executor.addFixture({ command: SGDISK, result: { stdout: '', stderr: '', exitCode: 0 } })
+        const outcome = await run(executor, mkPlan([B1_GROWN, B2_CONVERTED], [{ kind: 'partition', target: W }]), [X, Y, Z, W])
+        assert.equal(outcome.ok, false)
+        assert.match(outcome.error!, /cannot be given a disk number that no other 'tank' disk carries; nothing was partitioned/)
+        assert.ok(!executor.calls.some(c => c.command === SGDISK), 'no sgdisk ran')
+      })
+    }
+  })
+
   describe('array-grow', () => {
     it('is a no-op when the member is present and raid-devices is at target', async () => {
       const executor = world()

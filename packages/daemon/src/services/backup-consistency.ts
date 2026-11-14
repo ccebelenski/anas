@@ -450,6 +450,13 @@ export function deriveConsistency(
         reason: `${shown} is on a btrfs filesystem (${node.source}) that is not an ANAS AHR pool - ANAS does not snapshot filesystems it does not manage, so the backup is live`,
       }
     }
+    // cr3 (merge): null is "the mount table could not be read", not the flat layout.
+    if (pool.subvolLayout === null) {
+      return {
+        consistency: 'live',
+        reason: `the layout of AHR pool '${pool.name}' could not be read (the kernel mount table did not answer), so whether a snapshot can be taken is not known - the backup is live`,
+      }
+    }
     if (!pool.subvolLayout) {
       return {
         consistency: 'live',

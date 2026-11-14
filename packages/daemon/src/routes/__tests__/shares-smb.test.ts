@@ -1336,7 +1336,7 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     const mock = (s as unknown as { executor: MockExecutor }).executor
     const pools = await readAhrPools(mock)
     const pool = pools.find(p => p.name === 'ahr0')!
-    assert.ok(pool.capacity.freeBytes > 0, 'the fixture pool has free bytes')
+    assert.ok(pool.capacity.freeBytes !== null && pool.capacity.freeBytes > 0, 'the fixture pool has free bytes')
     const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
     const data = (detail.json() as { data: SmbShareDetail }).data
     assert.deepEqual(data.capacity, { availableBytes: pool.capacity.freeBytes })

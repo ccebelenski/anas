@@ -215,7 +215,7 @@ function addBlankBlkid(executor: MockExecutor): void {
 function acts(executor: MockExecutor): { command: string, args: string[] }[] {
   return executor.calls.filter(c =>
     !(c.command === '/usr/bin/cat' || c.command === '/usr/bin/findmnt' || c.command === '/usr/bin/lsblk' || c.command === '/usr/sbin/blkid'
-      || c.command === '/usr/bin/ls' || c.command === '/usr/sbin/lvs' || c.command === '/usr/sbin/vgs'
+      || c.command === '/usr/bin/ls' || c.command === '/usr/sbin/lvs' || c.command === '/usr/sbin/vgs' || c.command === '/usr/bin/realpath'
       || c.command === '/usr/sbin/pvs' || (c.command === '/usr/sbin/mdadm' && (c.args[0] === '--detail' || c.args[0] === '--examine'))),
   )
 }
@@ -266,7 +266,7 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
 
     // The mutation sequence, top-down (reads interleave; assert the acts).
     assert.deepEqual(acts(executor), [
-      { command: '/usr/bin/umount', args: [MOUNTPOINT] },
+      { command: '/usr/bin/umount', args: ['--', MOUNTPOINT] },
       { command: '/usr/bin/systemctl', args: ['daemon-reload'] },
       { command: '/usr/sbin/lvremove', args: ['-y', 't2/t2-vol'] },
       { command: '/usr/sbin/vgremove', args: ['-y', 't2'] },
@@ -342,7 +342,7 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
 
     const sequence = acts(executor)
     assert.deepEqual(sequence, [
-      { command: '/usr/bin/umount', args: [MOUNTPOINT] },
+      { command: '/usr/bin/umount', args: ['--', MOUNTPOINT] },
       { command: '/usr/bin/systemctl', args: ['daemon-reload'] },
       // THE fix: the cache is released before the volume can be removed.
       { command: '/usr/sbin/lvconvert', args: ['--config', 'devices/allow_mixed_block_sizes=1', '-y', '--uncache', 't2/t2-vol'] },
@@ -462,6 +462,8 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     await writeFile(fstabPath, FSTAB_SEED)
     await writeFile(confPath, '')
     const executor = new MockExecutor()
+    // cr3 AHR-CORE-L8: the disk reads answer (an unreadable one now stops the destroy).
+    addDiskReads(executor, '', JSON.stringify({ blockdevices: [] }))
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_EMPTY, stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', []), stderr: '', exitCode: 0 } })
@@ -498,6 +500,8 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     ].join('\n'))
     await writeFile(confPath, '')
     const executor = new MockExecutor()
+    // cr3 AHR-CORE-L8: the disk reads answer (an unreadable one now stops the destroy).
+    addDiskReads(executor, '', JSON.stringify({ blockdevices: [] }))
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_EMPTY, stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: {
       stdout: JSON.stringify({ filesystems: [
@@ -521,7 +525,7 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     // BOTH mounts go — pool mountpoint first, then the @snapshots sibling —
     // before the LVM teardown reads the LV.
     assert.deepEqual(
-      executor.calls.filter(c => c.command === '/usr/bin/umount').map(c => c.args[0]),
+      executor.calls.filter(c => c.command === '/usr/bin/umount').map(c => c.args.at(-1)),
       [MOUNTPOINT, SNAP_MOUNT],
     )
     assert.ok(progress.some(m => m.includes(SNAP_MOUNT) && m.includes('@snapshots')))
@@ -542,6 +546,8 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     ].join('\n'))
     await writeFile(confPath, '')
     const executor = new MockExecutor()
+    // cr3 AHR-CORE-L8: the disk reads answer (an unreadable one now stops the destroy).
+    addDiskReads(executor, '', JSON.stringify({ blockdevices: [] }))
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_EMPTY, stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: {
       stdout: JSON.stringify({ filesystems: [
@@ -563,7 +569,7 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     // The pool mountpoint is not mounted (nothing to unmount there) — but the
     // @snapshots mount is, and holding the LV open would fail the lvremove.
     assert.deepEqual(
-      executor.calls.filter(c => c.command === '/usr/bin/umount').map(c => c.args[0]),
+      executor.calls.filter(c => c.command === '/usr/bin/umount').map(c => c.args.at(-1)),
       [SNAP_MOUNT],
     )
     const fstab = await readFile(fstabPath, 'utf8')
@@ -1290,7 +1296,7 @@ describe('destroyAhrPool — a multi-segment LV is removed once, in one job (cr.
       const result = await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
       assert.deepEqual(result, { destroyed: 't2' })
       assert.deepEqual(acts(executor), [
-        { command: '/usr/bin/umount', args: [MOUNTPOINT] },
+        { command: '/usr/bin/umount', args: ['--', MOUNTPOINT] },
         { command: '/usr/bin/systemctl', args: ['daemon-reload'] },
         { command: '/usr/sbin/lvremove', args: ['-y', 't2/t2-vol'] },
         ...TEARDOWN_TAIL,
@@ -1313,5 +1319,169 @@ describe('destroyAhrPool — a multi-segment LV is removed once, in one job (cr.
       { command: '/usr/sbin/pvremove', args: ['-y', '/dev/sde1'] },
     ])
     assert.ok(executor.calls.some(c => c.command === '/usr/sbin/update-initramfs'), 'the job reached its last step')
+  })
+})
+
+/**
+ * cr3 (2026-11-14 review): the reads destroy acts on are read STRICTLY, and a
+ * mount or fstab line at a path is the pool's only by its SOURCE / spec.
+ * AHR-CORE-H1 (destroy half), AHR-CORE-L8, AHR-CORE-L9.
+ */
+describe('destroyAhrPool — cr3: failed reads stop it, and a path is not an identity', () => {
+  let dir: string
+  let fstabPath: string
+  let confPath: string
+  const progress: string[] = []
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-destroy-cr3-'))
+    fstabPath = join(dir, 'fstab')
+    confPath = join(dir, 'mdadm.conf')
+    progress.length = 0
+    await writeFile(fstabPath, FSTAB_SEED)
+    await writeFile(confPath, CONF_SEED)
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  /** The healthy mounted t2 world; `over` replaces one read's answer. */
+  function world(over: { ls?: object, lsblk?: object, findmnt?: object } = {}, mounts: object[] = [{ target: MOUNTPOINT, source: '/dev/mapper/t2-t2--vol', fstype: 'btrfs', options: 'rw' }]): MockExecutor {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+    addExamine(executor, T2_MEMBER_EXAMINE)
+    if (over.ls)
+      executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: over.ls as never })
+    if (over.lsblk)
+      executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: over.lsblk as never })
+    addDiskReads(executor, T2_BY_ID, T2_LSBLK)
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: (over.findmnt ?? { stdout: JSON.stringify({ filesystems: mounts }), stderr: '', exitCode: 0 }) as never })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', [{ lv_name: 't2-vol', vg_name: 't2', lv_attr: '-wi-ao----', lv_size: String(2 * GIB) }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: '1', lv_count: '1', vg_size: String(2 * GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', [{ pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' }]), stderr: '', exitCode: 0 } })
+    for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+    return executor
+  }
+
+  const FAIL = { stdout: '', stderr: 'read failed: I/O error', exitCode: 1 }
+
+  for (const [label, over, re] of [
+    ['L8: an unreadable block-device tree (lsblk)', { lsblk: FAIL }, /cannot read the block-device tree before destroying 't2' \(lsblk: read failed: I\/O error\)/],
+    ['L8: an unreadable /dev/disk/by-id listing', { ls: FAIL }, /cannot read \/dev\/disk\/by-id\/ before destroying 't2'/],
+    ['cr3 review 9: an lsblk that answers exit 0 in the wrong shape', { lsblk: { stdout: 'lsblk: sdd: failed to get device path\n', stderr: '', exitCode: 0 } }, /cannot read the block-device tree before destroying 't2' \(lsblk: the output is not lsblk's JSON tree\)/],
+    ['H1: an unreadable mount table (findmnt)', { findmnt: FAIL }, /cannot read the kernel mount table \(findmnt\) before destroying 't2'/],
+  ] as const) {
+    it(`${label} stops the destroy before ANY change`, async () => {
+      const executor = world(over)
+      await assert.rejects(destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }), re)
+      assert.deepEqual(acts(executor), [])
+      assert.equal(await readFile(fstabPath, 'utf8'), FSTAB_SEED)
+      assert.equal(await readFile(confPath, 'utf8'), CONF_SEED)
+    })
+  }
+
+  it('L9: an mdadm.conf that exists but cannot be read stops the destroy before ANY change (never "no pins")', async () => {
+    // A directory where the file should be: readFile fails with EISDIR — a
+    // read that could not see, not an absent file.
+    const unreadable = join(dir, 'conf-is-a-dir')
+    await mkdir(unreadable)
+    const executor = world()
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: unreadable }),
+      /cannot read .*conf-is-a-dir before destroying 't2'.*ARRAY pins could not be found/,
+    )
+    assert.deepEqual(acts(executor), [])
+  })
+
+  it('H1: a filesystem that is NOT the pool\'s mounted over it refuses before any change', async () => {
+    const executor = world({}, [
+      { target: MOUNTPOINT, source: '/dev/mapper/t2-t2--vol', fstype: 'btrfs', options: 'rw', children: [
+        { target: MOUNTPOINT, source: '/dev/sdq1', fstype: 'ext4', options: 'rw' },
+      ] },
+    ])
+    executor.prependFixture({ command: '/usr/bin/realpath', args: ['-e', '--', '/dev/sdq1'], result: { stdout: '/dev/sdq1\n', stderr: '', exitCode: 0 } })
+    executor.prependFixture({ command: '/usr/bin/realpath', args: ['-e', '--', '/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+      /a filesystem that is not 't2''s \(\/dev\/sdq1\) is mounted over pool 't2'/,
+    )
+    assert.deepEqual(acts(executor), [])
+  })
+
+  // cr3 review 6 (probe destroy-probe.test.ts): ownership was decided by the
+  // source's SPELLING; the pool's own mount listed as `/dev/dm-0[/@data]` was
+  // left "alone", the fstab line removed, and lvremove failed on every retry.
+  it('cr3 review 6: the pool\'s own mount listed as /dev/dm-0 is the pool\'s (resolved), unmounted before the fstab edit', async () => {
+    const executor = world({}, [{ target: MOUNTPOINT, source: '/dev/dm-0[/@data]', fstype: 'btrfs', options: 'rw' }])
+    executor.prependFixture({ command: '/usr/bin/realpath', args: ['-e', '--', '/dev/dm-0'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
+    executor.prependFixture({ command: '/usr/bin/realpath', args: ['-e', '--', '/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
+    await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    const umount = executor.calls.findIndex(c => c.command === '/usr/bin/umount' && c.args.at(-1) === MOUNTPOINT)
+    assert.ok(umount >= 0, progress.join(' | '))
+    assert.ok(!progress.some(m => m.includes('Leaving the mount')), progress.join(' | '))
+    assert.ok(progress.indexOf(`Unmounting ${MOUNTPOINT}`) < progress.findIndex(m => m.startsWith('Removing /etc/fstab entry')))
+  })
+
+  // cr3 review2 7 (probe d-destroy.test.ts D7/D8): the fstab edit removed the
+  // FIRST line at the pool's mountpoint whatever its spec — an operator's
+  // own line above ANAS's went, and ANAS's stayed dangling.
+  it('cr3 review2 7 (D8): with an operator line FIRST at the pool\'s path, only ANAS\'s line goes', async () => {
+    const operatorLine = `/dev/sdz1 ${MOUNTPOINT} ext4 noauto 0 0`
+    await writeFile(fstabPath, ['# static', operatorLine, `/dev/t2/t2-vol ${MOUNTPOINT} btrfs nofail 0 0`, ''].join('\n'))
+    const executor = world({}, [{ target: MOUNTPOINT, source: '/dev/mapper/t2-t2--vol[/@data]', fstype: 'btrfs', options: 'rw' }])
+    await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.equal(await readFile(fstabPath, 'utf8'), ['# static', operatorLine, ''].join('\n'))
+    assert.ok(progress.some(m => m.includes('Leaving the /etc/fstab line for /dev/sdz1')), progress.join(' | '))
+  })
+
+  it('cr3 review2 7 (D7): a foreign mount at the path and the operator\'s line first — ANAS\'s line goes, the operator\'s stays', async () => {
+    const operatorLine = `/dev/sdz1 ${MOUNTPOINT} ext4 noauto 0 0`
+    await writeFile(fstabPath, ['# static', operatorLine, `/dev/t2/t2-vol ${MOUNTPOINT} btrfs nofail 0 0`, ''].join('\n'))
+    const executor = world({}, [{ target: MOUNTPOINT, source: '/dev/sdz1', fstype: 'ext4', options: 'rw' }])
+    executor.prependFixture({ command: '/usr/bin/realpath', args: ['-e', '--', '/dev/sdz1'], result: { stdout: '/dev/sdz1\n', stderr: '', exitCode: 0 } })
+    executor.prependFixture({ command: '/usr/bin/realpath', args: ['-e', '--', '/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
+    await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.equal(await readFile(fstabPath, 'utf8'), ['# static', operatorLine, ''].join('\n'))
+    assert.ok(!executor.calls.some(c => c.command === '/usr/bin/umount'), 'the foreign mount stays')
+  })
+
+  it('cr3 review2 7: another line claims the pool\'s mountpoint and the pool has no line of its own — refused before any change', async () => {
+    const text = ['# static', `UUID=1234-abcd ${MOUNTPOINT} btrfs subvol=@data,nofail 0 0`, ''].join('\n')
+    await writeFile(fstabPath, text)
+    const executor = world()
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+      /has a line for .* with the spec UUID=1234-abcd, not 't2''s volume \/dev\/t2\/t2-vol — it cannot be told whether that line is this pool's or another filesystem's, so nothing was changed/,
+    )
+    assert.deepEqual(acts(executor), [])
+    assert.equal(await readFile(fstabPath, 'utf8'), text)
+  })
+
+  it('cr3 review 6: a device mount at the pool\'s path that cannot be resolved refuses before any change', async () => {
+    const executor = world({}, [{ target: MOUNTPOINT, source: '/dev/dm-0[/@data]', fstype: 'btrfs', options: 'rw' }])
+    executor.prependFixture({ command: '/usr/bin/realpath', result: { stdout: '', stderr: 'realpath: /dev/dm-0: No such file or directory', exitCode: 1 } })
+    await assert.rejects(
+      destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+      /the mount at .* \(\/dev\/dm-0\[\/@data\]\) could not be identified as 't2''s or another device's/,
+    )
+    assert.deepEqual(acts(executor), [])
+    assert.equal(await readFile(fstabPath, 'utf8'), FSTAB_SEED)
+  })
+
+  it('H1: a foreign mount and fstab line at the @snapshots PATH are left alone; the pool\'s own go', async () => {
+    const foreignSnapLine = `//nas/snaps ${SNAP_MOUNT} cifs nofail 0 0`
+    await writeFile(fstabPath, `${FSTAB_SEED}${foreignSnapLine}\n`)
+    const executor = world({}, [
+      { target: MOUNTPOINT, source: '/dev/mapper/t2-t2--vol[/@data]', fstype: 'btrfs', options: 'rw' },
+      { target: SNAP_MOUNT, source: '//nas/snaps', fstype: 'cifs', options: 'rw' },
+    ])
+    await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.deepEqual(executor.calls.filter(c => c.command === '/usr/bin/umount').map(c => c.args), [['--', MOUNTPOINT]])
+    assert.ok(progress.includes(`Leaving the mount at ${SNAP_MOUNT} alone: its source //nas/snaps is not a volume of 't2'`), progress.join(' | '))
+    const fstab = await readFile(fstabPath, 'utf8')
+    assert.ok(fstab.includes(foreignSnapLine), 'the foreign line at the @snapshots path stays')
+    assert.ok(!fstab.includes('/dev/t2/t2-vol'), 'the pool\'s own line goes')
   })
 })

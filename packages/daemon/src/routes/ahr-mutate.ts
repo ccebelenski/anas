@@ -17,11 +17,13 @@ import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { ahrnameClaim, diskClaim, guardCheck, guardConfirm, guarded, mountClaim, sendRefusal } from '../safety/guard.js'
 import { changeAhrMountpoint, createAhrPool, remountAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
-import { readAhrPoolLine } from '../services/ahr-fstab.js'
+import { inventoryUnreadableRefusal, isDiskStatusUnknown } from '../services/ahr-disk-recheck.js'
+import { isAhrPoolOwnLine, readAhrPoolLine } from '../services/ahr-fstab.js'
 import { ahrGuard, ahrPoolHeldByLun } from '../services/ahr-guard.js'
 import { ahrNameOccupancy, isIntentStaleForPool } from '../services/ahr-identity.js'
 import { defaultAhrIntentDir, readIntent } from '../services/ahr-intent.js'
-import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
+import { AhrPlanError, fmtBytes, fmtKnownBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
+import { foreignProgramHook, foreignProgramRefusal } from '../services/ahr-mdadm-conf.js'
 import { mirrorReconcileArray, mirrorReconcileArrayRefusal, mirrorReconcileEvidence, mirrorReconcileWarnings, reconcileMirrorBand } from '../services/ahr-mirror-reconcile.js'
 import { parityRewriteArray, parityRewriteArrayRefusal, parityRewriteEvidence, parityRewriteWarnings, rewriteBandParity } from '../services/ahr-parity-rewrite.js'
 import { ahrLvPath, ahrMountBase } from '../services/ahr-paths.js'
@@ -152,6 +154,9 @@ const REPAIR_REFUSED_STATES: Record<string, string> = {
   offline: 'is offline: the volume is not assembled, so there is nothing to repair',
   failed: 'has failed: there is no array left to reconstruct from',
   readonly: 'is read-only: a repair writes the reconstructed block back through md',
+  // cr3 (INVENTED-STATE-H3): the mount table could not be read, so whether
+  // btrfs forced the filesystem read-only is not known — never a write on it.
+  unknown: 'is in an unknown state: the kernel mount table could not be read, so whether the filesystem is read-only is not known',
 }
 
 /**
@@ -404,7 +409,9 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       return undefined
     const fstabText = await readConfig(fstabPath)
     for (const entry of parseFstab(fstabText)) {
-      if (entry.spec === ahrLvPath(poolName) && entry.mountpoint.startsWith('/'))
+      // cr3 AHR-CORE-M3: the pool's OWN line — never the @snapshots line,
+      // which carries the same LV spec.
+      if (isAhrPoolOwnLine(entry, poolName) && entry.mountpoint.startsWith('/'))
         return entry.mountpoint
     }
     return undefined
@@ -550,6 +557,8 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     selected: (AhrLayoutDisk & { model: string | null })[]
     /** One sentence per requested disk that is not (empty: all eligible). */
     problems: string[]
+    /** Requested disks whose inventory row could not be read (cr3: 409 `unreadable`, never "not available"). */
+    unreadable: string[]
   }
 
   /** The fresh layout for a selection, or the 400 that says why it cannot be built. */
@@ -581,6 +590,11 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
    * disk is composable, the layout is buildable.
    */
   function createSpec(req: { name: string, tier: AhrCreateRequest['tier'], disks: string[], mountpoint?: string }): GuardSpec<NewAhrPool> {
+    // cr3 AHR-CORE-H1: the path the job will mount at — typed, or the default
+    // <base>/<name>. The collision gates and the mount lock run on THIS path,
+    // never only on a typed one: another pool moved to /mnt/anas-ahr/<name>
+    // is exactly as occupied as a path the operator typed.
+    const effectiveMountpoint = req.mountpoint ?? join(ahrMountBase(mountBase), req.name)
     return {
       operation: 'ahr.create',
       object: {
@@ -593,11 +607,16 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
           // sizes, which the LVM stack must be told to accept (issue #8).
           const inventory = await reads.once('inventory', () => collectDisks(executor, diskIdentityCache))
           const problems: string[] = []
+          const unreadable: string[] = []
           const selected: NewAhrPool['selected'] = []
           for (const id of req.disks) {
             const disk = inventory.find(d => d.id === id)
             if (!disk) {
               problems.push(`disk '${id}' not found`)
+              continue
+            }
+            if (isDiskStatusUnknown(disk)) {
+              unreadable.push(id)
               continue
             }
             if (!isComposableDisk(disk)) {
@@ -608,7 +627,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
             }
             selected.push({ id: disk.id, usableBytes: disk.size, logicalSectorSize: disk.logicalSectorSize, model: disk.model })
           }
-          return { name: req.name, selected, problems }
+          return { name: req.name, selected, problems, unreadable }
         },
         id: async o => ({ name: o.name }),
         unbound: () => `Could not bind the create of AHR pool '${req.name}'`,
@@ -647,15 +666,30 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
             ? { status: 409, code: 'CONFLICT', message: `the name '${o.name}' is already in use on this node: ${occupied.join('; ')}. Choose another name` }
             : null
         },
-        // The mountpoint override (§2.6) must not shadow or fight anything
-        // that exists — at the route and again right before the wipe.
-        ...(req.mountpoint !== undefined ? mountpointCollisionGates<NewAhrPool>(req.mountpoint) : []),
+        // cr3 AHR-CORE-M4: a foreign mdadm PROGRAM hook refuses the create
+        // HERE (and again in the job, before the wipe) — the hook install
+        // that refuses it runs only after the arrays are built.
+        async () => {
+          let program: string | null
+          try {
+            program = await foreignProgramHook(mdadmConfPath)
+          }
+          catch (err) {
+            return { status: 503, code: 'UNAVAILABLE', message: `cannot read mdadm.conf (${err instanceof Error ? err.message : String(err)}) — refusing to create a pool whose monitor hook could not be checked` }
+          }
+          return program !== null ? { status: 409, code: 'CONFLICT', message: foreignProgramRefusal(program) } : null
+        },
+        // The mountpoint (§2.6) — the override or the default — must not
+        // shadow or fight anything that exists: at the route and again right
+        // before the wipe (cr3 AHR-CORE-H1: the default ran no gate at all).
+        ...mountpointCollisionGates<NewAhrPool>(effectiveMountpoint),
         // cr.52s-f F6: the mountpoint — typed or the default <base>/<name>,
         // the same path the job will build — must sit inside an EXISTING
         // parent (the service creates the leaf through its opened parent and
         // never a chain; refusing a missing parent here puts the 409 before
         // the confirm and the wipe, and the job's re-run before the build).
-        mountpointParentGate<NewAhrPool>(req.mountpoint ?? join(ahrMountBase(mountBase), req.name)),
+        mountpointParentGate<NewAhrPool>(effectiveMountpoint),
+        async o => o.unreadable.length > 0 ? inventoryUnreadableRefusal(o.unreadable) : null,
         async o => o.problems.length > 0
           ? { status: 400, code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${o.problems.join('; ')}` }
           : null,
@@ -670,7 +704,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         disks.sort()
         return [
           ahrnameClaim(req.name),
-          ...(req.mountpoint !== undefined ? [mountClaim(normalizeMountpointPath(req.mountpoint))] : []),
+          mountClaim(normalizeMountpointPath(effectiveMountpoint)),
           ...disks.map(id => diskClaim(id)),
         ]
       },
@@ -893,6 +927,15 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       object: guard.poolView(name, 'a remount'),
       gates: [
         async (pool) => {
+          // cr3 review 5: an ABSENT `mountedReadOnly` (the mount table could
+          // not be read) is not "read-write" — say what could not be read.
+          if (pool.mounted && pool.mountedReadOnly === undefined) {
+            return {
+              status: 503,
+              code: 'UNAVAILABLE',
+              message: `ANAS could not read the kernel mount table, so whether AHR pool '${pool.name}' is read-only is not known — nothing was done. Retry once it can be read`,
+            }
+          }
           if (!pool.mountedReadOnly) {
             return pool.mounted
               ? {
@@ -1086,7 +1129,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // that will be unmounted (cr.31 D3): the job drops the fstab line that
     // names the volume, and that is what the sentence says.
     const warnings = [
-      `Pool '${name}' (${fmtBytes(pool.capacity.usableBytes)} usable) will be permanently destroyed. Every array, partition, and all data is erased`,
+      `Pool '${name}' (${fmtKnownBytes(pool.capacity.usableBytes)} usable) will be permanently destroyed. Every array, partition, and all data is erased`,
       pool.mounted
         ? `The filesystem at '${pool.mountpoint}' will be unmounted: anything serving from it (shares, backups, mounts) stops working`
         : `The pool's filesystem is not mounted. An /etc/fstab line for its volume '${ahrLvPath(name)}' is removed with the pool`,
@@ -1234,7 +1277,9 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         async pool => (pool.state === 'scrubbing' || pool.state === 'building' || pool.state === 'rebuilding' || pool.state === 'expanding')
           ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' is ${pool.state}: a scrub would thrash the running operation. Wait for it to finish` }
           : null,
-        async pool => pool.mountpoint.startsWith('/dev/')
+        // The pool's `mounted` FACT (cr3: states over string matching), with
+        // the device-path mountpoint kept as the second door it always was.
+        async pool => (!pool.mounted || pool.mountpoint.startsWith('/dev/'))
           ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' is not mounted: btrfs scrub needs the filesystem online` }
           : null,
         // The other half of the selfheal.6 pair: a scrub cannot start
@@ -1399,6 +1444,12 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
           const claims = await guard.reads.claims(reads)
           for (const file of pool.repair.files) {
             const held = await heldByLun(claims, { path: file.path })
+            // cr3 (handed by the iSCSI area, 12b): a claim whose sessions could
+            // not be READ (`connectedInitiatorsUnknown`) is not "no session" —
+            // a repair writes through md under a file a guest may hold.
+            if (held && (held as { connectedInitiatorsUnknown?: boolean }).connectedInitiatorsUnknown === true) {
+              return { status: 409, code: 'CONFLICT', reason: 'unreadable', message: `'${file.path}' backs an iSCSI LUN whose initiator sessions could not be read, so whether a guest is using it right now is not known. A repair writes a reconstructed block through md; it is refused until the sessions can be read` }
+            }
             if (held && held.connectedInitiators.length > 0) {
               const { error } = lunSessionRefusal(file.path, held)
               return { status: 409, code: 'CONFLICT', reason: error.reason, message: error.message }

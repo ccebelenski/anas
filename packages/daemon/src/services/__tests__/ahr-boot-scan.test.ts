@@ -117,6 +117,68 @@ describe('ahr-boot-scan (GT-8 recovery + orphaned intents + reshape observation)
     assert.match(warnings[0].args[4], /vgchange -ay ahr0/)
   })
 
+  // cr3 AHR-CORE-L7: inactive-all-spares is also an incremental assembly
+  // still waiting for a slow disk. The ladder lets udev settle and reads
+  // mdstat again first; an array that assembled meanwhile is left alone.
+  it('cr3 L7: an array that assembles once udev settles is NOT force-started', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], results: [
+      { stdout: MDSTAT_INACTIVE_SPARES, stderr: '', exitCode: 0 },
+      { stdout: MDSTAT_HEALTHY_RESHAPE.replace(/\n\s+\[====>[^\n]*/, ''), stderr: '', exitCode: 0 },
+    ] })
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/udevadm', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const lines: string[] = []
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.recovered, [])
+    assert.ok(!executor.calls.some(c => c.command === MDADM && (c.args[0] === '--run' || c.args[0] === '--readwrite')), 'no force-start')
+    assert.ok(executor.calls.some(c => c.command === '/usr/bin/udevadm' && c.args[0] === 'settle'))
+    assert.ok(lines.some(l => l.includes('state=assembled-after-settle')), lines.join('\n'))
+  })
+
+  // cr3 review 8: an unguarded settle threw out of the whole boot scan.
+  it('cr3 review 8: a settle that times out skips THIS array\'s ladder and the scan carries on', async () => {
+    const executor = new MockExecutor()
+    mdstatFixture(executor, MDSTAT_INACTIVE_SPARES)
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/udevadm', timesOut: {} })
+    const lines: string[] = []
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.recovered, [])
+    assert.ok(!executor.calls.some(c => c.command === MDADM && c.args[0] === '--run'), 'never started degraded on an unknown')
+    assert.ok(lines.some(l => l.includes('reason=settle-or-reread-failed')), lines.join('\n'))
+  })
+
+  it('cr3 review 8: an array gone from mdstat after the settle is logged as vanished', async () => {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], results: [
+      { stdout: MDSTAT_INACTIVE_SPARES, stderr: '', exitCode: 0 },
+      { stdout: 'Personalities : [raid5]\nunused devices: <none>\n', stderr: '', exitCode: 0 },
+    ] })
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/udevadm', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const lines: string[] = []
+    await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.ok(lines.some(l => l.includes('state=vanished-after-settle')), lines.join('\n'))
+    assert.ok(!executor.calls.some(c => c.command === MDADM && c.args[0] === '--run'))
+  })
+
+  it('cr3 L7: the ladder\'s notification says what was read — never a reshape nobody read', async () => {
+    const executor = new MockExecutor()
+    mdstatFixture(executor, MDSTAT_INACTIVE_SPARES)
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgchange', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    await ahrBootScan(executor, { intentDir: dir, log: () => {} })
+    const body = executor.calls.find(c => c.command === '/usr/bin/perl' && c.args[2] === 'warning')!.args[4]
+    assert.match(body, /assembled INACTIVE with every member listed as a spare, and stayed so after udev settled/)
+    assert.ok(!body.includes('after an interrupted degraded reshape'), body)
+  })
+
   it('(a) never force-starts an UNPINNED array — a foreign `media-r1` survives the boot ladder (ident.3)', async () => {
     // A hand-built mirror that happens to be named like an AHR band, inactive
     // after the same power loss: no pin, no VG. Not ANAS's to `--run`.
@@ -423,6 +485,8 @@ function buildTankExecutor(mdstat: string): MockExecutor {
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...LSBLK_ARGS], result: { stdout: tankInventoryLsblkJson(), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: TANK_BY_ID, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '2', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
+  // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+  executor.addFixture({ command: '/usr/sbin/pvs', args: ['--reportformat', 'json', '--units', 'b', '--nosuffix', '-o', '+dev_size'], result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-ao----', lv_size: String(LV_SIZE) }] }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: TANK_BTRFS, stderr: '', exitCode: 0 } })

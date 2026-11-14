@@ -1,7 +1,7 @@
 import type { Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -14,7 +14,7 @@ import { LSBLK_ARGS } from '../../parsers/lsblk.js'
 import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { cacheRecoveryNotification, poolOfCacheLabel } from '../../services/ahr-cache-state.js'
-import { AHR_CACHE_LSBLK_ARGS } from '../../services/ahr-cache.js'
+import { AHR_CACHE_LSBLK_ARGS, CACHE_PV_IDENTITY_ARGS } from '../../services/ahr-cache.js'
 import { writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
@@ -104,6 +104,9 @@ const RW_OPTIONS = 'rw,relatime,space_cache=v2,subvolid=256,subvol=/@data'
 function ok(stdout: string) {
   return { stdout, stderr: '', exitCode: 0 }
 }
+
+/** The cache PV's LVM UUID, as `pvs -o pv_uuid` and `blkid -p` print it. */
+const CACHE_PV_UUID = 'Kc8Wd2-Xq1Y-0bZr-Hn3T-p9Lm-Qs4V-Ue7Rfa'
 
 type World = 'failed' | 'absent' | 'bandsdown' | 'readonly' | 'idlepull' | 'lvmstale' | 'healthy' | 'sweepfail'
 
@@ -279,6 +282,15 @@ function buildExecutor(world: World, opts: { lvconvertFails?: boolean } = {}): M
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: ok(lvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/lvs', args: ['--reportformat', 'json', '--units', 'b', '--nosuffix'], result: ok(lvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/pvs', args: [...PVS_ARGS], result: ok(pvsJson(world)) })
+  // cr3 (cache-event): the cache PVs' own identity — pvs with pv_uuid, then
+  // blkid -p on the named device. 'sweepfail' is now "the identity read is
+  // unreadable": no evidence either way.
+  executor.addFixture({ command: '/usr/sbin/pvs', args: [...CACHE_PV_IDENTITY_ARGS], result: world === 'sweepfail'
+    ? { stdout: '', stderr: '  Global lock failed', exitCode: 5 }
+    : ok(JSON.stringify({ report: [{ pv: (JSON.parse(pvsJson(world)) as { report: [{ pv: { pv_name: string, vg_name: string }[] }] }).report[0].pv.map(r => ({ pv_name: r.pv_name, vg_name: r.vg_name, pv_uuid: r.pv_name === '/dev/sds1' ? CACHE_PV_UUID : 'MdPv00-0000-0000-0000-0000-0000-000000' })) }] })) })
+  executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sds1'], result: cacheDiskPresent(world)
+    ? ok(`/dev/sds1: UUID="${CACHE_PV_UUID}" VERSION="LVM2 001" TYPE="LVM2_member" USAGE="raid" PART_ENTRY_NAME="tank-cache1"\n`)
+    : { stdout: '', stderr: '', exitCode: 2 } })
   executor.addFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: ok(DM_STATUS[world]) })
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: ok(JSON.stringify({
     filesystems: [{ target: MOUNTPOINT, source: `/dev/mapper/${DM_NAME}`, fstype: 'btrfs', options: world === 'readonly' ? RO_OPTIONS : RW_OPTIONS }],
@@ -617,15 +629,20 @@ describe('the udev rung — the IDLE pull (ahrcache.1 review)', () => {
     )
   })
 
-  it('dm HEALTHY and LVM still names the PV, but no disk carries the slice: the sweep is the evidence', async () => {
+  // cr3 review2 3 (the coordinator's ruling — the unattended rungs act only
+  // on what ANAS made): was "the sweep is the evidence", a 202 and an uncache.
+  // A NAMED PV whose device is gone cannot be read for its label, so it cannot
+  // be proven the cache — it could be an operator's own PV, and the recovery
+  // runs `vgreduce --removemissing`. A logged 200 no-op; LVM reports the gone
+  // device as [unknown] (ground truth, LVM 2.03.31), which IS the evidence.
+  it('dm HEALTHY and LVM still NAMES a gone PV: its label cannot be read, so nothing runs unattended — a 200 saying so', async () => {
     await build('lvmstale')
     const res = await postEvent()
-    assert.equal(res.statusCode, 202, res.body)
-    const job = await waitForJob(jobQueue, res.json().job.id)
-    assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.equal(lvconverts().length, 1)
-    // The sweep is this route's own read — the body only named the slice.
-    assert.ok(executor.calls.some(c => c.command === '/usr/bin/lsblk' && c.args.join(' ') === AHR_CACHE_LSBLK_ARGS.join(' ')))
+    assert.equal(res.statusCode, 200, res.body)
+    assert.equal(res.json().data.recovered, false)
+    assert.match(res.json().data.detail, /could not be read \(\/dev\/sds1 is gone/)
+    assert.equal(lvconverts().length, 0)
+    assert.ok(executor.calls.some(c => c.command === '/usr/sbin/blkid' && c.args.join(' ') === '-p /dev/sds1'))
   })
 
   it('a spurious event over a HEALTHY cache whose slice is still there is a 200 no-op', async () => {
@@ -638,11 +655,138 @@ describe('the udev rung — the IDLE pull (ahrcache.1 review)', () => {
     assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0)
   })
 
-  it('an unreadable label sweep is no evidence: a 200, nothing run', async () => {
+  it('an unreadable cache-identity read is no evidence: a 200, nothing run (cr3: was the label sweep)', async () => {
     await build('sweepfail')
     const res = await postEvent()
     assert.equal(res.statusCode, 200)
     assert.equal(res.json().data.recovered, false)
+    assert.equal(lvconverts().length, 0)
+  })
+
+  // cr3 (core review, the cache-event door): ANY disk with a `<pool>-cache<n>`
+  // label going away fires the event. A `failed` cache state that rests only
+  // on a dmsetup status that could not be READ (the GT-23 asymmetry) is no
+  // evidence: the event re-asks dm and acts only on its failure word, or on
+  // the sweep finding the cache slice gone.
+  it('cr3: an UNREADABLE dmsetup over a cache whose slice is still there is a 200 no-op — never an uncache', async () => {
+    await build('healthy')
+    executor.prependFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: { stdout: '', stderr: 'Command failed.', exitCode: 1 } })
+    const res = await postEvent()
+    assert.equal(res.statusCode, 200, res.body)
+    assert.equal(res.json().data.recovered, false)
+    assert.equal(lvconverts().length, 0)
+  })
+
+  it('cr3: an unreadable dmsetup with the cache device GONE ([unknown]) still recovers — its absence is the evidence', async () => {
+    await build('idlepull')
+    executor.prependFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: { stdout: '', stderr: 'Command failed.', exitCode: 1 } })
+    const res = await postEvent()
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(lvconverts().length, 1)
+  })
+
+  it('cr3: a STALE `tank-cache1` slice on another disk never hides the loss of the live cache device', async () => {
+    // cr3 review2 3: the live device's loss in LVM's own shape ([unknown]).
+    await build('idlepull')
+    // An earlier cache disk (detach keeps its slice) is still attached as sdz
+    // and carries the same GPT label: the label sweep found it and answered
+    // "the cache is here". The identity probe asks the live PV's device.
+    const tree = JSON.parse(ahrLsblkJson('idlepull')) as { blockdevices: object[] }
+    tree.blockdevices.push({ name: 'sdz', type: 'disk', size: 2 * GIB, fstype: null, mountpoint: null, partlabel: null, children: [
+      { name: 'sdz1', type: 'part', size: GIB, fstype: 'LVM2_member', mountpoint: null, partlabel: 'tank-cache1' },
+    ] })
+    executor.prependFixture({ command: '/usr/bin/lsblk', args: [...AHR_CACHE_LSBLK_ARGS], result: ok(JSON.stringify(tree)) })
+    executor.prependFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(`${byIdListing('idlepull')}lrwxrwxrwx 1 root root 9 Sep 24 20:00 ata-STALE_SSD -> ../../sdz\n`) })
+    const res = await postEvent()
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(lvconverts().length, 1)
+  })
+
+  it('cr3: a cache PV whose name now probes as ANOTHER PV on a slice labelled for this pool\'s cache is gone', async () => {
+    await build('healthy')
+    executor.prependFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sds1'], result: ok('/dev/sds1: UUID="Other0-0000-0000-0000-0000-0000-000000" TYPE="LVM2_member" PART_ENTRY_NAME="tank-cache1"\n') })
+    const res = await postEvent()
+    assert.equal(res.statusCode, 202, res.body)
+  })
+
+  // cr3 review2 3 (the coordinator's ruling, pinned): an operator's own PV in
+  // the pool's VG whose device vanished reads [unknown] beside the healthy
+  // cache. The recovery's `vgreduce --removemissing` would drop the
+  // operator's PV record with nobody present: no argv at all.
+  it('cr3 review2 3: an OPERATOR\'s extra PV in the VG whose device vanished — no argv', async () => {
+    await build('healthy')
+    const rows = [
+      { pv_name: '/dev/md127', vg_name: 'tank', pv_size: String(LV_SIZE), pv_free: '0', dev_size: String(LV_SIZE + 2 * MIB), pv_uuid: 'MdPv00-0000-0000-0000-0000-0000-000000' },
+      { pv_name: '/dev/sds1', vg_name: 'tank', pv_size: String(CACHE_PV_SIZE), pv_free: '0', dev_size: String(CACHE_PV_SIZE + 3 * MIB), pv_uuid: CACHE_PV_UUID },
+      { pv_name: '[unknown]', vg_name: 'tank', pv_size: String(GIB), pv_free: String(GIB), dev_size: '0', pv_uuid: 'OpPv00-0000-0000-0000-0000-0000-000000' },
+    ]
+    executor.prependFixture({ command: '/usr/sbin/pvs', args: [...PVS_ARGS], result: ok(JSON.stringify({ report: [{ pv: rows }] })) })
+    executor.prependFixture({ command: '/usr/sbin/pvs', args: [...CACHE_PV_IDENTITY_ARGS], result: ok(JSON.stringify({ report: [{ pv: rows.map(r => ({ pv_name: r.pv_name, vg_name: r.vg_name, pv_uuid: r.pv_uuid })) }] })) })
+    const res = await postEvent()
+    if (res.statusCode === 202)
+      await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(res.statusCode, 200, res.body)
+    for (const never of ['/usr/sbin/lvconvert', '/usr/sbin/vgreduce'])
+      assert.ok(!executor.calls.some(c => c.command === never), `${never} must not run`)
+  })
+
+  // cr3 review defect 1 (probe `cache-event-probe.test.ts`): a BAND's PV
+  // reading [unknown] was counted as the missing cache; with the cache SSD
+  // present and healthy a stale-slice event ran an unattended uncache.
+  it('cr3 review 1: a two-band pool with band 2 [unknown] and the cache present — no uncache', async () => {
+    await build('healthy')
+    const MDSTAT2 = `Personalities : [raid1]\nmd127 : active raid1 sdr1[1] sdq1[0]\n      2096128 blocks super 1.2 [2/2] [UU]\n\nmd126 : active raid1 sdr2[1] sdq2[0]\n      2096128 blocks super 1.2 [2/2] [UU]\n\nunused devices: <none>\n`
+    const pvRows = [
+      { pv_name: '/dev/md127', vg_name: 'tank', pv_size: String(LV_SIZE), pv_free: '0', dev_size: String(LV_SIZE + 2 * MIB), pv_uuid: 'MdPv00-0000-0000-0000-0000-0000-000000' },
+      { pv_name: '[unknown]', vg_name: 'tank', pv_size: String(LV_SIZE), pv_free: '0', dev_size: '0', pv_uuid: 'MdPv11-1111-1111-1111-1111-1111-111111' },
+      { pv_name: '/dev/sds1', vg_name: 'tank', pv_size: String(CACHE_PV_SIZE), pv_free: '0', dev_size: String(CACHE_PV_SIZE + 3 * MIB), pv_uuid: CACHE_PV_UUID },
+    ]
+    executor.prependFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: ok(MDSTAT2) })
+    executor.prependFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md126'], result: ok(MD_EXPORT.replace('tank-r1', 'tank-r2').replace('MD_UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa', 'MD_UUID=bbbbbbbb:bbbbbbbb:bbbbbbbb:bbbbbbbb')) })
+    executor.prependFixture({ command: '/usr/sbin/pvs', args: [...PVS_ARGS], result: ok(JSON.stringify({ report: [{ pv: pvRows }] })) })
+    executor.prependFixture({ command: '/usr/sbin/pvs', args: [...CACHE_PV_IDENTITY_ARGS], result: ok(JSON.stringify({ report: [{ pv: pvRows.map(r => ({ pv_name: r.pv_name, vg_name: r.vg_name, pv_uuid: r.pv_uuid })) }] })) })
+    // Both bands pinned, as ANAS pins every array it builds — band 2 is the
+    // pool's own even though its PV reads [unknown].
+    const conf = join(dir, 'mdadm.conf')
+    await writeFile(conf, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\nARRAY /dev/md/tank-r2 metadata=1.2 UUID=bbbbbbbb:bbbbbbbb:bbbbbbbb:bbbbbbbb\n')
+    process.env.ANAS_MDADM_CONF = conf
+    try {
+      const res = await postEvent()
+      if (res.statusCode === 202)
+        await waitForJob(jobQueue, res.json().job.id)
+      assert.equal(res.statusCode, 200, res.body)
+      assert.equal(lvconverts().length, 0)
+    }
+    finally {
+      delete process.env.ANAS_MDADM_CONF
+    }
+  })
+
+  // cr3 review defect 2: a blkid that COULD NOT SEE (the captured exit 2 +
+  // `Permission denied` line, exit 8) or that timed out read as "missing".
+  for (const [label, fixture] of [
+    ['exit 2 with Permission denied (captured shape)', { result: { stdout: '', stderr: 'blkid: error: /dev/sds1: Permission denied\n', exitCode: 2 } }],
+    ['exit 8 (ambivalent)', { result: { stdout: '', stderr: '', exitCode: 8 } }],
+    ['a timeout', { timesOut: {} }],
+  ] as const) {
+    it(`cr3 review 2: a present cache whose blkid probe gives ${label} — a 200 no-op, never an uncache or a 500`, async () => {
+      await build('healthy')
+      executor.prependFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sds1'], ...fixture })
+      const res = await postEvent()
+      assert.equal(res.statusCode, 200, res.body)
+      assert.equal(lvconverts().length, 0)
+    })
+  }
+
+  it('cr3 review 2: a pvs identity read that times out — a 200 no-op', async () => {
+    await build('healthy')
+    executor.prependFixture({ command: '/usr/sbin/pvs', args: [...CACHE_PV_IDENTITY_ARGS], timesOut: {} })
+    const res = await postEvent()
+    assert.equal(res.statusCode, 200, res.body)
     assert.equal(lvconverts().length, 0)
   })
 
@@ -707,5 +851,11 @@ describe('the recovery notification body (one home, three surfaces)', () => {
     const { title, body } = cacheRecoveryNotification({ pool: 'tank', device: null, readOnly: false, reason: 'missing' })
     assert.equal(title, 'AHR read cache missing: tank')
     assert.match(body, /was missing when pool 'tank' was activated/)
+  })
+
+  it('cr3: a read-only flag that could not be read is SAID, never left out as "writable"', () => {
+    const { body } = cacheRecoveryNotification({ pool: 'tank', device: null, readOnly: null, reason: 'failed' })
+    assert.match(body, /Whether the I\/O error forced the filesystem READ-ONLY could not be read/)
+    assert.ok(!body.includes('writes are stopped'))
   })
 })

@@ -108,7 +108,8 @@ export async function shareAvailableBytes(executor: CommandExecutor, path: strin
       const n = Number(r.stdout.trim())
       return Number.isInteger(n) && n >= 0 ? n : undefined
     }
-    return target.poolRecord.capacity.freeBytes
+    // cr3: null (unmounted, or the usage read failed) is a missing suggestion, never 0.
+    return target.poolRecord.capacity.freeBytes ?? undefined
   }
   catch {
     return undefined
@@ -219,6 +220,9 @@ export async function resolveSelfService(
   const target = await resolveSelfServiceTarget(executor, path)
   if (!target)
     throw new Error(`'${path}' is not on a ZFS dataset or an AHR pool — there are no snapshots to expose`)
+  // cr3 (merge): null is "the mount table could not be read", not the flat layout.
+  if (target.kind === 'ahr' && target.poolRecord.subvolLayout === null)
+    throw new Error(`the layout of pool '${target.pool}' could not be read (the kernel mount table did not answer), so whether it holds snapshots is not known - nothing was changed; try again`)
   if (target.kind === 'ahr' && !target.poolRecord.subvolLayout) {
     throw new Error(`pool '${target.pool}' predates the snapshot layout — Previous Versions needs @snapshots`)
   }

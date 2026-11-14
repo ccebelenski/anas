@@ -283,6 +283,17 @@ describe('POST /v1/ahr/:name/remount (ahrcache.1 slice 2)', () => {
     return server.inject({ method: 'POST', url: '/v1/ahr/tank/remount', headers })
   }
 
+  // cr3 review 5: an absent `mountedReadOnly` (findmnt unreadable) was read
+  // as false and refused with "is mounted read-write".
+  it('cr3 review 5: an unreadable mount table says so — never "mounted read-write"', async () => {
+    await build('ro')
+    executor.prependFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: '', stderr: 'findmnt: timeout', exitCode: 1 } })
+    const res = await post()
+    assert.equal(res.statusCode, 503, res.body)
+    assert.match(res.json().error.message, /could not read the kernel mount table, so whether AHR pool 'tank' is read-only is not known/)
+    assert.ok(!res.body.includes('mounted read-write'))
+  })
+
   it('401s without identity headers', async () => {
     await build('ro')
     const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/remount' })

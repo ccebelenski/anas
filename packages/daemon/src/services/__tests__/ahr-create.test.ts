@@ -72,6 +72,10 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     // live arrays), no labels, no VG of the new name.
     executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: 'Personalities : []\nunused devices: <none>\n', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/lsblk', args: ['-J', '-o', 'NAME,PARTLABEL'], result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
+    // cr3 AHR-CORE-H1: the rollback's teardown reads the mount table STRICTLY
+    // (an unreadable one stops it) — a real node always answers; nothing is
+    // mounted in these worlds.
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
     okOnly(executor, [
       '/usr/sbin/wipefs',
       '/usr/sbin/sgdisk',
@@ -641,6 +645,103 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
         assert.ok(!executor.calls.some(c => c.command === never), `${never} must not touch the foreign VG`)
       assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
     })
+
+    // cr3 AHR-CORE-H1 (review probe p1): another pool `bar` was moved to this
+    // create's DEFAULT path — mounted there, its line in fstab. The create
+    // reaches its fstab step and refuses (hasMount); the rollback used to
+    // unmount whatever was at the path and remove EVERY line there — bar's. It
+    // now unmounts only a filesystem whose source is this pool's LV and removes
+    // only the lines this job wrote: bar's mount and line survive.
+    it('H1: a rollback never unmounts or un-fstabs ANOTHER pool at the default path', async () => {
+      const mp = join(mountBase, 't3')
+      await mkdir(mp)
+      const barLine = `/dev/bar/bar-vol ${mp} btrfs subvol=@data,nofail 0 0`
+      await writeFile(fstabPath, `${FSTAB_SEED}${barLine}\n`)
+      const executor = t3Executor([
+        { command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: JSON.stringify({ filesystems: [{ target: mp, source: '/dev/mapper/bar-bar--vol[/@data]', fstype: 'btrfs', options: 'rw' }] }), stderr: '', exitCode: 0 } },
+        // cr3 review 6: the rollback resolves both device paths — bar's LV and
+        // this pool's are different dm nodes.
+        { command: '/usr/bin/realpath', args: ['-e', '--', '/dev/mapper/bar-bar--vol'], result: { stdout: '/dev/dm-1\n', stderr: '', exitCode: 0 } },
+        { command: '/usr/bin/realpath', args: ['-e', '--', '/dev/t3/t3-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } },
+      ])
+
+      await assert.rejects(create(executor), /already in \/etc\/fstab[\s\S]*rolled back/)
+
+      // The create's own top-level mount was taken off by the create itself
+      // (`umount -- <mp>` in its finally); the ROLLBACK unmounted nothing.
+      assert.ok(!rollbackSteps().some(m => m.startsWith('Unmounting')), `rollback unmounted: ${rollbackSteps().join(' | ')}`)
+      assert.ok(rollbackSteps().some(m => m.includes(`Leaving the mount at ${mp} alone`)))
+      assert.equal(executor.calls.filter(c => c.command === '/usr/bin/umount').length, 1)
+      assert.equal(await readFile(fstabPath, 'utf8'), `${FSTAB_SEED}${barLine}\n`, 'bar\'s line survives byte for byte')
+    })
+
+    it('H1: a rollback after its own fstab write removes exactly that line, never a stale line of the same LV', async () => {
+      // A stale line for the same LV spec at ANOTHER path (left by hand from an
+      // earlier pool of this name) is not this job's: only the line written
+      // by this attempt goes.
+      const stale = `/dev/t3/t3-vol /srv/old-t3 btrfs nofail 0 0`
+      await writeFile(fstabPath, `${FSTAB_SEED}${stale}\n`)
+      const executor = t3Executor([
+        // The final pool mount (after the fstab write) fails; the top-level
+        // carve mount before it succeeds.
+        { command: '/usr/bin/mount', results: [
+          { stdout: '', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: 'mount: wrong fs type', exitCode: 32 },
+        ] },
+      ])
+
+      await assert.rejects(create(executor), /wrong fs type[\s\S]*rolled back/)
+      const after = await readFile(fstabPath, 'utf8')
+      assert.ok(after.includes(stale), 'the stale line is not this job\'s and stays')
+      assert.ok(!after.includes(join(mountBase, 't3')), 'the line this job wrote is gone')
+      assert.ok(rollbackSteps().includes(`Removing the /etc/fstab entry this job wrote for ${join(mountBase, 't3')}`))
+    })
+
+    it('H1: the rollback unmounts the pool when the mount on top of the path IS its own LV', async () => {
+      const mp = join(mountBase, 't3')
+      const executor = t3Executor([
+        // The final pool mount (after the fstab write) answers an error.
+        { command: '/usr/bin/mount', results: [
+          { stdout: '', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: 'mount: timed out', exitCode: 32 },
+        ] },
+        // The kernel did mount it despite the error exit: the source is the
+        // pool's own LV, so the rollback takes it off.
+        { command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: JSON.stringify({ filesystems: [{ target: mp, source: '/dev/t3/t3-vol[/@data]', fstype: 'btrfs', options: 'rw' }] }), stderr: '', exitCode: 0 } },
+      ])
+      await assert.rejects(create(executor), /timed out[\s\S]*rolled back/)
+      assert.ok(rollbackSteps().includes(`Unmounting ${mp}`))
+      assert.deepEqual(executor.calls.filter(c => c.command === '/usr/bin/umount').at(-1)!.args, ['--', mp])
+    })
+  })
+
+  // cr3 AHR-CORE-M4 (review probe p3): a foreign PROGRAM line in mdadm.conf
+  // made every create fail at the hook install — AFTER the disks were wiped
+  // and the arrays built. The job now reads it before the first wipe.
+  it('M4: a foreign mdadm PROGRAM hook refuses the create before ANY disk is touched', async () => {
+    await writeFile(confPath, 'MAILADDR root\nPROGRAM /usr/local/sbin/site-raid-alert\n')
+    const executor = creationExecutor()
+    await assert.rejects(
+      createAhrPool(executor, { name: 't2', tier: 'ahr1', disks: [{ id: BIG, usableBytes: 3 * GIB }, { id: SMALL, usableBytes: 2 * GIB }] }, m => progress.push(m), { fstabPath, mdadmConfPath: confPath, mountBase }),
+      (err: Error) => {
+        assert.match(err.message, /PROGRAM line pointing at '\/usr\/local\/sbin\/site-raid-alert'.*nothing was touched/)
+        assert.ok(!err.message.includes('rolled back'), 'nothing to roll back')
+        return true
+      },
+    )
+    for (const never of ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/sbin/mdadm'])
+      assert.ok(!executor.calls.some(c => c.command === never), `${never} must not run`)
+    assert.equal(await readFile(confPath, 'utf8'), 'MAILADDR root\nPROGRAM /usr/local/sbin/site-raid-alert\n')
+  })
+
+  it('M4: ANAS\'s own PROGRAM hook already in place is no refusal', async () => {
+    await writeFile(confPath, 'PROGRAM /usr/local/bin/anas-md-event\n')
+    const executor = creationExecutor()
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t2-r1'], result: { stdout: `MD_NAME=t2-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/sdx1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/ls', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const result = await createAhrPool(executor, { name: 't2', tier: 'ahr1', disks: [{ id: BIG, usableBytes: 3 * GIB }, { id: SMALL, usableBytes: 2 * GIB }] }, m => progress.push(m), { fstabPath, mdadmConfPath: confPath, mountBase })
+    assert.equal(result.created, 't2')
   })
 
   // cr.52s-f F6: the service-side half of the no-chain rule (the route gate is

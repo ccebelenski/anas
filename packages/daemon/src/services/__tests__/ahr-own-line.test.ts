@@ -140,3 +140,91 @@ describe('AHR re-mounts use the pool\'s own fstab line as stored (cr.52s-a, revi
     assert.equal((await readAhrPoolLine(join(dir, 'missing-fstab'), 'tank')).kind, 'unreadable')
   })
 })
+
+/**
+ * cr3 AHR-CORE-M3 (review probe p5): the Previous Versions `@snapshots` line
+ * carries the pool's own LV spec. After create → enable Previous Versions →
+ * Change mountpoint, it comes FIRST in the file, and every reader that took
+ * "the first line with the LV spec" took it: the Remount verb and the snapshot
+ * rollback mounted the POOL `ro,subvol=@snapshots`, and a second move carried
+ * the @snapshots line away instead of the pool's.
+ */
+describe('cr3 M3: the @snapshots line is never the pool\'s own line', () => {
+  let dir: string
+  let mp: string
+  let fstabPath: string
+  const SNAP_LINE = '/dev/tank/tank-vol /mnt/anas-ahr-snapshots/tank btrfs ro,nofail,subvol=@snapshots 0 0'
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-own-line-m3-'))
+    mp = join(dir, 'tank')
+    await mkdir(mp)
+    fstabPath = join(dir, 'fstab')
+    // The order a Change mountpoint leaves: @snapshots first, the pool's line appended.
+    await writeFile(fstabPath, `UUID=abc / ext4 errors=remount-ro 0 1\n${SNAP_LINE}\n/dev/tank/tank-vol ${mp} btrfs ${OPERATOR_OPTIONS} 0 0\n`)
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('readAhrPoolLine picks the pool\'s line, not the @snapshots line before it', async () => {
+    const line = await readAhrPoolLine(fstabPath, 'tank')
+    assert.equal(line.kind === 'line' ? line.entry.mountpoint : line.kind, mp)
+  })
+
+  it('a @snapshots line ALONE is no pool line (none, not the snapshot mount)', async () => {
+    await writeFile(fstabPath, `${SNAP_LINE}\n`)
+    assert.equal((await readAhrPoolLine(fstabPath, 'tank')).kind, 'none')
+  })
+
+  it('the Remount verb mounts the pool with its own options, never ro,subvol=@snapshots', async () => {
+    const executor = okExecutor()
+    await remountAhrPool(executor, { name: 'tank', mountpoint: mp, subvolLayout: true }, () => {}, { fstabPath })
+    assert.equal(poolMountOptions(executor, mp), OPERATOR_OPTIONS)
+  })
+
+  it('the snapshot rollback remounts the pool with its own options', async () => {
+    const executor = okExecutor()
+    await rollbackAhrSnapshot(executor, mkPool(mp), 'good', () => {}, { runtimeDir: dir, fstabPath })
+    assert.equal(poolMountOptions(executor, mp), OPERATOR_OPTIONS)
+  })
+
+  it('a second Change mountpoint moves the pool\'s line and leaves the @snapshots line where it is', async () => {
+    const executor = okExecutor()
+    const target = join(dir, 'moved')
+    // The pool is UNMOUNTED here, so the line is found by spec alone — the
+    // shape where the @snapshots line used to win.
+    await changeAhrMountpoint(executor, { name: 'tank', mountpoint: '/dev/tank/tank-vol', mounted: false, subvolLayout: true }, target, () => {}, { fstabPath })
+    const text = await readFile(fstabPath, 'utf8')
+    assert.ok(text.includes(SNAP_LINE), 'the @snapshots line is untouched')
+    assert.match(text, new RegExp(`/dev/tank/tank-vol ${target} btrfs ${OPERATOR_OPTIONS} 0 0`))
+    assert.ok(!text.includes(` ${mp} `), 'the pool\'s old line moved')
+  })
+})
+
+// cr3 (INVENTED-STATE class): the Remount verb VERIFIES that the pool is
+// writable again by reading the mount table. A table that could not be read
+// used to answer "not read-only" and the verb reported success it never saw.
+describe('cr3: a remount the mount table cannot verify is never reported writable', () => {
+  let dir: string
+  let mp: string
+  let fstabPath: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-remount-verify-'))
+    mp = join(dir, 'tank')
+    await mkdir(mp)
+    fstabPath = join(dir, 'fstab')
+    await writeFile(fstabPath, `/dev/tank/tank-vol ${mp} btrfs ${OPERATOR_OPTIONS} 0 0\n`)
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('an unreadable findmnt after the mount fails the verb, naming why', async () => {
+    const executor = okExecutor()
+    executor.prependFixture({ command: FINDMNT, result: { stdout: '', stderr: 'findmnt: timeout', exitCode: 1 } })
+    await assert.rejects(
+      remountAhrPool(executor, { name: 'tank', mountpoint: mp, subvolLayout: true }, () => {}, { fstabPath }),
+      /mounted again, but the kernel mount table could not be read to verify it is writable/,
+    )
+  })
+})

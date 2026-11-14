@@ -221,6 +221,21 @@ function reportRows<K extends string, T>(json: string, key: K): T[] {
 }
 
 /** Parse `pvs --reportformat json` output. */
+/**
+ * Did an lvm report command answer in its JSON report shape, with a `key`
+ * section (cr3)? The parsers below read garbage as no rows — "no VG", "no LV"
+ * — so a reader that must not invent absence checks the shape first.
+ */
+export function isLvmReport(json: string, key: 'pv' | 'vg' | 'lv'): boolean {
+  try {
+    const root = JSON.parse(json) as { report?: unknown }
+    return Array.isArray(root.report) && root.report.some(section => section !== null && typeof section === 'object' && Array.isArray((section as Record<string, unknown>)[key]))
+  }
+  catch {
+    return false
+  }
+}
+
 export function parsePvsReport(json: string): LvmPv[] {
   return reportRows<'pv', RawPv>(json, 'pv')
     .filter(r => typeof r.pv_name === 'string')

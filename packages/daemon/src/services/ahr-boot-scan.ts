@@ -5,20 +5,25 @@ import type { LvmPv } from '../parsers/lvm-report.js'
 import type { GuardSpec } from '../safety/guard.js'
 import type { NamedMdArray } from './ahr-identity.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
+import { readFile } from 'node:fs/promises'
 import { mountOptionTokens } from '../parsers/fstab.js'
-import { parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
+import { isLvmReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
+import { getProgram, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
+import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { guardCheck, guarded, GuardRefusalError } from '../safety/guard.js'
 import { IdentityMismatchError } from '../safety/stable-id.js'
 import { cachedVgNames, notifyCacheRecoveryFailed, recoverFailedAhrCache } from './ahr-cache.js'
 import { resumeExpansion } from './ahr-expand-resume.js'
 import { defaultAhrFstabPath, mountAhrPool, readAhrPoolLine } from './ahr-fstab.js'
 import { ahrGuard } from './ahr-guard.js'
-import { isIntentStale, isOwnedArray, normalizeMdUuid, pinnedUuids, poolPvNames, readAhrPoolIdentity, readMdadmConfDoc, readNamedMdArrays } from './ahr-identity.js'
+import { isIntentStale, isOwnedArray, normalizeMdUuid, pinnedUuids, poolPvNames, readAhrPoolIdentity, readMdadmConfDoc, readNamedMdArrays, resolveMdadmConfPath } from './ahr-identity.js'
 import { defaultAhrIntentDir, listIntents, writeIntent } from './ahr-intent.js'
+import { ANAS_MD_EVENT_HOOK, installProgramHook } from './ahr-mdadm-conf.js'
 import { isSubvolLayoutMount } from './ahr-snapshots.js'
 import { AhrTopologyUnreadableError, readAhrPools } from './ahr-topology.js'
 import { mountTargetRefusal } from './mounts.js'
 import { pveNotify } from './pve-notify.js'
+import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
 
 /**
  * AHR daemon-start scan (Epic 11.6, docs/AHR-DESIGN.md §5.1/§5.3/§8, GT-8) —
@@ -78,6 +83,8 @@ import { pveNotify } from './pve-notify.js'
  *      cache it tells the operator the cache went unchecked (cr.61).
  */
 
+const CAT = '/usr/bin/cat'
+const SYSTEMCTL = '/usr/bin/systemctl'
 const MDADM = '/usr/sbin/mdadm'
 const VGCHANGE = '/usr/sbin/vgchange'
 const PVS = '/usr/sbin/pvs'
@@ -127,6 +134,132 @@ export interface BootScanReport {
    * an earlier pool of the same name. Left alone: never halted, never driven.
    */
   staleIntents: string[]
+  /**
+   * The md hook re-wire (cr3): what the pass decided about ANAS's mdadm.conf
+   * PROGRAM line. Optional so an older reader of the report is unaffected.
+   */
+  mdHook?: MdHookOutcome
+}
+
+/** What the md hook re-wire found and did (cr3). One word, logged with its detail. */
+export type MdHookOutcome
+  = | 'installed' // pools are ANAS's, no PROGRAM line: ANAS's hook was written
+    | 'present' // ANAS's own line is already there
+    | 'foreign' // another PROGRAM line — never replaced
+    | 'opted-out' // ANAS's line is COMMENTED OUT: the operator's deliberate choice
+    | 'no-pools' // no AHR pool this daemon identifies as its own
+    | 'unreadable' // the topology or mdadm.conf could not be read: unknown is no reason to edit
+    | 'failed' // the edit itself failed (logged; never fails the boot scan)
+
+/**
+ * ANAS's own PROGRAM line, commented out by the operator
+ * (`#PROGRAM /usr/local/bin/anas-md-event`) — in the spellings mdadm accepts
+ * for the live line (cr3 review2 4): case-insensitive, the keyword abbreviated
+ * to three or more letters (`#prog`), a trailing `# note`, CRLF.
+ */
+const COMMENTED_ANAS_HOOK_RE = /^[\t ]*#[\t ]*pro(?:g(?:r(?:am?)?)?)?[\t ]+\/usr\/local\/bin\/anas-md-event(?:[\t ]+#[^\n]*|[\t ]*\r?)$/im
+
+/**
+ * The md hook re-wire (cr3, moved here from the installer by the
+ * coordinator's decision): the uninstaller removes ANAS's own PROGRAM line
+ * (so it never points at a deleted binary); after a reinstall on a node with
+ * surviving AHR pools nothing put it back — `installProgramHook` ran only at
+ * pool create — and md events for those pools silently stopped reaching ANAS.
+ *
+ * At daemon start, after the md view is read: when this node has at least
+ * one AHR pool the daemon identifies AS ITS OWN (the md pass's `isOwnedArray`
+ * — the pinned array UUIDs or the VG's PVs, the one identity rule `readAhrPools`
+ * also applies; never a name pattern)
+ * and mdadm.conf carries no PROGRAM line, the same surgical, atomic edit pool
+ * create makes is made (`installProgramHook`), then `systemctl try-restart
+ * mdmonitor.service` so a monitor already running reads it (try-restart: a
+ * monitor that is not running is not started). No `update-initramfs`: the
+ * initramfs copy of mdadm.conf serves early-boot ASSEMBLY, and the monitor
+ * runs from the root filesystem — a PROGRAM-only change does not concern it.
+ *
+ * Nothing is edited when: there is no such pool; ANAS's line is present; a
+ * FOREIGN PROGRAM line exists (logged, named); ANAS's line is commented out
+ * (the operator's opt-out — logged); mdadm.conf or the topology could not be
+ * read (unknown is not a reason to edit). Never throws.
+ */
+export async function rewireMdHook(
+  executor: CommandExecutor,
+  opts: {
+    mdadmConfPath?: string
+    log: (line: string) => void
+    /**
+     * The arrays the boot scan's md pass identified as ANAS's own (pinned
+     * UUID, or a PV of the pool's VG — `isOwnedArray`, the one rule); `null`
+     * when that md view could not be read.
+     */
+    ownedArrays: { pool: string, band: number, kernelName: string }[] | null
+  },
+): Promise<MdHookOutcome> {
+  const { log } = opts
+  try {
+    if (opts.ownedArrays === null) {
+      log('ahr.boot md-hook=unchanged reason=topology-unreadable')
+      return 'unreadable'
+    }
+    if (opts.ownedArrays.length === 0)
+      return 'no-pools'
+    const confPath = resolveMdadmConfPath(opts.mdadmConfPath)
+    let text: string
+    try {
+      text = await readFile(confPath, 'utf8')
+    }
+    catch (err) {
+      log(`ahr.boot md-hook=unchanged reason=conf-unreadable path=${confPath} detail=${err instanceof Error ? err.message : String(err)}`)
+      return 'unreadable'
+    }
+    const program = getProgram(parseMdadmConfDoc(text))
+    if (program === ANAS_MD_EVENT_HOOK)
+      return 'present'
+    if (program !== undefined) {
+      log(`ahr.boot md-hook=unchanged reason=foreign-program program=${program} — mdadm allows one PROGRAM line and ANAS never replaces one it does not own`)
+      return 'foreign'
+    }
+    if (COMMENTED_ANAS_HOOK_RE.test(text)) {
+      log(`ahr.boot md-hook=unchanged reason=operator-opt-out — ANAS's PROGRAM line is commented out in ${confPath}`)
+      return 'opted-out'
+    }
+    // An EDIT needs the whole stack, not a pin alone: an ARRAY line in the
+    // ANAS form is something an operator can write by hand for their own
+    // `backup-r1` (the installer-review case), so the array must also be a PV
+    // of the VG named for its pool — the md → LVM shape only ANAS builds. A
+    // pvs that cannot be read is unknown: no edit.
+    const pvsRes = await executor.exec(PVS, PVS_ARGS)
+    // cr3 review2 6: exit 0 in the wrong shape is as unreadable as a failure.
+    if (pvsRes.exitCode !== 0 || !isLvmReport(pvsRes.stdout, 'pv')) {
+      log(`ahr.boot md-hook=unchanged reason=pvs-unreadable exit=${pvsRes.exitCode}${pvsRes.exitCode === 0 ? ' shape=not-a-pv-report' : ''}`)
+      return 'unreadable'
+    }
+    const pvs = parsePvsReport(pvsRes.stdout)
+    const pools = [...new Set(opts.ownedArrays
+      .filter(a => [`/dev/${a.kernelName}`, `/dev/md/${a.pool}-r${a.band}`].some(n => poolPvNames(pvs, a.pool).has(n)))
+      .map(a => a.pool))]
+    if (pools.length === 0) {
+      log(`ahr.boot md-hook=unchanged reason=no-full-stack arrays=${opts.ownedArrays.map(a => `${a.pool}-r${a.band}`).join(',')} — no array is a PV of its pool's volume group`)
+      return 'no-pools'
+    }
+    await installProgramHook(ANAS_MD_EVENT_HOOK, confPath)
+    // The line is written; a monitor restart that fails is logged with it —
+    // the next mdmonitor start reads the line either way.
+    let restarted: string
+    try {
+      const restart = await executor.exec(SYSTEMCTL, ['try-restart', 'mdmonitor.service'])
+      restarted = restart.exitCode === 0 ? 'ok' : `exit-${restart.exitCode}`
+    }
+    catch (err) {
+      restarted = `failed(${err instanceof Error ? err.message : String(err)})`
+    }
+    log(`ahr.boot md-hook=installed pools=${pools.join(',')} path=${confPath} mdmonitor-try-restart=${restarted}`)
+    return 'installed'
+  }
+  catch (err) {
+    log(`ahr.boot md-hook=failed detail=${err instanceof Error ? err.message : String(err)}`)
+    return 'failed'
+  }
 }
 
 /**
@@ -193,6 +326,9 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
   // pool — the fail-closed direction. An ABSENT /proc/mdstat is honestly "no
   // md arrays" (cr.33e) and the reader returns empty for it.
   let namedArrays: NamedMdArray[]
+  // The pools the md pass identifies as ANAS's own — the md hook re-wire's
+  // evidence (cr3); null when the md view could not be read.
+  let ownedArrays: { pool: string, band: number, kernelName: string }[] | null = []
   try {
     namedArrays = await readNamedMdArrays(executor)
   }
@@ -200,6 +336,7 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
     const read = err instanceof AhrTopologyUnreadableError ? err.command : 'md view'
     log(`ahr.boot md-arrays=unreadable read=${read} detail=${err instanceof Error ? err.message : String(err)}`)
     namedArrays = []
+    ownedArrays = null
   }
   const vgActivated = new Set<string>()
   for (const arr of namedArrays) {
@@ -218,6 +355,7 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
       log(`ahr.boot array=${label} kernel=${md.kernelName} uuid=${detail.uuid ?? 'unknown'} action=ignored reason=not-pinned-not-in-vg`)
       continue
     }
+    ownedArrays?.push({ pool: named.pool, band: named.band, kernelName: md.kernelName })
 
     // Classify this array's health for the (b) re-attach gate. Inactive OR
     // count-degraded (activeDevices < raidDevices) OR any faulted member ⇒
@@ -232,6 +370,37 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
       // unpinned inactive array is exactly the shape a foreign one has.
       if (detail.uuid === null || !pinned.has(normalizeMdUuid(detail.uuid))) {
         log(`ahr.boot array=${label} state=inactive-all-spares action=skipped reason=not-pinned`)
+        continue
+      }
+      // cr3 AHR-CORE-L7: inactive with every member `(S)` is ALSO what an
+      // incremental assembly still waiting for a slow disk looks like, and
+      // `--run` would start that array degraded, dropping the late member.
+      // Let udev finish delivering the members first, then read mdstat again:
+      // an array that assembled on its own is not this ladder's.
+      // cr3 review 8: neither read may throw out of the boot scan (the other
+      // arrays, the cache rung and the re-attach would all be skipped), and a
+      // settle or a re-read that did not answer is unknown — never a reason
+      // to start the array degraded.
+      let now: ReturnType<typeof parseMdstat>[number] | undefined
+      try {
+        await executor.exec(UDEVADM, udevSettleArgs(), { timeoutMs: UDEVADM_SETTLE_BUDGET_MS })
+        const again = await executor.exec(CAT, MDSTAT_CAT_ARGS)
+        if (again.exitCode !== 0) {
+          log(`ahr.boot array=${label} state=inactive-all-spares action=skipped reason=mdstat-unreadable-after-settle exit=${again.exitCode}`)
+          continue
+        }
+        now = parseMdstat(again.stdout).find(a => a.kernelName === md.kernelName)
+      }
+      catch (err) {
+        log(`ahr.boot array=${label} state=inactive-all-spares action=skipped reason=settle-or-reread-failed detail=${err instanceof Error ? err.message : String(err)}`)
+        continue
+      }
+      if (now === undefined) {
+        log(`ahr.boot array=${label} state=vanished-after-settle action=none`)
+        continue
+      }
+      if (now.active) {
+        log(`ahr.boot array=${label} state=assembled-after-settle action=none`)
         continue
       }
       log(`ahr.boot array=${label} state=inactive-all-spares action=recovery-ladder`)
@@ -253,9 +422,12 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
         executor,
         'warning',
         `AHR boot recovery: ${label}`,
-        `Array ${label} assembled INACTIVE after an interrupted degraded reshape (all members listed as spares — GT-8). `
-        + `ANAS ran the recovery ladder: mdadm --run (array started, degraded), mdadm --readwrite (reshape resumes from `
-        + `its kernel checkpoint), vgchange -ay ${named.pool}. Replace the failed disk once the reshape completes.`,
+        // cr3 AHR-CORE-L7: say what was READ — inactive, every member a
+        // spare, still so after udev settled — never a reshape nobody read.
+        `Array ${label} assembled INACTIVE with every member listed as a spare, and stayed so after udev settled — the shape `
+        + `GT-8 recorded after a power loss during a degraded reshape. ANAS ran the recovery ladder: mdadm --run (array `
+        + `started, degraded), mdadm --readwrite (an interrupted reshape resumes from its kernel checkpoint), vgchange -ay `
+        + `${named.pool}. Check the array in the Hybrid RAID view and replace any failed disk once md is idle.`,
       )
       report.recovered.push(label)
       continue
@@ -527,6 +699,9 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
     await pveNotify(executor, 'warning', `AHR expansion interrupted: ${pool}`, haltBody(pool, outcome.message))
     report.haltedIntents.push(pool)
   }
+
+  // ---- (e): the md hook re-wire (cr3) — never fails the scan --------------
+  report.mdHook = await rewireMdHook(executor, { mdadmConfPath: opts.mdadmConfPath, log, ownedArrays })
 
   return report
 }

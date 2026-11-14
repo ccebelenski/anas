@@ -161,6 +161,8 @@ function makeExecutor(opts: { breakAhr?: boolean, mdstat?: string } = {}): MockE
   mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: ok(ahrFixture('mdadm-export-r2.txt')) })
   mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok(ahrFixture('lsblk-ahr0.json')) })
   mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(ahrFixture('lvm-vgs.json')) })
+  // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+  mock.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(ahrFixture('lvm-lvs.json')) })
   mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok(ahrFixture('findmnt-ahr0.json')) })
   mock.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: ok(ahrFixture('btrfs-usage.txt')) })

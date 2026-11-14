@@ -7,6 +7,7 @@ import type { GuardSpec } from '../safety/guard.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrSpareRequest, DiskId, isComposableDisk, PoolName } from '@anas/shared'
 import { guardCheck, guardConfirm, guarded, sendRefusal } from '../safety/guard.js'
+import { inventoryUnreadableRefusal, isDiskStatusUnknown } from '../services/ahr-disk-recheck.js'
 import { projectExistingBands } from '../services/ahr-expand-exec.js'
 import { ahrGuard } from '../services/ahr-guard.js'
 import { fmtBytes } from '../services/ahr-layout.js'
@@ -114,6 +115,9 @@ export async function ahrSpareRoutes(server: FastifyInstance, opts: AhrSpareRout
         async ({ disk }) => {
           if (!disk)
             return { status: 400, code: 'VALIDATION_ERROR', message: `disk '${diskId}' not found in the inventory` }
+          // cr3: an inventory row that could not be read is not "not available".
+          if (isDiskStatusUnknown(disk))
+            return inventoryUnreadableRefusal([diskId])
           if (!isComposableDisk(disk)) {
             return { status: 400, code: 'VALIDATION_ERROR', message: disk.handsOff
               ? `disk '${diskId}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`

@@ -254,7 +254,8 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
     // tank-r1 is ANAS-pinned (story ident.3 — a pool's arrays are its own by
     // their pinned UUIDs).
     process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
-    await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\n')
+    // cr3 md hook re-wire: the conf as a pool create leaves it — the pin AND ANAS's PROGRAM line.
+    await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\nPROGRAM /usr/local/bin/anas-md-event\n')
     // cr.52r D3: the cache-recover rung mounts a DOWN pool DIRECTLY through the
     // pool's REAL mountpoint, which it reads from the pool's OWN fstab line
     // (the topology can only report the LV device path while unmounted). The
@@ -512,7 +513,8 @@ describe('ahr-boot-scan branch (d) — the rung is a job with its keys (cr.38)',
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-cr38-boot-cache-'))
     process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
-    await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\n')
+    // cr3 md hook re-wire: the conf as a pool create leaves it — the pin AND ANAS's PROGRAM line.
+    await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\nPROGRAM /usr/local/bin/anas-md-event\n')
   })
   afterEach(async () => {
     delete process.env.ANAS_MDADM_CONF
@@ -593,7 +595,8 @@ describe('ahr-boot-scan branch (d) — the skips the rung must not keep silent o
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-cr61-boot-cache-'))
     process.env.ANAS_MDADM_CONF = join(dir, 'mdadm.conf')
-    await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\n')
+    // cr3 md hook re-wire: the conf as a pool create leaves it — the pin AND ANAS's PROGRAM line.
+    await writeFile(process.env.ANAS_MDADM_CONF, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa\nPROGRAM /usr/local/bin/anas-md-event\n')
   })
   afterEach(async () => {
     delete process.env.ANAS_MDADM_CONF

@@ -6,7 +6,9 @@ import type { AhrLayoutDisk } from '../services/ahr-layout.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { AhrLayoutPreviewRequest, isComposableDisk, PoolName } from '@anas/shared'
+import { refusalBody } from '../safety/guard.js'
 import { withAhrCreateStatus } from '../services/ahr-create-status.js'
+import { inventoryUnreadableRefusal, isDiskStatusUnknown } from '../services/ahr-disk-recheck.js'
 import { readPoolIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
 import { AhrTopologyUnreadableError, readAhrPools, withExpansionIntent } from '../services/ahr-topology.js'
@@ -148,6 +150,7 @@ export async function ahrRoutes(
     // exclusions are safety-critical, not cosmetic).
     const inventory = await collectDisks(executor, diskIdentityCache)
     const problems: string[] = []
+    const unreadable: string[] = []
     // logicalSectorSize rides along so the preview can label a mixed 4Kn/512e
     // selection (issue #8) — the composer's live feedback is where the operator
     // should learn about it, long before anything is wiped.
@@ -158,6 +161,10 @@ export async function ahrRoutes(
         problems.push(`disk '${id}' not found`)
         continue
       }
+      if (isDiskStatusUnknown(disk)) {
+        unreadable.push(id)
+        continue
+      }
       if (!isComposableDisk(disk)) {
         problems.push(disk.handsOff
           ? `disk '${id}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`
@@ -165,6 +172,12 @@ export async function ahrRoutes(
         continue
       }
       selected.push({ id: disk.id, usableBytes: disk.size, logicalSectorSize: disk.logicalSectorSize })
+    }
+    if (unreadable.length > 0) {
+      // cr3: an inventory row that could not be read is not the request's fault.
+      const refusal = inventoryUnreadableRefusal(unreadable)
+      reply.code(refusal.status)
+      return refusalBody(refusal)
     }
     if (problems.length > 0) {
       reply.code(400)

@@ -1,9 +1,11 @@
+import type { MountEntry } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { FindmntNode } from '../parsers/findmnt.js'
 import type { ByIdMap } from '../parsers/lsblk.js'
 import type { LsblkIndex, PartInfo } from './ahr-topology.js'
 import { parseByIdToKernel, parseDiskByIdListing } from '../parsers/disk-by-id.js'
-import { parseFindmnt } from '../parsers/findmnt.js'
-import { parseFstab, removeMount } from '../parsers/fstab.js'
+import { effectiveMountAt, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
+import { parseFstab, parseFstabDoc, serializeFstabDoc, serializeMountLine } from '../parsers/fstab.js'
 import { lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { isMdPvName, matchCachePartitionLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
 import { uncacheAhrLv } from './ahr-cache.js'
@@ -12,7 +14,7 @@ import { ahrSliceLabelOwner, classifyPartition, classifyRetiredPartition, mayZap
 import { clearIntent } from './ahr-intent.js'
 import { unpinArrays } from './ahr-mdadm-conf.js'
 import { ahrLvPath } from './ahr-paths.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, indexLsblk } from './ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, dmName, indexLsblk, isLsblkTree, stripSubvolSuffix } from './ahr-topology.js'
 import { editConfig, readConfig } from './config-writer.js'
 import { ahrSnapshotsMountpoint } from './share-selfservice.js'
 
@@ -63,9 +65,38 @@ const VGREDUCE = '/usr/sbin/vgreduce'
 const MDADM = '/usr/sbin/mdadm'
 const SGDISK = '/usr/sbin/sgdisk'
 const UPDATE_INITRAMFS = '/usr/sbin/update-initramfs'
-const FINDMNT = '/usr/bin/findmnt'
 const LSBLK = '/usr/bin/lsblk'
 const LS = '/usr/bin/ls'
+const REALPATH = '/usr/bin/realpath'
+
+/** First line of a command's stderr, or its exit code — the read named in a refusal. */
+function firstLine(res: { stderr: string, exitCode: number }): string {
+  return res.stderr.trim().split('\n')[0] || `exit ${res.exitCode}`
+}
+
+/**
+ * Remove the pool's line(s) at `mountpoint` from an fstab document — matched
+ * by the spec ANAS wrote for this pool's LV, never by the path alone (cr3
+ * review2 7). Every other line is emitted unchanged.
+ */
+function removeSpecLineAt(text: string, spec: string, mountpoint: string): string {
+  const doc = parseFstabDoc(text).filter(l => !(l.kind === 'entry' && l.entry.spec === spec && l.entry.mountpoint === mountpoint))
+  return serializeFstabDoc(doc)
+}
+
+/**
+ * Remove ONE line from an fstab document: the active entry whose serialized
+ * form is exactly `entry`'s (the line a job wrote, matched whole). Every other
+ * line is emitted unchanged; no match is a no-op.
+ */
+function removeExactLine(text: string, entry: MountEntry): string {
+  const wanted = serializeMountLine(entry)
+  const doc = parseFstabDoc(text)
+  const idx = doc.findIndex(l => l.kind === 'entry' && !l.disabled && l.raw === wanted)
+  if (idx !== -1)
+    doc.splice(idx, 1)
+  return serializeFstabDoc(doc)
+}
 
 const BY_ID_DIR = '/dev/disk/by-id/'
 
@@ -104,6 +135,15 @@ export interface AhrDestroyTarget {
    * scrubbed without the per-partition identity proof.
    */
   disksWipedByCaller?: boolean
+  /**
+   * The failed create's rollback (cr3 AHR-CORE-H1): the fstab entries THIS job
+   * wrote. When present, destroy removes exactly these lines (matched whole)
+   * and no other — an empty list removes none. A line at the same path that the
+   * job did not write (another pool moved there, an operator's own mount) is not
+   * the job's to remove. Absent for the operator's Destroy, whose pool's lines
+   * are found by mountpoint and LV spec.
+   */
+  fstabEntriesWritten?: MountEntry[]
 }
 
 export interface AhrDestroyOptions {
@@ -194,6 +234,17 @@ export async function destroyAhrPool(
   const wipedByCaller = pool.disksWipedByCaller === true
 
   // --- WHO the pool is, read before anything changes (story ident.3) --------
+  // cr3 AHR-CORE-L9: mdadm.conf is read STRICTLY first. The identity reader
+  // degrades an unreadable conf to "no pins" (right for a display, where it
+  // only makes ownership stricter) — but here it made the unpin below a silent
+  // no-op, leaving the dead pool's ARRAY pins for the next boot to assemble.
+  // An absent conf is honestly "no pins"; any other failed read stops here.
+  try {
+    await readConfig(mdadmConfPath)
+  }
+  catch (err) {
+    throw new Error(`cannot read ${mdadmConfPath} before destroying '${name}' (${err instanceof Error ? err.message : String(err)}) — the pool's ARRAY pins could not be found, so nothing was changed`)
+  }
   // Kernel names are valid only within this pass (GT-2); the UUIDs are not.
   const identity = await readAhrPoolIdentity(executor, name, { mdadmConfPath, extraUuids: pool.createdArrayUuids })
   const liveArrays = identity.arrays.map(a => a.dev) // e.g. /dev/md127
@@ -210,10 +261,32 @@ export async function destroyAhrPool(
   // listing answers two questions (which member disks are ATTACHED, and which
   // kernel disk is which by-id), and the lsblk tree carries every partition's
   // label and signature.
+  //
+  // cr3 AHR-CORE-L8: a read that could not see never reads as "nothing
+  // there". For the operator's Destroy an unreadable by-id listing or block
+  // tree used to leave every member disk without a fact — silently not
+  // zeroed, not zapped, and the job still said "destroyed". Both now stop the
+  // destroy HERE, before any change. The failed create's rollback is the one
+  // caller that does not need them: it scrubs only the disks it wiped itself,
+  // by their by-id paths, so it carries on and says what it could not sweep.
   const byIdRes = await executor.exec(LS, ['-la', BY_ID_DIR])
+  const lsblkRaw = await executor.exec(LSBLK, AHR_LSBLK_ARGS)
+  // cr3 review 9: exit 0 with output that is not lsblk's JSON tree is as
+  // unreadable as a non-zero exit — never an empty tree.
+  const lsblkRes = lsblkRaw.exitCode === 0 && !isLsblkTree(lsblkRaw.stdout)
+    ? { ...lsblkRaw, exitCode: -1, stderr: 'the output is not lsblk\'s JSON tree' }
+    : lsblkRaw
+  if (!wipedByCaller) {
+    if (byIdRes.exitCode !== 0)
+      throw new Error(`cannot read ${BY_ID_DIR} before destroying '${name}' (ls: ${firstLine(byIdRes)}) — without it no member disk can be identified, so nothing was changed`)
+    if (lsblkRes.exitCode !== 0)
+      throw new Error(`cannot read the block-device tree before destroying '${name}' (lsblk: ${firstLine(lsblkRes)}) — without it no member partition can be identified, so nothing was changed`)
+  }
+  else if (byIdRes.exitCode !== 0 || lsblkRes.exitCode !== 0) {
+    updateProgress(`The ${byIdRes.exitCode !== 0 ? `${BY_ID_DIR} listing` : 'block-device tree'} could not be read — only the disks this job wiped are scrubbed; no other disk carrying '${name}' labels is swept`)
+  }
   const byIdAll = byIdRes.exitCode === 0 ? parseByIdToKernel(byIdRes.stdout) : new Map<string, string>()
   const byIdByKernel: ByIdMap = byIdRes.exitCode === 0 ? parseDiskByIdListing(byIdRes.stdout) : new Map()
-  const lsblkRes = await executor.exec(LSBLK, AHR_LSBLK_ARGS)
   const index: LsblkIndex = lsblkRes.exitCode === 0 ? indexLsblk(lsblkRes.stdout) : { partsByKernel: new Map(), lvmByDmName: new Map() }
 
   // The pool's cache slices: a non-md PV of the pool's VG, on a partition the
@@ -309,8 +382,84 @@ export async function destroyAhrPool(
   const lvs = parseLvsReport(lvsRes.stdout).filter(l => l.vgName === name)
 
   const mountpoint = pool.mounted ? pool.mountpoint : null
-  const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
-  const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
+  // cr3 AHR-CORE-H1: the mount table is read STRICTLY — an unreadable one is
+  // never "nothing mounted" (the unmount below would be skipped and lvremove
+  // would fail on a busy LV after the fstab lines were already gone). It stops
+  // the destroy here, before any change.
+  const findmntText = await readFindmntTable(executor, AHR_FINDMNT_ARGS)
+  if (findmntText === null)
+    throw new Error(`cannot read the kernel mount table (findmnt) before destroying '${name}' — nothing was changed`)
+  const mounts = parseFindmnt(findmntText)
+
+  // A mount is the pool's only when its SOURCE is one of the pool's own LVs
+  // (cr3 AHR-CORE-H1): a path is not an identity. Another pool moved to this
+  // pool's default path, an operator's own mount at the @snapshots path — those
+  // are left exactly as they are. findmnt appends the mounted subvolume to a
+  // btrfs source (`...-vol[/@data]`) and a daemon `mount -c` records the LV path
+  // as given, so both spellings, suffix stripped, name the pool's mount.
+  const ownSources = new Set<string>()
+  for (const lvName of new Set([`${name}-vol`, ...lvs.map(l => l.name)])) {
+    ownSources.add(`/dev/mapper/${dmName(name, lvName)}`)
+    ownSources.add(`/dev/${name}/${lvName}`)
+  }
+  // cr3 review 6: the SPELLING is the first answer, the device IDENTITY the
+  // second — a mount whose source names the pool's LV by another path (the
+  // kernel's `/dev/dm-N`, a by-id or by-uuid link) is resolved with
+  // `realpath -e` and compared with the LVs' own resolved nodes. (Not
+  // findmnt's MAJ:MIN: a btrfs mount reports its anonymous device, 0:N.)
+  const ownNodes = new Set<string>()
+  const resolvedSource = new Map<string, string | null>()
+  const resolve = async (path: string): Promise<string | null> => {
+    try {
+      const r = await executor.exec(REALPATH, ['-e', '--', path])
+      return r.exitCode === 0 && r.stdout.trim() !== '' ? r.stdout.trim() : null
+    }
+    catch {
+      return null
+    }
+  }
+  const spelledOwn = (m: FindmntNode): boolean => ownSources.has(stripSubvolSuffix(m.source))
+  const candidates = mounts.filter(m => (m.target === mountpoint || m.target === ahrSnapshotsMountpoint(name)) && !spelledOwn(m) && stripSubvolSuffix(m.source).startsWith('/dev/'))
+  if (candidates.length > 0) {
+    for (const lvName of new Set([`${name}-vol`, ...lvs.map(l => l.name)])) {
+      const node = await resolve(`/dev/${name}/${lvName}`)
+      if (node !== null)
+        ownNodes.add(node)
+    }
+    for (const m of candidates) {
+      const source = stripSubvolSuffix(m.source)
+      if (!resolvedSource.has(source))
+        resolvedSource.set(source, await resolve(source))
+    }
+    // A device-backed mount at the pool's path whose identity could not be
+    // read is neither the pool's nor someone else's: leaving it "alone" sent
+    // the fstab edit ahead and then lvremove failed on the busy LV, on every
+    // retry. Refused before any change.
+    const unresolved = candidates.filter(m => resolvedSource.get(stripSubvolSuffix(m.source)) === null || ownNodes.size === 0)
+    if (unresolved.length > 0)
+      throw new Error(`the mount at ${unresolved[0].target} (${unresolved[0].source}) could not be identified as '${name}''s or another device's (realpath could not resolve it or the pool's volume) — nothing was changed`)
+  }
+  const isOwnMount = (m: FindmntNode): boolean => {
+    if (spelledOwn(m))
+      return true
+    const node = resolvedSource.get(stripSubvolSuffix(m.source))
+    return node !== undefined && node !== null && ownNodes.has(node)
+  }
+  /** Unmount `target` only when the filesystem on top there is the pool's own. */
+  const ownTopMountAt = (target: string, what: string): boolean => {
+    const top = effectiveMountAt(mounts, target)
+    if (!top)
+      return false
+    if (isOwnMount(top))
+      return true
+    // The pool's filesystem is UNDER someone else's: `umount` would take the
+    // other one off, and lvremove would then fail on the pool's busy LV.
+    if (mounts.some(m => m.target === target && isOwnMount(m)))
+      throw new Error(`a filesystem that is not '${name}''s (${top.source}) is mounted over ${what} at ${target} — unmount it first; nothing was changed`)
+    updateProgress(`Leaving the mount at ${target} alone: its source ${top.source} is not a volume of '${name}'`)
+    return false
+  }
+  const unmountPool = mountpoint !== null && ownTopMountAt(mountpoint, `pool '${name}'`)
 
   // The Previous Versions @snapshots mount (smbsvc.1) is a SIBLING of the pool
   // mount base — never under the pool mountpoint — and the design keeps it
@@ -321,37 +470,64 @@ export async function destroyAhrPool(
   // stays" ruling ends. Unmounted but fstab-claimed is still torn down — the
   // mount is found live (like everything else here), never inferred from fstab.
   const snapMount = ahrSnapshotsMountpoint(name)
+  const unmountSnap = ownTopMountAt(snapMount, `the '${name}' @snapshots mount`)
 
-  // The pool's fstab lines (found by mountpoint OR by LV spec, so a
+  // The pool's fstab lines (found by its live mountpoint OR by LV spec, so a
   // half-destroyed, already-unmounted pool still gets its line removed). The LV
   // spec matches BOTH the pool's own line and the @snapshots line — every match
-  // goes; a destroyed pool leaves no line behind. An unreadable fstab throws
-  // here, before anything changed.
+  // goes; a destroyed pool leaves no line behind. A line at the @snapshots
+  // PATH whose spec is not the pool's is someone else's (cr3 AHR-CORE-H1: a
+  // path is not an identity) and stays. An unreadable fstab throws here,
+  // before anything changed.
+  // The failed create's rollback (cr3 AHR-CORE-H1) removes ONLY the lines it
+  // wrote — never "every line at the path", which took another pool's line.
   const fstabText = await readConfig(opts.fstabPath)
-  const fstabMountpoints = new Set(
-    parseFstab(fstabText)
-      .filter(e => e.mountpoint === mountpoint || e.mountpoint === snapMount || e.spec === ahrLvPath(name))
-      .map(e => e.mountpoint),
-  )
+  // cr3 review2 7: the pool's lines are found by IDENTITY — the spec ANAS
+  // writes for this pool's LV (its own line and the @snapshots line) — never
+  // by path: removing "the first line at the mountpoint" took an operator's
+  // own line above ANAS's and left ANAS's dangling. A line at the pool's
+  // mountpoint with another spec is told apart and left; when the pool has
+  // NO line of its own and another claims its mountpoint, the two cannot be
+  // told apart (a hand-edited UUID= line of the pool, or the operator's) —
+  // refused here, before any change.
+  const lvSpec = ahrLvPath(name)
+  const entries = parseFstab(fstabText)
+  const ownMountpoints = pool.fstabEntriesWritten !== undefined
+    ? []
+    : [...new Set(entries.filter(e => e.spec === lvSpec).map(e => e.mountpoint))]
+  const othersAtPath = pool.fstabEntriesWritten === undefined && mountpoint !== null
+    ? entries.filter(e => e.mountpoint === mountpoint && e.spec !== lvSpec)
+    : []
+  if (othersAtPath.length > 0 && !ownMountpoints.includes(mountpoint!)) {
+    throw new Error(`${opts.fstabPath} has a line for ${mountpoint} with the spec ${othersAtPath[0].spec}, not '${name}''s volume ${lvSpec} — it cannot be told whether that line is this pool's or another filesystem's, so nothing was changed. Point the pool's line at ${lvSpec} (or remove the other line) and retry`)
+  }
+  const writtenLines = (pool.fstabEntriesWritten ?? [])
+    .filter(e => parseFstabDoc(fstabText).some(l => l.kind === 'entry' && !l.disabled && l.raw === serializeMountLine(e)))
 
   // ===== ACTS — from here on the system changes ==============================
 
   // --- umount (only when actually mounted; the directory stays) --------------
-  if (mountpoint && mounts.some(m => m.target === mountpoint)) {
+  if (unmountPool && mountpoint !== null) {
     updateProgress(`Unmounting ${mountpoint}`)
-    await run(executor, UMOUNT, [mountpoint], { busyPath: mountpoint })
+    await run(executor, UMOUNT, ['--', mountpoint], { busyPath: mountpoint })
   }
-  if (mounts.some(m => m.target === snapMount)) {
+  if (unmountSnap) {
     updateProgress(`Unmounting ${snapMount} (Previous Versions @snapshots mount)`)
-    await run(executor, UMOUNT, [snapMount], { busyPath: snapMount })
+    await run(executor, UMOUNT, ['--', snapMount], { busyPath: snapMount })
   }
 
-  // --- fstab: drop the pool's lines -------------------------------------------
-  for (const mp of fstabMountpoints) {
+  // --- fstab: drop the pool's lines (by spec, never by path) -----------------
+  for (const other of othersAtPath)
+    updateProgress(`Leaving the /etc/fstab line for ${other.spec} at ${other.mountpoint} alone: it is not '${name}''s volume`)
+  for (const mp of ownMountpoints) {
     updateProgress(`Removing /etc/fstab entry for ${mp}`)
-    await editConfig(opts.fstabPath, current => removeMount(current, mp))
+    await editConfig(opts.fstabPath, current => removeSpecLineAt(current, lvSpec, mp))
   }
-  if (fstabMountpoints.size > 0) {
+  for (const entry of writtenLines) {
+    updateProgress(`Removing the /etc/fstab entry this job wrote for ${entry.mountpoint}`)
+    await editConfig(opts.fstabPath, current => removeExactLine(current, entry))
+  }
+  if (ownMountpoints.length > 0 || writtenLines.length > 0) {
     await run(executor, SYSTEMCTL, ['daemon-reload'])
   }
 

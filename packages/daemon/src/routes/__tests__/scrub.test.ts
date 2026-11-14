@@ -35,6 +35,8 @@ function mockAhrTopologyExecutor(executor: MockExecutor, mdstat: ExecResult): Mo
   executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
   executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+  // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+  executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
   executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
   executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })

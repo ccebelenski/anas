@@ -1,7 +1,7 @@
 import type { AhrPool } from '@anas/shared'
 import type { MockExecCall } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -293,6 +293,103 @@ describe('rollbackAhrSnapshot', () => {
       executor.calls.some(c => c.command === MOUNT && c.args.includes('btrfs')),
       'pool remounted in the finally despite the failure',
     )
+  })
+})
+
+// cr3 AHR-CORE-M6: a swap failing after the preserve-rename used to leave
+// @data renamed away; the finally's remount (subvol=@data) then failed on the
+// missing subvolume and ITS error replaced the real one.
+describe('rollbackAhrSnapshot — cr3 M6: a failed swap puts @data back, and the real error leads', () => {
+  let runtimeDir: string
+  beforeEach(async () => {
+    runtimeDir = await mkdtemp(join(tmpdir(), 'anas-snap-m6-'))
+  })
+  afterEach(async () => {
+    await rm(runtimeDir, { recursive: true, force: true })
+  })
+  const NOW = new Date('2026-07-24T09:00:00.000Z')
+  async function realPool(): Promise<AhrPool> {
+    const pool = mkPool({ mountpoint: join(runtimeDir, 'tank') })
+    await mkdir(pool.mountpoint, { recursive: true })
+    return pool
+  }
+  function world(mvResults: { stdout: string, stderr: string, exitCode: number }[], mountResults?: { stdout: string, stderr: string, exitCode: number }[]): MockExecutor {
+    const executor = new MockExecutor()
+    executor.addFixture({ command: MOUNT, ...(mountResults ? { results: mountResults } : { result: { stdout: '', stderr: '', exitCode: 0 } }) })
+    executor.addFixture({ command: UMOUNT, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MV, results: mvResults })
+    executor.addFixture({ command: BTRFS, result: { stdout: '', stderr: 'ERROR: cannot snapshot: No space left on device', exitCode: 1 } })
+    return executor
+  }
+  const OK = { stdout: '', stderr: '', exitCode: 0 }
+  const top = () => join(runtimeDir, 'tank.toplevel')
+
+  it('renames @snapshots/pre-rollback-<ts> back to @data BEFORE the remount, and says so', async () => {
+    const executor = world([OK, OK])
+    const pool = await realPool()
+    await assert.rejects(
+      rollbackAhrSnapshot(executor, pool, 'good', () => {}, { runtimeDir, now: NOW }),
+      /^Error: .*No space left on device — @data was renamed back; the pool is as it was before the rollback$/,
+    )
+    const mvs = executor.calls.filter(c => c.command === MV).map(c => c.args)
+    assert.deepEqual(mvs, [
+      ['--', join(top(), '@data'), join(top(), '@snapshots', 'pre-rollback-2026-07-24T090000Z')],
+      ['-T', '--', join(top(), '@snapshots', 'pre-rollback-2026-07-24T090000Z'), join(top(), '@data')],
+    ])
+    const restore = executor.calls.findIndex(c => c.command === MV && c.args.at(-1) === join(top(), '@data'))
+    const remount = executor.calls.findIndex(c => c.command === MOUNT && c.fdPaths?.[0] === pool.mountpoint)
+    assert.ok(restore >= 0 && remount > restore, 'restored, then remounted')
+  })
+
+  // cr3 review 7: a failed snapshot step that still created @data — GNU mv
+  // would nest the preserved subvolume inside it and claim restoration.
+  it('cr3 review 7: a NEW @data left by the failed step is never renamed onto; the job says where the original is', async () => {
+    const executor = world([OK, OK])
+    const pool = await realPool()
+    // withTopLevelMount mounts at <runtimeDir>/tank.toplevel; the failed
+    // snapshot step left a directory where @data belongs.
+    await mkdir(join(top(), '@data'), { recursive: true })
+    await assert.rejects(
+      rollbackAhrSnapshot(executor, pool, 'good', () => {}, { runtimeDir, now: NOW }),
+      /the failed step left a NEW @data behind, so the original was NOT renamed back: it is intact as @snapshots\/pre-rollback-2026-07-24T090000Z/,
+    )
+    assert.equal(executor.calls.filter(c => c.command === MV).length, 1, 'only the preserve-rename ran')
+  })
+
+  // cr3 review2 10: an lstat that could not SEE read as "no @data there".
+  it('cr3 review2 10: a stat of @data that fails for a reason other than ENOENT stops the rename-back, naming it', { skip: process.getuid?.() === 0 }, async () => {
+    const executor = world([OK, OK])
+    // After the preserve-rename, the top-level directory turns unreadable.
+    const orig = executor.exec.bind(executor)
+    executor.exec = async (command, args, opts) => {
+      const r = await orig(command, args, opts)
+      if (command === MV)
+        await chmod(top(), 0o000)
+      return r
+    }
+    const pool = await realPool()
+    try {
+      await assert.rejects(
+        rollbackAhrSnapshot(executor, pool, 'good', () => {}, { runtimeDir, now: NOW }),
+        /whether the failed step left a @data behind could not be read \(EACCES[^)]*\), so the original was NOT renamed back/,
+      )
+      assert.equal(executor.calls.filter(c => c.command === MV).length, 1, 'no rename-back')
+    }
+    finally {
+      await chmod(top(), 0o755).catch(() => {})
+    }
+  })
+
+  it('a rename-back that fails names where the data is, and the remount failure never replaces the real error', async () => {
+    // The top-level mount succeeds; the pool's remount then fails (no @data).
+    const executor = world([OK, { stdout: '', stderr: 'mv: cannot move', exitCode: 1 }], [OK, { stdout: '', stderr: 'mount: special device subvol=@data does not exist', exitCode: 32 }])
+    const pool = await realPool()
+    await assert.rejects(rollbackAhrSnapshot(executor, pool, 'good', () => {}, { runtimeDir, now: NOW }), (err: Error) => {
+      assert.match(err.message, /^.*No space left on device — and @data could not be renamed back from @snapshots\/pre-rollback-2026-07-24T090000Z \(mv: mv: cannot move\)/)
+      assert.match(err.message, /The pool's data is intact as @snapshots\/pre-rollback-2026-07-24T090000Z/)
+      assert.match(err.message, /remounting .* ALSO failed: mount: special device subvol=@data does not exist$/)
+      return true
+    })
   })
 })
 

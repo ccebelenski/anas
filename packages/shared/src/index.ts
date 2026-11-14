@@ -131,6 +131,7 @@ export {
   AhrMetadataCorrected,
   AhrMountpointRequest,
   AhrPool,
+  AhrPoolCapacity,
   AhrPoolState,
   AhrPreviewBand,
   AhrReplacePair,

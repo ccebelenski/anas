@@ -9,6 +9,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { randomUUID } from 'node:crypto'
 import { AhrExpandRequest, AhrReplaceRequest, DiskId, PoolName } from '@anas/shared'
 import { guardCheck, guardConfirm, guarded, GuardReads, refusalBody, sendRefusal } from '../safety/guard.js'
+import { inventoryUnreadableRefusal } from '../services/ahr-disk-recheck.js'
 import { executeReadd } from '../services/ahr-expand-exec.js'
 // The §5.3 recompute-and-continue core is shared with the daemon boot scan
 // (services/ahr-boot-scan.ts) — ONE implementation, no drift (single source).
@@ -16,7 +17,7 @@ import { computePlan, resolveApproved, resumeExpansion, submitExpansion } from '
 import { ahrGuard, expansionStateRefusal } from '../services/ahr-guard.js'
 import { poolIntentIdentity } from '../services/ahr-identity.js'
 import { AhrIntentConflictError, clearIntent, readPoolIntent, writeIntent } from '../services/ahr-intent.js'
-import { AhrPlanError, expansionGain, fmtBytes } from '../services/ahr-layout.js'
+import { AhrPlanError, expansionGain, fmtBytes, fmtKnownBytes } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { requireIdentity } from './identity.js'
 
@@ -136,24 +137,48 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     const members = memberIds(pool)
     const problems: string[] = []
     const approvedIds = new Set(members)
+    // cr3 AHR-CORE-M2: a disk the pool already holds in ANY role is never a
+    // disk to add. The pool's own hot spare passed (it is not a band member),
+    // and the executor then pulled the spare slice out of its band before the
+    // grow — a grow md refused left the band without its spare; a Replace
+    // onto the spare promoted it to a member (ruled out, §11). The read-cache
+    // disk is the same: its slice is an LVM PV, not a member to be partitioned.
+    const otherRole = (id: string): string | null => {
+      const disk = pool.disks.find(d => d.id === id)
+      if (!disk || members.has(id))
+        return null
+      // cr3 review 11: the disk's REAL role — a `member`-role disk outside
+      // every band's membership (slices labelled but in no array) is not a spare.
+      return disk.role === 'cache' ? 'read-cache disk' : disk.role === 'spare' ? 'hot spare' : 'member disk (its slices belong to no band array right now)'
+    }
     if (body.replace) {
       if (!members.has(body.replace.oldDiskId))
         problems.push(`disk '${body.replace.oldDiskId}' is not a member of pool '${pool.name}'`)
       if (members.has(body.replace.newDiskId))
         problems.push(`replacement disk '${body.replace.newDiskId}' is already a member of pool '${pool.name}'`)
+      const role = otherRole(body.replace.newDiskId)
+      if (role)
+        problems.push(`replacement disk '${body.replace.newDiskId}' is pool '${pool.name}''s ${role} — detach it first to use it as a member`)
       approvedIds.delete(body.replace.oldDiskId)
       approvedIds.add(body.replace.newDiskId)
     }
     for (const id of body.addDisks ?? []) {
       if (members.has(id))
         problems.push(`disk '${id}' is already a member of pool '${pool.name}'`)
+      const role = otherRole(id)
+      if (role)
+        problems.push(`disk '${id}' is pool '${pool.name}''s ${role} — detach it first to add it as a member`)
       approvedIds.add(id)
     }
     if (problems.length > 0) {
       reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: problems.join('; ') } })
       return null
     }
-    const { approved, problems: diskProblems } = await resolveApproved(executor, diskIdentityCache, pool, [...approvedIds], true)
+    const { approved, problems: diskProblems, unreadable } = await resolveApproved(executor, diskIdentityCache, pool, [...approvedIds], true)
+    if (unreadable.length > 0) {
+      reply.code(409).send(refusalBody(inventoryUnreadableRefusal(unreadable)))
+      return null
+    }
     if (diskProblems.length > 0) {
       reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: diskProblems.join('; ') } })
       return null
@@ -232,7 +257,9 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       // Planner-vs-planner (§5.2): the live volume can lag its own band math
       // after an abandoned expansion, and that owed growth is not this plan's.
       beforeUsableBytes: bundle.beforeUsableBytes,
-      after: bundle.after,
+      // The planner's own capacity (always numbers); `bundle.after` carries the
+      // live pool's used/free, which can be unknown (cr3).
+      after: bundle.plan.preview.capacity,
       bands: bundle.plan.preview.bands,
       warnings: bundle.plan.preview.warnings,
       tier: pool.ahrType,
@@ -247,7 +274,10 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     const { before, after, plan } = bundle
     const pendingDelta = after.pendingBytes - before.pendingBytes
     return [
-      `Usable capacity ${fmtBytes(before.usableBytes)} → ${fmtBytes(after.usableBytes)}${
+      // cr3 (AHR-panel L7): the confirm names every disk whose contents are
+      // overwritten — the new band slices are written over whatever is on it.
+      ...bundle.introducedDisks.map(d => `${d.id} (${fmtBytes(d.usableBytes)}) will be partitioned for the pool: anything stored on it is permanently erased`),
+      `Usable capacity ${fmtKnownBytes(before.usableBytes)} → ${fmtKnownBytes(after.usableBytes)}${
         pendingDelta > 0 ? `; ${fmtBytes(after.pendingBytes)} of capacity will be PENDING (physically present but locked — see below).` : '.'}`,
       'The pool stays ONLINE during the reshape, but performance is reduced; on large arrays a reshape takes hours to DAYS.',
       'Do NOT remove disks while the expansion runs. Power loss is survivable (md checkpoints and resumes); pulling disks is not.',
@@ -515,7 +545,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       message: `Abandon the halted expansion of pool '${pool.name}'`,
       warnings: [
         `The pool KEEPS its current reachable layout — nothing is rolled back at the block layer.`,
-        `Current layout: ${layout}; usable ${fmtBytes(pool.capacity.usableBytes)}${pool.capacity.pendingBytes > 0 ? `, ${fmtBytes(pool.capacity.pendingBytes)} pending` : ''}.`,
+        `Current layout: ${layout}; usable ${fmtKnownBytes(pool.capacity.usableBytes)}${pool.capacity.pendingBytes > 0 ? `, ${fmtBytes(pool.capacity.pendingBytes)} pending` : ''}.`,
         `Steps that already completed (grown arrays, added capacity) remain in effect; the remaining steps simply never run.`,
         `The approved disk set (${intent.approvedDisks.join(', ')}) is forgotten.`,
       ],

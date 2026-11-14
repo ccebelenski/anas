@@ -160,6 +160,8 @@ function addAhrPoolFixtures(mock: MockExecutor, opts: { subvol?: string, lvAttr?
   mock.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: { stdout: ahrLsblkJson(), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: `${[X, Y, Z].map(id => `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${id} -> ../../sd${id.slice(-1) === 'X' ? 'q' : id.slice(-1) === 'Y' ? 'r' : 's'}`).join('\n')}\n`, stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '1', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
+  // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+  mock.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: opts.lvAttr ?? '-wi-ao----', lv_size: String(LV_SIZE) }] }] }), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: FINDMNT, args: [...AHR_FINDMNT_ARGS], result: { stdout: JSON.stringify({ filesystems: [{
     target: '/mnt/anas-ahr/tank',
@@ -167,6 +169,9 @@ function addAhrPoolFixtures(mock: MockExecutor, opts: { subvol?: string, lvAttr?
     fstype: 'btrfs',
     options: `rw,relatime,space_cache=v2,${subvol}`,
   }] }), stderr: '', exitCode: 0 } })
+  // cr3: the pool's usage answers in its real shape — a usage read that says
+  // nothing is unknown free space (null), no longer a placeholder 0.
+  mock.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: `Overall:\n    Device size:\t\t${LV_SIZE}\n    Used:\t\t1048576\n    Free (estimated):\t\t${LV_SIZE - 2 * 1048576}\t(min: ${LV_SIZE - 4 * 1048576})\n`, stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
 }
 

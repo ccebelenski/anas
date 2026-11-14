@@ -1,6 +1,8 @@
 import type { MdadmArrayPin } from '../parsers/mdadm-conf.js'
+import { lstat, realpath } from 'node:fs/promises'
 import {
   getArrays,
+  getProgram,
   parseMdadmConfDoc,
   removeArray,
   removeProgram,
@@ -9,7 +11,7 @@ import {
   upsertProgram,
 } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
-import { editConfig } from './config-writer.js'
+import { editConfig, readConfig } from './config-writer.js'
 
 /**
  * AHR mdadm.conf pinning + monitor-hook wiring (AHR-DESIGN §2.6 / §7.2).
@@ -47,6 +49,35 @@ function resolveConfPath(override?: string): string {
 }
 
 /**
+ * The file an mdadm.conf EDIT writes (cr3 review2 5). The atomic write
+ * renames a temp file over its path, so a SYMLINKED mdadm.conf (an operator
+ * keeping it under version control, a config-management tree) was replaced
+ * by a regular file and the operator's real file silently stopped being
+ * read. The link is resolved and its TARGET is edited in its own directory —
+ * the link stays a link. A path that does not exist yet is written as is (a
+ * first pin); a link whose target cannot be resolved is never written.
+ */
+async function writableConfPath(path: string): Promise<string> {
+  let st: Awaited<ReturnType<typeof lstat>>
+  try {
+    st = await lstat(path)
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return path
+    throw err
+  }
+  if (!st.isSymbolicLink())
+    return path
+  try {
+    return await realpath(path)
+  }
+  catch (err) {
+    throw new Error(`${path} is a symbolic link whose target cannot be resolved (${err instanceof Error ? err.message : String(err)}) — mdadm.conf was not written`)
+  }
+}
+
+/**
  * Pin a pool's arrays: add-or-update one canonical ARRAY line per array,
  * keyed by UUID. Surgical — untouched lines are preserved byte-for-byte.
  * No-op (no write, no .bak) when `arrays` is empty or nothing changes.
@@ -54,7 +85,7 @@ function resolveConfPath(override?: string): string {
 export async function pinArrays(arrays: MdadmArrayPin[], path?: string): Promise<void> {
   if (arrays.length === 0)
     return
-  await editConfig(resolveConfPath(path), (current) => {
+  await editConfig(await writableConfPath(resolveConfPath(path)), (current) => {
     const doc = parseMdadmConfDoc(current)
     for (const pin of arrays)
       upsertArray(doc, pin)
@@ -94,7 +125,7 @@ export function ahrArrayLinePool(a: { device: string, name?: string }): string |
 export async function unpinArrays(uuids: string[], path?: string): Promise<void> {
   if (uuids.length === 0)
     return
-  await editConfig(resolveConfPath(path), (current) => {
+  await editConfig(await writableConfPath(resolveConfPath(path)), (current) => {
     const doc = parseMdadmConfDoc(current)
     for (const uuid of uuids)
       removeArray(doc, uuid)
@@ -111,9 +142,27 @@ export async function unpinArrays(uuids: string[], path?: string): Promise<void>
  * ANAS never overwrites a hook it does not own.
  */
 export async function installProgramHook(hookPath: string = ANAS_MD_EVENT_HOOK, confPath?: string): Promise<void> {
-  await editConfig(resolveConfPath(confPath), (current) => {
+  await editConfig(await writableConfPath(resolveConfPath(confPath)), (current) => {
     const doc = parseMdadmConfDoc(current)
     upsertProgram(doc, hookPath)
     return serializeMdadmConfDoc(doc)
   })
+}
+
+/**
+ * The PROGRAM hook a create would refuse to replace (cr3 AHR-CORE-M4), read
+ * BEFORE the first wipe: the foreign hook's path when mdadm.conf names a
+ * PROGRAM that is not ANAS's, else null. `installProgramHook` throws on
+ * exactly this — after the disks were wiped and the arrays built, so every
+ * create on such a node wiped its disks for nothing. Reads strictly: an
+ * unreadable conf throws (an absent one is honestly no hook).
+ */
+export async function foreignProgramHook(confPath?: string, hookPath: string = ANAS_MD_EVENT_HOOK): Promise<string | null> {
+  const program = getProgram(parseMdadmConfDoc(await readConfig(resolveConfPath(confPath))))
+  return program !== undefined && program !== hookPath ? program : null
+}
+
+/** The refusal sentence for {@link foreignProgramHook} — one wording at the route and in the job. */
+export function foreignProgramRefusal(program: string): string {
+  return `mdadm.conf already has a PROGRAM line pointing at '${program}'. mdadm allows one monitor hook and ANAS never replaces one it does not own, so an AHR pool cannot be created here until that line is removed or pointed at ${ANAS_MD_EVENT_HOOK} — nothing was touched`
 }

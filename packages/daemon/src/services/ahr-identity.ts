@@ -100,6 +100,39 @@ export async function readMdadmConfDoc(path?: string): Promise<MdadmConfDoc> {
 }
 
 /**
+ * Read + parse mdadm.conf STRICTLY (cr3 review2 2): null when it exists but
+ * cannot be read; an ABSENT conf is honestly no pins. For the questions where
+ * "no pins" is not the safe answer — how many bands a pool has.
+ */
+export async function readMdadmConfDocStrict(path?: string): Promise<MdadmConfDoc | null> {
+  try {
+    return parseMdadmConfDoc(await readConfig(resolveMdadmConfPath(path)))
+  }
+  catch {
+    return null
+  }
+}
+
+/**
+ * THE band count of a pool for the band rule (cr3 review2 2): an `[unknown]`
+ * PV is the CACHE's only when every band already has its own named md PV, and
+ * "every band" is not the arrays in /proc/mdstat — a band whose members are
+ * ALL absent has no mdstat entry at all. The count is the larger of the
+ * arrays seen and the arrays the pool's pins in mdadm.conf name; `null`
+ * (unknown) when the conf could not be read.
+ */
+export function poolBandCount(pool: string, arraysSeen: number, confDoc: MdadmConfDoc | null): number | null {
+  if (confDoc === null)
+    return null
+  return Math.max(arraysSeen, pinnedUuids(confDoc, pool).size)
+}
+
+/** {@link poolBandCount} with its own strict conf read. */
+export async function readPoolBandCount(pool: string, arraysSeen: number, mdadmConfPath?: string): Promise<number | null> {
+  return poolBandCount(pool, arraysSeen, await readMdadmConfDocStrict(mdadmConfPath))
+}
+
+/**
  * The md UUIDs pinned for `pool` — every ARRAY line whose device is
  * `/dev/md/<pool>-r<N>` (the form ANAS writes) or whose `name=` is
  * `<pool>-r<N>` (homehost-tolerant). Foreign ARRAY lines are never counted.

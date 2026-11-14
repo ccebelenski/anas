@@ -122,6 +122,12 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
    * in an offline/failed/read-only state.
    */
   const SNAPSHOT_GATES: Gate<AhrPool>[] = [
+    // cr3 review 3: an UNKNOWN state (the mount table could not be read) is
+    // said first — the layout below is unknown then, and the flat-layout
+    // sentence would advise destroying a pool on a read that did not see.
+    async pool => pool.state === 'unknown' || pool.subvolLayout === null
+      ? { status: 409, code: 'CONFLICT', message: `Pool '${pool.name}' is in an unknown state — the kernel mount table could not be read, so its subvolume layout and whether it is read-only are not known. Retry once it can be read.` }
+      : null,
     async pool => !pool.subvolLayout
       ? { status: 409, code: 'CONFLICT', message: `Pool '${pool.name}' uses the pre-snapshot flat layout — btrfs snapshots are unavailable. There is no in-place migration (moving data across subvolume boundaries is a copy); destroy and recreate the pool to gain the @data/@snapshots layout (§12).` }
       : null,
@@ -161,6 +167,11 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
     const pool = await loadPool(request.params.name, reply)
     if (!pool)
       return
+    // cr3 review 3: a layout that could not be read is never "no snapshots".
+    if (pool.subvolLayout === null) {
+      reply.code(503)
+      return { error: { code: 'UNAVAILABLE', message: `the kernel mount table could not be read, so the subvolume layout of AHR pool '${pool.name}' is unknown — its snapshots cannot be listed` } }
+    }
     if (!pool.subvolLayout)
       return { data: [] } // flat layout: no snapshots (the UI shows the advisory)
     return { data: await listAhrSnapshots(executor, pool, svc) }

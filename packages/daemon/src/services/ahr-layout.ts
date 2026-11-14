@@ -191,6 +191,14 @@ function levelFor(tier: AhrType, members: number): ArrayLevel | null {
  */
 export { fmtBytes }
 
+/**
+ * {@link fmtBytes} for a figure a live read may not have (cr3): `null` — the
+ * read behind it could not be made — prints `unknown`, never `0 B`.
+ */
+export function fmtKnownBytes(n: number | null): string {
+  return n === null ? 'unknown' : fmtBytes(n)
+}
+
 interface RoundedDisk {
   id: string
   roundedBytes: number

@@ -297,6 +297,11 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `AHR pool '${target.pool}' not found` } })
       return false
     }
+    // cr3 (merge): null is "the mount table could not be read", not the flat layout.
+    if (pool.subvolLayout === null) {
+      reply.code(503).send({ error: { code: 'UNAVAILABLE', message: `The layout of AHR pool '${target.pool}' could not be read (the kernel mount table did not answer), so whether it can hold snapshots is not known - nothing was changed; try again` } })
+      return false
+    }
     if (!pool.subvolLayout) {
       reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `AHR pool '${target.pool}' uses the pre-snapshot flat layout — snapshots are unavailable (§12)` } })
       return false

@@ -365,6 +365,11 @@ describe('resumeExpansion — the shared §5.3 recompute-and-continue core', () 
         'children': d.parts.map(p => ({ name: p, type: 'part', size: GIB, fstype: null, mountpoint: null })),
       })) }), stderr: '', exitCode: 0 } })
       executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: `${disks.map(d => `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${d.id} -> ../../${d.kernel}`).join('\n')}\n`, stderr: '', exitCode: 0 } })
+      // cr3 (merge): the inventory's ZFS read must ANSWER — a node with no
+      // pools prints this document (OpenZFS: `zpool status -j` with no pools);
+      // an unanswered read would make every disk `unknown` and stop the
+      // resume before the half-joined check this test is about.
+      executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '{"output_version":{"command":"zpool status","vers_major":0,"vers_minor":1},"pools":{}}\n', stderr: '', exitCode: 0 } })
       // W's own GPT (readDiskTree): both slices carry THIS pool's labels.
       executor.addFixture({ command: '/usr/bin/lsblk', args: diskLsblkArgs(`/dev/disk/by-id/${W}`), result: { stdout: JSON.stringify({ blockdevices: [{ name: 'sdt', type: 'disk', size: SIZE_4G, partlabel: null, children: [
         { name: 'sdt1', type: 'part', size: 2 * GIB - MIB, partlabel: 'tank-d4-b1' },

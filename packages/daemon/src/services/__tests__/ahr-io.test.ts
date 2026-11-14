@@ -120,6 +120,8 @@ describe('collectAhrTelemetry — topology + sample-time resolution', () => {
     mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok(load('lsblk-ahr0.json')) })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(load('disk-by-id-ahr.txt')) })
     mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(load('lvm-vgs.json')) })
+    // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+    mock.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(load('lvm-lvs.json')) })
     mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok(load('findmnt-ahr0.json')) })
     mock.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: ok(load('btrfs-usage.txt')) })

@@ -11,7 +11,7 @@ import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { isPvUnderSized, PV_UNDERSIZE_MARGIN_BYTES } from '../ahr-layout.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, AhrTopologyUnreadableError, buildAhrWarnings, readAhrPools, withExpansionIntent } from '../ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, AhrTopologyUnreadableError, buildAhrPoolBriefs, buildAhrWarnings, readAhrPools, withExpansionIntent } from '../ahr-topology.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/ahr')
@@ -35,6 +35,8 @@ function healthyExecutor(overrides?: { mdstat?: string, findmnt?: string, lsblk?
   mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok(overrides?.lsblk ?? loadFixture('lsblk-ahr0.json')) })
   mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(overrides?.byId ?? loadFixture('disk-by-id-ahr.txt')) })
   mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(loadFixture('lvm-vgs.json')) })
+  // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+  mock.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(loadFixture('lvm-lvs.json')) })
   mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok(overrides?.findmnt ?? loadFixture('findmnt-ahr0.json')) })
   mock.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: ok(loadFixture('btrfs-usage.txt')) })
@@ -176,6 +178,8 @@ function pve5Executor(overrides?: { mdstat?: string, vgs?: string, lvs?: string 
   mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok('{"blockdevices":[]}') })
   mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok('') })
   mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(overrides?.vgs ?? pve5Vgs()) })
+  // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+  mock.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(overrides?.lvs ?? pve5Lvs()) })
   mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('') })
   return mock
@@ -523,6 +527,8 @@ unused devices: <none>
       mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok('') })
       // vgs/lvs have ONLY ahr0 — no `media` VG or LV.
       mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(loadFixture('lvm-vgs.json')) })
+      // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+      mock.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
       mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(loadFixture('lvm-lvs.json')) })
       mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('') })
       return mock
@@ -574,6 +580,8 @@ unused devices: <none>
       mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok('{"blockdevices":[]}') })
       mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok('') })
       mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(loadFixture('lvm-vgs.json')) })
+      // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+      mock.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
       mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(loadFixture('lvm-lvs.json')) })
       mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('') })
       const confPath = join(confDir, 'mdadm.conf')
@@ -650,7 +658,8 @@ unused devices: <none>
     /** ahr0 with the given PV rows. */
     function pvExecutor(rows: { name: string, size: number, devSize: number }[]): MockExecutor {
       const mock = healthyExecutor()
-      mock.addFixture({
+      // Ahead of the world's default (empty) pvs answer.
+      mock.prependFixture({
         command: '/usr/sbin/pvs',
         result: ok(JSON.stringify({ report: [{ pv: rows.map(r => ({
           pv_name: r.name,
@@ -1011,5 +1020,161 @@ unused devices: <none>
         }
       })
     })
+  })
+})
+
+/**
+ * cr3 (2026-11-14 review): AHR-CORE-M5 / INVENTED-STATE-M4 (probe p2 and
+ * `invented-state/ahr-reads.mts`), INVENTED-STATE-H3, the invented-state
+ * table rows (vg/lv sizes, capacity used/free/usable) and the AHR-panel
+ * hand-offs (btrfs scrub running, md's slot count). A read that failed never
+ * reads as absent, healthy, idle or zero.
+ */
+describe('cr3: a failed read is unknown, never invented', () => {
+  const LOCK = { stdout: '', stderr: '  Global lock failed: check global lockspace is started', exitCode: 5 }
+  let dir: string
+  let confPath: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-topology-cr3-'))
+    confPath = join(dir, 'mdadm.conf')
+    const uuid = (n: string) => /MD_UUID=(\S+)/.exec(loadFixture(n))![1]
+    await writeFile(confPath, `ARRAY /dev/md/ahr0-r1 metadata=1.2 UUID=${uuid('mdadm-export-r1.txt')}\nARRAY /dev/md/ahr0-r2 metadata=1.2 UUID=${uuid('mdadm-export-r2.txt')}\n`)
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  for (const [read, command, args] of [
+    ['vgs', '/usr/sbin/vgs', VGS_ARGS],
+    ['lvs', '/usr/sbin/lvs', LVS_ARGS],
+    ['pvs', '/usr/sbin/pvs', undefined],
+    ['lsblk', '/usr/bin/lsblk', AHR_LSBLK_ARGS],
+    ['ls -la /dev/disk/by-id/', '/usr/bin/ls', ['-la', '/dev/disk/by-id/']],
+  ] as const) {
+    it(`M5: a failed ${read} raises the unreadable error — never "failed", "not found", kernel names or zero partitions`, async () => {
+      for (const conf of [confPath, join(dir, 'no-pins.conf')]) {
+        const mock = healthyExecutor()
+        mock.prependFixture({ command, ...(args ? { args: [...args] } : {}), result: LOCK })
+        await assert.rejects(readAhrPools(mock, conf), (err: Error) => {
+          assert.ok(err instanceof AhrTopologyUnreadableError, String(err))
+          assert.match(err.message, new RegExp(`\\(${read.replaceAll('/', '\\/')}.* exited 5`))
+          return true
+        })
+      }
+    })
+  }
+
+  it('cr3 review 10: a by-id listing that fails ONCE (a link vanished mid-listing) is retried after a short settle', async () => {
+    const mock = healthyExecutor()
+    mock.prependFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], results: [
+      { stdout: '', stderr: 'ls: cannot access \'/dev/disk/by-id/wwn-0x1-part2\': No such file or directory', exitCode: 1 },
+      ok(loadFixture('disk-by-id-ahr.txt')),
+    ] })
+    mock.addFixture({ command: '/usr/bin/udevadm', result: ok('') })
+    const [pool] = await readAhrPools(mock, confPath)
+    assert.equal(pool.state, 'healthy')
+    assert.ok(mock.calls.some(c => c.command === '/usr/bin/udevadm' && c.args.join(' ') === 'settle --timeout=5'))
+    assert.equal(mock.calls.filter(c => c.command === '/usr/bin/ls').length, 2)
+  })
+
+  it('M5: an lvm report that answers exit 0 in the wrong shape is unreadable too, never "no VG"', async () => {
+    const mock = healthyExecutor()
+    mock.prependFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok('  WARNING: something\n') })
+    await assert.rejects(readAhrPools(mock, confPath), AhrTopologyUnreadableError)
+  })
+
+  it('H3: a failed findmnt on a pool btrfs put READ-ONLY: state unknown, mountedReadOnly absent, an advisory — never healthy', async () => {
+    const mock = healthyExecutor()
+    mock.prependFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: '', stderr: 'findmnt: timeout', exitCode: 1 } })
+    const [pool] = await readAhrPools(mock, confPath)
+    assert.equal(pool.state, 'unknown')
+    assert.equal('mountedReadOnly' in pool, false)
+    assert.ok(pool.advisories.some(a => a.includes('the kernel mount table could not be read') && a.includes('read-only is unknown')), JSON.stringify(pool.advisories))
+    // The mount itself is still known (lsblk's MOUNTPOINT column) — its
+    // subvolume layout is not (cr3 review 3: never invented as flat).
+    assert.equal(pool.mounted, true)
+    assert.equal(pool.subvolLayout, null)
+    // ...and the dashboard cards it rather than reading it as fine.
+    const [card] = buildAhrWarnings([pool])
+    assert.equal(card.level, 'warning')
+    assert.match(card.message, /is in an unknown state — the kernel mount table could not be read/)
+  })
+
+  it('H3: control — a readable table reports the read-only flag as before', async () => {
+    const ro = loadFixture('findmnt-ahr0.json').replace('"rw,relatime,space_cache=v2,subvolid=5', '"ro,relatime,space_cache=v2,subvolid=5')
+    const [pool] = await readAhrPools(healthyExecutor({ findmnt: ro }), confPath)
+    assert.equal(pool.state, 'readonly')
+    assert.equal(pool.mountedReadOnly, true)
+  })
+
+  it('table: a MOUNTED pool whose usage read failed reports used/free null and says so — never 0', async () => {
+    const mock = healthyExecutor()
+    mock.prependFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: { stdout: '', stderr: 'ERROR: cannot access', exitCode: 1 } })
+    const [pool] = await readAhrPools(mock, confPath)
+    assert.equal(pool.capacity.usedBytes, null)
+    assert.equal(pool.capacity.freeBytes, null)
+    assert.ok(pool.capacity.usableBytes !== null && pool.capacity.usableBytes > 0, 'usable comes from the LV')
+    assert.ok(pool.advisories.some(a => a.includes('used and free space are unknown')))
+  })
+
+  it('table: an UNMOUNTED pool reports used/free null (no filesystem to read), its usable from the LV', async () => {
+    const lsblk = loadFixture('lsblk-ahr0.json').replaceAll('"mountpoint": "/mnt/anas-ahr/ahr0"', '"mountpoint": null')
+    const findmnt = JSON.stringify({ filesystems: [] })
+    const [pool] = await readAhrPools(healthyExecutor({ lsblk, findmnt }), confPath)
+    assert.equal(pool.mounted, false)
+    assert.equal(pool.capacity.usedBytes, null)
+    assert.equal(pool.capacity.freeBytes, null)
+    assert.equal(pool.btrfsScrubRunning, false, 'no filesystem mounted, no scrub')
+  })
+
+  it('table: a pool whose VG is gone reports vg/lv sizes and usable null — never placeholder 0', async () => {
+    const mock = healthyExecutor()
+    mock.prependFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(JSON.stringify({ report: [{ vg: [] }] })) })
+    mock.prependFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(JSON.stringify({ report: [{ lv: [] }] })) })
+    mock.prependFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok(JSON.stringify({ filesystems: [] })) })
+    mock.prependFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok(loadFixture('lsblk-ahr0.json').replaceAll('"mountpoint": "/mnt/anas-ahr/ahr0"', '"mountpoint": null')) })
+    const [pool] = await readAhrPools(mock, confPath)
+    assert.equal(pool.state, 'failed')
+    assert.equal(pool.vg.sizeBytes, null)
+    assert.equal(pool.vg.freeBytes, null)
+    assert.equal(pool.lv.sizeBytes, null)
+    assert.equal(pool.capacity.usableBytes, null)
+  })
+
+  it('panel M3: a RUNNING btrfs scrub fuses the pool to scrubbing; the field says true', async () => {
+    const mock = healthyExecutor()
+    mock.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', '/mnt/anas-ahr/ahr0'], result: ok('UUID:             8a0c\nScrub started:    Sat Nov 14 10:00:00 2026\nStatus:           running\nDuration:         0:01:00\n') })
+    const [pool] = await readAhrPools(mock, confPath)
+    assert.equal(pool.btrfsScrubRunning, true)
+    assert.equal(pool.state, 'scrubbing')
+  })
+
+  it('panel M3: a finished / never-run scrub is false, and the pool reads healthy', async () => {
+    for (const out of ['Status:           finished\n', 'UUID: 8a0c\n\tno stats available\n']) {
+      const mock = healthyExecutor()
+      mock.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', '/mnt/anas-ahr/ahr0'], result: ok(out) })
+      const [pool] = await readAhrPools(mock, confPath)
+      assert.equal(pool.btrfsScrubRunning, false)
+      assert.equal(pool.state, 'healthy')
+    }
+  })
+
+  it('panel M3: a scrub-status read that FAILED is null (unknown), never false', async () => {
+    const mock = healthyExecutor()
+    mock.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', '/mnt/anas-ahr/ahr0'], result: { stdout: '', stderr: 'ERROR: cannot access', exitCode: 1 } })
+    const [pool] = await readAhrPools(mock, confPath)
+    assert.equal(pool.btrfsScrubRunning, null)
+  })
+
+  it('panel hand-off: each array carries md\'s own slot count; mid-failover the rows outnumber it', async () => {
+    const mock = healthyExecutor({ mdstat: MDSTAT_SPARE_REBUILDING, lsblk: lsblkWithSpare(), byId: BY_ID_WITH_SPARE })
+    const [pool] = await readAhrPools(mock, confPath)
+    const r1 = pool.arrays.find(a => a.band === 1)!
+    assert.equal(r1.raidDevices, 3)
+    // The failed row and the row being rebuilt onto are both listed (and the
+    // rebuild target carries no marker): four non-spare rows for three slots.
+    assert.equal(r1.members.filter(m => m.memberState !== 'spare').length, 4)
+    const brief = buildAhrPoolBriefs([pool])[0].bands.find(b => b.band === 1)!
+    assert.equal(brief.memberCount, 3, 'the dashboard reads md\'s count, never the row count')
   })
 })

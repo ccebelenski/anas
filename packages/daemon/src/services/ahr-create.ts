@@ -11,12 +11,12 @@ import { ROLLED_BACK_MARKER } from './ahr-create-status.js'
 import { destroyAhrPool } from './ahr-destroy.js'
 import { requireComposableNow } from './ahr-disk-recheck.js'
 import { LVM_MIXED_BLOCK_ARGS, run, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
-import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, ahrFstabEntry, ahrPoolLineForRemount, defaultAhrFstabPath, mountAhrPool } from './ahr-fstab.js'
+import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, ahrFstabEntry, ahrPoolLineForRemount, defaultAhrFstabPath, isAhrPoolOwnLine, isAhrSnapshotsLine, mountAhrPool } from './ahr-fstab.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { ahrNameOccupancy } from './ahr-identity.js'
 import { clearIntent } from './ahr-intent.js'
 import { floorToGranularity, planFreshLayout } from './ahr-layout.js'
-import { installProgramHook, pinArrays } from './ahr-mdadm-conf.js'
+import { foreignProgramHook, foreignProgramRefusal, installProgramHook, pinArrays } from './ahr-mdadm-conf.js'
 import { ahrLvPath, ahrMountBase } from './ahr-paths.js'
 import { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
 import { isAhrMountReadOnly } from './ahr-topology.js'
@@ -165,8 +165,8 @@ export async function ensureAhrTargetOrdering(
   let changed = false
   try {
     await editConfig(fstabPath, (current) => {
-      const lvPath = ahrLvPath(pool.name)
-      const existing = parseFstab(current).find(e => e.mountpoint === pool.mountpoint || e.spec === lvPath)
+      // cr3 AHR-CORE-M3: never the @snapshots line, which shares the LV spec.
+      const existing = parseFstab(current).find(e => !isAhrSnapshotsLine(e) && (e.mountpoint === pool.mountpoint || isAhrPoolOwnLine(e, pool.name)))
       if (!existing)
         return current
       // Two tokens, each added idempotently: the ordering edge (iscsi.8) and the
@@ -220,6 +220,12 @@ interface CreateLedger {
   planned: PlannedDisk[]
   /** md UUIDs of the arrays this attempt created — its own before they are pinned. */
   createdArrayUuids: string[]
+  /**
+   * The fstab entries this attempt wrote (cr3 AHR-CORE-H1) — recorded once the
+   * write landed. The rollback removes exactly these and no other line: a
+   * line at the same path is someone else's until this job wrote it.
+   */
+  fstabEntriesWritten: MountEntry[]
 }
 
 /**
@@ -247,6 +253,12 @@ async function executeCreate(
   const occupied = await ahrNameOccupancy(executor, name, { mdadmConfPath: opts.mdadmConfPath })
   if (occupied.length > 0)
     throw new Error(`the pool name '${name}' is already in use on this node — nothing was touched: ${occupied.join('; ')}`)
+  // cr3 AHR-CORE-M4: the monitor hook is installed after the arrays are
+  // built, and a foreign PROGRAM line refuses it — read it HERE, while the
+  // disks are untouched, never after the wipe.
+  const foreignHook = await foreignProgramHook(opts.mdadmConfPath)
+  if (foreignHook !== null)
+    throw new Error(foreignProgramRefusal(foreignHook))
   if (opts.diskCache)
     await requireComposableNow(executor, opts.diskCache, spec.disks.map(d => d.id))
   if (opts.intentDir !== undefined)
@@ -433,6 +445,7 @@ async function executeCreate(
       throw new Error(`Mount '${mountpoint}' is already in /etc/fstab`)
     return addMount(current, written)
   })
+  ledger.fstabEntriesWritten.push(written)
   await run(executor, SYSTEMCTL, ['daemon-reload'])
   // cr.52r D3: the pool mounts DIRECTLY from the entry just written, through
   // the daemon-opened directory (the fd pins the mount; `-c` keeps the kernel
@@ -495,6 +508,7 @@ export async function createAhrPool(
     mountpoint: spec.mountpoint ?? join(ahrMountBase(opts.mountBase), spec.name),
     planned: [],
     createdArrayUuids: [],
+    fstabEntriesWritten: [],
   }
 
   try {
@@ -518,6 +532,8 @@ export async function createAhrPool(
           // `mounted: true` lets destroy CONSIDER the mountpoint; its own live
           // findmnt check decides whether anything is actually mounted, so this
           // is correct at every stage — before the first mount and after it.
+          // It unmounts only a filesystem whose SOURCE is this pool's LV (cr3
+          // AHR-CORE-H1): whatever else sits at the path is left alone.
           mounted: true,
           mountpoint: ledger.mountpoint,
           disks: ledger.planned.map(d => ({
@@ -529,6 +545,8 @@ export async function createAhrPool(
           // else on the node is reachable from this teardown.
           createdArrayUuids: ledger.createdArrayUuids,
           disksWipedByCaller: true,
+          // Only the lines this attempt wrote (cr3 AHR-CORE-H1).
+          fstabEntriesWritten: ledger.fstabEntriesWritten,
         },
         m => updateProgress(`Rollback: ${m}`),
         { fstabPath: opts.fstabPath, mdadmConfPath: opts.mdadmConfPath },
@@ -591,10 +609,13 @@ export async function createAhrPool(
  */
 export async function remountAhrPool(
   executor: CommandExecutor,
-  pool: { name: string, mountpoint: string, subvolLayout: boolean },
+  pool: { name: string, mountpoint: string, subvolLayout: boolean | null },
   updateProgress: (message: string) => void,
   opts: { fstabPath?: string } = {},
 ): Promise<{ mountpoint: string, readOnly: boolean }> {
+  // cr3 review 3: a layout that could not be read refuses before the unmount.
+  if (pool.subvolLayout === null)
+    throw new Error(`the kernel mount table could not be read, so pool '${pool.name}''s mount cannot be verified — nothing was unmounted`)
   const line = await ahrPoolLineForRemount(opts.fstabPath ?? defaultAhrFstabPath(), pool.name, updateProgress)
 
   updateProgress(`Unmounting ${pool.mountpoint}`)
@@ -604,6 +625,10 @@ export async function remountAhrPool(
   await mountAhrPool(executor, pool, line)
 
   const readOnly = await isAhrMountReadOnly(executor, pool.mountpoint)
+  // cr3: a mount table that could not be read never verifies the remount —
+  // "writable again" is exactly the claim it cannot make.
+  if (readOnly === null)
+    throw new Error(`pool '${pool.name}' was mounted again, but the kernel mount table could not be read to verify it is writable — check the Hybrid RAID view before relying on it`)
   if (readOnly) {
     throw new Error(
       `pool '${pool.name}' mounted again but is STILL read-only. btrfs re-applies the flag when the fault that caused it `
@@ -625,12 +650,17 @@ export async function remountAhrPool(
  */
 export async function changeAhrMountpoint(
   executor: CommandExecutor,
-  pool: { name: string, mountpoint: string, mounted: boolean, subvolLayout: boolean },
+  pool: { name: string, mountpoint: string, mounted: boolean, subvolLayout: boolean | null },
   newMountpoint: string,
   updateProgress: (message: string) => void,
   opts: { fstabPath: string },
 ): Promise<{ mountpoint: string }> {
   const { name } = pool
+  // cr3 review 3: a layout that could not be read refuses before the unmount
+  // (the move may have to write ANAS's own line, which carries the layout).
+  if (pool.subvolLayout === null)
+    throw new Error(`the kernel mount table could not be read, so pool '${name}''s subvolume layout is unknown — nothing was unmounted`)
+  const subvolLayout = pool.subvolLayout
   const lvPath = ahrLvPath(name)
 
   if (pool.mounted) {
@@ -646,7 +676,9 @@ export async function changeAhrMountpoint(
     // pool's REAL layout carries through (§12): a subvol pool keeps
     // subvol=@data, a flat pool keeps its plain entry — the move never
     // fabricates a subvolume option the filesystem does not have.
-    const existing = parseFstab(current).find(e => e.mountpoint === pool.mountpoint || e.spec === lvPath)
+    // cr3 AHR-CORE-M3: the @snapshots line carries the same LV spec; it is
+    // never the pool's line, so a move never carries it off.
+    const existing = parseFstab(current).find(e => !isAhrSnapshotsLine(e) && (e.mountpoint === pool.mountpoint || isAhrPoolOwnLine(e, name)))
     const without = existing ? removeMount(current, existing.mountpoint) : current
     // cr.52s-a: the pool's OWN active line moves with only its mountpoint
     // changed — the operator's options (`noatime`, `compress=`, …) stay;
@@ -654,7 +686,7 @@ export async function changeAhrMountpoint(
     // the line found by mountpoint names another device).
     moved = existing && existing.spec === lvPath && !existing.disabled
       ? { ...existing, mountpoint: newMountpoint }
-      : ahrFstabEntry(name, newMountpoint, pool.subvolLayout)
+      : ahrFstabEntry(name, newMountpoint, subvolLayout)
     return addMount(without, moved)
   })
   await run(executor, SYSTEMCTL, ['daemon-reload'])
@@ -667,7 +699,7 @@ export async function changeAhrMountpoint(
   await createMountpointThroughOpenedParent(newMountpoint)
   // cr.52r D3: the move's mount, through the daemon-opened directory — the
   // line just written, as written.
-  await mountAhrPool(executor, { name, mountpoint: newMountpoint, subvolLayout: pool.subvolLayout }, moved ?? null)
+  await mountAhrPool(executor, { name, mountpoint: newMountpoint, subvolLayout }, moved ?? null)
   // The old mountpoint directory stays (plain umount semantics — the mounts
   // feature's recorded decision).
 

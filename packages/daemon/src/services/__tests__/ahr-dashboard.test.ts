@@ -39,6 +39,8 @@ function healthyExecutor(overrides?: { mdstat?: string, findmnt?: string, vgs?: 
   mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok(loadFixture('lsblk-ahr0.json')) })
   mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(loadFixture('disk-by-id-ahr.txt')) })
   mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(overrides?.vgs ?? loadFixture('lvm-vgs.json')) })
+  // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+  mock.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(overrides?.lvs ?? loadFixture('lvm-lvs.json')) })
   mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok(overrides?.findmnt ?? loadFixture('findmnt-ahr0.json')) })
   mock.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: ok(loadFixture('btrfs-usage.txt')) })
@@ -228,7 +230,10 @@ describe('collectAhrWarnings (fail-open source for GET /v1/status)', () => {
     }
   })
 
-  it('an AHR read error degrades the source to no warnings, never a throw', async () => {
+  // cr3 review2 1: was "degrades the source to no warnings, never a throw" —
+  // a failed read is never "no warnings"; the route marks the section
+  // unavailable for any throw.
+  it('cr3: an AHR read error THROWS — never a silent "no warnings"', async () => {
     const throwing: CommandExecutor = {
       exec: async () => {
         throw new Error('boom')
@@ -241,7 +246,7 @@ describe('collectAhrWarnings (fail-open source for GET /v1/status)', () => {
         throw new Error('boom')
       },
     }
-    assert.deepEqual(await collectAhrWarnings(throwing), [])
+    await assert.rejects(collectAhrWarnings(throwing), /boom/)
   })
 
   it('an UNREADABLE mdstat THROWS, never a silent no-warnings (F3)', async () => {
@@ -488,7 +493,9 @@ describe('buildAhrCapacityWarnings (parity with ZFS capacity cards)', () => {
 })
 
 describe('collectAhrPoolBriefs (fail-open source for GET /v1/status)', () => {
-  it('an AHR read error degrades the source to [] (never a throw)', async () => {
+  // cr3 review2 1: was "degrades the source to [] (never a throw)" — with
+  // findmnt failing a schema refusal made the dashboard's AHR pools VANISH.
+  it('cr3: an AHR read error THROWS — never a silent []', async () => {
     const throwing: CommandExecutor = {
       exec: async () => {
         throw new Error('boom')
@@ -501,7 +508,7 @@ describe('collectAhrPoolBriefs (fail-open source for GET /v1/status)', () => {
         throw new Error('boom')
       },
     }
-    assert.deepEqual(await collectAhrPoolBriefs(throwing), [])
+    await assert.rejects(collectAhrPoolBriefs(throwing), /boom/)
   })
 
   it('an UNREADABLE mdstat (no match → command-not-found 127) THROWS, never a silent [] (F3)', async () => {
@@ -513,6 +520,18 @@ describe('collectAhrPoolBriefs (fail-open source for GET /v1/status)', () => {
       (err: unknown) => err instanceof AhrTopologyUnreadableError
         && /cat \/proc\/mdstat/.test((err as AhrTopologyUnreadableError).command),
     )
+  })
+
+  // cr3 review2 1 (probe c1-brief.test.ts): with findmnt unreadable the
+  // pool's subvolLayout is null; the brief schema refused it, the catch
+  // turned that into [], and the dashboard's AHR pools vanished unmarked.
+  it('cr3: findmnt unreadable — the brief carries subvolLayout null, the pool is still there', async () => {
+    const mock = healthyExecutor()
+    mock.prependFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: '', stderr: 'findmnt: timeout', exitCode: 1 } })
+    const briefs = await collectAhrPoolBriefs(mock)
+    assert.equal(briefs.length, 1)
+    assert.equal(briefs[0].state, 'unknown')
+    assert.equal(briefs[0].subvolLayout, null)
   })
 
   it('reports [] when the READABLE topology has no AHR arrays — the read answered, empty', async () => {

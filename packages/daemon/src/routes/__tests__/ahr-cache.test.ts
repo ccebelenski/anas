@@ -322,6 +322,10 @@ function buildExecutor(world: World): MockExecutor {
   executor.addFixture({ command: '/usr/bin/perl', result: ok('') })
   // cr.38: the attach's signature probe. A blank disk is `blkid -p`'s captured
   // "nothing found": exit 2, no output (docs/BACKUP-RESTORE-GROUND-TRUTH.md).
+  // cr3 review 4: the leftover cache SLICE as blkid reads it — a partition
+  // carrying the outdated PV label (the live-PV line captured on PVE 9 / LVM
+  // 2.03.31). Exit 2 on a partition is a device blkid could not see.
+  executor.addFixture({ command: '/usr/sbin/blkid', args: ['-p', `/dev/disk/by-id/${C}-part1`], result: ok(`/dev/disk/by-id/${C}-part1: ${readFileSync(join(fileURLToPath(new URL('../../fixtures/ahr/', import.meta.url)), 'blkid-p-lvm-pv.txt'), 'utf8')}`) })
   executor.addFixture({ command: '/usr/sbin/blkid', result: { stdout: '', stderr: '', exitCode: 2 } })
   // Mutation plumbing — quiet success; the tests assert the ARGV, not effects.
   executor.addFixture({ command: '/usr/sbin/wipefs', result: ok('') })
@@ -1000,17 +1004,35 @@ describe('cr.38 — the AHR cache verbs re-gate in the job (ruling (j))', () => 
     release()
     const job = await waitForJob(jobQueue, id)
     assert.equal(job.status, 'failed', JSON.stringify(job))
-    assert.equal(job.error?.code, 'CONFLICT', JSON.stringify(job.error))
-    assert.match(job.error!.message, /refusing any cache change of volume group 'tank': its PVs cannot be proven to be this pool's/)
+    // cr3 AHR-CORE-M5: an unreadable pvs now makes the pool READ itself
+    // unavailable (the topology raises the unreadable error), one read before
+    // requirePoolVg's own refusal — the job still changes nothing.
+    assert.match(job.error!.message, /the AHR topology could not be read \(pvs exited 5/, JSON.stringify(job.error))
     assert.deepEqual(mutations(), [], 'no slice, no pvcreate, no vgextend')
+  })
+
+  // cr3 (handed, 12c): an attach changes the VG — refused on a pool whose
+  // state is unknown (the mount table could not be read).
+  it('cr3 12c: attach on a pool in the UNKNOWN state is refused 409 before a job exists', async () => {
+    await build('none')
+    world.prependFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: '', stderr: 'findmnt: timeout', exitCode: 1 } })
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/cache', headers: IDENTITY_HEADERS, payload: { disks: [C] } })
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.reason, 'unreadable')
+    assert.match(res.json().error.message, /is in an unknown state/)
+    assert.equal(jobQueue.list().length, 0)
+    assert.deepEqual(mutations(), [])
   })
 
   it('attach: requirePoolVg is a gate at the route too — an unreadable PV view refuses before a job exists', async () => {
     await build('none')
     pvsBroken = true
     const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/cache', headers: IDENTITY_HEADERS, payload: { disks: [C] } })
-    assert.equal(res.statusCode, 409, res.body)
-    assert.equal(res.json().error.reason, 'foreign-vg')
+    // cr3 AHR-CORE-M5: refused one read earlier — the pool's topology read
+    // raises the unreadable error (503 UNAVAILABLE through the daemon's error
+    // handler; this bare test server answers it 500). No job, nothing changed.
+    assert.notEqual(res.statusCode, 202, res.body)
+    assert.match(res.body, /the AHR topology could not be read \(pvs exited 5/)
     assert.equal(jobQueue.list().length, 0)
     assert.deepEqual(mutations(), [])
   })

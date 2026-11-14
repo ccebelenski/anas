@@ -9,6 +9,8 @@ export const SUBVOL_DATA = '@data'
 /** The `@snapshots` subvolume — the snapshot home, outside the mounted tree. */
 export const SUBVOL_SNAPSHOTS = '@snapshots'
 
+const LEADING_SLASHES_RE = /^\/+/
+
 /**
  * The fstab option ordering AHR pool mounts after the iSCSI target service
  * (story iscsi.8): LIO restores its LUNs from image files that live ON the
@@ -81,6 +83,39 @@ export function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: bo
   }
 }
 
+/** One `subvol=` token's value, its leading `/` dropped (btrfs accepts both spellings). */
+function subvolOption(entry: MountEntry): string | null {
+  for (const token of entry.options.passthrough.split(',')) {
+    const t = token.trim()
+    if (t.startsWith('subvol='))
+      return t.slice('subvol='.length).replace(LEADING_SLASHES_RE, '')
+  }
+  return null
+}
+
+/**
+ * Is `entry` the Previous Versions `@snapshots` line (smbsvc.1)? It carries
+ * the pool's own LV spec, so the spec alone never tells it from the pool's
+ * line (cr3 AHR-CORE-M3); the subvolume it mounts does.
+ */
+export function isAhrSnapshotsLine(entry: MountEntry): boolean {
+  return subvolOption(entry) === SUBVOL_SNAPSHOTS
+}
+
+/**
+ * THE rule for "the pool's OWN fstab line" (cr3 AHR-CORE-M3), one predicate
+ * for every reader and writer that looks for it: the line whose spec is the
+ * pool's LV path and that is NOT the `@snapshots` line. Before, each reader
+ * took the first line with the LV spec — after a Change mountpoint moved the
+ * pool's line below the `@snapshots` one, the Remount verb and the snapshot
+ * rollback re-mounted the POOL `ro,subvol=@snapshots`, the boot cache rung
+ * mounted the wrong line, and a second Change mountpoint moved the
+ * `@snapshots` line instead of the pool's.
+ */
+export function isAhrPoolOwnLine(entry: MountEntry, name: string): boolean {
+  return entry.spec === ahrLvPath(name) && !isAhrSnapshotsLine(entry)
+}
+
 /** The fstab the daemon was configured with when a caller has no path to hand (the server's own default). */
 export function defaultAhrFstabPath(): string {
   return process.env.ANAS_FSTAB_PATH ?? '/etc/fstab'
@@ -106,8 +141,7 @@ export async function readAhrPoolLine(fstabPath: string, name: string): Promise<
   catch (err) {
     return { kind: 'unreadable', detail: err instanceof Error ? err.message : String(err) }
   }
-  const spec = ahrLvPath(name)
-  const entry = parseFstab(text).find(e => e.spec === spec && !e.disabled)
+  const entry = parseFstab(text).find(e => isAhrPoolOwnLine(e, name) && !e.disabled)
   return entry ? { kind: 'line', entry } : { kind: 'none' }
 }
 
@@ -129,10 +163,14 @@ export async function readAhrPoolLine(fstabPath: string, name: string): Promise<
  */
 export async function mountAhrPool(
   executor: Parameters<typeof mountThroughOpenedDir>[0],
-  pool: { name: string, mountpoint: string, subvolLayout: boolean },
+  pool: { name: string, mountpoint: string, subvolLayout: boolean | null },
   line: MountEntry | null,
 ): Promise<void> {
-  const entry = line ?? ahrFstabEntry(pool.name, pool.mountpoint, pool.subvolLayout)
+  // cr3 review 3: ANAS's defaults carry the layout (`subvol=@data` or not); a
+  // layout that could not be read (null) is never guessed into a mount.
+  if (line === null && pool.subvolLayout === null)
+    throw new Error(`pool '${pool.name}' has no fstab line and its subvolume layout could not be read (the kernel mount table did not answer) — not mounting it with guessed options`)
+  const entry = line ?? ahrFstabEntry(pool.name, pool.mountpoint, pool.subvolLayout === true)
   const args = ['-c', '-t', entry.fstype, ...directMountOptionArgs(entry), '--', entry.spec]
   const r = await mountThroughOpenedDir(executor, pool.mountpoint, args)
   if (r.exitCode !== 0)

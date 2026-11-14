@@ -316,6 +316,9 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     ex.addFixture({ command: '/usr/bin/cat', result: { stdout: 'Personalities : []\nunused devices: <none>\n', stderr: '', exitCode: 0 } })
     ex.addFixture({ command: '/usr/bin/lsblk', result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
     ex.addFixture({ command: '/usr/sbin/vgs', result: { stdout: JSON.stringify({ report: [{ vg: [] }] }), stderr: '', exitCode: 0 } })
+    // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+    ex.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
+    ex.addFixture({ command: '/usr/sbin/lvs', result: { stdout: JSON.stringify({ report: [{ lv: [] }] }), stderr: '', exitCode: 0 } })
     // The create job's commands.
     for (const command of ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/bin/udevadm', '/usr/sbin/pvcreate', '/usr/sbin/vgcreate', '/usr/sbin/lvcreate', '/usr/sbin/mkfs.btrfs', '/usr/bin/btrfs', '/usr/sbin/update-initramfs', '/usr/bin/systemctl', '/usr/bin/mount', '/usr/bin/umount', '/usr/bin/perl', '/usr/sbin/mdadm'])
       ex.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -683,6 +686,38 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.match(job.error!.message, /is already claimed in fstab/)
     assert.ok(!executor.calls.some(c => ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/sbin/mdadm'].includes(c.command) && c.args[0] !== '--detail'), 'nothing was wiped or built')
   })
+
+  // cr3 AHR-CORE-H1: the DEFAULT mountpoint (<base>/<name>) ran no collision
+  // gate — another pool moved there (live mount + fstab line) passed the route
+  // and the job, the disks were wiped, and the failed create's rollback then
+  // unmounted and un-fstabbed the OTHER pool. The default path is now gated
+  // exactly as a typed one, at the route (no confirm code minted).
+  it('H1: the DEFAULT mountpoint is gated — a live mount there answers 409 before any confirm', async () => {
+    const mp = join(dir, 'mnt', 'tpool')
+    executor.prependFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: JSON.stringify({ filesystems: [{ target: mp, source: '/dev/mapper/bar-bar--vol[/@data]', fstype: 'btrfs', options: 'rw' }] }), stderr: '', exitCode: 0 } })
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }) })
+    assert.equal(res.statusCode, 409, res.body)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    assert.match(res.json().error.message, /is already a mountpoint/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+  })
+
+  it('M4: a foreign mdadm PROGRAM hook answers 409 at the route — before a confirm code, long before a wipe', async () => {
+    await writeFile(join(dir, 'mdadm.conf'), 'PROGRAM /usr/local/sbin/site-raid-alert\n')
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }) })
+    assert.equal(res.statusCode, 409, res.body)
+    assert.match(res.json().error.message, /PROGRAM line pointing at '\/usr\/local\/sbin\/site-raid-alert'/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+  })
+
+  it('H1: the DEFAULT mountpoint is gated — an fstab line there answers 409 before any confirm', async () => {
+    const mp = join(dir, 'mnt', 'tpool')
+    await writeFile(join(dir, 'fstab'), `# empty\n/dev/bar/bar-vol ${mp} btrfs subvol=@data,nofail 0 0\n`)
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }) })
+    assert.equal(res.statusCode, 409, res.body)
+    assert.match(res.json().error.message, /is already claimed in fstab/)
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'), 'nothing was wiped')
+  })
 })
 
 /**
@@ -721,6 +756,8 @@ describe('POST /v1/ahr/:name/{scrub,repair} — the in-flight exclusion', () => 
     executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
     executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
     executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
@@ -819,6 +856,8 @@ describe('POST /v1/ahr/:name/{scrub,repair} — the in-flight exclusion', () => 
     executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
     executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
     executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
@@ -868,6 +907,8 @@ describe('POST /v1/ahr/:name/{scrub,repair} — the in-flight exclusion', () => 
     executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
     executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
     executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
@@ -899,7 +940,7 @@ describe('POST /v1/ahr/:name/{scrub,repair} — the in-flight exclusion', () => 
       // A guard refusal is not a scrub failure: nothing notified, nothing
       // started — the body never ran.
       assert.ok(!executor.calls.some(c => c.command === '/usr/bin/perl' && c.args[3] === 'AHR scrub failed'), JSON.stringify(executor.calls.filter(c => c.command === '/usr/bin/perl')))
-      assert.ok(!executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[0] === 'scrub'), 'no btrfs scrub was started')
+      assert.ok(!executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[0] === 'scrub' && c.args[1] === 'start'), 'no btrfs scrub was started')
     }
     finally {
       await app.close()
@@ -930,6 +971,8 @@ describe('POST /v1/ahr/:name/scrub — an OFFLINE pool is refused', () => {
     executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
     executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: { ...lvs, stdout: lvs.stdout.replace('"-wi-a-----"', '"-wi-------"') } })
     executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
     executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
@@ -966,7 +1009,7 @@ describe('POST /v1/ahr/:name/scrub — an OFFLINE pool is refused', () => {
     // `degraded`, which is not in the busy list, so the scrub was ALLOWED.
     assert.ok(!message.includes('would thrash'), message)
     // Nothing was started: no btrfs scrub, no md check.
-    assert.ok(!executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[0] === 'scrub'), 'no btrfs scrub')
+    assert.ok(!executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[0] === 'scrub' && c.args[1] === 'start'), 'no btrfs scrub')
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check'), 'no md check')
   })
 })
@@ -1044,6 +1087,8 @@ describe('POST /v1/ahr/:name/parity-rewrite', () => {
     executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
     executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
     executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
@@ -1357,6 +1402,8 @@ describe('POST /v1/ahr/:name/mirror-reconcile', () => {
     executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
     executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
     executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
@@ -1557,6 +1604,8 @@ describe('DELETE /v1/ahr/:name — identity doors (ident.3)', () => {
     executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: opts.unmounted ? { ...lsblk, stdout: lsblk.stdout.replaceAll('"mountpoint": "/mnt/anas-ahr/ahr0"', '"mountpoint": null') } : lsblk })
     executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     executor.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: mockFixtures.ahrPvs() })
     executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: opts.unmounted ? { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } : mockFixtures.ahrFindmnt() })

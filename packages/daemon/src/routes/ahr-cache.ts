@@ -5,11 +5,14 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { Gate, GuardReads, GuardSpec } from '../safety/guard.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrCacheEventRequest, AttachAhrCacheRequest, isComposableDisk, PoolName } from '@anas/shared'
+import { dmCacheHealth, DMSETUP_BIN, dmsetupStatusArgs, parseDmsetupStatus } from '../parsers/dmsetup.js'
 import { guardCheck, guarded, sendRefusal } from '../safety/guard.js'
-import { attachAhrCache, detachAhrCache, findCacheSlices, notifyCacheRecoveryFailed, recoverFailedAhrCache } from '../services/ahr-cache.js'
+import { attachAhrCache, cacheDeviceVerdict, detachAhrCache, notifyCacheRecoveryFailed, recoverFailedAhrCache } from '../services/ahr-cache.js'
+import { inventoryUnreadableRefusal, isDiskStatusUnknown } from '../services/ahr-disk-recheck.js'
 import { ahrGuard } from '../services/ahr-guard.js'
-import { requirePoolVg } from '../services/ahr-identity.js'
+import { readPoolBandCount, requirePoolVg } from '../services/ahr-identity.js'
 import { fmtBytes } from '../services/ahr-layout.js'
+import { dmName } from '../services/ahr-topology.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -22,6 +25,14 @@ export interface AhrCacheRouteOptions {
 }
 
 const BLKID = '/usr/sbin/blkid'
+
+/**
+ * Each read the cache-event verdict makes (dmsetup, pvs, blkid) is bounded so
+ * the whole answer lands inside the udev hook's own wait (`anas-cache-event.sh`:
+ * `curl --max-time 10`) — cr3 review2 8. A read that runs out is `unknown`:
+ * the logged 200 no-op, and the boot rung re-checks at the next start.
+ */
+const CACHE_EVENT_READ_BUDGET_MS = 2000
 
 /** One `KEY="value"` pair of a `blkid -p` line — the signature it names (TYPE, PTTYPE, …). */
 const SIGNATURE_RE = /\b(TYPE|PTTYPE|USAGE)="([^"]*)"/g
@@ -128,6 +139,8 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     /** The picked disks that carry this pool's own leftover `<pool>-cache<n>` slice (§13). */
     reclaimable: string[]
     problems: string[]
+    /** Picked disks whose inventory row could not be read (cr3: 409 `unreadable`). */
+    unreadable: string[]
   }
   type AttachObject = AhrPool & { pick: CachePick }
 
@@ -148,6 +161,7 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     const reclaimable = new Set(pool.cache?.state === 'absent' ? pool.cache.devices : [])
     const inventory = await reads.once('inventory', () => collectDisks(executor, diskIdentityCache))
     const problems: string[] = []
+    const unreadable: string[] = []
     const selected: CachePick['selected'] = []
     for (const id of requestedIds) {
       const poolDisk = pool.disks.find(d => d.id === id)
@@ -160,6 +174,10 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
         problems.push(`disk '${id}' not found in the inventory`)
         continue
       }
+      if (isDiskStatusUnknown(disk)) {
+        unreadable.push(id)
+        continue
+      }
       if (!isComposableDisk(disk) && !reclaimable.has(id)) {
         problems.push(disk.handsOff
           ? `disk '${id}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`
@@ -168,7 +186,7 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
       }
       selected.push({ id: disk.id, size: disk.size, model: disk.model, rotational: disk.rotational })
     }
-    return { selected, reclaimable: requestedIds.filter(id => reclaimable.has(id)), problems }
+    return { selected, reclaimable: requestedIds.filter(id => reclaimable.has(id)), problems, unreadable }
   }
 
   /**
@@ -245,6 +263,11 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
         async pool => pool.state === 'offline' || pool.state === 'failed'
           ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' is ${pool.state}: its volume is not assembled, so there is nothing to cache. See the Hybrid RAID view` }
           : null,
+        // cr3 (handed, 12c): an attach changes the VG — never on a pool whose
+        // state could not be decided (the mount table could not be read).
+        async pool => pool.state === 'unknown'
+          ? { status: 409, code: 'CONFLICT', reason: 'unreadable', message: `AHR pool '${pool.name}' is in an unknown state — the kernel mount table could not be read, so whether its filesystem is read-only is not known. Retry once it can be read` }
+          : null,
         // Already cached: attaching a second cache to one LV is not a thing LVM
         // does, and silently no-op'ing would read as success. AFTER the state
         // check on purpose: an offline pool with a cache is refused for being
@@ -252,6 +275,7 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
         async pool => pool.cache && pool.cache.state !== 'absent'
           ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' already has a read cache (${pool.cache.devices.join(', ') || 'device missing'}, ${fmtBytes(pool.cache.sizeBytes)}, state '${pool.cache.state}'). Detach it before attaching another` }
           : null,
+        async pool => pool.pick.unreadable.length > 0 ? inventoryUnreadableRefusal(pool.pick.unreadable) : null,
         async pool => pool.pick.problems.length > 0
           ? { status: 400, code: 'VALIDATION_ERROR', message: `Ineligible cache disk selection: ${pool.pick.problems.join('; ')}` }
           : null,
@@ -375,8 +399,8 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
    * THE BODY IS A REPORT, NOT A COMMAND. Nothing in it can make the daemon
    * uncache a healthy pool: the verdict comes from this node's own reads — the
    * pool's `cache.state` (dm-cache's own failure word, or the cache PV's device
-   * gone under the band guard) and a fresh label sweep that finds no
-   * `<pool>-cache<n>` slice left on any disk. The body only supplies the slice
+   * gone under the band guard) and the cache PVs' own identity probed now
+   * (cr3: `cacheDeviceVerdict`, never a GPT label). The body only supplies the slice
    * LABEL, which is used to NAME the device in the notification once the disk
    * is gone and its by-id can no longer be resolved.
    *
@@ -430,11 +454,11 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     const verdict = await cacheRecoveryVerdict(pre.object, (err) => {
       // An unreadable sweep is no evidence either way: log it and answer on
       // what the pool read said. The boot rung re-checks at the next start.
-      request.log.warn({ pool: poolName, err: err instanceof Error ? err.message : String(err) }, 'ahr.cache event: label sweep unreadable')
+      request.log.warn({ pool: poolName, err: err instanceof Error ? err.message : String(err) }, 'ahr.cache event: cache device identity unreadable')
     })
     if (!verdict.recover) {
       reply.code(200)
-      return { data: nothingToRecover(pre.object) }
+      return { data: nothingToRecover(pre.object, verdict.unknown) }
     }
 
     const job = jobQueue.submit(
@@ -447,7 +471,7 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
         // The verdict again, on the pool as the job read it.
         const now = await cacheRecoveryVerdict(live, () => {})
         if (!now.recover)
-          return nothingToRecover(live)
+          return nothingToRecover(live, now.unknown)
         try {
           return await recoverFailedAhrCache(
             executor,
@@ -471,12 +495,16 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
   })
 
   /** The event's "nothing to recover" answer (the route's 200 body and the job's result). */
-  function nothingToRecover(pool: AhrPool) {
+  function nothingToRecover(pool: AhrPool, unknown: string | null) {
     return {
       pool: pool.name,
       recovered: false,
       cacheState: pool.cache?.state ?? 'absent',
-      detail: `the read cache on AHR pool '${pool.name}' reads '${pool.cache?.state ?? 'absent'}' — nothing to recover`,
+      // cr3 review2 9: when the evidence read could not answer, say so —
+      // never "reads 'healthy'" about a device nobody could identify.
+      detail: unknown !== null
+        ? `whether the read cache device of AHR pool '${pool.name}' is still present could not be read (${unknown}) — nothing was done; the next event or daemon start checks again`
+        : `the read cache on AHR pool '${pool.name}' reads '${pool.cache?.state ?? 'absent'}' — nothing to recover`,
     }
   }
 
@@ -484,12 +512,17 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
    * The verdict, from this node's own reads. Recovery needs evidence that the
    * cache is broken or its device gone, and there are two kinds:
    *
-   *  1. `cache.state: 'failed'` — dm-cache reporting a failure word, an ACTIVE
-   *     cache target whose `dmsetup status` cannot be read (the GT-23
-   *     asymmetry in `buildAhrCacheState`), or the cache PV's device gone: an
-   *     `[unknown]` PV in the VG while every band has its own named md PV.
-   *  2. A cache target that still reads `healthy`, and NO disk left carrying
-   *     one of the pool's `<pool>-cache<n>` slices (a fresh lsblk sweep).
+   *  1. `cache.state: 'failed'` with dm-cache's own failure word, asked again
+   *     here (cr3: a `failed` that rests on a `dmsetup status` that could not be
+   *     READ — the GT-23 asymmetry in `buildAhrCacheState` — is no evidence on
+   *     its own), or the cache PV's device gone: an `[unknown]` PV in the VG
+   *     while every band has its own named md PV.
+   *  2. A cache target that reads `healthy` (or an unconfirmed `failed`) whose
+   *     cache PV no longer probes as itself — `cacheDeviceVerdict` compares
+   *     each cache PV's LVM UUID with what `blkid -p` reads on its device now.
+   *     Before cr3 this was a label sweep, and ANY disk carrying a
+   *     `<pool>-cache<n>` slice (a stale one left on an earlier cache disk —
+   *     detach keeps the slice) hid the loss of the live device.
    *
    * Why the second exists, and why `healthy` alone is not the answer: dm-cache
    * enters Fail only after an I/O on the cache device fails. A removal on an
@@ -497,8 +530,8 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
    * counters; nothing raises the event again, and the pool returns EIO from
    * its first read. The event is itself the fact that a device went away, so
    * the verdict accepts "the slice's disk is gone" as evidence. When LVM has
-   * already noticed, (1) catches it through the `[unknown]` PV; the sweep
-   * covers the moment in which it has not.
+   * already noticed, (1) catches it through the `[unknown]` PV; the identity
+   * probe covers the moment in which it has not.
    *
    * THE IDLE-PULL SHAPE IS NOT IN GT-19, which measured the removal under a
    * running read load (dm had already failed when the event arrived). The
@@ -510,20 +543,56 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
    * is usually a band that did not assemble, and uncaching a partial VG is
    * not this rung's call (the boot rung and the operator own that shape).
    */
-  async function cacheRecoveryVerdict(pool: AhrPool, onSweepError: (err: unknown) => void): Promise<{ recover: boolean, cause: 'missing' | 'failed' }> {
+  async function cacheRecoveryVerdict(pool: AhrPool, onSweepError: (err: unknown) => void): Promise<{ recover: boolean, cause: 'missing' | 'failed', unknown: string | null }> {
+    let unknown: string | null = null
     let recover = pool.cache?.state === 'failed'
     let cause: 'missing' | 'failed' = pool.cache?.deviceMissing === true ? 'missing' : 'failed'
-    if (!recover && pool.cache?.state === 'healthy') {
+    // cr3 (core review, the cache-event door): the event is raised by ANY
+    // disk with a `<pool>-cache<n>` GPT label going away — a stale slice on
+    // an unrelated disk fires it too. `failed` without `deviceMissing` can be
+    // the topology's GT-23 asymmetry (an active cache target whose `dmsetup
+    // status` could not be READ), which is no evidence about the cache at
+    // all. The event acts on dm-cache's own failure word, asked again now —
+    // never on a status read that did not answer.
+    if (recover && pool.cache?.deviceMissing !== true) {
       try {
-        if ((await findCacheSlices(executor, pool.name)).length === 0) {
-          recover = true
-          cause = 'missing'
-        }
+        const res = await executor.exec(DMSETUP_BIN, dmsetupStatusArgs(dmName(pool.name, pool.lv.name)), { timeoutMs: CACHE_EVENT_READ_BUDGET_MS })
+        recover = res.exitCode === 0 && dmCacheHealth(parseDmsetupStatus(res.stdout)) === 'failed'
       }
       catch (err) {
+        // A status read that did not finish is no evidence (logged, no 500).
         onSweepError(err)
+        unknown = `dmsetup status: ${err instanceof Error ? err.message : String(err)}`
+        recover = false
       }
     }
-    return { recover, cause }
+    // The evidence for a healthy-reading cache whose disk went away — and for
+    // a `failed` one whose dm answer could not be confirmed — is THE cache
+    // device's identity (cr3): every cache PV of the VG still probing as
+    // itself. Never a GPT label sweep: a stale `<pool>-cache<n>` slice on an
+    // earlier cache disk hid the loss of the live one.
+    if (!recover && (pool.cache?.state === 'healthy' || pool.cache?.state === 'failed')) {
+      // A failed read here is a logged no-op (never a thrown 500): the old
+      // sweep's catch answered the same way, and the boot rung re-checks.
+      let device: Awaited<ReturnType<typeof cacheDeviceVerdict>>
+      try {
+        device = await cacheDeviceVerdict(executor, { name: pool.name, bandCount: await readPoolBandCount(pool.name, pool.arrays.length) }, { timeoutMs: CACHE_EVENT_READ_BUDGET_MS })
+      }
+      catch (err) {
+        device = { verdict: 'unknown', detail: err instanceof Error ? err.message : String(err) }
+      }
+      if (device.verdict === 'missing') {
+        recover = true
+        cause = 'missing'
+      }
+      else if (device.verdict === 'unknown') {
+        unknown = device.detail
+        onSweepError(new Error(`the cache device of '${pool.name}' could not be identified: ${device.detail}`))
+      }
+      else {
+        unknown = null
+      }
+    }
+    return { recover, cause, unknown }
   }
 }

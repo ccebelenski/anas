@@ -118,3 +118,19 @@ export function parseBtrfsUsage(text: string): BtrfsUsage {
 
   return out
 }
+
+/** `Status:   running` — the first line of `btrfs scrub status`' state block. */
+const SCRUB_STATUS_RE = /^Status:\s+(\S+)/m
+
+/**
+ * The state word of `btrfs scrub status <mountpoint>` (`running`, `finished`,
+ * `aborted`, ...), or null when the output carries no `Status:` line — a
+ * filesystem never scrubbed prints "no stats available". The same pattern as
+ * `parseBtrfsScrubStatus` in services/ahr-scrub.ts (cr3: the topology cannot
+ * import the scrub engine — the start-path structural guard of the scrub store
+ * forbids it — so the word is read here; the scrub engine's copy should be
+ * pointed at this one, handed to that area).
+ */
+export function parseBtrfsScrubStatusWord(text: string): string | null {
+  return text.match(SCRUB_STATUS_RE)?.[1] ?? null
+}

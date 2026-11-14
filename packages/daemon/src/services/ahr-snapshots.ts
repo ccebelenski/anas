@@ -1,6 +1,6 @@
 import type { AhrPool, AhrSnapshot } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
-import { mkdir, rmdir } from 'node:fs/promises'
+import { lstat, mkdir, rmdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { AhrSnapshotName } from '@anas/shared'
 import {
@@ -440,6 +440,13 @@ export async function rollbackAhrSnapshot(
     updateProgress(`Unmounting ${pool.mountpoint}`)
     await run(executor, UMOUNT, ['--', pool.mountpoint], { busyPath: pool.mountpoint })
   }
+  // cr3 AHR-CORE-M6: a swap that fails AFTER the preserve-rename puts the
+  // pool's @data back where it was (rename again) before the remount — else
+  // the remount of `subvol=@data` found nothing, failed, and its error
+  // REPLACED the real one, leaving the pool unmounted with @data renamed away.
+  // The original failure always leads; a failed remount is added, never
+  // substituted.
+  let failure: unknown = null
   try {
     await withTopLevelMount(executor, pool, async (top) => {
       const dataPath = join(top, SUBVOL_DATA)
@@ -452,15 +459,50 @@ export async function rollbackAhrSnapshot(
       await run(executor, MV, ['--', dataPath, preservedPath])
       // 2) The swap: a WRITABLE snapshot of the chosen snapshot becomes @data.
       updateProgress(`Rolling @data back to @snapshots/${snapName}`)
-      await run(executor, BTRFS, ['subvolume', 'snapshot', chosenPath, dataPath])
+      try {
+        await run(executor, BTRFS, ['subvolume', 'snapshot', chosenPath, dataPath])
+      }
+      catch (err) {
+        const why = err instanceof Error ? err.message : String(err)
+        // cr3 review 7: a failed `btrfs subvolume snapshot` can still have
+        // created @data. GNU mv would then NEST the preserved subvolume inside
+        // it and the job would claim the pool was as before. Never rename
+        // onto an existing @data; -T so mv never moves INTO a directory.
+        // cr3 review2 10: only ENOENT is "absent" — a stat that could not
+        // see (EACCES, EIO) is no licence to rename onto the path.
+        const present = await lstat(dataPath).then(() => true, (statErr: NodeJS.ErrnoException) => statErr.code === 'ENOENT' ? false : statErr)
+        if (present instanceof Error) {
+          throw new Error(`${why} — and whether the failed step left a @data behind could not be read (${present.message}), so the original was NOT renamed back: it is intact as @snapshots/${preserved}. Rename it to @data on the top-level subvolume before mounting the pool`)
+        }
+        if (present) {
+          throw new Error(`${why} — and the failed step left a NEW @data behind, so the original was NOT renamed back: it is intact as @snapshots/${preserved}. Remove the new @data on the top-level subvolume and rename @snapshots/${preserved} to @data before mounting the pool`)
+        }
+        updateProgress(`The swap failed — renaming @snapshots/${preserved} back to @data`)
+        const back = await executor.exec(MV, ['-T', '--', preservedPath, dataPath])
+        if (back.exitCode !== 0) {
+          throw new Error(`${why} — and @data could not be renamed back from @snapshots/${preserved} (mv: ${back.stderr.trim().split('\n')[0] || `exit ${back.exitCode}`}). The pool's data is intact as @snapshots/${preserved}: rename it to @data on the top-level subvolume before mounting the pool`)
+        }
+        throw new Error(`${why} — @data was renamed back; the pool is as it was before the rollback`)
+      }
     }, opts)
   }
-  finally {
-    // Remount the pool mountpoint no matter what — a half-done rollback must
-    // never leave the pool offline (fstab still has the subvol=@data entry).
-    updateProgress(`Remounting ${pool.mountpoint}`)
+  catch (err) {
+    failure = err
+  }
+  // Remount the pool mountpoint no matter what — a half-done rollback must
+  // never leave the pool offline (fstab still has the subvol=@data entry).
+  updateProgress(`Remounting ${pool.mountpoint}`)
+  try {
     // cr.52r D3: through the daemon-opened directory, the pool's own entry.
     await mountAhrPool(executor, pool, line)
   }
+  catch (mountErr) {
+    if (failure === null)
+      throw mountErr
+    const first = failure instanceof Error ? failure.message : String(failure)
+    throw new Error(`${first}; remounting ${pool.mountpoint} ALSO failed: ${mountErr instanceof Error ? mountErr.message : String(mountErr)}`)
+  }
+  if (failure !== null)
+    throw failure
   return { pool: pool.name, rolledBackTo: snapName, preserved }
 }

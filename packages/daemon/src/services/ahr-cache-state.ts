@@ -89,7 +89,11 @@ export interface CacheStateInput {
   /** Every PV `pvs` reported (the whole node's — filtered here). */
   pvs: LvmPv[]
   /** How many band arrays the pool has — the missing-PV discriminator. */
-  bandCount: number
+  /**
+   * The pool's band count for the band rule (`poolBandCount`): arrays seen or
+   * pinned, whichever is more; null = unknown (mdadm.conf unreadable).
+   */
+  bandCount: number | null
   /** `lsblk`'s partitions by kernel name (the topology reader's index). */
   partsByKernel: Map<string, CachePartInfo>
   /** kernel disk name → by-id (the topology reader's map). */
@@ -189,7 +193,13 @@ export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   // nameless one cannot be a band's. Without that test a pool with an
   // unassembled band would report a failed cache it never had.
   const bandPvCount = inVg.filter(p => isMdPvName(p.name)).length
-  const unknownPvs = isCacheTarget && bandPvCount >= bandCount
+  // cr3 review2 2/3: and only with the band count KNOWN (a band absent from
+  // mdstat is still a band — `poolBandCount`), and only when every other PV
+  // in the VG is ANAS's (a missing row beside an operator's own PV may be
+  // the operator's: never the unattended rungs' to drop).
+  // And only when no NAMED cache slice is still there: a missing row beside a
+  // live cache PV is somebody else's (an operator's PV that vanished).
+  const unknownPvs = isCacheTarget && bandCount !== null && bandPvCount >= bandCount && foreignPvs.length === 0 && namedCachePvs.length === 0
     ? inVg.filter(p => p.name === UNKNOWN_PV_NAME)
     : []
 
@@ -364,7 +374,8 @@ export function foreignVgPvAdvisory(pool: string, pvNames: string[]): string {
 export function cacheRecoveryNotification(input: {
   pool: string
   device: string | null
-  readOnly: boolean
+  /** null: the mount table could not be read after the uncache (cr3) — said so, never "writable". */
+  readOnly: boolean | null
   /** `missing` at activation (the boot rung), `failed` under a live pool. */
   reason: 'failed' | 'missing'
 }): { title: string, body: string } {
@@ -378,7 +389,10 @@ export function cacheRecoveryNotification(input: {
       readOnly
         ? ' The filesystem was forced READ-ONLY by the I/O error, so writes are stopped until the pool is remounted:'
         + ' use Remount in the Hybrid RAID view (it unmounts and mounts the pool, which breaks open share handles).'
-        : ''
+        : readOnly === null
+          ? ' Whether the I/O error forced the filesystem READ-ONLY could not be read (the mount table did not answer):'
+          + ' if writes fail, use Remount in the Hybrid RAID view.'
+          : ''
     } The cache disk stays out of the pool until it is attached again.`
   return {
     title: reason === 'failed' ? `AHR read cache failed: ${pool}` : `AHR read cache missing: ${pool}`,

@@ -143,6 +143,8 @@ function buildExecutor(opts: { subvol?: string, lvAttr?: string, mountpoint?: st
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: { stdout: ahrLsblkJson(mp), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: `${DISKS.map(d => `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${d.id} -> ../../${d.kernel}`).join('\n')}\n`, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '1', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
+  // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
+  executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: opts.lvAttr ?? '-wi-ao----', lv_size: String(LV_SIZE) }] }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: findmntJson(opts.subvol ?? 'subvolid=256,subvol=/@data', mp), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', mp], result: { stdout: BTRFS_USAGE, stderr: '', exitCode: 0 } })
@@ -226,6 +228,22 @@ describe('AHR snapshot routes (story 11.12)', () => {
       { name: 'nightly', createdAt: '2026-07-23T14:23:01', readonly: true },
       { name: 'pre-rollback-2026-07-24T090000Z', createdAt: '2026-07-24T09:00:00', readonly: false },
     ])
+  })
+
+  // cr3 review 3 (probe p5-subvol): with findmnt unreadable the layout was
+  // INVENTED as flat, and the first snapshot gate told the operator to
+  // destroy and recreate a snapshot-layout pool.
+  it('cr3 review 3: an unreadable mount table — the snapshot verbs say UNKNOWN, never "flat layout ... destroy"', async () => {
+    await build()
+    executor.prependFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: '', stderr: 'findmnt: timeout', exitCode: 1 } })
+    const create = await server.inject({ method: 'POST', url: '/v1/ahr/tank/snapshots', headers: IDENTITY, payload: { name: 'x' } })
+    assert.equal(create.statusCode, 409, create.body)
+    assert.match(create.json().error.message, /is in an unknown state — the kernel mount table could not be read/)
+    assert.ok(!create.body.includes('destroy and recreate'), create.body)
+    // The list is never "no snapshots" from a read that did not see.
+    const list = await server.inject({ method: 'GET', url: '/v1/ahr/tank/snapshots', headers: IDENTITY })
+    assert.equal(list.statusCode, 503, list.body)
+    assert.deepEqual(mutatingCalls(), [])
   })
 
   it('GET 404 for an unknown pool', async () => {
