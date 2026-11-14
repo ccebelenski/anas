@@ -1,4 +1,4 @@
-import type { MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
+import type { CifsCredentialKeyKind, MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
 import { cifsCredentialKeyKind, escapeFstabField, escapeFstabOptionValue, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN, X_SYSTEMD_AUTOMOUNT_TOKEN } from '@anas/shared'
 
 /** Recognized enum-value sets, mirrored from the shared schema (never drift). */
@@ -9,6 +9,25 @@ const NFS_SEC_VALUES = new Set<string>(MountNfsSec.options)
 const NFS_LOOKUPCACHE_VALUES = new Set<string>(MountLookupCache.options)
 /** A plain charset token (mirrors MountCharset) — else the option round-trips raw. */
 const CHARSET_RE = /^[\w.-]+$/
+
+/**
+ * The option-token spellings mount.cifs honours for each credential (cr3.mounts
+ * review 3, from cifs-utils 7.4 `parse_opt_token`: EXACT, case-sensitive).
+ */
+const HONOURED_CREDENTIAL_KEYS: Record<CifsCredentialKeyKind, ReadonlySet<string>> = {
+  username: new Set(['user', 'username']),
+  secret: new Set(['pass', 'password', 'pass2', 'password2']),
+  domain: new Set(['dom', 'domain', 'workgroup']),
+  file: new Set(['cred', 'credentials']),
+}
+
+/**
+ * An fstab octal escape that libmount turns into an option SEPARATOR before
+ * mount.cifs sees the option (cr3.mounts review 4, D4): `\054` is `,` and
+ * `\075` is `=`. A token carrying one does not say what its raw text says
+ * (`user=bob\054password=S` is a username AND a password to mount.cifs).
+ */
+const ESCAPED_SEPARATOR_RE = /\\0(?:54|75)/
 
 /**
  * Round-trip parser and surgical editor for /etc/fstab (see fstab(5)).
@@ -46,23 +65,43 @@ const CHARSET_RE = /^[\w.-]+$/
  * hand-edited entry's exotica survive an edit to an unrelated field.
  */
 
-/** Whitespace splitter for the six fstab fields. */
-const FIELD_SPLIT = /\s+/
+/**
+ * The field separator libmount reads (cr3.mounts M3): ASCII SPACE and TAB,
+ * nothing else. JavaScript's `\s` also matches every Unicode space (NBSP,
+ * U+2003, U+3000, ...) and VT/FF/CR, all of which libmount reads as DATA inside
+ * a field; splitting on them made a line ANAS wrote for a mountpoint or CIFS
+ * share carrying one unreadable to ANAS while mount and systemd read it fine.
+ * Proven with util-linux's own reader on a scratch file:
+ * `fixtures/mounts/fstab-libmount-split` and its
+ * `findmnt --fstab -F <file> --json` answer beside it. The writer escapes
+ * exactly these two (plus newline and backslash), so reader and writer agree.
+ */
+const FIELD_SPLIT = /[ \t]+/
+/** Leading/trailing field separators (the {@link FIELD_SPLIT} set). */
+const EDGE_BLANKS_RE = /^[ \t]+|[ \t]+$/g
+/** A CRLF file's line ending: libmount drops a trailing CR, nothing else. */
+const TRAILING_CR_RE = /\r+$/
+
+/** Trim the libmount field separators (space, tab) off both ends; every other byte is data. */
+function trimBlanks(s: string): string {
+  return s.replace(EDGE_BLANKS_RE, '')
+}
 
 /**
  * The four mandatory fstab fields with their ORIGINAL separators, plus whatever
- * follows (dump/pass, and any spacing a human chose).
+ * follows (dump/pass, and any spacing a human chose). Separators are the
+ * {@link FIELD_SPLIT} set (space, tab) — cr3.mounts M3.
  *
- * The tail is `(?:\s[\s\S]*)?` rather than `[\s\S]*` on purpose: a `\S+`
- * field followed by "anything" can split the same text in many ways, and the
+ * The tail is `(?:[ \t][\s\S]*)?` rather than `[\s\S]*` on purpose: a field
+ * followed by "anything" can split the same text in many ways, and the
  * regex engine will try them all on a long malformed line. Requiring the tail to
- * start with whitespace makes the split unambiguous, because a non-space field
- * can never absorb it.
+ * start with a separator makes the split unambiguous, because a field can
+ * never absorb one. The caller strips a CRLF line's trailing CR first.
  */
-const FSTAB_FOUR_FIELDS = /^(\s*)(\S+)(\s+)(\S+)(\s+)(\S+)(\s+)(\S+)((?:\s[\s\S]*)?)$/
+const FSTAB_FOUR_FIELDS = /^([ \t]*)([^ \t]+)([ \t]+)([^ \t]+)([ \t]+)([^ \t]+)([ \t]+)([^ \t]+)((?:[ \t][\s\S]*)?)$/
 
-/** Single whitespace char — the token boundary before an inline `#` comment. */
-const WS_CHAR = /\s/
+/** Single field separator — the token boundary before an inline `#` comment (libmount's, cr3.mounts M3). */
+const WS_CHAR = /[ \t]/
 
 /**
  * The index of a `#` that BEGINS an inline trailing comment — a `#` at column 0
@@ -190,8 +229,12 @@ function entryOptionsOps(line: { disabled: boolean, raw: string }):
   const marker = line.disabled && line.raw.startsWith(ANAS_MARKER) ? ANAS_MARKER : ''
   const body = line.raw.slice(marker.length)
   const hashIdx = inlineCommentIndex(body)
-  const fieldsPart = hashIdx === -1 ? body : body.slice(0, hashIdx)
+  const rawFields = hashIdx === -1 ? body : body.slice(0, hashIdx)
   const comment = hashIdx === -1 ? '' : body.slice(hashIdx)
+  // A CRLF line's CR is the line ending, not part of the last field (libmount
+  // drops it): carved off here and put back after the tail, byte-identical.
+  const cr = TRAILING_CR_RE.exec(rawFields)?.[0] ?? ''
+  const fieldsPart = rawFields.slice(0, rawFields.length - cr.length)
 
   // Leading whitespace, then four fields with their ORIGINAL separators. The
   // fourth is the options column; everything after it is left untouched.
@@ -204,7 +247,7 @@ function entryOptionsOps(line: { disabled: boolean, raw: string }):
     comment,
     head: `${lead}${spec}${s1}${mp}${s2}${fstype}${s3}`,
     opts,
-    tail,
+    tail: `${tail}${cr}`,
   }
 }
 
@@ -255,7 +298,7 @@ export function addMountOption(text: string, mountpoint: string, token: string):
     const ops = entryOptionsOps(line)
     if (!ops)
       return text
-    if (ops.opts.split(',').map(o => o.trim()).includes(token))
+    if (ops.opts.split(',').map(trimBlanks).includes(token))
       return text
     rewriteEntryOptions(line, opts => (opts ? `${opts},${token}` : token))
     refreshEntry(line)
@@ -283,6 +326,84 @@ export function carriesAutomount(text: string, mountpoint: string): boolean {
   return false
 }
 
+/** What {@link cifsCredentialTokenScan} reports about one line. */
+export interface CifsCredentialTokens {
+  /** Index of the LAST honoured user token. */
+  user?: number
+  /** Index of the LAST honoured domain token. */
+  domain?: number
+  /** Index of the LAST honoured credentials-file token. */
+  file?: number
+  /** How many honoured credentials-file tokens the line carries (review 4, D5). */
+  files: number
+  /** The honoured secret keys present, as decoded (`password`, `pass2`, ...) — names, never values. */
+  secretKeys: string[]
+  /** Keys (as written) spelled in a way mount.cifs does not honour. */
+  unhonoured: string[]
+}
+
+/**
+ * Where the credential tokens of a CIFS line sit, and which are spelled in a
+ * way mount.cifs does not honour (cr3.mounts review 3). mount.cifs takes the
+ * LAST user and domain on the option line, a credentials file counting at the
+ * position of its `credentials=` token — so a migration needs the order to
+ * write the account the mount actually used. Positions are token indexes in
+ * the OPTIONS column (keys decoded as libmount decodes them); `unhonoured`
+ * lists the keys (as written, never a value) whose spelling mount.cifs does
+ * not read as that option. Undefined when the line is absent or unparseable.
+ */
+export function cifsCredentialTokenScan(text: string, mountpoint: string): CifsCredentialTokens | undefined {
+  for (const line of parseFstabDoc(text)) {
+    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
+      continue
+    const ops = entryOptionsOps(line)
+    if (!ops)
+      return undefined
+    const out: CifsCredentialTokens = { unhonoured: [], files: 0, secretKeys: [] }
+    ops.opts.split(',').map(trimBlanks).forEach((token, i) => {
+      const eq = token.indexOf('=')
+      if (eq === -1 || ESCAPED_SEPARATOR_RE.test(token))
+        return
+      const rawKey = token.slice(0, eq)
+      const key = unescapeFstabField(rawKey)
+      const kind = cifsCredentialKeyKind(key)
+      if (kind === null)
+        return
+      if (!HONOURED_CREDENTIAL_KEYS[kind].has(key)) {
+        out.unhonoured.push(`${rawKey}=`)
+        return
+      }
+      if (kind === 'username') {
+        out.user = i
+      }
+      else if (kind === 'domain') {
+        out.domain = i
+      }
+      else if (kind === 'file') {
+        out.file = i
+        out.files++
+      }
+      else if (!out.secretKeys.includes(key)) {
+        out.secretKeys.push(key)
+      }
+    })
+    return out
+  }
+  return undefined
+}
+
+/**
+ * Does the entry carry a secret ON its line — an inline password or alternate
+ * password (lifted, migrated only by the Save), or a verbatim secret token?
+ * cr3.mounts review 3 (4): the one test every door that re-serialises a line
+ * asks; only the migrating Save may move such a secret, nothing else may lose it.
+ */
+export function carriesInlineSecret(entry: MountEntry): boolean {
+  return entry.inlineCredentials?.password !== undefined
+    || entry.inlineCredentials?.password2 !== undefined
+    || (entry.secretOptions?.length ?? 0) > 0
+}
+
 /** Remove ONLY the line for `mountpoint` (active or disabled). No-op if absent. */
 export function removeMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
@@ -305,7 +426,7 @@ function disabledTokens(entry: MountEntry): string[] {
 
 /** The key of one option token (before any `=`), whitespace-trimmed. */
 function optionKey(token: string): string {
-  const t = token.trim()
+  const t = trimBlanks(token)
   const eq = t.indexOf('=')
   return eq === -1 ? t : t.slice(0, eq)
 }
@@ -331,7 +452,7 @@ const PARKED_LEGACY_AUTOMOUNT_TOKEN = `${X_ANAS_DISABLED_AUTOMOUNT_TOKEN}=commen
 
 /** Is `token` a LIVE automount — `x-systemd.automount` or the legacy `comment=systemd.automount` (cr.70)? Exact, as the generator matches each. */
 function isLiveAutomountToken(token: string): boolean {
-  const t = token.trim()
+  const t = trimBlanks(token)
   return t === X_SYSTEMD_AUTOMOUNT_TOKEN || t === LEGACY_AUTOMOUNT_TOKEN
 }
 
@@ -346,7 +467,7 @@ function isParkedAutomountToken(token: string): boolean {
 
 /** Replace a token's trimmed text, keeping any surrounding whitespace byte-for-byte. */
 function swapTokenText(token: string, to: string): string {
-  const core = token.trim()
+  const core = trimBlanks(token)
   const at = token.indexOf(core)
   return `${token.slice(0, at)}${to}${token.slice(at + core.length)}`
 }
@@ -363,14 +484,14 @@ function swapTokenText(token: string, to: string): string {
 function parkAutomount(opts: string): string {
   return opts.split(',')
     .map(t => (isLiveAutomountToken(t)
-      ? swapTokenText(t, t.trim() === LEGACY_AUTOMOUNT_TOKEN ? PARKED_LEGACY_AUTOMOUNT_TOKEN : X_ANAS_DISABLED_AUTOMOUNT_TOKEN)
+      ? swapTokenText(t, trimBlanks(t) === LEGACY_AUTOMOUNT_TOKEN ? PARKED_LEGACY_AUTOMOUNT_TOKEN : X_ANAS_DISABLED_AUTOMOUNT_TOKEN)
       : t))
     .join(',')
 }
 
 /** Does a parked automount token carry the legacy spelling (the `=comment` value)? */
 function parkedAutomountIsLegacy(token: string): boolean {
-  const t = token.trim()
+  const t = trimBlanks(token)
   const eq = t.indexOf('=')
   return eq !== -1 && t.slice(eq + 1).toLowerCase() === 'comment'
 }
@@ -463,6 +584,13 @@ export function disableMount(text: string, mountpoint: string): string {
     }
     else if (line.raw.startsWith(ANAS_MARKER)) {
       // Legacy marker — convert to the option form (writes THAT line).
+      // cr3.mounts review 3 (4): the conversion RE-SERIALISES the entry, and
+      // the serializer never writes an inline password or alternate password
+      // back (those leave a line only through the migrating Save). A line
+      // carrying one is left byte-identical — it is already disabled — and
+      // the route refuses the verb before it gets here.
+      if (carriesInlineSecret(line.entry))
+        break
       const comment = line.trailingComment ? `   ${line.trailingComment}` : ''
       line.raw = disabledSerialization(line.entry, comment)
       refreshEntry(line)
@@ -508,10 +636,10 @@ export function enableMount(text: string, mountpoint: string): string {
       // kept-noauto ⇒ the operator's own `noauto` stays.
       const tokens = ops.opts.split(',').filter(o => o !== '')
       const isDisableToken = (t: string): boolean =>
-        t.trim().split('=')[0].toLowerCase() === X_ANAS_DISABLED_TOKEN
+        trimBlanks(t).split('=')[0].toLowerCase() === X_ANAS_DISABLED_TOKEN
       // Same rule as classifyOptions: any disable token that is not the
       // kept-noauto form is the bare form.
-      const hasBare = tokens.some(t => isDisableToken(t) && t.trim().toLowerCase() !== X_ANAS_DISABLED_KEPT_TOKEN)
+      const hasBare = tokens.some(t => isDisableToken(t) && trimBlanks(t).toLowerCase() !== X_ANAS_DISABLED_KEPT_TOKEN)
       // Removal matches the TRIMMED token so a hand-spaced token still goes, but
       // every SURVIVING token keeps its exact bytes — a comma-separated
       // `defaults, nofail` the operator wrote stays `defaults, nofail`, so the
@@ -519,7 +647,7 @@ export function enableMount(text: string, mountpoint: string): string {
       rewriteEntryOptions(line, (opts) => {
         const out: string[] = []
         for (const t of opts.split(',').filter(o => o !== '')) {
-          if (!isDisableToken(t) && !(hasBare && t.trim() === 'noauto'))
+          if (!isDisableToken(t) && !(hasBare && trimBlanks(t) === 'noauto'))
             out.push(t)
         }
         return unparkAutomount(out.join(','))
@@ -570,8 +698,13 @@ export function mountOptionTokens(entry: MountEntry): string {
  * caller then passes NO `-o` at all (`mount -o ''` is not the same as none).
  */
 export function directMountOptionTokens(entry: MountEntry): string {
+  // cr3.mounts follow-up (2): a hand-written secret token (`password2=`, a
+  // password on a line not read as CIFS) stays on the LINE but never reaches
+  // a direct mount's argv, where every process on the node can read it. The
+  // routes refuse to mount such a line at all; this is the belt to that.
+  const secrets = new Set(entry.secretOptions ?? [])
   return buildOptionTokens(entry)
-    .filter(t => !isUserspaceOnlyOption(t))
+    .filter(t => !isUserspaceOnlyOption(t) && !secrets.has(t))
     .join(',')
 }
 
@@ -595,7 +728,7 @@ export function directMountOptionArgs(entry: MountEntry): string[] {
  * token still goes; every SURVIVING token keeps its exact bytes.
  */
 function isUserspaceOnlyOption(token: string): boolean {
-  const key = token.trim().split('=')[0].toLowerCase()
+  const key = trimBlanks(token).split('=')[0].toLowerCase()
   return key.startsWith('x-')
     || key === '_netdev'
     || key === 'nofail'
@@ -629,7 +762,7 @@ function parseEntryLine(raw: string): { entry: MountEntry, trailingComment: stri
     return { entry: parsed.entry, trailingComment: parsed.trailingComment, disabled: true }
   }
 
-  const trimmed = raw.trim()
+  const trimmed = trimBlanks(raw.replace(TRAILING_CR_RE, ''))
   if (trimmed === '' || trimmed.startsWith('#'))
     return null // blank line or whole-line (incl. commented-out) entry
 
@@ -644,7 +777,7 @@ function parseEntryLine(raw: string): { entry: MountEntry, trailingComment: stri
 
 /** Parse an ACTIVE (uncommented) fstab data line into an entry, or null. */
 function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: string, parkedAutomount: boolean } | null {
-  const trimmed = raw.trim()
+  const trimmed = trimBlanks(raw.replace(TRAILING_CR_RE, ''))
   if (trimmed === '' || trimmed.startsWith('#'))
     return null
 
@@ -655,7 +788,9 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
   const fieldsPart = hashIdx === -1 ? raw : raw.slice(0, hashIdx)
   const trailingComment = hashIdx === -1 ? '' : raw.slice(hashIdx)
 
-  const fields = fieldsPart.trim().split(FIELD_SPLIT)
+  // cr3.mounts M3: libmount's separators only (space, tab), a CRLF line's CR
+  // dropped as libmount drops it — every other byte is data in its field.
+  const fields = trimBlanks(fieldsPart.replace(TRAILING_CR_RE, '')).split(FIELD_SPLIT)
   // Need at least spec, mountpoint, fstype, options; dump/pass default to 0.
   if (fields.length < 4)
     return null
@@ -673,8 +808,8 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
   if (!mountpoint.startsWith('/'))
     return null
 
-  const tokens = optStr.split(',').map(o => o.trim()).filter(Boolean)
-  const { options, credentialsFile, inlineCredentials, disable, parkedAutomount, secretOptions } = classifyOptions(fstype, tokens)
+  const tokens = optStr.split(',').map(trimBlanks).filter(Boolean)
+  const { options, credentialsFile, credentialsKey, inlineCredentials, disable, parkedAutomount, secretOptions, escapedSeparatorTokens } = classifyOptions(fstype, tokens)
 
   const entry: MountEntry = {
     spec,
@@ -686,10 +821,14 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
   }
   if (credentialsFile !== undefined)
     entry.credentialsFile = credentialsFile
+  if (credentialsKey !== undefined)
+    entry.credentialsKey = credentialsKey
   if (inlineCredentials !== undefined)
     entry.inlineCredentials = inlineCredentials
   if (secretOptions !== undefined)
     entry.secretOptions = secretOptions
+  if (escapedSeparatorTokens !== undefined)
+    entry.escapedSeparatorTokens = escapedSeparatorTokens
   // The option-form disable: carried by the line's own tokens, so a disabled
   // entry is `disabled: true` exactly like a legacy `#ANAS ` one.
   if (disable)
@@ -705,8 +844,22 @@ function toInt(s: string | undefined): number {
 }
 
 /** True for NFS fstypes (`nfs`, `nfs4`). */
-function isNfs(fstype: string): boolean {
+export function isNfs(fstype: string): boolean {
   return fstype === 'nfs' || fstype === 'nfs4'
+}
+
+/**
+ * True for the CIFS fstypes: `cifs` and `smb3` — mount.cifs' own alias
+ * (`mount.smb3`), which the kernel also registers. cr3.mounts M5: the
+ * inventory already read `smb3` as CIFS (so every Mounts verb accepted it)
+ * while this reader and the serializer did not — a credential rotation on an
+ * `smb3` line "completed" with the old file still named on the line, the
+ * detail said no credentials were set, and an inline password stayed out of
+ * the migration. One rule now: what the inventory calls CIFS, the reader, the
+ * serializer and the edit merge treat as CIFS.
+ */
+export function isCifs(fstype: string): boolean {
+  return fstype === 'cifs' || fstype === 'smb3'
 }
 
 /**
@@ -718,7 +871,7 @@ function isNfs(fstype: string): boolean {
 export function classifyOptions(
   fstype: string,
   tokens: string[],
-): { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true, secretOptions?: string[] } {
+): { options: MountOptions, credentialsFile?: string, credentialsKey?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true, secretOptions?: string[], escapedSeparatorTokens?: number[] } {
   const common: MountCommonOptions = {
     readOnly: false,
     nofail: false,
@@ -734,20 +887,34 @@ export function classifyOptions(
   const cifs: MountCifsOptions = {}
   const passthrough: string[] = []
   let credentialsFile: string | undefined
+  let credentialsKey: string | undefined
   const inline: MountInlineCredentials = {}
   /** Hand-written secret tokens kept verbatim, never passthrough (cr.60). */
   const secretOptions: string[] = []
+  /** 1-based positions of tokens carrying an escaped separator (review 4, D4). */
+  const escapedSeparatorTokens: number[] = []
   const nfsFs = isNfs(fstype)
-  const cifsFs = fstype === 'cifs'
+  const cifsFs = isCifs(fstype)
   /** How (if at all) the line is disabled: the form of its `x-anas.disabled` token. */
   let disable: 'bare' | 'kept-noauto' | undefined
   /** Did the line carry a parked `x-anas.disabled-automount` (cr.19)? */
   let parkedAutomount = false
 
-  for (const token of tokens) {
+  for (const [index, token] of tokens.entries()) {
     const eq = token.indexOf('=')
     const key = eq === -1 ? token : token.slice(0, eq)
     const value = eq === -1 ? '' : token.slice(eq + 1)
+
+    // --- an escaped separator (cr3.mounts review 4, D4) — FAIL CLOSED, on
+    // any line: ANAS cannot tell what the token says once libmount splits
+    // it, so it is hidden whole (a secret may be inside), written back as it
+    // was, never put on an argv, and the verbs that act on the line refuse
+    // naming its POSITION (1-based) — never its content.
+    if (ESCAPED_SEPARATOR_RE.test(token)) {
+      secretOptions.push(token)
+      escapedSeparatorTokens.push(index + 1)
+      continue
+    }
 
     // --- ANAS disable token (cr.6, §2 Mounts ruling) ---
     // CONSUMED — never passthrough, never shown to the UI as an extra option:
@@ -776,7 +943,19 @@ export function classifyOptions(
     // "users may mount" flag, never a username. A SECRET never rides the
     // passthrough a response carries, whatever the fstype: on a line ANAS
     // does not read as CIFS (`smb3`, …) it is kept verbatim in secretOptions.
-    const credKind = cifsCredentialKeyKind(key)
+    // cr3.mounts review 3 (11): the key is classified as libmount hands it to
+    // mount.cifs — fstab octal escapes DECODED (`\160assword=` is
+    // `password=`), so an escaped spelling is redacted, refused and migrated
+    // like the plain one.
+    const credKey = eq === -1 ? key : unescapeFstabField(key)
+    const credKind = cifsCredentialKeyKind(credKey)
+    // cr3.mounts review 4: mount.cifs reads credential OPTION tokens by an
+    // exact, case-sensitive match. A username / domain / credentials token in
+    // another spelling (`USERNAME=`, `Domain=`, `CREDENTIALS=`) is not that
+    // credential to mount.cifs, so it is not one here either: it rides the
+    // passthrough as the ordinary option it is (a migrating Save refuses the
+    // line, naming it). A SECRET in any spelling stays hidden (below).
+    const honoured = credKind !== null && HONOURED_CREDENTIAL_KEYS[credKind].has(credKey)
     if (credKind === 'secret' && eq !== -1 && !cifsFs) {
       secretOptions.push(token)
       continue
@@ -792,8 +971,12 @@ export function classifyOptions(
 
     // --- CIFS tier ---
     if (cifsFs) {
-      if (credKind === 'file') {
+      if (eq !== -1 && credKind === 'file' && honoured) {
         credentialsFile = value
+        // cr3.mounts review 2: `cred=` is mount.cifs' alias — the spelling is
+        // the operator's and the serializer re-emits it.
+        if (key !== 'credentials')
+          credentialsKey = key
         continue
       }
       // `guest` is STRUCTURAL, like `credentials=`: the serializer re-derives
@@ -824,7 +1007,8 @@ export function classifyOptions(
       // decoded value leaves the fstab line only through the serializer's
       // `user=` token (buildOptionTokens), which re-encodes it; passthrough
       // and secretOptions tokens were never decoded, so they stay verbatim.
-      if (eq !== -1 && credKind === 'username') {
+      if (eq !== -1 && credKind === 'username' && honoured) {
+        // The LAST user token wins (mount.cifs parse_options), as here.
         inline.username = unescapeFstabField(value)
         // cr.60r item 1b: keep the operator's SPELLING. `username=bob` and
         // `user=bob` are the same account to mount.cifs but different bytes on
@@ -835,12 +1019,29 @@ export function classifyOptions(
         continue
       }
       if (eq !== -1 && credKind === 'secret') {
-        // `password2=` (the rotation password) is not part of the creds file
-        // ANAS writes: hidden the same, kept verbatim on the line.
-        if (key.toLowerCase() === 'password2')
+        // cr3.mounts review 2: `password2=`/`pass2=` (the ALTERNATE password a
+        // server-side rotation uses) is lifted into its own channel — never
+        // read as the main password — and migrated to the credentials file
+        // (a `password2=value` line, cifs-utils 7.4) on the next save.
+        // cr3.mounts review 3 (1): mount.cifs reads these option tokens by an
+        // EXACT, case-sensitive match (`parse_opt_token`: pass|password,
+        // pass2|password2). Another spelling (`PASSWORD=`, `Pass2=`) is still
+        // a secret HERE — hidden, redacted and refused, the safe side — but
+        // it is not what mount.cifs used, so it is never migrated: it stays
+        // verbatim in secretOptions, and Mount and Save refuse the line
+        // naming the token. Of two honoured password tokens the FIRST counts
+        // ("password specified twice, ignoring second").
+        if (credKey === 'password2' || credKey === 'pass2') {
+          if (inline.password2 === undefined)
+            inline.password2 = unescapeFstabField(value)
+        }
+        else if (credKey === 'password' || credKey === 'pass') {
+          if (inline.password === undefined)
+            inline.password = unescapeFstabField(value)
+        }
+        else {
           secretOptions.push(token)
-        else
-          inline.password = unescapeFstabField(value)
+        }
         continue
       }
       // `domain=` (and `dom=`/`workgroup=`) is a credential-set token too;
@@ -849,7 +1050,7 @@ export function classifyOptions(
       // non-inline `domain=` option round-trips as before. Only when
       // username/password are ALSO present is it treated as an inline-
       // credential domain (migrated to the creds file, stripped inline).
-      if (eq !== -1 && credKind === 'domain') {
+      if (eq !== -1 && credKind === 'domain' && honoured) {
         inline.domain = unescapeFstabField(value)
         applyCifsToken(cifs, 'domain', value, passthrough)
         continue
@@ -880,9 +1081,11 @@ export function classifyOptions(
   if (parkedAutomount && disable !== undefined)
     common.automount = true
 
-  const result: { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true, secretOptions?: string[] } = { options }
+  const result: { options: MountOptions, credentialsFile?: string, credentialsKey?: string, inlineCredentials?: MountInlineCredentials, disable?: 'bare' | 'kept-noauto', parkedAutomount?: true, secretOptions?: string[], escapedSeparatorTokens?: number[] } = { options }
   if (credentialsFile !== undefined)
     result.credentialsFile = credentialsFile
+  if (credentialsKey !== undefined)
+    result.credentialsKey = credentialsKey
   if (Object.keys(inline).length > 0)
     result.inlineCredentials = inline
   if (disable !== undefined)
@@ -891,6 +1094,8 @@ export function classifyOptions(
     result.parkedAutomount = true
   if (secretOptions.length > 0)
     result.secretOptions = secretOptions
+  if (escapedSeparatorTokens.length > 0)
+    result.escapedSeparatorTokens = escapedSeparatorTokens
   return result
 }
 
@@ -1107,9 +1312,10 @@ function applyCifsToken(cifs: MountCifsOptions, key: string, value: string, pass
  * hangs until `nofail` hides it. `guest` makes the request anonymous instead:
  * an auth-requiring share answers EACCES, which is honest.
  */
-export function cifsAuthToken(credentialsFile: string | undefined, username?: string, usernameTokenKey?: string): string {
+export function cifsAuthToken(credentialsFile: string | undefined, username?: string, usernameTokenKey?: string, credentialsTokenKey?: string): string {
+  // cr3.mounts review 2: a line written `cred=` keeps that spelling.
   if (credentialsFile)
-    return `credentials=${credentialsFile}`
+    return `${credentialsTokenKey ?? 'credentials'}=${credentialsFile}`
   // cr.60r (the review's DEFECT): a username is NEVER lost and NEVER replaced
   // by `guest`. An empty username is no username — the line is credential-less
   // and `guest` is right. cr.60r item 1b: the fstab serializer passes the
@@ -1160,11 +1366,11 @@ function buildOptionTokens(entry: MountEntry): string[] {
       t.push('bg')
   }
 
-  if (entry.fstype === 'cifs') {
+  if (isCifs(entry.fstype)) {
     const cifs = entry.options.cifs
     if (cifs?.vers !== undefined)
       t.push(`vers=${cifs.vers}`)
-    t.push(cifsAuthToken(entry.credentialsFile, entry.inlineCredentials?.username, entry.inlineCredentials?.usernameKey))
+    t.push(cifsAuthToken(entry.credentialsFile, entry.inlineCredentials?.username, entry.inlineCredentials?.usernameKey, entry.credentialsKey))
     // A hand-written line carrying BOTH a credentials file and a bare
     // `user=`/`username=` keeps both (cr.60r: the username is never lost),
     // spelled as it was written (item 1b); with no file the auth token above
@@ -1226,7 +1432,8 @@ function buildOptionTokens(entry: MountEntry): string[] {
 
   if (entry.options.passthrough)
     t.push(...entry.options.passthrough.split(','))
-  // cr.60 (M7): the hand-written secrets ANAS does not migrate (`password2=`)
+  // cr.60 (M7): the hand-written secrets ANAS does not migrate (a password on
+  // a line that is not CIFS — cr3 review 2 migrates a CIFS `password2=`)
   // go back on the line as they were — out of every response, never dropped.
   if (entry.secretOptions)
     t.push(...entry.secretOptions)

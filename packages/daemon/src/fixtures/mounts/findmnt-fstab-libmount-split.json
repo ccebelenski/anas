@@ -1,0 +1,65 @@
+{
+   "filesystems": [
+      {
+         "target": "/mnt/media old",
+         "source": "nas:/export",
+         "fstype": "nfs4",
+         "options": "vers=4.2,nofail"
+      },{
+         "target": "/mnt/photos",
+         "source": "//nas/共有　写真",
+         "fstype": "cifs",
+         "options": "vers=3.1.1,guest,nofail"
+      },{
+         "target": "/mnt/tab",
+         "source": "//nas/tab\tshare",
+         "fstype": "cifs",
+         "options": "guest,nofail"
+      },{
+         "target": "/mnt/lead",
+         "source": "nas:/x",
+         "fstype": "nfs4",
+         "options": "nofail"
+      },{
+         "target": "/mnt/v\u000bt",
+         "source": "nas:/a",
+         "fstype": "nfs4",
+         "options": "nofail"
+      },{
+         "target": "/mnt/f\ff",
+         "source": "nas:/b",
+         "fstype": "nfs4",
+         "options": "nofail"
+      },{
+         "target": "/mnt/cr",
+         "source": "nas:/c",
+         "fstype": "nfs4",
+         "options": "nofail"
+      },{
+         "target": "/mnt/cr2\rx",
+         "source": "nas:/d",
+         "fstype": "nfs4",
+         "options": "nofail"
+      },{
+         "target": "/mnt/e",
+         "source": "nas:/e",
+         "fstype": "nfs4",
+         "options": "nofail"
+      },{
+         "target": "/mnt/f #x",
+         "source": "nas:/f",
+         "fstype": "nfs4",
+         "options": "nofail"
+      },{
+         "target": "/mnt/g",
+         "source": " nas:/g",
+         "fstype": "nfs4",
+         "options": "nofail"
+      },{
+         "target": "/mnt/h em",
+         "source": "nas:/h",
+         "fstype": "nfs4",
+         "options": "nofail"
+      }
+   ]
+}

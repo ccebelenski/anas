@@ -517,11 +517,12 @@ describe('runMountTest — probe stages (TEST SEAM)', () => {
     assert.equal(result.verdict, 'invalid')
     assert.equal(result.stage, 'mount')
     assert.match(result.detail ?? '', /server or share is malformed/)
-    // argv: timeout 15 /usr/bin/mount -t cifs -o <opts> <spec> <probeDir>
+    // argv: timeout 15 /usr/bin/mount -t cifs -o <opts> -- <spec> <probeDir> (cr3.mounts L8: `--` before the spec)
     const probe = exec.calls.find(c => c.command === TIMEOUT)!
     assert.equal(probe.args[4], '-o')
     assert.equal(probe.args[5], 'vers=3.1.1,guest')
-    assert.equal(probe.args[6], '//10.0.0.212/pictures')
+    assert.equal(probe.args[6], '--')
+    assert.equal(probe.args[7], '//10.0.0.212/pictures')
   })
 
   // cr.60 (review L8): the probe credentials live under the daemon's runtime

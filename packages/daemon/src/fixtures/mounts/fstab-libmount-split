@@ -1,0 +1,13 @@
+# cr3.mounts M3: which bytes split an fstab line (libmount reads ASCII space and tab only)
+nas:/export /mnt/media old nfs4 vers=4.2,nofail 0 0
+//nas/共有　写真 /mnt/photos cifs vers=3.1.1,guest,nofail 0 0
+//nas/tab\011share /mnt/tab cifs guest,nofail	0	0
+  nas:/x	/mnt/lead nfs4 nofail 0 0
+nas:/a /mnt/vt nfs4 nofail 0 0
+nas:/b /mnt/ff nfs4 nofail 0 0
+nas:/c /mnt/cr nfs4 nofail 0 0
+nas:/d /mnt/cr2x nfs4 nofail 0 0
+nas:/e /mnt/e nfs4 nofail 0 0 # trailing comment
+nas:/f /mnt/f #x nfs4 nofail 0 0
+ nas:/g /mnt/g nfs4 nofail 0 0
+nas:/h /mnt/h em nfs4 nofail 0 0

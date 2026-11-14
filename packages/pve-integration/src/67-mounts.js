@@ -285,7 +285,19 @@
             label: 'LOCAL', cls: 'anas-mount-local-badge',
             title: 'Local filesystem — managed under Pools (ZFS), not the Mounts feature',
         },
+        // cr3.mounts follow-up (4): PVE's storage.cfg could not be read, so
+        // whether PVE owns the mount is unknown — never shown as ANAS's.
+        unknown: {
+            label: 'UNKNOWN', cls: 'anas-mount-unknown-badge',
+            title: 'ANAS could not read PVE\'s storage configuration (storage.cfg), so whether PVE owns this mount is unknown — view only until it can be read',
+        },
     };
+
+    // PVE ownership unknown (the daemon could not read storage.cfg; additive —
+    // absent on an older daemon and on a read that worked).
+    function isPveUnknown(rec) {
+        return getf(rec, 'pveOwnershipUnknown') === true;
+    }
 
     function ownerOf(rec) {
         if (isPveManaged(rec)) {
@@ -293,6 +305,9 @@
         }
         if (isAhrManaged(rec)) {
             return 'ahr';
+        }
+        if (isPveUnknown(rec)) {
+            return 'unknown';
         }
         return isRemoteRec(rec) ? 'anas' : 'local';
     }
@@ -312,6 +327,11 @@
             title: 'Configured but not present in the mount table.' },
         armed: { color: 'var(--anas-accent,#3468c0)', label: 'Automount (armed)',
             title: 'An automount placeholder — mounts on first access. Not an error.' },
+        // cr3.mounts INVENTED-STATE-M10: a state ANAS could not read — the
+        // kernel mount table, or the guarded health probe, gave no answer.
+        // Never drawn as "Not mounted".
+        unknown: { color: 'var(--anas-warn,#b06a12)', label: 'Unknown',
+            title: 'ANAS could not read this mount\'s state (the kernel mount table or the health probe did not answer) — it may or may not be mounted.' },
         disabled: { color: 'var(--anas-muted,gray)', label: 'Disabled',
             title: 'Deliberately disabled — the fstab line is kept, marked noauto,x-anas.disabled (an automount line is parked too). Enable removes the marker; the mount returns at the next boot or via Mount.' },
     };
@@ -525,6 +545,11 @@
             // Story iscsi.6: the holding iSCSI LUN, carried through verbatim.
             // Absent on an old daemon ⇒ undefined ⇒ nothing is gated.
             heldByLun: m.heldByLun,
+            // cr3.mounts M10: the mount table could not be read (additive;
+            // absent on an old daemon, and on a read that worked).
+            tableUnreadable: m.tableUnreadable === true,
+            pveOwnershipUnknown: m.pveOwnershipUnknown === true,
+            disabled: m.disabled === true,
             raw: m,
         };
         // Materialise the ownership facet so the Managed-by column has a real
@@ -563,6 +588,11 @@
                 }
             }
             var list = (res && res.data) || [];
+            // cr3.mounts follow-up (3): the daemon could not read the kernel
+            // mount table — the list may be short (a mount not in fstab cannot
+            // be listed) and nothing in it is known mounted or not. Said above
+            // the grid, never left to read as "No mounts found".
+            setTableNotice(grid, !!(res && res.tableUnreadable));
             var rows = [];
             for (var i = 0; i < list.length; i++) {
                 rows.push(mountRow(list[i]));
@@ -616,6 +646,19 @@
     ANAS.mounts = ANAS.mounts || {};
     ANAS.mounts.reload = loadMounts;
 
+    // Show or hide the "mount table could not be read" notice docked above the
+    // grid (cr3.mounts follow-up (3)).
+    function setTableNotice(grid, unreadable) {
+        try {
+            var notice = grid.down('#mountsTableNotice');
+            if (notice) {
+                notice.setHidden(!unreadable);
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
     // ---- Toolbar state -----------------------------------------------------
 
     function setDisabled(grid, itemId, disabled) {
@@ -629,15 +672,34 @@
         }
     }
 
+    // A button tooltip is a QuickTip, and a QuickTip renders its text as HTML
+    // (cr3.mounts L17: the iSCSI LUN tip carries the LUN's names from the
+    // node) — every tip is encoded once here. setTooltip writes the attribute
+    // through the DOM, so the attribute itself needs no second encoding.
     function btnSetTip(grid, itemId, msg) {
         try {
             var btn = grid.down('#' + itemId);
             if (btn && typeof btn.setTooltip === 'function') {
-                btn.setTooltip(msg || '');
+                btn.setTooltip(enc(msg || ''));
             }
         } catch (e) {
             // non-fatal
         }
+    }
+
+    // Can this row be opened in the Edit dialog? The ONE rule the Edit button
+    // and the row double-click share (cr3.mounts M4): a remote share ANAS
+    // manages (not PVE's, not an AHR pool's) whose line is not disabled.
+    function canEditRec(rec) {
+        if (!rec || isPveManaged(rec) || isAhrManaged(rec) || isPveUnknown(rec) || !isRemoteRec(rec)) {
+            return false;
+        }
+        // cr3.mounts H2 (review fix 4): an edit re-mounts, so a mount an
+        // iSCSI LUN's image sits under is not edited (the daemon's 409 too).
+        if (mountHeldByLun(rec)) {
+            return false;
+        }
+        return ('' + getf(rec, 'state')).toLowerCase() !== 'disabled' && getf(rec, 'disabled') !== true;
     }
 
     // Enable/disable selection-dependent actions. PVE-managed rows are hands-off
@@ -648,7 +710,8 @@
         var has = !!rec;
         var pve = has && isPveManaged(rec);
         var ahr = has && isAhrManaged(rec);
-        var mutable = has && !pve && !ahr && isRemoteRec(rec);
+        var pveUnknown = has && !pve && !ahr && isPveUnknown(rec);
+        var mutable = has && !pve && !ahr && !pveUnknown && isRemoteRec(rec);
 
         setDisabled(grid, 'mountToggle', !mutable);
         setDisabled(grid, 'mountEdit', !mutable);
@@ -656,9 +719,11 @@
 
         var tip = pve ? t('Disabled — PVE manages this mount')
             : (ahr ? t('View only — this is an ANAS Hybrid RAID pool; manage it from the Hybrid RAID view')
-                : (has && !isRemoteRec(rec)
-                    ? t('View only — not an ANAS-managed filesystem')
-                    : ''));
+                : (pveUnknown
+                    ? t('View only — ANAS could not read PVE\'s storage configuration, so whether PVE owns this mount is unknown')
+                    : (has && !isRemoteRec(rec)
+                        ? t('View only — not an ANAS-managed filesystem')
+                        : '')));
         btnSetTip(grid, 'mountToggle', tip);
         btnSetTip(grid, 'mountEdit', tip);
         btnSetTip(grid, 'mountRemove', tip);
@@ -681,7 +746,7 @@
         var isOff = has && ('' + rec.get('state')).toLowerCase() === 'disabled';
         var persisted = has && first(rec.get('persistent'), rec.get('inFstab')) === true;
         setDisabled(grid, 'mountDisable', !(mutable && persisted));
-        btnSetTip(grid, 'mountDisable', (pve || ahr) ? tip
+        btnSetTip(grid, 'mountDisable', (pve || ahr || pveUnknown) ? tip
             : (has && !persisted ? t('Only fstab-persisted mounts can be disabled') : ''));
         try {
             var dbtn = grid.down('#mountDisable');
@@ -691,6 +756,21 @@
             }
         } catch (eD) {
             // non-fatal
+        }
+        // cr3.mounts L13: an ARMED automount is not mounted — the daemon
+        // answers Unmount with "not currently mounted" (404). The toggle is
+        // greyed with what to do instead.
+        var rowState = has ? ('' + rec.get('state')).toLowerCase() : '';
+        if (has && rowState === 'armed') {
+            setDisabled(grid, 'mountToggle', true);
+            btnSetTip(grid, 'mountToggle', t('Automount armed — it mounts on first access. Use Disable to stop it mounting.'));
+        }
+        // cr3.mounts M10: with the mount table unreadable, ANAS cannot tell
+        // mounted from not — Mount/Unmount wait until it can (the daemon
+        // refuses them 503 too).
+        if (has && rec.get('tableUnreadable') === true) {
+            setDisabled(grid, 'mountToggle', true);
+            btnSetTip(grid, 'mountToggle', t('ANAS could not read the kernel mount table — whether this is mounted is unknown, so Mount/Unmount are unavailable until it can.'));
         }
         if (isOff) {
             // A disabled entry is config-off: enable it before mount/edit.
@@ -720,6 +800,9 @@
             }
             setDisabled(grid, 'mountRemove', true);
             btnSetTip(grid, 'mountRemove', lunTip);
+            // H2 (review fix 4): Edit re-mounts — greyed with the same reason.
+            setDisabled(grid, 'mountEdit', true);
+            btnSetTip(grid, 'mountEdit', lunTip);
         }
     }
 
@@ -1497,6 +1580,9 @@
         var problems = [];
         if (!n.server) {
             problems.push('server is required');
+        } else if (n.server.charAt(0) === '-') {
+            // cr3.mounts L8 — the shared normaliser's rule, ported.
+            problems.push('server must not begin with \'-\' (a host name or address never does)');
         }
         if (type === 'cifs' && !path) {
             problems.push('share name is required (the name of the share on the server, e.g. `pictures`)');
@@ -1592,7 +1678,26 @@
         if (type === 'cifs') {
             var user = ('' + (valOf(win, '#credUser') || '')).trim();
             var pass = valOf(win, '#credPass');
-            var dom = ('' + (valOf(win, '#credDomain') || '')).trim();
+            var domRaw = '' + (valOf(win, '#credDomain') || '');
+            var dom = domRaw.trim();
+            // cr3.mounts L9: an EDIT with no new password tests the mount
+            // with the credentials its line already carries — the dialog is
+            // never shown the stored password, so it cannot send it, and a
+            // username alone is a body the daemon refuses. The daemon reads
+            // the line by its mountpoint (and probes only its own share).
+            if (win._stored && win._stored.mountpoint && !pass) {
+                // (review fix 3) a username typed WITHOUT its password is an
+                // identity the stored credentials do not prove: no request,
+                // the operator is told to type the password.
+                // review 4 (D3): the Domain field is "changed" only against what
+                // it was loaded with, byte for byte.
+                var domChanged = win._domainLoaded !== undefined ? domRaw !== win._domainLoaded : dom !== (win._stored.domain || '');
+                if ((user && user !== (win._stored.username || '')) || domChanged) {
+                    return null;
+                }
+                body.mountpoint = win._stored.mountpoint;
+                return body;
+            }
             if (user || pass || dom) {
                 body.credentials = {};
                 if (user) { body.credentials.username = user; }
@@ -1637,6 +1742,11 @@
         var color = spec.level === 'bad' ? 'var(--anas-danger,#c23b2c)'
             : spec.level === 'warn' ? 'var(--anas-warn,#b06a12)' : 'var(--anas-ok,#1f9c56)';
         var text = t(spec.msg) + (data.detail ? (' — ' + data.detail) : '');
+        // cr3.mounts M7: a probe mount or directory the daemon could not take
+        // down is said, with what to run (an older daemon sends no field).
+        if (data.cleanup) {
+            text += ' ' + t('Probe cleanup:') + ' ' + data.cleanup;
+        }
         var html;
         if (ANAS.gfx && typeof ANAS.gfx.callout === 'function') {
             html = ANAS.gfx.callout(enc(text), { level: spec.level });
@@ -1662,13 +1772,18 @@
             ANAS.alertMsg('Invalid input', t('Enter a server and, for CIFS, a share name to test.'));
             return;
         }
+        var body = testBody(win);
+        if (!body) {
+            ANAS.alertMsg('Invalid input', t('Enter the password to test this username and domain — the saved credentials belong to another account.'));
+            return;
+        }
         var area = win.down('#testResult');
         if (area) {
             area.update('<span style="color:var(--anas-muted,gray);">'
                 + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
                 + enc(t('testing…')) + '</span>');
         }
-        ANAS.api.post(node, '/mounts/test', testBody(win)).then(function (res) {
+        ANAS.api.post(node, '/mounts/test', body).then(function (res) {
             if (win.destroyed || win.destroying) {
                 return;
             }
@@ -2158,7 +2273,9 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-mount-edit',
-                title: isEdit ? (t('Edit Remote Share') + ': ' + (e.mountpoint || raw.mountpoint || ''))
+                // cr3.mounts H1: a window title is HTML — the mountpoint is
+                // text from the node (a mount another user made can name it).
+                title: isEdit ? (t('Edit Remote Share') + ': ' + enc(e.mountpoint || raw.mountpoint || ''))
                     : t('Add Remote Share'),
                 modal: true,
                 width: 560,
@@ -2375,6 +2492,10 @@
             ANAS.warn('mount wizard wiring failed: ' + ANAS.errText(eWire));
         }
 
+        // cr3.mounts L17: an edit acts on THIS mount — its identity, exactly
+        // as the daemon spelled it (a trailing space is part of a path), is
+        // the PUT's target; the read-only field's text is never re-parsed.
+        win._editMountpoint = isEdit ? ('' + (e.mountpoint || raw.mountpoint || '')) : null;
         win.show();
         applyType(win, protoType);
         onChange();
@@ -2458,6 +2579,15 @@
                 // shows the creds-file reference only when it does (a blank
                 // password on save keeps the set) — never for a guest entry.
                 credsSet: !!(d.credentials && d.credentials.set),
+                // The mount's identity, for a Test that uses the line's own
+                // stored credentials (cr3.mounts L9).
+                mountpoint: d.mountpoint || mountpoint,
+                // The stored username (cr3.mounts L9 review fix 3): a different
+                // typed one needs its password to be tested.
+                username: (d.credentials && d.credentials.username) || '',
+                // The Domain the field is pre-filled with (review 2 (3)): a
+                // different one, like a different username, needs the password.
+                domain: ('' + (first((co.cifs || {}).domain, d.credentials && d.credentials.domain) || '')).trim(),
             };
             setFld(win, '#server', d.server);
             setFld(win, '#remotePath', d.remotePath);
@@ -2511,6 +2641,17 @@
             // Domain lives in the credentials section; for a hand-written inline
             // entry it is surfaced via d.credentials.domain (never a cifs option).
             setFldExact(win, '#credDomain', first(cifs.domain, d.credentials && d.credentials.domain));
+            // Where that domain came from (cr3.mounts L12 review fix 1): the
+            // line's own `domain=`, or — only when the line has none — the
+            // credentials file's metadata, which a save must not echo.
+            win._fileDomain = (cifs.domain === undefined && d.credentials && d.credentials.domain)
+                ? d.credentials.domain : undefined;
+            // cr3.mounts review 4 (D3): what the field was LOADED with, byte
+            // for byte (a file's `CORP ` keeps its space), and the line's own
+            // value: an untouched field sends the line's own value, never a
+            // trimmed copy of the file's.
+            win._domainLoaded = '' + (valOf(win, '#credDomain') || '');
+            win._lineDomain = cifs.domain;
             setFldExact(win, '#cifsUid', cifs.uid);
             setChk(win, '#cifsForceuid', cifs.forceuid === true);
             setFldExact(win, '#cifsGid', cifs.gid);
@@ -2530,6 +2671,9 @@
 
             // Unrecognized options round-trip verbatim through the extra field.
             setFldExact(win, '#extraOptions', co.passthrough);
+            // cr3.mounts review 3 (9): what the line stores, byte for byte —
+            // a save of an untouched field sends exactly this.
+            win._storedPassthrough = (co.passthrough === undefined || co.passthrough === null) ? '' : ('' + co.passthrough);
 
             // Saved CIFS username (never the password).
             if (d.credentials && d.credentials.username) {
@@ -2575,6 +2719,14 @@
             options.vers = pickOrNull(win, '#cifsVers');
             options.cache = pickOrNull(win, '#cifsCache');
             options.domain = textOrNull(win, '#credDomain');
+            // cr3.mounts L12 (review fix 1) / review 4 (D3): `options.domain`
+            // is the LINE's option. An UNTOUCHED field (compared byte for byte
+            // with what it was loaded with) sends exactly the line's own value
+            // — null when the line has none, whatever the credentials file
+            // shows; only an edited field sends what the operator typed.
+            if (win._domainLoaded !== undefined && ('' + (valOf(win, '#credDomain') || '')) === win._domainLoaded) {
+                options.domain = (win._lineDomain === undefined || win._lineDomain === null) ? null : win._lineDomain;
+            }
             options.uid = numOrNull(win, '#cifsUid');
             options.forceuid = !!valOf(win, '#cifsForceuid');
             options.gid = numOrNull(win, '#cifsGid');
@@ -2621,9 +2773,15 @@
         var norm = normalizeMountTarget(type, valOf(win, '#server'), valOf(win, '#remotePath'));
         var server = norm.server;
         var remotePath = norm.remotePath;
-        var mountpoint = ('' + (valOf(win, '#mountpoint') || '')).trim();
+        var mountpoint = (isEdit && win._editMountpoint)
+            ? win._editMountpoint
+            : ('' + (valOf(win, '#mountpoint') || '')).trim();
         if (!server || (type === 'cifs' && !remotePath)) {
             ANAS.alertMsg('Invalid input', t('Enter a server and, for CIFS, a share name.'));
+            return;
+        }
+        if (norm.problems.length > 0) {
+            ANAS.alertMsg('Invalid input', t(norm.problems.join('; ')));
             return;
         }
         if (!MP_RE.test(mountpoint)) {
@@ -2653,7 +2811,12 @@
         }
         // Always sent: a BLANKED passthrough field must drop the stored
         // passthrough, which an omitted field could never say (#34).
-        body.extraOptions = ('' + (valOf(win, '#extraOptions') || '')).trim();
+        // cr3.mounts review 3 (9): an untouched field sends the stored bytes
+        // (a hand-written trailing VT/NBSP is the line's, never trimmed off);
+        // only what the operator typed is trimmed.
+        var extraRaw = '' + (valOf(win, '#extraOptions') || '');
+        body.extraOptions = (isEdit && win._storedPassthrough !== undefined && extraRaw === win._storedPassthrough)
+            ? extraRaw : extraRaw.trim();
         if (type === 'cifs') {
             var user = ('' + (valOf(win, '#credUser') || '')).trim();
             var passFld = win.down('#credPass');
@@ -2871,6 +3034,20 @@
                     store: store,
                     selModel: { mode: 'SINGLE' },
                     emptyText: t('No mounts found'),
+                    // cr3.mounts follow-up (3): shown by loadMounts when the
+                    // daemon says the kernel mount table could not be read.
+                    dockedItems: [{
+                        xtype: 'component',
+                        dock: 'top',
+                        itemId: 'mountsTableNotice',
+                        cls: 'anas-mounts-table-notice',
+                        hidden: true,
+                        padding: '6 10',
+                        html: '<span style="color:var(--anas-warn,#b06a12);">'
+                            + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
+                            + enc(t('ANAS could not read the kernel mount table (findmnt). Whether anything is mounted is unknown, and mounts that are not in /etc/fstab cannot be listed until it can be read.'))
+                            + '</span>',
+                    }],
                     viewConfig: {
                         getRowClass: function (record) {
                             try {
@@ -2928,7 +3105,11 @@
                             loadMountDetail(view, node, rec ? rec.get('mountpoint') : null);
                         },
                         itemdblclick: function (grid, rec) {
-                            if (!rec || isPveManaged(rec) || isAhrManaged(rec) || !isRemoteRec(rec)) {
+                            // cr3.mounts M4: the row double-click opens Edit only
+                            // when the Edit button would — the SAME gate
+                            // (updateButtons), so a disabled line is never
+                            // edited (the daemon refuses it too).
+                            if (!rec || !canEditRec(rec)) {
                                 return;
                             }
                             openMountEdit(grid.up('#mountsView'), node, rec.getData());

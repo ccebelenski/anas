@@ -6,16 +6,18 @@ import type { BoundId, ConfirmStore } from '../safety/confirm.js'
 import type { Advisory, Gate, GuardReads, GuardSpec, Refusal } from '../safety/guard.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { LiveAtTarget } from '../services/mount-match.js'
-import type { MountTestStages } from '../services/mounts.js'
-import { readdir, rm } from 'node:fs/promises'
+import type { CredentialsFileContent, MountTestStages, StoredProbeCredentials } from '../services/mounts.js'
+import { readdir, readFile, rm } from 'node:fs/promises'
+import { join, resolve as resolvePath } from 'node:path'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { classifyKind, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
-import { addMount, carriesAutomount, directMountOptionArgs, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
-import { PVE_STORAGE_CFG, readPveMountPaths, readPveTerritoryClaims, readZfsMountpoints } from '../parsers/pve-storage.js'
+import { addMount, ANAS_MARKER, carriesAutomount, carriesInlineSecret, cifsCredentialTokenScan, directMountOptionArgs, disableMount, enableMount, getMount, hasMount, isCifs, isNfs, parseFstabDoc, removeMount, replaceMount, serializeMountLine } from '../parsers/fstab.js'
+import { PVE_STORAGE_CFG, readPveMountPathsStrict, readPveTerritoryClaims, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
+import { ahrMountBase } from '../services/ahr-paths.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders, runFuser, toolNotFound } from '../services/busy-diagnosis.js'
-import { editConfig, readConfig } from '../services/config-writer.js'
+import { editConfig, readConfig, writeFileAtomic } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { describeLive, liveAtTarget, specMatchesLive } from '../services/mount-match.js'
 import {
@@ -23,12 +25,19 @@ import {
   applyOption,
   applySecOption,
   buildBaseInventory,
+  buildInventory,
   buildMountDetail,
+  buildSpec,
   cleanMountStderr,
   createMountpointThroughOpenedParent,
+  CredentialsContentError,
+  CredentialsFileUninterpretableError,
+  credsFileName,
   credsFilePath,
   deliveredMatchesIntent,
+  effectiveCifsAccount,
   entryFromRequest,
+  formatCredentials,
   fstabHasMount,
   fstabLineRevision,
   InvalidExtraOptionsError,
@@ -37,14 +46,17 @@ import {
   mountTargetRefusal,
   mountThroughOpenedDir,
   normalizeMountpointPath,
+  parseSpec,
   probeInventoryHealth,
+  ProbeRuntimeDirError,
   pveStorageFor,
+  readCredentialsSecrets,
   readEffectiveOptions,
-  readFindmnt,
   readMdadmConfText,
   removeCredentialsFileIfUnreferenced,
   removeEmptyMountpointDir,
   removeMountpointLeafThroughOpenedParent,
+  restoreFileBytes,
   rotateCredentialsFile,
   runMountTest,
   stopAutomountUnit,
@@ -61,6 +73,8 @@ const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 const LSOF = '/usr/bin/lsof'
 
+/** A carriage return or line feed inside a credentials value (review 4, N6). */
+const LINE_BREAK_RE = /[\r\n]/
 /** Whitespace splitter for lsof columns. */
 const WHITESPACE_RE = /\s+/
 /** A bare PID (lsof second column). */
@@ -327,6 +341,236 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     }
   }
 
+  /** Is `file` inside ANAS's own credentials directory (a file ANAS wrote and may rewrite)? */
+  function isAnasCredentialsFile(file: string): boolean {
+    return resolvePath(file).startsWith(`${resolvePath(credsDir)}/`)
+  }
+
+  /**
+   * THE gate for a line that carries a secret ON it (cr3.mounts M6, follow-up
+   * (2), reviews 2 and 3). A secret never rides a command line, and only the
+   * migrating Save may move one; every other door refuses, nothing changed:
+   *  - a verbatim secret token: a password on a line that is not CIFS
+   *    (nothing can hold it), or a CIFS password spelled in a way mount.cifs
+   *    does not read as that option (`PASSWORD=`; it reads exact, case-
+   *    sensitive keys) — Mount and Edit refuse naming the key;
+   *  - an inline password / alternate password on a line that ALSO names
+   *    the operator's own credentials file (outside ANAS's directory): ANAS
+   *    does not copy or edit that file (ruling, review 3) — Mount and Edit
+   *    refuse, saying exactly what to move where;
+   *  - otherwise an inline password / alternate password: Mount refuses with
+   *    the Edit-then-Save sentence (M6); Edit is the migrating Save; Disable
+   *    of a LEGACY `#ANAS ` line (whose conversion re-serialises it) refuses
+   *    with Enable-then-Edit-and-Save.
+   * Only KEYS are ever named, never a value.
+   */
+  function inlineSecretGate(verb: 'mount' | 'update' | 'disable'): Gate<MountObject> {
+    return async (o) => {
+      const e = o.entry
+      if (!e)
+        return null
+      // cr3.mounts review 4 (D4): a token with an escaped separator (`\054`,
+      // `\075`) is opaque — on ANY line, every verb that acts on the line
+      // refuses, naming the token's POSITION, never its content.
+      if (e.escapedSeparatorTokens?.length) {
+        const which = e.escapedSeparatorTokens.length === 1 ? `option ${e.escapedSeparatorTokens[0]}` : `options ${e.escapedSeparatorTokens.join(', ')}`
+        return {
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          reason: 'escaped-separator',
+          message: `${VERBING[verb]} '${o.mountpoint}' is refused: ${which} of its /etc/fstab line contains an escaped ',' or '=' (\\054 or \\075), which libmount turns into a separator before mount.cifs reads the option, so ANAS cannot tell what that option says — nothing was done. Fix the line on the node, then try again. (Unmount and Remove still work.)`,
+        }
+      }
+      // cr3.mounts review 4 (D5): mount.cifs reads EVERY credentials file a
+      // line names, in order; ANAS would know only the last.
+      const scan = cifsCredentialTokenScan(o.fstabText, o.mountpoint)
+      if (isCifs(e.fstype) && scan && scan.files > 1) {
+        return {
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          reason: 'several-credentials-files',
+          message: `${VERBING[verb]} '${o.mountpoint}' is refused: its /etc/fstab line names a credentials file ${scan.files} times (credentials=/cred=). mount.cifs reads each of them in order, and ANAS will not choose one for it — nothing was done. Keep one credentials file on the line on the node, then try again.`,
+        }
+      }
+      if (verb === 'disable' && !parseFstabDoc(o.fstabText).some(l => l.kind === 'entry' && l.entry.mountpoint === o.mountpoint && l.raw.startsWith(ANAS_MARKER)))
+        return null
+      if (e.secretOptions?.length) {
+        const keys = [...new Set(e.secretOptions.map(t => `${t.split('=')[0]}=`))].join(', ')
+        return {
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          reason: 'inline-secret-option',
+          message: isCifs(e.fstype)
+            ? `${VERBING[verb]} '${o.mountpoint}' is refused: its /etc/fstab line keeps ${keys}, a password spelled in a way mount.cifs does not read as that option (it reads exactly password=, pass=, password2=, pass2=), so ANAS cannot tell what the mount used and will not move it into a credentials file or put it on a command line — nothing was done. `
+            + `Respell or remove ${keys} on the line on the node, then try again.`
+            : `${VERBING[verb]} '${o.mountpoint}' is refused: its /etc/fstab line keeps a password option inline (${keys}) on a ${e.fstype} line, where no credentials file can hold it, and ANAS never puts a secret on a command line, where any process on the node can read it — nothing was done. `
+              + `Remove ${keys} from the line on the node (a ${e.fstype} mount does not use it), then try again.`,
+        }
+      }
+      const inline = e.inlineCredentials
+      if (inline?.password === undefined && inline?.password2 === undefined)
+        return null
+      // Only the keys actually on the line are named (review 4, D1).
+      const what = (scan?.secretKeys ?? []).map(k => `${k}=`).join(' and ') || 'a password'
+      if (e.credentialsFile && !isAnasCredentialsFile(e.credentialsFile)) {
+        // cr3.mounts review 4 (D1): what to do, PER KEY actually on the line.
+        // When the file already holds that kind of password, the inline one
+        // is not used (the file's wins) and adding a second line to the file
+        // would change the account (the last line wins): only remove it.
+        const file = e.credentialsFile
+        const inFile = await readCredentialsSecrets(file).then(c => c ?? {}, () => undefined)
+        const steps = (scan?.secretKeys ?? []).map((key) => {
+          const field = key === 'password2' || key === 'pass2' ? 'password2' : 'password'
+          if (inFile === undefined)
+            return `the inline ${key}=: if ${file} already has a ${field}= line, the inline one is not used (the file's wins) — remove it from the line; if it has none, move it into ${file} as a ${field}= line and remove it from the line`
+          return inFile[field] !== undefined
+            ? `the inline ${key}= is not used (the file's ${field} wins): remove it from the line`
+            : `move the inline ${key}= into ${file} as a ${field}= line and remove it from the line`
+        })
+        return {
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          reason: 'operator-credentials-file',
+          message: `${VERBING[verb]} '${o.mountpoint}' is refused: its /etc/fstab line names your credentials file ${file} (outside ANAS's credentials directory ${credsDir}) and also keeps ${what} inline. ANAS does not copy or edit your file, so it does not migrate this line — nothing was changed. `
+            + `On the node: ${steps.join('; ')}. Then try again.`,
+        }
+      }
+      if (verb === 'mount') {
+        // M6: the direct mount (cr.52r D3) lifts an inline secret out of the
+        // argv, so mount.cifs ran without it and waited on a prompt.
+        return {
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          reason: 'inline-credentials',
+          message: `Mount '${o.mountpoint}' keeps its password inline in /etc/fstab, and ANAS mounts a CIFS share only from a protected credentials file — nothing was done. `
+            + `Open Edit and Save: the password moves to a root-only credentials file and the share is mounted. (Or mount it on the node yourself: mount ${o.mountpoint})`,
+        }
+      }
+      if (verb === 'disable') {
+        return {
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          reason: 'inline-credentials',
+          message: `Disabling '${o.mountpoint}' is refused: its /etc/fstab line (already disabled in the old #ANAS form) keeps ${what} inline, and rewriting the line would lose it — nothing was changed. `
+            + `Enable it, then open Edit and Save to move the password into a protected credentials file.`,
+        }
+      }
+      return null
+    }
+  }
+
+  /**
+   * What a migrating Save writes into the credentials file (cr3.mounts
+   * reviews 2/3), decided before the first act: the account mount.cifs used
+   * — the line's inline tokens and, when the line names ANAS's OWN file, that
+   * file's content, by mount.cifs' precedence ({@link effectiveCifsAccount}).
+   * Refused, nothing changed, when the line spells a credential token in a
+   * way mount.cifs does not read, when the file cannot be read, when there is
+   * no username anywhere, or when a value would break the file's lines.
+   * (A line naming the OPERATOR's file never gets here: inlineSecretGate.)
+   */
+  async function migrationPlan(existing: MountEntry, fstabText: string): Promise<{ refusal: string } | { content: CredentialsFileContent }> {
+    const mp = existing.mountpoint
+    const scan = cifsCredentialTokenScan(fstabText, mp)
+    if (scan && scan.unhonoured.length > 0) {
+      const keys = scan.unhonoured.join(', ')
+      return { refusal: `Saving '${mp}' is refused: its /etc/fstab line spells ${keys} in a way mount.cifs does not read as that option (it reads exactly user=/username=, dom=/domain=/workgroup=, cred=/credentials=), so ANAS cannot tell which account the mount used and does not migrate its password — nothing was changed. Respell or remove ${keys} on the line on the node, then Save again.` }
+    }
+    let file: Partial<CredentialsFileContent> | null = null
+    if (existing.credentialsFile) {
+      try {
+        file = await readCredentialsSecrets(existing.credentialsFile)
+      }
+      catch (err) {
+        if (err instanceof CredentialsFileUninterpretableError)
+          return { refusal: `Saving '${mp}' is refused: ${err.message} — nothing was migrated or changed. Fix the file on the node, then Save again.` }
+        return { refusal: `Could not read the credentials file '${existing.credentialsFile}' this line names (${(err as NodeJS.ErrnoException).code ?? String(err)}) — nothing was changed` }
+      }
+      // review 4 (N6): a line break in the FILE's value is the file's to fix.
+      const broken = file ? (Object.entries(file) as Array<[string, string]>).find(([, v]) => LINE_BREAK_RE.test(v)) : undefined
+      if (broken)
+        return { refusal: `Saving '${mp}' is refused: the ${broken[0]} in the credentials file '${existing.credentialsFile}' contains a carriage return or line break, which ANAS will not copy — nothing was changed. Fix the file on the node, then Save again.` }
+    }
+    const account = effectiveCifsAccount(existing, fstabText, file)
+    if (!account.username)
+      return { refusal: `Saving '${mp}' is refused: its /etc/fstab line keeps a password inline but names no username (on the line or in its credentials file), so a credentials file written from it would not mean what the line means — nothing was changed. Add username=<name> to the line on the node, then Save again.` }
+    const content: CredentialsFileContent = {
+      username: account.username,
+      ...(account.password !== undefined ? { password: account.password } : {}),
+      ...(account.password2 !== undefined ? { password2: account.password2 } : {}),
+      ...(account.domain !== undefined ? { domain: account.domain } : {}),
+    }
+    try {
+      formatCredentials(content)
+    }
+    catch (err) {
+      if (err instanceof CredentialsContentError)
+        return { refusal: `Saving '${mp}' is refused: ${err.message}. Fix the line on the node, then Save again.` }
+      throw err
+    }
+    return { content }
+  }
+
+  /**
+   * The old account's alternate password a rotation carries into the new
+   * file (cr3.mounts review 3 (3)): only when the old content can be read and
+   * the typed username is the old account's. Never a reason to fail the
+   * rotation — the notes say what was not carried, and why.
+   */
+  async function alternatePasswordToCarry(existing: MountEntry, fstabText: string, newUser: string): Promise<{ password2?: string, notes: string[] }> {
+    let file: Partial<CredentialsFileContent> | null = null
+    if (existing.credentialsFile) {
+      // cr3.mounts review 4 (P1, ruling): nothing is ever copied out of the
+      // OPERATOR's file — only ANAS's own file carries its alternate password.
+      if (!isAnasCredentialsFile(existing.credentialsFile))
+        return { notes: [`Any alternate password in '${existing.credentialsFile}' was not carried over to the new credentials — ANAS does not copy anything out of your file.`] }
+      try {
+        file = await readCredentialsSecrets(existing.credentialsFile)
+      }
+      catch (err) {
+        const why = err instanceof CredentialsFileUninterpretableError ? err.message : `it could not be read (${(err as NodeJS.ErrnoException).code ?? String(err)})`
+        return { notes: [`The alternate password in '${existing.credentialsFile}' was not carried over to the new credentials: ${why}.`] }
+      }
+    }
+    const account = effectiveCifsAccount(existing, fstabText, file)
+    if (account.password2 === undefined)
+      return { notes: [] }
+    if (account.username !== newUser)
+      return { notes: [`The alternate password of ${account.username ? `'${account.username}'` : 'the old account'} was not carried over to '${newUser}' — it belongs to the old account.`] }
+    return { password2: account.password2, notes: [] }
+  }
+
+  /**
+   * cr3.mounts review 4 (N1): after an edit took an inline secret OFF the
+   * line (a migrating Save, a Remove), the config writer's backup
+   * `<fstab>.bak` — a copy of the file as it was before that edit, 0644 —
+   * still holds it. A byte-identical second edit does not refresh it (the
+   * writer skips a no-op edit, `next === before`), so the line in the backup
+   * is replaced through the writer's own atomic helper: the old raw line by
+   * the new one (or dropped, after a Remove); every other byte of the backup
+   * stays. When the secret is still in the backup after that (an older
+   * spelling of the line), the job says so with the one command that clears it.
+   */
+  async function scrubFstabBackup(oldRaw: string, newRaw: string | null, entry: MountEntry): Promise<string | undefined> {
+    const bak = `${fstabPath}.bak`
+    const secrets = [entry.inlineCredentials?.password, entry.inlineCredentials?.password2, ...(entry.secretOptions ?? [])].filter((v): v is string => typeof v === 'string' && v !== '')
+    const clear = `/etc/fstab's backup ${bak} still holds the password this edit took off the line — clear it on the node: cp ${fstabPath} ${bak}`
+    let text: string
+    try {
+      text = await readFile(bak, 'utf8')
+    }
+    catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ENOENT' ? undefined : clear
+    }
+    const holds = (t: string): boolean => t.split('\n').includes(oldRaw) || secrets.some(sec => t.includes(sec))
+    if (!holds(text))
+      return undefined
+    const next = text.split('\n').flatMap(l => (l === oldRaw ? (newRaw === null ? [] : [newRaw]) : [l])).join('\n')
+    if (holds(next))
+      return clear
+    return writeFileAtomic(bak, next).then(() => undefined, () => clear)
+  }
+
   /** A state gate: `holds(o)` must be true, else the refusal (the route's 4xx, the job's error). */
   function stateGate(holds: (o: MountObject) => boolean, refusal: Refusal): Gate<MountObject> {
     return async o => (holds(o) ? null : refusal)
@@ -345,8 +589,14 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     // Enable touches fstab alone; every other verb decides on the live table.
     if (verb !== 'enable')
       gates.push(tableGate)
-    if (verb === 'update')
-      gates.push(stateGate(o => !!o.entry, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' is not in /etc/fstab` }))
+    if (verb === 'update') {
+      gates.push(
+        stateGate(o => !!o.entry, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' is not in /etc/fstab` }),
+        // cr3.mounts M4: an edit re-mounts the line, so a DISABLED line (which
+        // Mount refuses) is refused here too — an edit of one used to mount it.
+        stateGate(o => !o.entry?.disabled, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is disabled — enable it first, then edit it` }),
+      )
+    }
     if (verb === 'remove')
       gates.push(stateGate(o => !!o.entry || o.mounted, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' not found` }))
     gates.push(remoteGate)
@@ -370,7 +620,12 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     // the job BEFORE the fstab line is rewritten (a refusal after the edit
     // would leave the op half-done).
     if (verb === 'update')
-      gates.push(async o => mountTargetRefusal(o.mountpoint))
+      gates.push(async o => mountTargetRefusal(o.mountpoint), async o => ahrBaseRefusal(o.mountpoint))
+    // cr3.mounts M6, follow-up (2), reviews 2 and 3: a secret on the line
+    // never rides a command line and is never lost by a door that is not the
+    // migrating Save (inlineSecretGate).
+    if (verb === 'mount' || verb === 'update' || verb === 'disable')
+      gates.push(inlineSecretGate(verb))
     if (verb === 'enable') {
       gates.push(
         stateGate(o => !!o.entry, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not in /etc/fstab` }),
@@ -381,7 +636,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       gates.push(stateGate(o => !!o.entry, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not in /etc/fstab — nothing to disable` }))
     if (verb === 'unmount')
       gates.push(stateGate(o => o.mounted, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' is not currently mounted` }))
-    if (verb === 'unmount' || verb === 'disable' || verb === 'remove')
+    // cr3.mounts H2: an edit RE-MOUNTS (`remountEntry` unmounts first, or
+    // mounts over an unmounted target), so it takes the LUN gate the other
+    // unmounting verbs take — the same hard 409, route and job.
+    if (verb === 'unmount' || verb === 'disable' || verb === 'remove' || verb === 'update')
       gates.push(lunGate(verbing))
     return gates
   }
@@ -413,7 +671,12 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
    * never the flattened pre-ident.4 name, which two mountpoints could share.
    */
   function credentialsFileOf(o: MountObject): string | undefined {
-    const kind = o.entry ? classifyKind(o.entry.fstype, o.entry.spec) : undefined
+    // cr3.mounts L11: a session (no-line) CIFS mount ANAS created named its
+    // file by the same hashed name — a Remove of it deletes that file too
+    // (one left by a create from before L11 removed it at mount time).
+    const kind = o.entry
+      ? classifyKind(o.entry.fstype, o.entry.spec)
+      : (o.live.real ? classifyKind(o.live.real.fstype, o.live.real.source) : undefined)
     return o.entry?.credentialsFile ?? (kind === 'cifs' ? credsFilePath(credsDir, o.mountpoint) : undefined)
   }
 
@@ -493,6 +756,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // sets a mountpoint — the mount takes the 409 with the shared code and
         // sentence, and the job re-runs the gate under its lock.
         async s => mountTargetRefusal(s.mountpoint),
+        async s => ahrBaseRefusal(s.mountpoint),
         async (s, reads) => {
           const paths = await mountReads.pvePaths(reads)
           if (paths === 'storage-cfg')
@@ -577,19 +841,25 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
 
   // --- GET /mounts — inventory --------------------------------------------
   server.get('/mounts', async () => {
+    // cr3.mounts INVENTED-STATE-M10: the STRICT table read — an unreadable
+    // table is `null`, and the rows say unknown (`buildInventory`), never
+    // "not mounted"; the list itself says so too (`tableUnreadable`,
+    // additive), because a mount that is not in fstab cannot be listed.
     const [findmntText, fstabText, pveMountPaths, ahrSpecs] = await Promise.all([
-      readFindmnt(executor),
+      readFindmntTable(executor),
       readConfig(fstabPath),
-      readPveMountPaths(storagePath),
+      // cr3.mounts follow-up (4): strict — an unreadable storage.cfg is null,
+      // and every row says PVE ownership is unknown.
+      readPveMountPathsStrict(storagePath ?? PVE_STORAGE_CFG),
       readAhrSpecs(),
     ])
-    const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths, ahrSpecs)
+    const rows = buildInventory(findmntText, fstabText, pveMountPaths, ahrSpecs)
     await probeInventoryHealth(executor, rows)
     // Story iscsi.6: which mounts a LUN's image file sits under, so Unmount and
     // Remove can be greyed with the reason attached. ONE claims read for the
     // whole grid; additive, so a mount nothing holds carries no field.
     await annotateHeldByLun(rows)
-    return { data: rows }
+    return { data: rows, ...(findmntText === null ? { tableUnreadable: true } : {}) }
   })
 
   // --- GET /mounts/:mountpoint — detail (mountpoint is URL-encoded) --------
@@ -842,6 +1112,15 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             throw new Error(`Mount create '${req.mountpoint}' failed — ${[why, ...survivors].join('; ')}; nothing was rolled back`)
           }
         }
+        // cr3.mounts L11: a NON-persistent mount has no line to name its
+        // credentials file, and mount.cifs read it at mount time (the kernel
+        // keeps the session's secret) — so the file goes now. Left on disk it
+        // was a secret nothing referenced and no Remove ever deleted.
+        if (!req.persistent && credsFile !== undefined) {
+          const rmFailure = await rm(credsFile, { force: true }).then(() => null, (e: unknown) => (e as NodeJS.ErrnoException).code ?? String(e))
+          if (rmFailure !== null)
+            warnings.push(`The credentials file '${credsFile}' of this session mount could not be removed (${rmFailure}) — remove it by hand`)
+        }
         return { created: req.mountpoint, warnings }
       }),
       // Story cr.39: one mount verb at a time per mountpoint.
@@ -877,12 +1156,35 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if ('refusal' in pre)
       return sendRefusal(reply, pre.refusal)
     const existing = pre.object.entry as MountEntry // the line-exists gate passed
+    // cr3.mounts M5: credentials belong to a CIFS line. Sent for any other
+    // (an NFS line), they used to be written to a credentials file the line
+    // never names — an orphaned secret and a job that said it rotated.
+    if (body.credentials && !isCifs(existing.fstype)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mp}' is ${existing.fstype}, not CIFS — credentials apply to CIFS mounts only, and nothing was written` } }
+    }
 
     // `mergeEntry` re-validates a SUPPLIED `extraOptions` at this write door
     // (cr.2 — defence in depth, Principle 6); a wayward value is a 400.
+    // cr3.mounts L12 (review fix 1): the dialog shows a credentials FILE's
+    // domain in its Domain field when the line carries none; echoed back as
+    // `options.domain` it would add `domain=` to a line nobody edited. A
+    // domain equal to the one the line's own credentials file already gives
+    // is the file's, not an edit of the line: kept off it.
+    // cr3.mounts review 3 (10): a file that cannot be read is UNKNOWN, never
+    // "no credentials" — its domain may be the one the dialog shows, so the
+    // edit keeps the line's credential tokens as they are (domain kept off).
+    let options = body.options
+    if (typeof options?.domain === 'string' && isCifs(existing.fstype) && existing.options.cifs?.domain === undefined && existing.credentialsFile) {
+      const fileDomain = await readCredentialsSecrets(existing.credentialsFile).then(c => c?.domain ?? null, () => undefined)
+      if (fileDomain === undefined || fileDomain === options.domain) {
+        const { domain: _fromFile, ...rest } = options
+        options = rest
+      }
+    }
     let merged: MountEntry
     try {
-      merged = mergeEntry(existing, body.options, body.automount, body.extraOptions)
+      merged = mergeEntry(existing, options, body.automount, body.extraOptions)
     }
     catch (err) {
       if (err instanceof InvalidExtraOptionsError) {
@@ -901,7 +1203,19 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     // credential shape (an empty password / a prompt) and would CHANGE the
     // mount. So the username stays where it is: the serializer re-emits the
     // `user=` token (never `guest`), and the line keeps the account it named.
-    const migrating = existing.inlineCredentials?.password !== undefined
+    // cr3.mounts review 2: an inline ALTERNATE password (`password2=`/`pass2=`)
+    // is migrated exactly like the password (mount.cifs reads it from the
+    // credentials file too).
+    const migrating = existing.inlineCredentials?.password !== undefined || existing.inlineCredentials?.password2 !== undefined
+    // cr3.mounts review 3: the migration's content is decided before anything
+    // is done — at the route (a 400) and again in the job.
+    if (migrating && !body.credentials) {
+      const plan = await migrationPlan(existing, pre.object.fstabText)
+      if ('refusal' in plan) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', reason: 'migration-refused', message: plan.refusal } }
+      }
+    }
 
     const job = jobQueue.submit(
       'mount.update',
@@ -910,25 +1224,83 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       { ...identity, params: { mountpoint: mp, ...(body.options ? { options: body.options } : {}) } },
       // Ruling (j): id, the line's revision and every gate (the foreign mount
       // check among them, right before anything is written) run again here.
-      guarded(spec, pre, async (_o, { updateProgress }) => {
+      guarded(spec, pre, async (o, { updateProgress }) => {
         // VALIDATE-THEN-COMMIT (issue #24): the new secret is proven against the
         // server BEFORE anything is written. Nothing below this point runs on a
         // rejected password, so the live creds file and fstab stay untouched.
-        if (body.credentials) {
-          updateProgress('Validating credentials')
-          merged.credentialsFile = await rotateCredentialsFile(executor, credsDir, merged, body.credentials)
+        // cr3.mounts L12 (review fix 5): a save that changes nothing — the
+        // merged line says exactly what the stored line says (the forced
+        // `nofail` aside), no credentials sent, nothing to migrate — does
+        // NOTHING: no fstab write, no daemon-reload, and no remount (which
+        // used to unmount a live share under its holders, or mount an
+        // unmounted `noauto` line). The result says so.
+        if (!body.credentials && !migrating && sameLine(existing, merged)) {
+          updateProgress('Nothing to change')
+          return { updated: mp, unchanged: true, message: `Nothing changed — the /etc/fstab line of '${mp}' already says this; the line and the mount were left as they are.` }
         }
-        else if (migrating && existing.inlineCredentials?.password !== undefined) {
+        const editWarnings: string[] = []
+        // cr3.mounts review 3 (6): the credentials file this job may write is
+        // the mount's hashed ANAS file. What was there BEFORE is kept, so a
+        // failed /etc/fstab write puts it back (or removes the file this job
+        // made) — a copy of a password is never left behind by a failure.
+        const ownFile = credsFilePath(credsDir, mp)
+        // null: there was no file; undefined: one that could not be read —
+        // only a rotation with typed credentials goes on over it (review 3
+        // (3): rotation is the way out of a broken file). Kept as BYTES and
+        // put back as bytes (review 4, N3). Read only when this Save writes
+        // the file (review 4, N9): an option-only Save never needs it.
+        let ownBefore: Buffer | null | undefined = null
+        if (body.credentials || migrating) {
+          try {
+            ownBefore = await readFile(ownFile)
+          }
+          catch (err) {
+            const code = (err as NodeJS.ErrnoException).code
+            // ENOTDIR: what is in the creds directory's place is not a
+            // directory, so no such file exists (the write then says why).
+            if (code === 'ENOENT' || code === 'ENOTDIR')
+              ownBefore = null
+            else if (body.credentials)
+              ownBefore = undefined
+            else
+              throw new Error(`Could not read the credentials file '${ownFile}' before writing it (${code ?? String(err)}) — nothing was changed`)
+          }
+        }
+        // What the line said before (for the backup scrub, review 4 N1).
+        const oldRaw = parseFstabDoc(o.fstabText).find(l => l.kind === 'entry' && l.entry.mountpoint === mp)?.raw
+        let wroteOwnFile = false
+        if (body.credentials) {
+          // cr3.mounts review 3 (3): a rotation with the full new credentials
+          // TYPED is the way out of a broken file — it proceeds whether or not
+          // the old file can be read. The old account's alternate password is
+          // carried over only when it can be read and the username is the
+          // same; otherwise the result says it was not.
+          const carry = await alternatePasswordToCarry(existing, o.fstabText, body.credentials.username)
+          editWarnings.push(...carry.notes)
+          updateProgress('Validating credentials')
+          const rotated = await rotateCredentialsFile(executor, credsDir, merged, {
+            ...body.credentials,
+            ...(carry.password2 !== undefined ? { password2: carry.password2 } : {}),
+          })
+          wroteOwnFile = true
+          merged.credentialsFile = rotated.path
+          if (rotated.warning)
+            editWarnings.push(rotated.warning)
+        }
+        else if (migrating) {
           // Operator did NOT retype the password: seed the creds file from the
           // EXTRACTED inline secret (one-time migration) so the mount keeps working
           // with its real password (specials like '#' preserved via the line-based
           // creds format). The plaintext never returns to the fstab line.
+          // cr3.mounts reviews 2/3: the account written is the one mount.cifs
+          // used — the line's inline tokens and (when it is ANAS's own) the
+          // file it names, by mount.cifs' precedence (migrationPlan).
+          const plan = await migrationPlan(existing, o.fstabText)
+          if ('refusal' in plan)
+            throw new Error(plan.refusal)
           updateProgress('Migrating inline credentials to a protected file')
-          merged.credentialsFile = await writeCredentialsFile(credsDir, mp, {
-            username: existing.inlineCredentials.username ?? '',
-            password: existing.inlineCredentials.password,
-            ...(existing.inlineCredentials.domain !== undefined ? { domain: existing.inlineCredentials.domain } : {}),
-          })
+          merged.credentialsFile = await writeCredentialsFile(credsDir, mp, plan.content)
+          wroteOwnFile = true
         }
         // cr.60r: rotated credentials REPLACE the line's inline identity too —
         // the new file names the account, so a username-only line's `user=bob`
@@ -942,16 +1314,53 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           if (merged.options.cifs)
             delete merged.options.cifs.domain
         }
+        // cr3.mounts L12 (§2 dialog contract: "an untouched edit rewrites
+        // byte-identically"): a save that changes nothing the line says —
+        // no option, no credential, nothing to migrate — leaves the line's
+        // bytes alone. A rewrite canonicalises a hand-written line (spacing,
+        // token order, `nfsvers=` → `vers=`), which is not the operator's
+        // edit. The forced `nofail` is ANAS's rule for the lines it writes;
+        // on its own it is not a reason to rewrite a line nobody edited.
         updateProgress('Rewriting /etc/fstab entry')
-        await editConfig(fstabPath, (current) => {
-          if (!hasMount(current, mp))
-            throw new Error(`Mount '${mp}' is not in /etc/fstab`)
-          return replaceMount(current, mp, merged)
-        })
+        try {
+          await editConfig(fstabPath, (current) => {
+            if (!hasMount(current, mp))
+              throw new Error(`Mount '${mp}' is not in /etc/fstab`)
+            return replaceMount(current, mp, merged)
+          })
+        }
+        catch (err) {
+          const why = err instanceof Error ? err.message : String(err)
+          if (!wroteOwnFile)
+            throw err
+          // cr3.mounts review 3 (6): undo only what this job did to the file.
+          const holds = body.credentials ? 'the new credentials (already tested against the server)' : 'the credentials migrated from the line'
+          if (ownBefore === undefined)
+            throw new Error(`Rewriting /etc/fstab failed (${why}) — the credentials file '${ownFile}' now holds ${holds} (what it held before could not be read, so it could not be put back); /etc/fstab was not changed`)
+          const undo = ownBefore === null
+            ? await rm(ownFile, { force: true }).then(() => null, (e: unknown) => (e as NodeJS.ErrnoException).code ?? String(e))
+            : await restoreFileBytes(ownFile, ownBefore, 0o600).then(() => null, (e: unknown) => (e as NodeJS.ErrnoException).code ?? String(e))
+          // review 4 (D2): when the line ALREADY named this file, deleting it
+          // would break the next mount — say what it holds now instead.
+          const fileClause = undo === null
+            ? (ownBefore === null ? `the credentials file '${ownFile}' this job wrote was removed again` : `the credentials file '${ownFile}' was put back as it was`)
+            : ownBefore !== null && existing.credentialsFile === ownFile
+              ? `the credentials file '${ownFile}' this line names could not be put back (${undo}) and now holds ${holds} — leave it in place: the line still names it`
+              : `the credentials file '${ownFile}' this job wrote could not be ${ownBefore === null ? 'removed' : 'put back'} (${undo}) and must be removed by hand`
+          throw new Error(`Rewriting /etc/fstab failed (${why}) — ${fileClause}; /etc/fstab was not changed`)
+        }
+        // cr3.mounts review 4 (N1): the writer's backup (`<fstab>.bak`, the
+        // file as it was before this edit) still holds the secret this Save
+        // moved out of the line — scrubbed (the migrated line takes its place).
+        if (migrating && oldRaw !== undefined) {
+          const newRaw = parseFstabDoc(await readConfig(fstabPath)).find(l => l.kind === 'entry' && l.entry.mountpoint === mp)?.raw ?? null
+          const left = await scrubFstabBackup(oldRaw, newRaw, existing)
+          if (left)
+            editWarnings.push(left)
+        }
         // A rotation writes the hashed name (ident.4 (d)); the file the line
         // named before (a pre-ident.4 flattened name) goes once nothing
         // references it — and only from the ANAS creds directory.
-        const editWarnings: string[] = []
         if (existing.credentialsFile && merged.credentialsFile && existing.credentialsFile !== merged.credentialsFile) {
           const left = await removeCredentialsFileIfUnreferenced(credsDir, existing.credentialsFile, await readConfig(fstabPath))
           if (left)
@@ -1079,8 +1488,8 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             await assertNoNewHolders(mp, holders)
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
-          if (r.exitCode !== 0 && !lazy)
-            throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp, configfsOptionsFrom(iscsiPaths)))
+          if (r.exitCode !== 0)
+            throw new Error(await unmountFailure(r, mp, lazy))
         }
         // Story cr.24/cr.39: references that appeared after the confirm.
         const warnings = [...ctx.newAdvisories]
@@ -1180,8 +1589,8 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             await assertNoNewHolders(mp, holders)
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
-          if (r.exitCode !== 0 && !lazy)
-            throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp, configfsOptionsFrom(iscsiPaths)))
+          if (r.exitCode !== 0)
+            throw new Error(await unmountFailure(r, mp, lazy))
         }
         if (o.entry) {
           updateProgress('Removing /etc/fstab entry')
@@ -1194,22 +1603,55 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           updateProgress('Reloading systemd (daemon-reload)')
           await daemonReload(executor)
         }
+        // cr3.mounts review 4 (N1): a removed line that carried an inline
+        // secret leaves it in the writer's backup — scrubbed the same way.
+        if (o.entry && carriesInlineSecret(o.entry)) {
+          const oldRaw = parseFstabDoc(o.fstabText).find(l => l.kind === 'entry' && l.entry.mountpoint === mp)?.raw
+          const left = oldRaw === undefined ? undefined : await scrubFstabBackup(oldRaw, null, o.entry)
+          if (left)
+            resultWarnings.push(left)
+        }
         // The file the confirm named (the scope check above proved it still is
         // the one); removed only from the creds dir and only when no other line
         // references it — decided on the fstab as it is after the line is gone.
         const file = credentialsFileOf(o)
+        const fstabAfter = await readConfig(fstabPath)
         if (file) {
           updateProgress('Removing credentials file')
-          const kept = await removeCredentialsFileIfUnreferenced(credsDir, file, await readConfig(fstabPath))
+          const kept = await removeCredentialsFileIfUnreferenced(credsDir, file, fstabAfter)
           if (kept)
             resultWarnings.push(kept)
         }
+        // cr3.mounts review 4 (N7): ANAS's own leftovers for THIS mountpoint
+        // go too — a stale rotation candidate (`.<hashed>.validating`, never
+        // referenced) and an orphaned hashed credentials file no line names.
+        // Only files of ANAS's own name pattern in ANAS's own directory.
+        const hashed = credsFilePath(credsDir, mp)
+        if (hashed !== file) {
+          const kept = await removeCredentialsFileIfUnreferenced(credsDir, hashed, fstabAfter)
+          if (kept)
+            resultWarnings.push(kept)
+        }
+        const candidate = join(credsDir, `.${credsFileName(mp)}.validating`)
+        const leftCandidate = await rm(candidate, { force: true }).then(() => null, (e: unknown) => (e as NodeJS.ErrnoException).code ?? String(e))
+        if (leftCandidate !== null)
+          resultWarnings.push(`A stale credentials candidate '${candidate}' could not be removed (${leftCandidate}) — remove it by hand.`)
         if (removeMountpointDir) {
           // rmdir semantics only, and only once the mount is really gone. A
           // directory that will not go (not empty, still held) NEVER fails the
           // delete the user asked for — it rides the result as a warning.
           updateProgress(`Removing the mountpoint directory ${mp}`)
-          const left = await removeEmptyMountpointDir(mp, await isMounted(mp))
+          // cr3.mounts L14: the directory the opt-in removes is the line's
+          // TEXTUAL mountpoint — a hand-written line can name `/srv`, `/home`
+          // or `/mnt`. A path the mount-target rule protects, or a top-level
+          // directory of the root filesystem, is never removed (even empty):
+          // left in place and said.
+          const protectedPath = await mountTargetRefusal(mp)
+          const left = protectedPath !== null
+            ? `The directory '${mp}' was left in place — ANAS never removes a path the mount-target rule refuses (${protectedPath.message}).`
+            : isTopLevelDir(mp)
+              ? `The directory '${mp}' was left in place — it is a top-level directory of the root filesystem.`
+              : await removeEmptyMountpointDir(mp, await isMounted(mp))
           if (left)
             resultWarnings.push(left)
         }
@@ -1241,8 +1683,88 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: target.problems.join('; ') } }
     }
-    const result = await runMountTest(executor, parsed.data, mountTestStages)
-    return { data: result }
+    // cr3.mounts L9: the Edit dialog tests an existing CIFS mount with the
+    // credentials its line already carries (it is never shown the password,
+    // so it cannot send it). Only that line's own share is probed with them:
+    // stored credentials are never offered to another server.
+    let stored: StoredProbeCredentials = {}
+    if (parsed.data.mountpoint !== undefined && parsed.data.type === 'cifs' && !parsed.data.credentials) {
+      const mp = parsed.data.mountpoint
+      const fstabText = await readConfig(fstabPath)
+      const entry = getMount(fstabText, mp)
+      if (!entry || !isCifs(entry.fstype)) {
+        reply.code(404)
+        return { error: { code: 'NOT_FOUND', message: `Mount '${mp}' is not a CIFS line in /etc/fstab — there are no stored credentials to test with` } }
+      }
+      if (buildSpec('cifs', target) !== buildSpec('cifs', parseSpec('cifs', entry.spec))) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `The stored credentials of '${mp}' are tested only against its own share (${entry.spec}) — nothing was probed` } }
+      }
+      // cr3.mounts review 4 (N8): test what the MOUNT uses — one account path
+      // (effectiveCifsAccount), the line's own user/domain/password tokens
+      // over the file by mount.cifs' precedence. A line whose credential
+      // tokens ANAS cannot read (an escaped separator, several files) is not
+      // tested as something else.
+      const scan = cifsCredentialTokenScan(fstabText, mp)
+      if (entry.escapedSeparatorTokens?.length || (scan?.files ?? 0) > 1) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `The /etc/fstab line of '${mp}' has options ANAS cannot read the way mount.cifs does (an escaped ',' or '=', or more than one credentials file), so Test cannot tell which account the mount uses — fix the line on the node, or type the credentials to test them` } }
+      }
+      const inl = entry.inlineCredentials
+      const lineSaysAccount = inl?.username !== undefined || inl?.domain !== undefined || inl?.password !== undefined || inl?.password2 !== undefined
+      if (entry.credentialsFile && !lineSaysAccount) {
+        stored = { credentialsFile: entry.credentialsFile }
+      }
+      else {
+        let file: Partial<CredentialsFileContent> | null = null
+        if (entry.credentialsFile) {
+          try {
+            file = await readCredentialsSecrets(entry.credentialsFile)
+          }
+          catch (err) {
+            reply.code(400)
+            const why = err instanceof CredentialsFileUninterpretableError ? err.message : `the credentials file '${entry.credentialsFile}' could not be read (${(err as NodeJS.ErrnoException).code ?? String(err)})`
+            return { error: { code: 'VALIDATION_ERROR', message: `Test cannot use the stored credentials of '${mp}': ${why} — type the credentials to test them` } }
+          }
+        }
+        const account = effectiveCifsAccount(entry, fstabText, file)
+        // (review fix 3) a user with no password anywhere cannot be tested as
+        // that user: a guest probe would answer for an identity the line does not use.
+        if (account.password === undefined && account.username) {
+          reply.code(400)
+          return { error: { code: 'VALIDATION_ERROR', message: `The /etc/fstab line of '${mp}' names the user '${account.username}' but no password or credentials file, so Test cannot prove that identity — type the password to test it` } }
+        }
+        if (account.password !== undefined && !account.username) {
+          reply.code(400)
+          return { error: { code: 'VALIDATION_ERROR', message: `The /etc/fstab line of '${mp}' keeps a password but names no username, so Test cannot tell which account the mount uses — type the credentials to test them` } }
+        }
+        if (account.password !== undefined) {
+          stored = {
+            inline: {
+              username: account.username ?? '',
+              password: account.password,
+              ...(account.password2 !== undefined ? { password2: account.password2 } : {}),
+              ...(account.domain !== undefined ? { domain: account.domain } : {}),
+            },
+          }
+        }
+      }
+      if (entry.options.cifs?.vers !== undefined)
+        stored.vers = entry.options.cifs.vers
+    }
+    try {
+      const result = await runMountTest(executor, parsed.data, mountTestStages, stored)
+      return { data: result }
+    }
+    catch (err) {
+      // cr3.mounts review 2 (5): the probe's private directory could not be
+      // made — a 503 naming it, never a raw errno 500.
+      if (err instanceof ProbeRuntimeDirError) {
+        reply.code(503)
+        return { error: { code: 'UNAVAILABLE', message: err.message } }
+      }
+      throw err
+    }
   })
 
   // --- helpers ------------------------------------------------------------
@@ -1263,9 +1785,28 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     return warning ? [warning] : []
   }
 
-  /** Is the mountpoint currently in the kernel mount table? */
+  /**
+   * The job failure of an unmount that did not happen. cr3.mounts L16: a
+   * FORCED (lazy) unmount that fails is a failure too — it used to be
+   * ignored, and the job went on to report the mount disabled or removed
+   * (Remove deleting the credentials file) while it was still mounted. It
+   * fails before anything else is changed, and says so.
+   */
+  async function unmountFailure(r: ExecResult, mp: string, lazy: boolean): Promise<string> {
+    const why = r.stderr.trim() || `umount exited ${r.exitCode}`
+    if (lazy)
+      return `The forced (lazy) unmount of '${mp}' failed (${why}) — it is still mounted, and nothing else was changed`
+    return enrichBusyError(executor, why, mp, configfsOptionsFrom(iscsiPaths))
+  }
+
+  /**
+   * Is the mountpoint currently in the kernel mount table? An UNREADABLE
+   * table answers true (cr3.mounts: a read that failed never reads as
+   * "not mounted") — the one caller then leaves the directory in place.
+   */
   async function isMounted(mountpoint: string): Promise<boolean> {
-    return mountedIn(await readFindmnt(executor), mountpoint)
+    const table = await readFindmntTable(executor)
+    return table === null || mountedIn(table, mountpoint)
   }
 
   /** Parse + validate a URL-encoded mountpoint param, or 400 and return null. */
@@ -1278,6 +1819,33 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     }
     return parsed.data
   }
+}
+
+/**
+ * cr3.mounts (from the AHR review): a remote share is never placed at or under
+ * the base ANAS Hybrid RAID pools mount at (`/mnt/anas-ahr`, or the
+ * `ANAS_AHR_MOUNT_BASE` override) — that tree is AHR's: a share there is a
+ * second way into an AHR create colliding with an existing mount (the pool's
+ * own mountpoint is `<base>/<pool>`). Create and edit refuse it, at the route
+ * and in the job.
+ */
+function ahrBaseRefusal(mountpoint: string): Refusal | null {
+  const mp = normalizeMountpointPath(mountpoint)
+  const base = normalizeMountpointPath(ahrMountBase())
+  if (mp !== base && !mp.startsWith(`${base}/`))
+    return null
+  return {
+    status: 409,
+    code: 'CONFLICT',
+    reason: 'ahr-mount-base',
+    message: `Mountpoint '${mp}' is under ${base}, where ANAS Hybrid RAID pools are mounted — a remote share there would collide with a pool's mountpoint. Choose a path outside ${base}.`,
+  }
+}
+
+/** Is `mountpoint` a directory directly under `/` (`/mnt`, `/srv`, `/media`)? */
+function isTopLevelDir(mountpoint: string): boolean {
+  const n = normalizeMountpointPath(mountpoint)
+  return n !== '/' && n.lastIndexOf('/') === 0
 }
 
 /** Does the findmnt table list `mountpoint` as mounted? */
@@ -1508,6 +2076,18 @@ async function dirContents(path: string): Promise<string[] | null> {
 }
 
 /**
+ * Does the merged entry say exactly what the line already says (cr3.mounts
+ * L12)? Compared in the canonical serialization both would be written in, with
+ * the merge's forced `nofail` set back to the line's own value — so an edit
+ * that only echoes the entry (the dialog sends every field on every save, #34)
+ * is recognised as untouched whatever spelling the line was written in.
+ */
+function sameLine(existing: MountEntry, merged: MountEntry): boolean {
+  const asLine = { ...merged, options: { ...merged.options, common: { ...merged.options.common, nofail: existing.options.common.nofail } } }
+  return serializeMountLine(asLine) === serializeMountLine(existing)
+}
+
+/**
  * Merge an update's flat option changes onto an existing entry, under the clear
  * contract (issue #34): a value OVERRIDES, `null` REMOVES the stored option, and
  * an omitted field KEEPS it. Before the null case existed, a blanked dialog
@@ -1550,9 +2130,15 @@ function mergeEntry(
     // blanked the field. Only an omitted field keeps what was there. A
     // SUPPLIED value is re-validated at this write door (cr.2 — defence in
     // depth, Principle 6); PRESERVED hand-written passthrough is not.
-    passthrough: extraOptions === undefined ? existing.options.passthrough : validatedExtraOptions(extraOptions),
+    // cr3.mounts (review fix 6): a byte-equal echo of the stored passthrough
+    // is the line's own and is kept as it is — a hand-written token that would
+    // not pass the write-side token rule (an octal escape, a quote) must not
+    // make every save of the line a 400. Anything else is validated.
+    passthrough: extraOptions === undefined || extraOptions === existing.options.passthrough
+      ? existing.options.passthrough
+      : validatedExtraOptions(extraOptions, existing.options.passthrough),
   }
-  if (existing.fstype === 'nfs4' || existing.fstype === 'nfs') {
+  if (isNfs(existing.fstype)) {
     const nfs = { ...existing.options.nfs }
     applyOption(nfs, 'vers', input?.vers)
     applyOption(nfs, 'hard', input?.hard)
@@ -1569,7 +2155,7 @@ function mergeEntry(
     applySecOption(nfs, input?.sec, MountNfsSec.options)
     options.nfs = nfs
   }
-  if (existing.fstype === 'cifs') {
+  if (isCifs(existing.fstype)) {
     const cifs = { ...existing.options.cifs }
     applyOption(cifs, 'vers', input?.vers)
     applyOption(cifs, 'domain', input?.domain)

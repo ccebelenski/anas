@@ -48,6 +48,8 @@ export {
   FstabOptionToken,
   fstabOptionTokens,
   isFstabOptionToken,
+  NOFAIL_DEFEATING_OPTION_KEYS,
+  nofailDefeatingOption,
   unescapeFstabField,
   X_ANAS_DISABLED_AUTOMOUNT_TOKEN,
   X_ANAS_DISABLED_KEPT_TOKEN,

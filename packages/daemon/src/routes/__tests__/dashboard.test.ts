@@ -346,6 +346,10 @@ describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () =>
     // cr3: the unit dir exists on every node; a missing one is a task store
     // that could not be read in full (the replication section cards it).
     mkdirSync(join(tmp, 'systemd'), { recursive: true })
+    // cr3.mounts INVENTED-STATE-H1: the mounts section now reports a mount
+    // table it could not read as UNAVAILABLE (it used to answer "no
+    // warnings"), so this bare node answers findmnt — a readable, empty table.
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: '{"filesystems":[]}', stderr: '', exitCode: 0 } })
     const srv = Fastify({ logger: false })
     await srv.register(dashboardRoutes, {
       prefix: '/v1',

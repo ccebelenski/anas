@@ -16,20 +16,20 @@ import type {
 } from '@anas/shared'
 import type { CommandExecutor, ExecOptions, ExecResult } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
+import type { CifsCredentialTokens } from '../parsers/fstab.js'
 import type { Gate, Refusal } from '../safety/guard.js'
 import { createHash } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import { constants as FS_CONSTANTS } from 'node:fs'
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
-import { tmpdir } from 'node:os'
 import { basename, dirname, join, normalize, resolve } from 'node:path'
-import { CIFS_CREDENTIAL_OPTION_KEYS, MountCifsSec, MountExtraOptions, MountNfsSec, normalizeMountTarget, unescapeFstabField } from '@anas/shared'
+import { CIFS_CREDENTIAL_OPTION_KEYS, fstabOptionTokens, MountCifsSec, MountExtraOptions, MountNfsSec, nofailDefeatingOption, normalizeMountTarget } from '@anas/shared'
 import { classifyKind, effectiveMountAt, effectiveMounts, isIgnoredMount, optionsReadOnly, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
-import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
+import { cifsAuthToken, cifsCredentialTokenScan, getMount, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
-import { readPveMountPaths } from '../parsers/pve-storage.js'
+import { PVE_STORAGE_CFG, readPveMountPathsStrict } from '../parsers/pve-storage.js'
 import { zodIssue } from '../validation.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { readConfig, writeFileAtomic } from './config-writer.js'
@@ -53,7 +53,7 @@ const PORT_CIFS = 445
 
 /** ESTALE marker in `stat` stderr. */
 const STALE_RE = /stale file handle/i
-/** Whitespace splitter (stat capacity fields / fstab fields). */
+/** Whitespace splitter (stat capacity fields). */
 const WHITESPACE_RE = /\s+/
 /** `mount error(N)` errno extractor (mount.cifs). */
 const MOUNT_ERRNO_RE = /mount error\((\d+)\)/
@@ -251,6 +251,47 @@ export function pveStorageFor(mountpoint: string, pveMountPaths: Map<string, str
   return undefined
 }
 
+/** The health detail of a row whose mount table could not be read (cr3.mounts INVENTED-STATE-M10). */
+export const MOUNT_TABLE_UNREADABLE_DETAIL
+  = 'ANAS could not read the kernel mount table (findmnt), so whether this mount is mounted, and its health, is unknown.'
+
+/**
+ * cr3.mounts INVENTED-STATE-M10: the inventory over an UNREADABLE mount table
+ * (`findmntText` null). The fstab overlay is still true — every configured
+ * line is listed, its disabled state is an fstab fact — but nothing about the
+ * live side is: no row reads `unmounted` (the old answer, from an empty
+ * table), `mounted` is null, `state` is `unknown`, and each row says
+ * `tableUnreadable`. A mount not in fstab cannot be listed at all; the flag on
+ * every row (and the list's own field, at the route) is how a reader knows the
+ * list may be short.
+ */
+export function buildInventory(
+  findmntText: string | null,
+  fstabText: string,
+  pveMountPaths: Map<string, string> | null,
+  ahrSpecs: Set<string> = new Set(),
+): MountSummary[] {
+  const rows = buildBaseInventory(findmntText ?? '', fstabText, pveMountPaths ?? new Map(), ahrSpecs)
+  // cr3.mounts follow-up (4): an UNREADABLE storage.cfg (`null`, the strict
+  // reader's answer) leaves PVE ownership unknown — said on every row that is
+  // not already PVE's by its fixed path (/mnt/pve needs no file).
+  if (pveMountPaths === null) {
+    for (const row of rows) {
+      if (!row.pveManaged)
+        row.pveOwnershipUnknown = true
+    }
+  }
+  if (findmntText !== null)
+    return rows
+  for (const row of rows) {
+    row.mounted = null
+    row.tableUnreadable = true
+    if (row.state !== 'disabled')
+      row.state = 'unknown'
+  }
+  return rows
+}
+
 /**
  * Fill state + capacity for every live inventory row via the guarded probe.
  * Armed (automount placeholder) and unmounted rows are left as-is — `stat -f` on
@@ -366,27 +407,36 @@ export function buildMountWarnings(
 
 /**
  * Build the inventory (with health probes) and derive the dashboard mount
- * warnings, FAIL-OPEN. Mirrors how replication warnings are wired.
+ * warnings.
+ *
+ * cr3.mounts INVENTED-STATE-H1/M10: a read that failed is never "no
+ * warnings". This collector used to catch every failure and answer `[]` — a
+ * successful read to the dashboard — and an unreadable mount table read as
+ * "nothing mounted", which raised a "configured but not mounted" card for
+ * every boot mount instead. Now an unreadable findmnt table, or an fstab that
+ * cannot be read, THROWS: the dashboard section (`readDashboardSection`)
+ * reports the mounts section unavailable.
  */
 export async function collectMountWarnings(
   executor: CommandExecutor,
   opts: { fstabPath: string, storagePath?: string, mdadmConfPath?: string },
 ): Promise<DashboardWarning[]> {
-  try {
-    const [findmntText, fstabText, pveMountPaths, mdadmConfText] = await Promise.all([
-      readFindmnt(executor),
-      readConfig(opts.fstabPath),
-      readPveMountPaths(opts.storagePath),
-      opts.mdadmConfPath ? readMdadmConfText(opts.mdadmConfPath) : Promise.resolve(''),
-    ])
-    const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths, ahrPinnedSpecs(mdadmConfText))
-    await probeInventoryHealth(executor, rows)
-    const entriesByMount = new Map(parseFstab(fstabText).map(e => [e.mountpoint, e]))
-    return buildMountWarnings(rows, entriesByMount)
-  }
-  catch {
-    return []
-  }
+  const [findmntText, fstabText, pveMountPaths, mdadmConfText] = await Promise.all([
+    readFindmntTable(executor),
+    readConfig(opts.fstabPath),
+    readPveMountPathsStrict(opts.storagePath ?? PVE_STORAGE_CFG),
+    opts.mdadmConfPath ? readMdadmConfText(opts.mdadmConfPath) : Promise.resolve(''),
+  ])
+  if (findmntText === null)
+    throw new Error('the kernel mount table (findmnt) could not be read')
+  // cr3.mounts follow-up (4): PVE's mounts never warn from here — an
+  // unreadable storage.cfg cannot say which those are, so it is a failed read.
+  if (pveMountPaths === null)
+    throw new Error(`PVE's storage configuration (${opts.storagePath ?? PVE_STORAGE_CFG}) could not be read`)
+  const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths, ahrPinnedSpecs(mdadmConfText))
+  await probeInventoryHealth(executor, rows)
+  const entriesByMount = new Map(parseFstab(fstabText).map(e => [e.mountpoint, e]))
+  return buildMountWarnings(rows, entriesByMount)
 }
 
 /**
@@ -654,12 +704,22 @@ export function applySecOption<S extends string>(
 /** Thrown by {@link validatedExtraOptions}; the routes turn it into a 400. */
 export class InvalidExtraOptionsError extends Error {}
 
-export function validatedExtraOptions(extraOptions: string | null | undefined): string {
+export function validatedExtraOptions(extraOptions: string | null | undefined, kept = ''): string {
   if (extraOptions === undefined || extraOptions === null)
     return ''
   const parsed = MountExtraOptions.safeParse(extraOptions)
   if (!parsed.success)
     throw new InvalidExtraOptionsError(zodIssue(parsed.error))
+  // cr3.mounts L15: a token that undoes the forced `nofail` is never WRITTEN
+  // by ANAS — unless it is already on the line (`kept`, the edited entry's
+  // own passthrough): a hand-written one is the operator's, and the dialog
+  // echoes it on every save.
+  const already = new Set(fstabOptionTokens(kept))
+  for (const token of fstabOptionTokens(extraOptions)) {
+    const refusal = already.has(token) ? null : nofailDefeatingOption(token)
+    if (refusal !== null)
+      throw new InvalidExtraOptionsError(refusal)
+  }
   return extraOptions
 }
 
@@ -828,29 +888,136 @@ export async function removeCredentialsFileIfUnreferenced(
 }
 
 /** Render a credentials file exactly as `mount.cifs` accepts (NOTES §7). */
-export function formatCredentials(creds: { username: string, password: string, domain?: string }): string {
-  const lines = [`username=${creds.username}`, `password=${creds.password}`]
+/**
+ * What a credentials file ANAS writes holds. mount.cifs reads four lines
+ * (cifs-utils 7.4, PVE 9's `man mount.cifs`): `username=`, `password=`,
+ * `password2=` (the alternate password, cr3.mounts review 2) and `domain=`.
+ * `password` is optional only for a migrated line that never had one.
+ */
+export interface CredentialsFileContent {
+  username: string
+  password?: string
+  password2?: string
+  domain?: string
+}
+
+/** A line break inside a credentials-file value (it would forge another line). */
+const CREDS_LINE_BREAK_RE = /[\r\n]/
+
+/**
+ * Thrown by {@link formatCredentials} — its sentence never carries a value.
+ * cr3.mounts review 3 (7): a value with a line break (a hand-written `\012`
+ * decodes into one) would write an extra line (`domain=EVIL`), and an empty
+ * `username=` line is a file that does not mean what the fstab line meant.
+ */
+export class CredentialsContentError extends Error {}
+
+export function formatCredentials(creds: CredentialsFileContent): string {
+  for (const [field, value] of Object.entries(creds)) {
+    if (typeof value === 'string' && CREDS_LINE_BREAK_RE.test(value))
+      throw new CredentialsContentError(`the ${field} contains a line break, which a credentials file cannot hold (it would become another line) — nothing was written`)
+  }
+  if (!creds.username)
+    throw new CredentialsContentError('there is no username to write into a credentials file — nothing was written')
+  const lines = [`username=${creds.username}`]
+  if (creds.password !== undefined)
+    lines.push(`password=${creds.password}`)
+  if (creds.password2 !== undefined)
+    lines.push(`password2=${creds.password2}`)
   if (creds.domain)
     lines.push(`domain=${creds.domain}`)
   return `${lines.join('\n')}\n`
 }
 
-/** Parse a credentials file's non-secret metadata (username/domain only). */
-export function parseCredentialsMeta(text: string): { username?: string, domain?: string } {
-  const meta: { username?: string, domain?: string } = {}
-  for (const line of text.split('\n')) {
+/** Leading spaces and tabs on a credentials-file line (all mount.cifs skips). */
+const CREDS_LINE_LEAD_RE = /^[ \t]+/
+
+/**
+ * Read a credentials file's text EXACTLY as mount.cifs does (cr3.mounts
+ * review 3 (1), cifs-utils 7.4 `open_cred_file` / `parse_cred_line`): each
+ * line loses only its leading spaces and tabs (and its `\n`); its key is
+ * matched by a case-insensitive PREFIX — `user`... is the username, `pass2`... or
+ * `password2`... the alternate password, `pass`... the password, `dom`... the
+ * domain (checked in that order; there is no `workgroup` in a FILE); the
+ * value is everything after the first `=`, untrimmed; a later line
+ * OVERWRITES an earlier one. A file ANAS read any other way would show or
+ * migrate an account the mount does not use.
+ */
+export function parseCredentialsFileText(text: string): Partial<CredentialsFileContent> {
+  const out: Partial<CredentialsFileContent> = {}
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(CREDS_LINE_LEAD_RE, '')
     const eq = line.indexOf('=')
     if (eq === -1)
       continue
-    const key = line.slice(0, eq).trim()
-    const value = line.slice(eq + 1).trim()
-    if (key === 'username')
-      meta.username = value
-    else if (key === 'domain')
-      meta.domain = value
-    // password is deliberately ignored — never surfaced.
+    const value = line.slice(eq + 1)
+    const l = line.toLowerCase()
+    if (l.startsWith('user'))
+      out.username = value
+    else if (l.startsWith('pass2') || l.startsWith('password2'))
+      out.password2 = value
+    else if (l.startsWith('pass'))
+      out.password = value
+    else if (l.startsWith('dom'))
+      out.domain = value
   }
-  return meta
+  return out
+}
+
+/**
+ * Read a credentials file's FULL content, secrets included — DAEMON-SIDE
+ * ONLY (cr3.mounts review 2): a migration that moves a line's inline
+ * alternate password into ANAS's file needs the password the line's own file
+ * holds, and a rotation keeps the stored alternate password. Never returned
+ * by any route; {@link parseCredentialsMeta} is the response-facing reader.
+ * `null` when the file does not exist; any other failure throws.
+ */
+export async function readCredentialsSecrets(path: string): Promise<Partial<CredentialsFileContent> | null> {
+  let bytes: Buffer
+  try {
+    bytes = await readFile(path)
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return null
+    throw err
+  }
+  return parseCredentialsFileText(credentialsFileText(path, bytes))
+}
+
+/** mount.cifs reads a credentials file in 4096-byte lines (`fgets`): a longer line is split. */
+const CREDS_FILE_LINE_MAX = 4095
+
+/**
+ * cr3.mounts review 4 (N3): a credentials file mount.cifs would read
+ * differently from ANAS — a line of {@link CREDS_FILE_LINE_MAX} bytes or more
+ * (mount.cifs' buffer splits it into two lines) or bytes that are not UTF-8
+ * — is NOT interpreted: nothing is shown, migrated or carried from it.
+ */
+export class CredentialsFileUninterpretableError extends Error {}
+
+/** The file's text, or {@link CredentialsFileUninterpretableError}. */
+function credentialsFileText(path: string, bytes: Buffer): string {
+  let text: string
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  }
+  catch {
+    throw new CredentialsFileUninterpretableError(`the credentials file '${path}' is not UTF-8 text, so ANAS cannot tell what mount.cifs reads in it`)
+  }
+  if (text.split('\n').some(l => Buffer.byteLength(l, 'utf8') >= CREDS_FILE_LINE_MAX))
+    throw new CredentialsFileUninterpretableError(`the credentials file '${path}' has a line of ${CREDS_FILE_LINE_MAX} bytes or more, which mount.cifs splits in two, so ANAS cannot tell what it reads`)
+  return text
+}
+
+/**
+ * Parse a credentials file's non-secret metadata (username/domain only), by
+ * the SAME rules mount.cifs reads the file with ({@link parseCredentialsFileText}).
+ * The passwords are never surfaced.
+ */
+export function parseCredentialsMeta(text: string): { username?: string, domain?: string } {
+  const { username, domain } = parseCredentialsFileText(text)
+  return { ...(username !== undefined ? { username } : {}), ...(domain !== undefined ? { domain } : {}) }
 }
 
 /**
@@ -859,7 +1026,14 @@ export function parseCredentialsMeta(text: string): { username?: string, domain?
  * validate-then-commit rotation's candidate staging.
  */
 async function ensureCredsDir(dir: string): Promise<void> {
-  await mkdir(dir, { recursive: true, mode: 0o700 })
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+  }
+  catch (err) {
+    // cr3.mounts review 4 (N10): a sentence, never a raw `EEXIST ... mkdir`.
+    const code = (err as NodeJS.ErrnoException).code ?? String(err)
+    throw new Error(`ANAS could not create its credentials directory ${dir} (${code}${code === 'EEXIST' || code === 'ENOTDIR' ? ': something that is not a directory is in its place' : ''}) — no credentials file was written`)
+  }
   await chmod(dir, 0o700).catch(() => {})
 }
 
@@ -871,7 +1045,7 @@ async function ensureCredsDir(dir: string): Promise<void> {
 async function writeCredsFileAt(
   dir: string,
   path: string,
-  creds: { username: string, password: string, domain?: string },
+  creds: CredentialsFileContent,
 ): Promise<void> {
   await ensureCredsDir(dir)
   await writeFile(path, formatCredentials(creds), { encoding: 'utf8', mode: 0o600 })
@@ -886,7 +1060,7 @@ async function writeCredsFileAt(
 export async function writeCredentialsFile(
   dir: string,
   mountpoint: string,
-  creds: { username: string, password: string, domain?: string },
+  creds: CredentialsFileContent,
 ): Promise<string> {
   const path = credsFilePath(dir, mountpoint)
   await ensureCredsDir(dir)
@@ -908,16 +1082,18 @@ export async function writeCredentialsFile(
  * the new secret cannot be proven, and nothing is committed.
  *
  * A non-CIFS entry has nothing to prove a secret against (`mount.nfs` reads no
- * credentials file), so it keeps the plain atomic write.
+ * credentials file) and no line that would name the file: refused (cr3.mounts M5).
  */
 export async function rotateCredentialsFile(
   executor: CommandExecutor,
   dir: string,
   entry: MountEntry,
-  creds: { username: string, password: string, domain?: string },
-): Promise<string> {
+  creds: CredentialsFileContent,
+): Promise<{ path: string, warning?: string }> {
+  // cr3.mounts M5: a non-CIFS entry names no credentials file, so a secret
+  // written for it is an orphan — refused (the route refuses it first).
   if (classifyKind(entry.fstype, entry.spec) !== 'cifs')
-    return writeCredentialsFile(dir, entry.mountpoint, creds)
+    throw new Error(`Mount '${entry.mountpoint}' is ${entry.fstype}, not CIFS — credentials apply to CIFS mounts only; nothing was written`)
 
   const live = credsFilePath(dir, entry.mountpoint)
   const candidate = join(dir, `.${credsFileName(entry.mountpoint)}.validating`)
@@ -933,7 +1109,8 @@ export async function rotateCredentialsFile(
       throw new Error(credentialProbeError(entry.mountpoint, probe))
     await rename(candidate, live)
     await chmod(live, 0o600).catch(() => {})
-    return live
+    // cr3.mounts M7: a probe mount that could not be taken down is said, never assumed gone.
+    return probe.cleanup !== undefined ? { path: live, warning: probe.cleanup } : { path: live }
   }
   catch (err) {
     await rm(candidate, { force: true }).catch(() => {})
@@ -955,16 +1132,52 @@ function credentialProbeError(mountpoint: string, probe: ProbeOutcome): string {
   return `${lead}: ${underlying}. Nothing was changed — the saved credentials and /etc/fstab are untouched.`
 }
 
-/** Read a credentials file's non-secret metadata; { set:false } if absent. */
+/**
+ * Put a file's earlier BYTES back, atomically (cr3.mounts review 4, N3): a
+ * private temp sibling (`wx`, `mode`), fsynced, renamed over the path. Never
+ * through a text decode — a file ANAS could not interpret is restored as it was.
+ */
+export async function restoreFileBytes(path: string, bytes: Buffer, mode: number): Promise<void> {
+  const tmp = join(dirname(path), `.${basename(path)}.restore-${process.pid}-${Date.now()}`)
+  const fh = await open(tmp, 'wx', mode)
+  try {
+    await fh.writeFile(bytes)
+    await fh.sync()
+  }
+  finally {
+    await fh.close()
+  }
+  try {
+    await rename(tmp, path)
+  }
+  catch (err) {
+    await rm(tmp, { force: true }).catch(() => {})
+    throw err
+  }
+}
+
+/**
+ * Read a credentials file's non-secret metadata; { set:false } if absent.
+ * cr3.mounts review 4 (N3): a file mount.cifs would read differently from
+ * ANAS is `{ set: true, unknown: true }` — its account is never guessed.
+ */
 export async function readCredentialsMeta(
   path: string,
-): Promise<{ set: boolean, username?: string, domain?: string }> {
+): Promise<{ set: boolean, username?: string, domain?: string, unknown?: true }> {
+  let bytes: Buffer
   try {
-    const text = await readFile(path, 'utf8')
-    return { set: true, ...parseCredentialsMeta(text) }
+    bytes = await readFile(path)
   }
   catch {
     return { set: false }
+  }
+  try {
+    return { set: true, ...parseCredentialsMeta(credentialsFileText(path, bytes)) }
+  }
+  catch (err) {
+    if (err instanceof CredentialsFileUninterpretableError)
+      return { set: true, unknown: true }
+    throw err
   }
 }
 
@@ -1039,6 +1252,7 @@ export async function runMountTest(
   executor: CommandExecutor,
   req: MountTestRequest,
   stages: MountTestStages = {},
+  stored: StoredProbeCredentials = {},
 ): Promise<MountTestResult> {
   const port = req.type === 'nfs' ? PORT_NFS : PORT_CIFS
   const { server } = normalizeMountTarget(req.type, req)
@@ -1051,9 +1265,16 @@ export async function runMountTest(
   if (!portReachable)
     return { verdict: 'unreachable', stage: 'tcp', dnsResolved: true, portReachable: false, detail: `No answer on ${server}:${port}` }
 
-  const { verdict, detail } = await probeMountAttempt(executor, req)
+  const { verdict, detail, cleanup } = await probeMountAttempt(executor, req, stored)
   // `stderr` stays daemon-side: the wire result carries the curated detail only.
-  return { verdict, ...(detail !== undefined ? { detail } : {}), stage: 'mount', dnsResolved: true, portReachable: true }
+  return {
+    verdict,
+    ...(detail !== undefined ? { detail } : {}),
+    stage: 'mount',
+    dnsResolved: true,
+    portReachable: true,
+    ...(cleanup !== undefined ? { cleanup } : {}),
+  }
 }
 
 /** DNS resolvable? */
@@ -1102,33 +1323,101 @@ interface ProbeOutcome {
   verdict: MountTestVerdict
   detail?: string
   stderr?: string
+  /**
+   * cr3.mounts M7: what the probe could not clean up — a probe mount that
+   * did not unmount, a probe directory that would not go — and what to run.
+   * Absent when both are gone.
+   */
+  cleanup?: string
 }
+
+/** The mkdtemp prefix of a probe's private MOUNT POINT directory (cr3.mounts follow-up). */
+export const MOUNT_PROBE_MOUNT_PREFIX = 'anas-mount-probe-mnt-'
+
+/**
+ * cr3.mounts review 2 (5): the probe's private directory under the runtime dir
+ * could not be made. The routes answer it 503 with this sentence (it names the
+ * directory and the errno), never a raw errno 500.
+ */
+export class ProbeRuntimeDirError extends Error {}
+
+/** Make one private 0700 probe directory under the runtime dir, or throw {@link ProbeRuntimeDirError}. */
+async function makeProbeDir(prefix: string): Promise<string> {
+  const base = mountProbeRuntimeDir()
+  let made: string | undefined
+  try {
+    await mkdir(base, { recursive: true, mode: 0o700 })
+    made = await mkdtemp(join(base, prefix))
+    await chmod(made, 0o700)
+    return made
+  }
+  catch (err) {
+    if (made !== undefined)
+      await rmdir(made).catch(() => {})
+    const why = (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err))
+    throw new ProbeRuntimeDirError(`ANAS could not create its private probe directory under ${base} (${why}) — the probe was not run; the directory is anasd's runtime directory (the unit creates it), so check that it exists and is writable by root`)
+  }
+}
+
+/** `timeout`'s own exit when it had to stop the command (the mount may have landed). */
+const TIMEOUT_FIRED_EXIT = 124
 
 /**
  * A guarded probe mount of `spec` into a throwaway private dir, then unmount —
  * the ONE probe both the preflight test and the credential rotation use, so the
- * two can never diagnose the same server differently. The mount is always
- * cleaned up; the caller owns the credentials file's lifetime.
+ * two can never diagnose the same server differently. The caller owns the
+ * credentials file's lifetime.
+ *
+ * cr3.mounts M7 — the cleanup NEVER recurses. The probe directory goes with
+ * `rmdir(2)` only: the kernel refuses a directory that is still a mountpoint
+ * (EBUSY) or holds anything (ENOTEMPTY), so a probe mount that is still up can
+ * never be walked into — the old `rm -rf` would have descended into the LIVE
+ * share and deleted whatever the credentials allowed. The unmount runs after a
+ * mount that succeeded AND after one `timeout` stopped (124: the kernel may
+ * have finished the mount after the helper was killed); a failed unmount, or a
+ * directory that would not go, is REPORTED in `cleanup`, never assumed.
+ *
+ * L8: `--` ends mount(8)'s options before the positional spec, so a server
+ * text that begins with `-` can never be read as a flag.
  */
 async function probeMountSpec(executor: CommandExecutor, probe: ProbeMountSpec): Promise<ProbeOutcome> {
-  const probeDir = await mkdtemp(join(tmpdir(), 'anas-mount-probe-'))
+  // cr3.mounts follow-up: the probe MOUNT POINT lives where the probe
+  // credentials do — a private 0700 directory under anasd's own runtime
+  // directory (tmpfs, root-only) — never `os.tmpdir()`, where a live remote
+  // share sat under a world-writable /tmp for the probe's lifetime. No
+  // fallback: a probe that cannot make its directory here refuses.
+  const probeDir = await makeProbeDir(MOUNT_PROBE_MOUNT_PREFIX)
+  const problems: string[] = []
+  let outcome: ProbeOutcome
   try {
     const args = probe.type === 'nfs'
-      ? ['15', MOUNT, '-t', 'nfs4', '-o', `vers=${probe.vers ?? '4.2'},soft,timeo=10,retrans=1,retry=0`, probe.spec, probeDir]
-      : ['15', MOUNT, '-t', 'cifs', '-o', cifsProbeOptions(probe), probe.spec, probeDir]
+      ? ['15', MOUNT, '-t', 'nfs4', '-o', `vers=${probe.vers ?? '4.2'},soft,timeo=10,retrans=1,retry=0`, '--', probe.spec, probeDir]
+      : ['15', MOUNT, '-t', 'cifs', '-o', cifsProbeOptions(probe), '--', probe.spec, probeDir]
 
     const r = await executor.exec(TIMEOUT, args)
-    if (r.exitCode === 0) {
-      await executor.exec(UMOUNT, [probeDir]).catch(() => {})
-      return { verdict: 'ok' }
+    if (r.exitCode === 0 || r.exitCode === TIMEOUT_FIRED_EXIT) {
+      const u = await executor.exec(UMOUNT, ['--', probeDir])
+        .catch((err: unknown) => ({ stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: -1 }))
+      // After a timeout "not mounted" is the expected answer; the rmdir below
+      // is what proves the directory is no longer a mountpoint.
+      if (u.exitCode !== 0 && r.exitCode === 0)
+        problems.push(`the probe mount at '${probeDir}' could not be unmounted (${cleanMountStderr(u.stderr) || `umount exited ${u.exitCode}`})`)
     }
-    const stderr = cleanMountStderr(r.stderr)
-    const verdict = probe.type === 'nfs' ? mapNfsFailure(stderr) : mapCifsFailure(stderr)
-    return { verdict, detail: verdictDetail(probe.type, verdict, stderr), stderr }
+    if (r.exitCode === 0) {
+      outcome = { verdict: 'ok' }
+    }
+    else {
+      const stderr = cleanMountStderr(r.stderr)
+      const verdict = probe.type === 'nfs' ? mapNfsFailure(stderr) : mapCifsFailure(stderr)
+      outcome = { verdict, detail: verdictDetail(probe.type, verdict, stderr), stderr }
+    }
   }
   finally {
-    await rm(probeDir, { recursive: true, force: true }).catch(() => {})
+    const left = await rmdir(probeDir).then(() => null, (err: unknown) => (err as NodeJS.ErrnoException).code ?? String(err))
+    if (left !== null && left !== 'ENOENT')
+      problems.push(`the probe directory '${probeDir}' was left in place (${left}) — if it is still mounted, unmount it by hand (umount ${probeDir}), then remove the empty directory`)
   }
+  return problems.length > 0 ? { ...outcome, cleanup: `${problems.join('; ')}.` } : outcome
 }
 
 /**
@@ -1164,24 +1453,139 @@ function mountProbeRuntimeDir(): string {
 }
 
 /**
+ * cr3.mounts review 2 (6): the START-UP sweep of what a daemon that died
+ * mid-probe left under the runtime directory — a probe MOUNT POINT
+ * (`anas-mount-probe-mnt-*`, possibly with the share still mounted on it) and
+ * a probe CREDENTIALS dir (`anas-mount-probe-creds-*`, holding a plaintext
+ * `probe.cred`). The same exact-prefix rule as the rclone sweep
+ * (rclone-probe.ts `sweepStaleProbeDirs`); nothing else in the directory is
+ * touched. It runs once at start, when this process has no probe in flight.
+ *
+ *  - a probe mount point the mount table shows mounted is unmounted with a
+ *    plain `umount -- <dir>` (never lazy, never forced); a failure is
+ *    reported and the directory left;
+ *  - every probe directory is then removed with `rmdir(2)` only — never
+ *    recursively: a directory still mounted (or not empty) refuses, and is
+ *    reported. A credentials dir loses its one `probe.cred` file first.
+ *  - an unreadable mount table unmounts nothing (it cannot see what is
+ *    mounted) and says so; the rmdir is still safe.
+ *
+ * Never throws for one directory; `failures` are journal lines for the caller.
+ */
+export async function sweepStaleMountProbes(
+  executor: CommandExecutor,
+  base: string = mountProbeRuntimeDir(),
+  startedAtMs: number = Date.now() - process.uptime() * 1000,
+): Promise<{ removed: string[], failures: string[] }> {
+  const removed: string[] = []
+  const failures: string[] = []
+  let names: string[]
+  try {
+    names = (await readdir(base, { withFileTypes: true }))
+      .filter(e => e.isDirectory() && (e.name.startsWith(MOUNT_PROBE_MOUNT_PREFIX) || e.name.startsWith(MOUNT_PROBE_CREDS_PREFIX)))
+      .map(e => e.name)
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return { removed, failures }
+    return { removed, failures: [`could not list ${base}: ${(err as NodeJS.ErrnoException).code ?? String(err)}`] }
+  }
+  if (names.length === 0)
+    return { removed, failures }
+  const table = names.some(n => n.startsWith(MOUNT_PROBE_MOUNT_PREFIX)) ? await readFindmntTable(executor) : ''
+  if (table === null)
+    failures.push(`the kernel mount table (findmnt) could not be read, so no leftover probe mount under ${base} was unmounted`)
+  const nodes = table ? parseFindmnt(table) : []
+  for (const name of names) {
+    const dir = join(base, name)
+    // cr3.mounts review 3 (8): lstat first — only a REAL directory (never a
+    // symlink) made before this process started counts as a leftover. The
+    // time test is a belt only: on a MOUNTED probe directory lstat reads the
+    // share root's times, not the directory's (review 4, N4). What protects a
+    // probe of THIS process is that the caller AWAITS this sweep before the
+    // socket listens, so no probe can be in flight while it runs.
+    const st = await lstat(dir).catch(() => null)
+    if (st === null || !st.isDirectory())
+      continue
+    const made = st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs
+    if (made >= startedAtMs)
+      continue
+    if (name.startsWith(MOUNT_PROBE_MOUNT_PREFIX)) {
+      const stacked = nodes.filter(n => n.target === dir).length
+      let unmountFailed = false
+      for (let i = 0; i < stacked && !unmountFailed; i++) {
+        const u = await executor.exec(UMOUNT, ['--', dir])
+          .catch((err: unknown) => ({ stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: -1 }))
+        if (u.exitCode !== 0) {
+          unmountFailed = true
+          failures.push(`the leftover probe mount at '${dir}' could not be unmounted (${cleanMountStderr(u.stderr) || `umount exited ${u.exitCode}`}) — unmount it by hand (umount ${dir}), then remove the empty directory`)
+        }
+      }
+      if (unmountFailed)
+        continue
+    }
+    else {
+      // Only the one regular `probe.cred` of a probe credentials directory is
+      // ever unlinked; anything else there is reported and left.
+      const inside = await readdir(dir).catch(() => null)
+      const cred = join(dir, 'probe.cred')
+      const credSt = inside?.length === 1 && inside[0] === 'probe.cred' ? await lstat(cred).catch(() => null) : null
+      if (inside === null || (inside.length > 0 && !credSt?.isFile())) {
+        failures.push(`the leftover probe credentials directory '${dir}' holds something other than a single regular probe.cred — it was left in place`)
+        continue
+      }
+      if (credSt) {
+        const gone = await rm(cred).then(() => true, () => false)
+        if (!gone) {
+          failures.push(`the leftover probe credentials file '${cred}' could not be removed — it was left in place`)
+          continue
+        }
+      }
+    }
+    const left = await rmdir(dir).then(() => null, (err: unknown) => (err as NodeJS.ErrnoException).code ?? String(err))
+    if (left === null)
+      removed.push(name)
+    else
+      failures.push(`the leftover probe directory '${dir}' was left in place (${left})`)
+  }
+  return { removed, failures }
+}
+
+/**
+ * cr3.mounts L9: the credentials an EXISTING CIFS line carries, for a test
+ * that sent none (the Edit dialog cannot re-send a password it is never
+ * shown). The route resolves them from the line and proves the request names
+ * that line's own share first.
+ */
+export interface StoredProbeCredentials {
+  /** The credentials file the line names — passed to mount.cifs by path. */
+  credentialsFile?: string
+  /** A hand-written inline secret — written to the probe's private 0600 file like a typed one. */
+  inline?: CredentialsFileContent
+  /** The line's own `vers=`, when the request names none. */
+  vers?: string
+}
+
+/**
  * The preflight probe for a test request: build the spec the write path would
  * write (`buildSpec`) and prove it. CIFS credentials ride a 0600 file in a
  * private 0700 dir under the daemon's runtime directory (never argv, never
  * `/tmp` — cr.60, review L8), removed with the dir on every path out.
  */
-async function probeMountAttempt(executor: CommandExecutor, req: MountTestRequest): Promise<ProbeOutcome> {
+async function probeMountAttempt(executor: CommandExecutor, req: MountTestRequest, stored: StoredProbeCredentials = {}): Promise<ProbeOutcome> {
   const spec = buildSpec(req.type, req)
-  if (req.type === 'nfs' || !req.credentials)
-    return probeMountSpec(executor, { type: req.type, spec, ...(req.vers !== undefined ? { vers: req.vers } : {}) })
+  const vers = req.vers ?? stored.vers
+  const credentials = req.credentials ?? stored.inline
+  if (req.type === 'cifs' && !req.credentials && stored.credentialsFile)
+    return probeMountSpec(executor, { type: 'cifs', spec, ...(vers !== undefined ? { vers } : {}), credentialsFile: stored.credentialsFile })
+  if (req.type === 'nfs' || !credentials)
+    return probeMountSpec(executor, { type: req.type, spec, ...(vers !== undefined ? { vers } : {}) })
 
-  const base = mountProbeRuntimeDir()
-  await mkdir(base, { recursive: true, mode: 0o700 })
-  const credsDir = await mkdtemp(join(base, MOUNT_PROBE_CREDS_PREFIX))
+  const credsDir = await makeProbeDir(MOUNT_PROBE_CREDS_PREFIX)
   const credentialsFile = join(credsDir, 'probe.cred')
   try {
-    await chmod(credsDir, 0o700)
-    await writeFile(credentialsFile, formatCredentials(req.credentials), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
-    return await probeMountSpec(executor, { type: req.type, spec, ...(req.vers !== undefined ? { vers: req.vers } : {}), credentialsFile })
+    await writeFile(credentialsFile, formatCredentials(credentials), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    return await probeMountSpec(executor, { type: req.type, spec, ...(vers !== undefined ? { vers } : {}), credentialsFile })
   }
   finally {
     await rm(credsDir, { recursive: true, force: true }).catch(() => {})
@@ -1294,6 +1698,22 @@ export async function readUnitState(executor: CommandExecutor, mountpoint: strin
 
 /** Placeholder the plaintext password is replaced with in any client-facing string. */
 export const REDACTED_SECRET = '*****'
+
+/** One regex-literal character (the secret keys are letters and digits, but escape anyway). */
+const REGEX_SPECIAL_RE = /[.*+?^${}()|[\]\\]/g
+
+/**
+ * A key's characters, each matched in either case OR as its three-digit fstab
+ * octal escape (cr3.mounts review 3 (11)): `\160assword`, `PASSWORD` and
+ * `password` are all one secret key to the redaction.
+ */
+function escapedKeyPattern(key: string): string {
+  return Array.from(key, (ch) => {
+    const forms = new Set([ch.toLowerCase(), ch.toUpperCase()])
+    const alts = [...forms].flatMap(c => [c.replace(REGEX_SPECIAL_RE, '\\$&'), `\\\\${c.charCodeAt(0).toString(8).padStart(3, '0')}`])
+    return `(?:${alts.join('|')})`
+  }).join('')
+}
 /**
  * A SECRET option token — `<key>=<value>` for every secret key of the ONE
  * shared list (`CIFS_CREDENTIAL_OPTION_KEYS.secret`: `password`, `pass`,
@@ -1303,15 +1723,28 @@ export const REDACTED_SECRET = '*****'
  * after the key means `password2=` is never read as `password` + `2`.
  */
 const SECRET_OPTION_RE = new RegExp(
-  `(^|[\\s,])((?:${CIFS_CREDENTIAL_OPTION_KEYS.secret.join('|')})=)[^,\\s]*`,
-  'gi',
+  // cr3.mounts (review fix 2): a value ends where the READER ends it — at a
+  // comma or one of libmount's field separators (space, tab; M3), never at
+  // any Unicode space: a password carrying NBSP or U+3000 was redacted only
+  // up to that character and its tail reached every reader of `fstabLine`.
+  // cr3.mounts review 3 (11): each key character may also be written as its
+  // fstab octal escape (`\160assword=` is `password=` to libmount).
+  `(^|[ \\t,])((?:${CIFS_CREDENTIAL_OPTION_KEYS.secret.map(escapedKeyPattern).join('|')})=)[^, \\t]*`,
+  'g',
 )
+/**
+ * A whole option token carrying an escaped separator (`\054`, `\075`;
+ * cr3.mounts review 4, D4): redacted WHOLE — key and value — because once
+ * libmount splits it, any part of it may be a secret.
+ */
+const ESCAPED_SEPARATOR_TOKEN_RE = /(^|[ \t,])[^, \t]*\\0(?:54|75)[^, \t]*/g
+
 /** Advisory shown when a mount still carries inline plaintext credentials. */
 export const INLINE_CREDS_WARNING
   = 'Credentials are stored inline in /etc/fstab (plaintext); saving migrates them to a protected root-only file.'
 /** Advisory shown when a line carries a secret option ANAS does not migrate (cr.60). */
 export const INLINE_SECRET_OPTION_WARNING
-  = 'A password option ANAS does not migrate (password2=, or a password on a line that is not read as CIFS) is stored inline in /etc/fstab (plaintext). ANAS never shows it and writes it back unchanged when it rewrites the line.'
+  = 'This /etc/fstab line keeps an option ANAS will not act on — a password on a line that is not CIFS, a password spelled in a way mount.cifs does not read, or an option with an escaped "," or "=" (\\054, \\075). ANAS never shows it, never passes it to a command, and does not mount, edit or disable this line until it is fixed on the node.'
 
 /**
  * Redact every inline plaintext secret from an fstab line so it can be
@@ -1322,7 +1755,9 @@ export const INLINE_SECRET_OPTION_WARNING
  * stays byte-for-byte.
  */
 export function redactFstabLine(line: string): string {
-  return line.replace(SECRET_OPTION_RE, `$1$2${REDACTED_SECRET}`)
+  return line
+    .replace(ESCAPED_SEPARATOR_TOKEN_RE, `$1${REDACTED_SECRET}`)
+    .replace(SECRET_OPTION_RE, `$1$2${REDACTED_SECRET}`)
 }
 
 /**
@@ -1333,9 +1768,9 @@ export function redactFstabLine(line: string): string {
  * and a warning. Everything else is preserved.
  */
 export function entryForResponse(entry: MountEntry): MountEntry {
-  if (!entry.inlineCredentials && !entry.secretOptions)
+  if (!entry.inlineCredentials && !entry.secretOptions && !entry.escapedSeparatorTokens)
     return entry
-  const { inlineCredentials: _drop, secretOptions: _secrets, ...rest } = entry
+  const { inlineCredentials: _drop, secretOptions: _secrets, escapedSeparatorTokens: _escaped, ...rest } = entry
   return rest
 }
 
@@ -1349,12 +1784,53 @@ export function entryForResponse(entry: MountEntry): MountEntry {
  */
 export function hasInlineCredentials(entry: MountEntry | undefined): boolean {
   const inline = entry?.inlineCredentials
-  return !!inline && (inline.username !== undefined || inline.password !== undefined)
+  return !!inline && (inline.username !== undefined || inline.password !== undefined || inline.password2 !== undefined)
 }
 
 // ============================================================================
 // Detail assembly (GET /v1/mounts/:mountpoint)
 // ============================================================================
+
+/** The account a CIFS line mounts with — never a password in any response. */
+export interface CifsAccount {
+  username?: string
+  password?: string
+  password2?: string
+  domain?: string
+}
+
+/**
+ * The account mount.cifs actually uses for a CIFS line that carries inline
+ * credential tokens AND names a credentials file (cr3.mounts review 3, the
+ * precedence in cifs-utils 7.4 `parse_options`):
+ *  - a PASSWORD (and the alternate password) from the FILE wins in either
+ *    order ("password specified twice, ignoring second");
+ *  - the USERNAME and DOMAIN are the LAST on the option line, the file
+ *    counting at the position of its `credentials=` token.
+ * `file` is the file's content (`null`: no file, or none to read). The token
+ * order comes from the line itself ({@link cifsCredentialTokenScan}).
+ */
+export function effectiveCifsAccount(entry: MountEntry, fstabText: string, file: Partial<CredentialsFileContent> | null): CifsAccount {
+  const inline = entry.inlineCredentials ?? {}
+  const pos: CifsCredentialTokens = cifsCredentialTokenScan(fstabText, entry.mountpoint) ?? { unhonoured: [], files: 0, secretKeys: [] }
+  const fileIsLater = (lineAt: number | undefined): boolean => pos.file !== undefined && (lineAt === undefined || pos.file > lineAt)
+  const pick = (fromFile: string | undefined, fromLine: string | undefined, lineAt: number | undefined): string | undefined =>
+    fromFile !== undefined && (fromLine === undefined || fileIsLater(lineAt)) ? fromFile : fromLine
+  const account: CifsAccount = {}
+  const username = pick(file?.username, inline.username, pos.user)
+  const domain = pick(file?.domain, inline.domain, pos.domain)
+  const password = file?.password ?? inline.password
+  const password2 = file?.password2 ?? inline.password2
+  if (username !== undefined)
+    account.username = username
+  if (domain !== undefined)
+    account.domain = domain
+  if (password !== undefined)
+    account.password = password
+  if (password2 !== undefined)
+    account.password2 = password2
+  return account
+}
 
 /**
  * Assemble a MountDetail for `mountpoint`: the inventory row + the fstab line as
@@ -1367,20 +1843,30 @@ export async function buildMountDetail(
   mountpoint: string,
   opts: { fstabPath: string, credsDir: string, storagePath?: string, mdadmConfPath?: string },
 ): Promise<MountDetail | null> {
-  const [findmntText, fstabText, pveMountPaths, mdadmConfText] = await Promise.all([
-    readFindmnt(executor),
+  // cr3.mounts INVENTED-STATE-M10: the STRICT table read — unreadable is
+  // null and the detail says unknown, never "not currently mounted".
+  const [table, fstabText, pveMountPaths, mdadmConfText] = await Promise.all([
+    readFindmntTable(executor),
     readConfig(opts.fstabPath),
-    readPveMountPaths(opts.storagePath),
+    // cr3.mounts follow-up (4): strict — unreadable is null, carried as
+    // `pveOwnershipUnknown`, never "not PVE's".
+    readPveMountPathsStrict(opts.storagePath ?? PVE_STORAGE_CFG),
     opts.mdadmConfPath ? readMdadmConfText(opts.mdadmConfPath) : Promise.resolve(''),
   ])
-  const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths, ahrPinnedSpecs(mdadmConfText))
+  const findmntText = table ?? ''
+  const rows = buildInventory(table, fstabText, pveMountPaths, ahrPinnedSpecs(mdadmConfText))
   const row = rows.find(r => r.mountpoint === mountpoint)
   if (!row)
     return null
 
   let health: MountDetail['health'] = { state: row.state }
   let capacity: MountCapacity | undefined
-  if (row.disabled) {
+  if (row.tableUnreadable) {
+    health = row.disabled
+      ? { state: 'disabled', detail: `Disabled in /etc/fstab — will not mount at boot. ${MOUNT_TABLE_UNREADABLE_DETAIL}` }
+      : { state: 'unknown', detail: MOUNT_TABLE_UNREADABLE_DETAIL }
+  }
+  else if (row.disabled) {
     // cr.6: a disabled line carries `noauto` (+ an `x-anas.disabled` token) or
     // a legacy `#ANAS ` comment — either way it is not mounted at boot. The
     // STATE stays 'disabled' even over a leftover autofs placeholder (cr.19:
@@ -1432,34 +1918,39 @@ export async function buildMountDetail(
   if (entry?.secretOptions)
     detail.warnings.push(INLINE_SECRET_OPTION_WARNING)
   if (row.type === 'cifs') {
-    if (hasInlineCredentials(entry)) {
-      // Inline plaintext credentials found (18.5 anti-pattern): reflect their
-      // presence + non-secret metadata (username/domain), NEVER the password, and
-      // guide the operator that a save migrates them to the protected creds file.
-      // cr.60r: the migration advisory belongs to the SECRET only — a line with
-      // a username and no password migrates nothing (the username stays on the
-      // line by design), so it earns no "saving migrates them" hint.
-      const inline = entry!.inlineCredentials!
-      detail.credentials = {
-        set: true,
-        ...(inline.username ? { username: inline.username } : {}),
-        ...(inline.domain ? { domain: inline.domain } : {}),
-      }
-      if (inline.password !== undefined)
-        detail.warnings.push(INLINE_CREDS_WARNING)
+    // ONE path for the account (cr3.mounts review 4, N2): the file the line
+    // names (or, for a session mount with no line, ANAS's hashed file, then
+    // the pre-ident.4 flattened one), then the line's own user/domain tokens
+    // by mount.cifs' precedence (effectiveCifsAccount) — never the password.
+    // A line that names no file uses none: an orphaned hashed file is not its
+    // account (review 4). A file mount.cifs would read differently is
+    // UNKNOWN (N3), never guessed. The migration advisory belongs to an inline
+    // SECRET only (cr.60r).
+    const inline = entry?.inlineCredentials
+    let fileMeta: Awaited<ReturnType<typeof readCredentialsMeta>> | undefined
+    if (entry?.credentialsFile) {
+      fileMeta = await readCredentialsMeta(entry.credentialsFile)
+    }
+    else if (!entry) {
+      fileMeta = await readCredentialsMeta(credsFilePath(opts.credsDir, mountpoint))
+      if (!fileMeta.set)
+        fileMeta = await readCredentialsMeta(join(opts.credsDir, legacyCredsFileName(mountpoint)))
+    }
+    if (fileMeta?.unknown) {
+      detail.credentials = { set: true, unknown: true }
     }
     else {
-      // The fstab line names its file; a line that names none falls back to
-      // the hashed name, then the pre-ident.4 flattened one (read both, write new).
-      let meta = await readCredentialsMeta(entry?.credentialsFile ?? credsFilePath(opts.credsDir, mountpoint))
-      if (!meta.set && !entry?.credentialsFile)
-        meta = await readCredentialsMeta(join(opts.credsDir, legacyCredsFileName(mountpoint)))
+      const account: CifsAccount = entry
+        ? effectiveCifsAccount(entry, fstabText, fileMeta?.set ? fileMeta : null)
+        : { ...(fileMeta?.username !== undefined ? { username: fileMeta.username } : {}), ...(fileMeta?.domain !== undefined ? { domain: fileMeta.domain } : {}) }
       detail.credentials = {
-        set: meta.set,
-        ...(meta.username ? { username: meta.username } : {}),
-        ...(meta.domain ? { domain: meta.domain } : {}),
+        set: (fileMeta?.set ?? false) || hasInlineCredentials(entry),
+        ...(account.username ? { username: account.username } : {}),
+        ...(account.domain ? { domain: account.domain } : {}),
       }
     }
+    if (inline?.password !== undefined || inline?.password2 !== undefined)
+      detail.warnings.push(INLINE_CREDS_WARNING)
   }
 
   return detail
@@ -1467,17 +1958,13 @@ export async function buildMountDetail(
 
 /** The exact fstab line for `mountpoint`, or undefined. */
 export function fstabLineFor(fstabText: string, mountpoint: string): string | undefined {
-  for (const raw of fstabText.split('\n')) {
-    if (raw.trim().startsWith('#') || raw.trim() === '')
-      continue
-    // Only a token-starting `#` is a trailing comment — a `#` inside a field (an
-    // option value such as a password) is data, never truncate on it (BUG-2).
-    const hashIdx = inlineCommentIndex(raw)
-    const fieldsPart = hashIdx === -1 ? raw : raw.slice(0, hashIdx)
-    const fields = fieldsPart.trim().split(WHITESPACE_RE)
-    // The field is octal-escaped (`\040` for a space, cr.2); compare decoded.
-    if (fields.length >= 2 && unescapeFstabField(fields[1]) === mountpoint)
-      return raw
+  // cr3.mounts M3: through THE parser (libmount's field separators, the octal
+  // unescape, a token-starting `#` as the only comment — BUG-2), never a
+  // second splitter that can disagree with it. A legacy `#ANAS ` line is a
+  // comment to every other reader of this file, so it is skipped here as before.
+  for (const line of parseFstabDoc(fstabText)) {
+    if (line.kind === 'entry' && line.entry.mountpoint === mountpoint && !line.raw.startsWith('#'))
+      return line.raw
   }
   return undefined
 }

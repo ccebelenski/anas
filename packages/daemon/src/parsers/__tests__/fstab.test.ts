@@ -123,8 +123,13 @@ describe('classifyOptions — inline plaintext CIFS credentials (BUG-1 security)
     assert.equal(options.passthrough, '')
   })
 
-  it('cr.60 (M7): every spelling of the shared list lifts the same way — `user=`/`pass=`, any case, `dom=`/`workgroup=`', () => {
-    for (const [u, p, d] of [['user', 'pass', 'dom'], ['USERNAME', 'PASSWORD', 'WORKGROUP'], ['User', 'Pass', 'workgroup']]) {
+  // cr3.mounts review 3 (1): mount.cifs reads option tokens by an EXACT,
+  // case-sensitive match. The honoured spellings lift as before; another
+  // spelling of a PASSWORD (`PASSWORD=`, `Pass=`) is still hidden and refused
+  // (the safe side) but kept verbatim in secretOptions — never lifted as the
+  // password a Save would migrate. (Before: every case lifted as the password.)
+  it('cr.60 (M7) / cr3 review 3: every spelling is hidden; only mount.cifs\' exact spellings lift as the password', () => {
+    for (const [u, p, d] of [['user', 'pass', 'dom'], ['username', 'password', 'workgroup']]) {
       const spelled = tokens.map(t => t.replace(/^username=/, `${u}=`).replace(/^password=/, `${p}=`).replace(/^domain=/, `${d}=`))
       const { options, inlineCredentials, secretOptions } = classifyOptions('cifs', spelled)
       assert.deepEqual(inlineCredentials, { username: 'ccebelenski', usernameKey: u, password: 'Xy#zzy!$', domain: 'CORP' }, spelled.join(','))
@@ -132,22 +137,48 @@ describe('classifyOptions — inline plaintext CIFS credentials (BUG-1 security)
       assert.equal(options.passthrough, '')
       assert.equal(secretOptions, undefined)
     }
+    for (const [u, p, d] of [['USERNAME', 'PASSWORD', 'WORKGROUP'], ['User', 'Pass', 'workgroup']]) {
+      const spelled = tokens.map(t => t.replace(/^username=/, `${u}=`).replace(/^password=/, `${p}=`).replace(/^domain=/, `${d}=`))
+      const { options, inlineCredentials, secretOptions } = classifyOptions('cifs', spelled)
+      assert.equal(inlineCredentials?.password, undefined, `${p}= is not what mount.cifs reads as the password`)
+      assert.deepEqual(secretOptions, [`${p}=Xy#zzy!$`])
+      assert.ok(!options.passthrough.includes('Xy#zzy'), options.passthrough)
+    }
   })
 
-  it('cr.60 (M7): `password2=` is hidden from the passthrough and kept verbatim; a line of another fstype hides its secret too', () => {
-    const withTwo = classifyOptions('cifs', [...tokens, 'password2=R0tate#2'])
-    assert.deepEqual(withTwo.secretOptions, ['password2=R0tate#2'])
-    assert.equal(withTwo.options.passthrough, '')
-    const smb3 = classifyOptions('smb3', tokens)
-    assert.deepEqual(smb3.secretOptions, ['password=Xy#zzy!$'])
-    assert.ok(!smb3.options.passthrough.includes('Xy#zzy'), smb3.options.passthrough)
+  // cr3.mounts review 2 (re-ruled): a CIFS `password2=`/`pass2=` is the
+  // ALTERNATE password and is lifted into its own channel (migrated to the
+  // credentials file on save) — it used to be kept verbatim in secretOptions.
+  it('cr.60 (M7) / cr3 review 2: `password2=`/`pass2=` is hidden from the passthrough and lifted as the alternate password; a line of another fstype hides its secret too', () => {
+    for (const key of ['password2', 'pass2']) {
+      const withTwo = classifyOptions('cifs', [...tokens, `${key}=R0tate#2`])
+      assert.equal(withTwo.inlineCredentials?.password2, 'R0tate#2', key)
+      assert.equal(withTwo.inlineCredentials?.password, 'Xy#zzy!$', `${key} is never read as the MAIN password`)
+      assert.equal(withTwo.secretOptions, undefined)
+      assert.equal(withTwo.options.passthrough, '')
+    }
+    // cr3.mounts review 3 (1): `PASS2=` is not mount.cifs' spelling — hidden,
+    // verbatim, never lifted (it was lifted as password2 before).
+    const upper = classifyOptions('cifs', [...tokens, 'PASS2=R0tate#2'])
+    assert.equal(upper.inlineCredentials?.password2, undefined)
+    assert.deepEqual(upper.secretOptions, ['PASS2=R0tate#2'])
+    assert.ok(!upper.options.passthrough.includes('R0tate'), upper.options.passthrough)
+    // cr3.mounts M5: `smb3` is mount.cifs' alias and reads as CIFS now, so the
+    // "line of another fstype" is an NFS line carrying a password option.
+    const other = classifyOptions('nfs4', tokens)
+    assert.deepEqual(other.secretOptions, ['password=Xy#zzy!$'])
+    assert.ok(!other.options.passthrough.includes('Xy#zzy'), other.options.passthrough)
     // A bare `user` is mount(8)'s "users may mount" flag — never a username.
     assert.equal(classifyOptions('cifs', ['user', 'vers=3.0']).options.passthrough, 'user')
   })
 
-  it('cr.60 (M7): a rewritten line writes `password2=` back unchanged', () => {
+  // cr3.mounts review 2 (re-ruled): the alternate password is never written
+  // back onto a line — the save that rewrites the line migrates it into the
+  // credentials file (routes mounts.test.ts, cr.60 / follow-up (2)). It used
+  // to be written back unchanged.
+  it('cr.60 (M7) / cr3 review 2: the serializer never writes the alternate password back onto a line', () => {
     const entry = parseFstab(`//10.0.0.114/chiap2 /m cifs ${[...tokens, 'password2=R0tate#2'].join(',')} 0 0\n`)[0]
-    assert.ok(serializeMountLine(entry).includes('password2=R0tate#2'), serializeMountLine(entry))
+    assert.ok(!serializeMountLine(entry).includes('R0tate#2'), serializeMountLine(entry))
   })
 
   it('options AFTER a `#`-bearing password are still parsed (no mid-field comment truncation)', () => {
@@ -923,10 +954,20 @@ describe('cr.60r — a username with no password is never lost and never becomes
     assert.ok(!line.includes('username='), `must not grow the long spelling: ${line}`)
   })
 
-  it('item 1b: mixed case is the operator\'s too — `USERNAME=bob` is re-emitted as written', () => {
-    const entry = parseFstab('//h/s /mnt/q1i cifs USERNAME=bob,vers=3.0 0 0\n')[0]
-    assert.deepEqual(entry.inlineCredentials, { username: 'bob', usernameKey: 'USERNAME' })
-    assert.ok(serializeMountLine(entry).includes('USERNAME=bob'))
+  // cr3.mounts review 4 (coverage, against the authority): mount.cifs reads
+  // option tokens by an EXACT, case-sensitive match, so `USERNAME=bob` is not
+  // a username to it — and no longer to ANAS: it rides the passthrough as the
+  // ordinary option it is (it used to be lifted as the username). Still
+  // re-emitted exactly as written.
+  it('item 1b / cr3 review 4: `USERNAME=bob`, `User=bob`, `WORKGROUP=W`, `Domain=D` are not credentials (mount.cifs is case-sensitive) — passthrough, re-emitted as written', () => {
+    for (const tok of ['USERNAME=bob', 'User=bob', 'WORKGROUP=W', 'Domain=D', 'CREDENTIALS=/x']) {
+      const entry = parseFstab(`//h/s /mnt/q1i cifs ${tok},vers=3.0 0 0\n`)[0]
+      assert.equal(entry.inlineCredentials, undefined, tok)
+      assert.equal(entry.credentialsFile, undefined, tok)
+      assert.equal(entry.options.cifs?.domain, undefined, tok)
+      assert.equal(entry.options.passthrough, tok)
+      assert.ok(serializeMountLine(entry).includes(tok), tok)
+    }
   })
 
   it('item 1b: a credentials FILE plus a hand-written `username=bob` keeps the file spelling AND the long username token', () => {
@@ -955,9 +996,15 @@ describe('cr.60r — a username with no password is never lost and never becomes
 })
 
 describe('cr.60r — fstab octal escapes across the migration seam (possible 2)', () => {
-  it('probe g: a `\\054`-escaped secret decodes on the way into the creds channel', () => {
-    const { inlineCredentials } = classifyOptions('cifs', ['pass=wo\\054rds'])
-    assert.equal(inlineCredentials!.password, 'wo,rds')
+  // cr3.mounts review 4 (D4): `\054` (`,`) and `\075` (`=`) are SEPARATORS
+  // once libmount decodes them — a token carrying one is not what its raw
+  // text says, so it is hidden whole and never lifted (it used to decode
+  // into the password).
+  it('probe g / cr3 review 4: a token with an escaped separator is hidden whole, never lifted', () => {
+    const { inlineCredentials, secretOptions, escapedSeparatorTokens } = classifyOptions('cifs', ['vers=3.0', 'pass=wo\\054rds'])
+    assert.equal(inlineCredentials, undefined)
+    assert.deepEqual(secretOptions, ['pass=wo\\054rds'])
+    assert.deepEqual(escapedSeparatorTokens, [2])
   })
 
   it('every fstab octal escape decodes in the lifted credential — `\\040` space, `\\011` tab, `\\134` backslash', () => {
@@ -967,19 +1014,29 @@ describe('cr.60r — fstab octal escapes across the migration seam (possible 2)'
     assert.equal(inlineCredentials!.domain, 'D X')
   })
 
-  it('an escaped username with no password round-trips the ESCAPE byte-for-byte (decode → re-encode on the way back to the line)', () => {
+  // cr3.mounts review 4 (D4): an escaped separator makes the token opaque —
+  // not a username any more (it used to be lifted and decoded), still
+  // written back byte-for-byte.
+  it('an escaped-separator token round-trips the ESCAPE byte-for-byte and is never lifted', () => {
     const line = '//h/s /mnt/q1r cifs user=bob\\054weird,vers=3.0 0 0'
     const entry = parseFstab(`${line}\n`)[0]
-    assert.equal(entry.inlineCredentials!.username, 'bob,weird') // decoded in the channel
+    assert.equal(entry.inlineCredentials, undefined)
+    assert.deepEqual(entry.escapedSeparatorTokens, [1])
     const written = serializeMountLine(entry)
     assert.ok(written.includes('user=bob\\054weird'), `the comma must go back escaped: ${written}`)
     assert.ok(!written.includes('user=bob,weird'), `a raw comma would split the option list: ${written}`)
   })
 
+  // cr3.mounts review 2: a CIFS `password2=` is lifted and DECODED like the
+  // password (it goes to the credentials file); the verbatim secretOptions
+  // case is now a password on a line that is not CIFS.
   it('secretOptions and passthrough tokens are NOT decoded — they stay byte-identical (they never left the line)', () => {
-    const { secretOptions, options } = classifyOptions('cifs', ['password2=a\\054b', 'x-fer=q\\040r'])
-    assert.deepEqual(secretOptions, ['password2=a\\054b'])
+    const { secretOptions, options } = classifyOptions('nfs4', ['password=a\\054b', 'x-fer=q\\040r'])
+    assert.deepEqual(secretOptions, ['password=a\\054b'])
     assert.equal(options.passthrough, 'x-fer=q\\040r')
+    // cr3.mounts review 4 (D4): an escaped separator is never lifted (it used to decode to 'a,b').
+    assert.deepEqual(classifyOptions('cifs', ['password2=a\\054b']).secretOptions, ['password2=a\\054b'])
+    assert.equal(classifyOptions('cifs', ['password2=a\\040b']).inlineCredentials?.password2, 'a b', 'any OTHER escape still decodes')
   })
 })
 

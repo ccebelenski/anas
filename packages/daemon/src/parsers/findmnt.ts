@@ -96,9 +96,6 @@ export function isIgnoredMount(fstype: string, mountpoint: string): boolean {
   return isPseudoFstype(fstype) || isSystemMountTarget(mountpoint)
 }
 
-/** `host:/export` NFS source shape (host, then `:/`). */
-const NFS_SOURCE_RE = /^[^/]+:\//
-
 /**
  * Is this text findmnt's OWN shape — an object whose `filesystems` is an
  * array? THE shape gate for a fail-closed caller (cr.23 review): valid JSON
@@ -290,9 +287,17 @@ export function effectiveMountAt(nodes: FindmntNode[], target: string): FindmntN
 }
 
 /**
- * Disambiguate a mount's kind from its fstype and source (ground truth §1):
- * `source` of `//host/share` = CIFS, `host:/export` = NFS, a pool name = ZFS,
- * `systemd-1` = an autofs placeholder, a device/`UUID=` = local.
+ * Disambiguate a mount's kind from its fstype and source (ground truth §1).
+ *
+ * cr3.mounts H1/L10: NFS and CIFS are decided by the FSTYPE alone — `nfs`,
+ * `nfs4`, `cifs` and its `smb3` alias — never by the source's shape. The
+ * source of a FUSE mount is whatever its owner says (`fusermount3 -o
+ * fsname=nas:/backup` is open to any local user), and sshfs, glusterfs and
+ * davfs sources look like `host:/path` too: reading those as NFS made them
+ * remote shares ANAS would edit, unmount, disable and remove (and put an
+ * unprivileged user's mountpoint text into the Edit window's title). The
+ * source only separates a device-backed local filesystem from `other`; both
+ * are observe-only.
  */
 export function classifyKind(fstype: string, source: string): MountKind {
   if (fstype === 'cifs' || fstype === 'smb3')
@@ -311,10 +316,6 @@ export function classifyKind(fstype: string, source: string): MountKind {
   // itself a directory; findmnt can't always tell, so this stays best-effort.
   if (source.startsWith('/dev/') || source.startsWith('UUID=') || source.startsWith('PARTUUID=') || source.startsWith('LABEL='))
     return 'local'
-  if (source.startsWith('//'))
-    return 'cifs'
-  if (NFS_SOURCE_RE.test(source))
-    return 'nfs'
   return 'other'
 }
 

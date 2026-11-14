@@ -83,10 +83,17 @@ describe('the request schemas gate extraOptions at the boundary', () => {
     assert.equal(good.success, true)
   })
 
-  it('UpdateMountRequest: `credentials=/x` is refused with the field named', () => {
-    const parsed = UpdateMountRequest.safeParse({ extraOptions: 'credentials=/x' })
+  // cr3.mounts (review fix 6): the dialog echoes the stored passthrough on
+  // every save, and a hand-written token need not pass the write-side rule —
+  // so the UPDATE boundary takes single-line text, and the daemon keeps a
+  // byte-equal echo and validates anything else (`credentials=/x` included:
+  // routes/__tests__/cr3-mounts.test.ts "review fixes (6)"). A newline is
+  // still refused here, with the field named.
+  it('UpdateMountRequest: a newline is refused with the field named; other text is left to the daemon', () => {
+    const parsed = UpdateMountRequest.safeParse({ extraOptions: 'nofail\nnofail' })
     assert.equal(parsed.success, false)
     assert.match((parsed as { error: { issues: Array<{ path: unknown[] }> } }).error.issues[0].path.join('.'), /extraOptions/)
+    assert.equal(UpdateMountRequest.safeParse({ extraOptions: 'credentials=/x' }).success, true)
   })
 
   // cr.2 audit (ruling (i)): `options.domain` is written VERBATIM as one fstab

@@ -10,6 +10,7 @@ import { ahrBootScan } from './services/ahr-boot-scan.js'
 import { BACKUP_UNIT_KIND } from './services/backup-units.js'
 import { CLOUD_UNIT_KIND } from './services/cloud-units.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
+import { sweepStaleMountProbes } from './services/mounts.js'
 import { PROBE_TMP_BASE, sweepStaleProbeDirs } from './services/rclone-probe.js'
 import { REPLICATION_UNIT_PREFIX } from './services/replication-units.js'
 import { reconcileSelfhealState, reconcileWasQuiet } from './services/selfheal-reconcile.js'
@@ -56,6 +57,17 @@ async function main() {
   })
 
   try {
+    // cr3.mounts: leftover mount-probe directories of a killed earlier run are
+    // swept BEFORE the socket opens, so no request's probe can exist yet (the
+    // sweep unmounts a leftover probe mount and removes its scratch
+    // credentials). It never throws.
+    if (!MOCK) {
+      const probeSweep = await sweepStaleMountProbes(new CommandBudgetExecutor((server as unknown as { executor: CommandExecutor }).executor))
+      for (const name of probeSweep.removed)
+        server.log.warn(`mount probe sweep: removed leftover probe dir ${name}`)
+      for (const f of probeSweep.failures)
+        server.log.warn(`mount probe sweep: ${f}`)
+    }
     await server.listen({ path: SOCKET_PATH })
     // The socket IS the trust boundary (Principle 9): anasd trusts the X-Anas-*
     // identity headers precisely because only local root can reach the socket.

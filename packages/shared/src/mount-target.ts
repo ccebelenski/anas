@@ -106,6 +106,12 @@ export function normalizeMountTarget(
   const problems: string[] = []
   if (!server)
     problems.push('server is required')
+  // cr3.mounts L8: a host name or address never begins with `-`, and a spec
+  // that does could be read as an option by a tool that takes it positionally
+  // (systemd runs `mount <What> <Where>` from the fstab line). Refused here,
+  // so every door that builds a spec — create, test, the panel port — agrees.
+  else if (server.startsWith('-'))
+    problems.push('server must not begin with \'-\' (a host name or address never does)')
   if (type === 'cifs' && !remotePath)
     problems.push('share name is required (the name of the share on the server, e.g. `pictures`)')
   return { server, remotePath, problems }

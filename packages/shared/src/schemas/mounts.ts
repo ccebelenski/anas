@@ -266,6 +266,13 @@ export type MountCifsOptions = z.infer<typeof MountCifsOptions>
 export const MountInlineCredentials = z.object({
   username: z.string().optional(),
   password: z.string().optional(),
+  /**
+   * cr3.mounts review 2: the ALTERNATE password (`password2=`/`pass2=`) a
+   * server-side rotation uses. mount.cifs reads it from the credentials file
+   * too (a `password2=value` line, cifs-utils 7.4), so it is migrated there
+   * on the next save exactly like `password`.
+   */
+  password2: z.string().optional(),
   domain: z.string().optional(),
   /**
    * The KEY the lifted username was written under (cr.60r: config files are
@@ -305,6 +312,13 @@ export const MountEntry = z.object({
   /** CIFS credentials file referenced (`credentials=…`) — path only, never the secret. */
   credentialsFile: z.string().optional(),
   /**
+   * cr3.mounts review 2 (additive): the KEY the line names its credentials
+   * file under when it is not `credentials` — mount.cifs' `cred=` alias,
+   * kept as the operator spelled it (config files are the API). Absent for
+   * `credentials=`.
+   */
+  credentialsKey: z.string().optional(),
+  /**
    * Inline plaintext CIFS credentials lifted out of a hand-written fstab options
    * list (`username=`/`password=`/`domain=`). TRANSIENT, daemon-only — the whole
    * channel is dropped before any response. Drives one-time migration to the
@@ -314,14 +328,22 @@ export const MountEntry = z.object({
   inlineCredentials: MountInlineCredentials.optional(),
   /**
    * Hand-written SECRET option tokens ANAS does not migrate (cr.60, review
-   * M7): `password2=…` on a CIFS line (mount.cifs's second password — not
-   * part of the credentials file ANAS writes), and any secret key of the
-   * shared list on a line of another fstype (`smb3`). Verbatim tokens, kept
+   * M7): any secret key of the shared list on a line that is not CIFS (cr3
+   * review 2: a CIFS line's `password2=`/`pass2=` is migrated now, through
+   * `inlineCredentials.password2`). Verbatim tokens, kept
    * OUT of `passthrough` so no response carries them, and written back as
    * they were when ANAS rewrites the line. TRANSIENT, daemon-only — dropped
    * before any response, like `inlineCredentials`.
    */
   secretOptions: z.array(z.string()).optional(),
+  /**
+   * cr3.mounts review 4 (D4): 1-based positions of option tokens carrying an
+   * fstab-escaped separator (`\054` = `,`, `\075` = `=`) that libmount splits
+   * before mount.cifs reads the option. Such a token is kept in
+   * `secretOptions` (hidden whole) and the verbs that act on the line refuse
+   * naming the position. TRANSIENT, daemon-only — dropped before any response.
+   */
+  escapedSeparatorTokens: z.array(z.number().int().positive()).optional(),
   dump: z.number().int().nonnegative(),
   pass: z.number().int().nonnegative(),
   /**
@@ -352,8 +374,12 @@ export const MountSummary = z.object({
   fstype: z.string(),
   /** Liveness state. */
   state: MountState,
-  /** Present in the kernel mount table (findmnt). */
-  mounted: z.boolean(),
+  /**
+   * Present in the kernel mount table (findmnt). `null` (cr3.mounts
+   * INVENTED-STATE-M10, additive) when the table could not be read — then
+   * nothing is known about it, and `tableUnreadable` says so.
+   */
+  mounted: z.boolean().nullable(),
   /** Persisted in /etc/fstab. */
   persistent: z.boolean(),
   /** NFS or CIFS. */
@@ -402,6 +428,23 @@ export const MountSummary = z.object({
    * field ⇒ no gating).
    */
   heldByLun: IscsiHeldByLun.optional(),
+  /**
+   * cr3.mounts INVENTED-STATE-M10 (additive): the kernel mount table
+   * (findmnt) could not be read, so whether this mount is mounted — and its
+   * health — is UNKNOWN: `state` is `unknown` (a disabled line keeps
+   * `disabled`, an fstab fact), `mounted` is null. Absent when the table was
+   * read. Before it, an unreadable table read as "every fstab mount is not
+   * mounted" and the mounts not in fstab vanished.
+   */
+  tableUnreadable: z.boolean().optional(),
+  /**
+   * cr3.mounts follow-up (4) (additive): PVE's storage.cfg exists but could
+   * not be read, so whether PVE owns this mount is UNKNOWN — `pveManaged`
+   * false then means "not known to be PVE's", never "not PVE's". Every
+   * mutation verb refuses on the same read (the gates read storage.cfg
+   * strictly); the panel shows the row hands-off. Absent when the file was read.
+   */
+  pveOwnershipUnknown: z.boolean().optional(),
 })
 export type MountSummary = z.infer<typeof MountSummary>
 
@@ -439,6 +482,13 @@ export const MountCredentialsInfo = z.object({
   set: z.boolean(),
   username: z.string().optional(),
   domain: z.string().optional(),
+  /**
+   * cr3.mounts review 4 (N3), additive: the credentials file exists but is
+   * not something mount.cifs reads the way ANAS can (a line of 4095 bytes or
+   * more, or not UTF-8) — its account is UNKNOWN, never shown, never
+   * migrated or carried. Absent when the file was read.
+   */
+  unknown: z.boolean().optional(),
 })
 export type MountCredentialsInfo = z.infer<typeof MountCredentialsInfo>
 
@@ -648,12 +698,18 @@ export const UpdateMountRequest = z.object({
   automount: z.boolean().optional(),
   options: MountRequestOptions.optional(),
   /**
-   * Verbatim passthrough options — a strict comma-separated TOKEN list (cr.2);
-   * credential-carrying tokens are refused. Under the clear contract (#34) an
-   * EMPTY string (or `null`) drops the stored passthrough; omitting the field
-   * keeps it.
+   * Verbatim passthrough options. Under the clear contract (#34) an EMPTY
+   * string (or `null`) drops the stored passthrough; omitting the field keeps
+   * it. cr3.mounts (review fix 6): single-line text at this boundary, because
+   * the dialog echoes the stored passthrough on every save and a hand-written
+   * token need not pass the write-side rule; the daemon keeps a BYTE-EQUAL
+   * echo as it is and validates anything else against {@link MountExtraOptions}
+   * (cr.2's strict token list, credentials refused) before it is written.
    */
-  extraOptions: MountExtraOptions.nullable().optional(),
+  extraOptions: z.string()
+    .refine(s => !s.includes('\n') && !s.includes('\0'), 'extra options are one line: a newline or NUL is not allowed')
+    .nullable()
+    .optional(),
   /** Rotate CIFS credentials (write-only). */
   credentials: MountCredentials.optional(),
 })
@@ -709,6 +765,16 @@ export const MountTestRequest = z.object({
   vers: MountVers.optional(),
   /** CIFS credentials for the auth probe (write-only). */
   credentials: MountCredentials.optional(),
+  /**
+   * cr3.mounts L9 (additive): test an EXISTING CIFS mount with the credentials
+   * its /etc/fstab line already carries — what the Edit dialog's Test sends
+   * when no new password was typed (the stored password is never sent back to
+   * a browser, so it cannot be re-sent). Used only when `credentials` is
+   * absent; the server/share must be the line's own, so stored credentials
+   * are only ever offered to the server they were configured for. An older
+   * daemon ignores the field (a guest probe).
+   */
+  mountpoint: AbsolutePath.optional(),
 })
 export type MountTestRequest = z.infer<typeof MountTestRequest>
 
@@ -723,5 +789,11 @@ export const MountTestResult = z.object({
   dnsResolved: z.boolean(),
   /** TCP reached on 2049 (NFS) / 445 (CIFS). */
   portReachable: z.boolean(),
+  /**
+   * cr3.mounts M7 (additive): what the probe could not clean up — a probe
+   * mount that would not unmount, a probe directory that would not go — and
+   * what to run. Absent when both are gone; an older panel ignores it.
+   */
+  cleanup: z.string().optional(),
 })
 export type MountTestResult = z.infer<typeof MountTestResult>

@@ -93,6 +93,9 @@ describe('mount routes (Epic 18)', () => {
     process.env.ANAS_FSTAB_PATH = fstabPath
     process.env.ANAS_CREDS_DIR = join(dir, 'creds')
     process.env.ANAS_STORAGE_CFG = STORAGE_CFG
+    // cr3.mounts follow-up: a credential rotation's probe mount point lives
+    // under the daemon's runtime dir — a private stand-in for /run/anas here.
+    process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR = join(dir, 'run')
     server = createServer({ mock: true, logger: false })
     // The dev mock's findmnt reports the RAW fixture paths; the fstab now maps
     // them into the tmpdir (cr.52r D3), so the inventory JOIN needs the same
@@ -113,6 +116,7 @@ describe('mount routes (Epic 18)', () => {
     delete process.env.ANAS_FSTAB_PATH
     delete process.env.ANAS_CREDS_DIR
     delete process.env.ANAS_STORAGE_CFG
+    delete process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR
     await rm(dir, { recursive: true, force: true })
   })
 
@@ -1059,8 +1063,12 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(data.credentials?.username, 'ccebelenski')
     })
 
-    it('cr.60: a save migrates `pass=` like `password=`, and writes `password2=` back unchanged', async () => {
-      await writeFile(fstabPath, FSTAB_FIXTURE + SPELLINGS[2].line(INLINE_LINE).replace('username=', 'user=').replace('password=', 'pass='))
+    // cr3.mounts follow-up (2) split this test in two: a save re-mounts the
+    // line, and a `password2=` ANAS cannot migrate would ride the mount's argv
+    // — so a line carrying one is now refused (it was saved, with the token
+    // written back and passed to mount(8)). The `pass=` migration is unchanged.
+    it('cr.60: a save migrates `pass=` like `password=`', async () => {
+      await writeFile(fstabPath, FSTAB_FIXTURE + INLINE_LINE.replace('username=', 'user=').replace('password=', 'pass='))
       const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc(INLINE_MP)}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ options: { ro: true } }) })
       assert.equal(res.statusCode, 202, res.payload)
       const job = await waitForJob(server!, res.json().job.id)
@@ -1068,10 +1076,33 @@ describe('mount routes (Epic 18)', () => {
       const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(INLINE_MP))!
       assert.ok(line.includes('credentials='), line)
       assert.ok(!line.includes(`pass=${PASSWORD}`) && !line.includes('user='), line)
-      assert.ok(line.includes('password2=R0tate#2'), `the rotation password stays on the line: ${line}`)
       const creds = await readFile(join(dir, 'creds', credsFileName(INLINE_MP)), 'utf8')
       assert.ok(creds.includes(`password=${PASSWORD}`), creds)
       assert.ok(creds.includes('username=ccebelenski'), creds)
+    })
+
+    it('cr3.mounts follow-up (2), as re-ruled after review 2: a save MIGRATES `password2=` with `pass=` into the credentials file — none stays on the line, none rides any argv', async () => {
+      await writeFile(fstabPath, FSTAB_FIXTURE + SPELLINGS[2].line(INLINE_LINE).replace('username=', 'user=').replace('password=', 'pass='))
+      const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc(INLINE_MP)}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ options: { ro: true } }) })
+      assert.equal(res.statusCode, 202, res.payload)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(INLINE_MP))!
+      assert.ok(line.includes('credentials='), line)
+      assert.ok(!line.includes('R0tate#2') && !line.includes('password2=') && !line.includes(`pass=${PASSWORD}`), `no secret is left on the line: ${line}`)
+      const creds = await readFile(join(dir, 'creds', credsFileName(INLINE_MP)), 'utf8')
+      assert.ok(creds.includes(`password=${PASSWORD}`), creds)
+      assert.ok(creds.includes('password2=R0tate#2'), creds)
+      assert.ok(creds.includes('username=ccebelenski'), creds)
+      const executor = (server as unknown as { executor: MockExecutor }).executor
+      assert.ok(!executor.calls.some(c => [c.command, ...c.args].join(' ').includes('R0tate#2')), 'the alternate password is in no argv')
+      // cr3.mounts review 3 (12): and in neither the HTTP answer nor the job record.
+      for (const secret of ['R0tate#2', PASSWORD]) {
+        assert.ok(!res.payload.includes(secret), `the answer carries no secret: ${res.payload}`)
+        assert.ok(!JSON.stringify(job).includes(secret), 'the job record carries no secret')
+        const listed = await server!.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY_HEADERS })
+        assert.ok(!listed.payload.includes(secret), 'nor the job list')
+      }
     })
 
     // cr.60r (the review's DEFECT): a hand-written CIFS line with a username
@@ -1142,21 +1173,21 @@ describe('mount routes (Epic 18)', () => {
     })
 
     // cr.60r (possible 2): the review's probe line `g` — the secret carries an
-    // fstab octal escape (`\054` = `,`); the creds file must hold the REAL
-    // character, and the rewritten line must name the file.
-    it('cr.60r: a `\\054`-escaped secret migrates DECODED to the creds file', async () => {
-      await writeFile(fstabPath, `${FSTAB_FIXTURE}//h/s ${MP('/mnt/q1g')} cifs user=bob,pass=wo\\054rds,vers=3.0 0 0\n`)
+    // fstab octal escape (`\054` = `,`). cr3.mounts review 4 (D4): libmount
+    // DECODES `\054` into a separator before mount.cifs reads the option, so
+    // mount.cifs reads `pass=wo` and an option `rds` — not the password
+    // `wo,rds` this test used to migrate into the creds file. The line is
+    // refused (fail closed), naming the token's position, nothing written.
+    it('cr.60r / cr3 review 4: a `\\054`-escaped secret is refused at Save (libmount splits it) — nothing written, nothing echoed', async () => {
+      const text = `${FSTAB_FIXTURE}//h/s ${MP('/mnt/q1g')} cifs user=bob,pass=wo\\054rds,vers=3.0 0 0\n`
+      await writeFile(fstabPath, text)
       const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc(MP('/mnt/q1g'))}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ options: { ro: true } }) })
-      assert.equal(res.statusCode, 202, res.payload)
-      const job = await waitForJob(server!, res.json().job.id)
-      assert.equal(job.status, 'completed', JSON.stringify(job.error))
-      const creds = await readFile(join(dir, 'creds', credsFileName(MP('/mnt/q1g'))), 'utf8')
-      assert.ok(creds.includes('password=wo,rds'), `the escape must decode into the creds file: ${creds}`)
-      assert.ok(!creds.includes('\\054'), creds)
-      assert.ok(creds.includes('username=bob'), creds)
-      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(MP('/mnt/q1g')))!
-      assert.ok(line.includes('credentials='), line)
-      assert.ok(!line.includes('pass='), line)
+      assert.equal(res.statusCode, 400, res.payload)
+      assert.equal(res.json().error.reason, 'escaped-separator')
+      assert.match(res.json().error.message, /option 2 of its \/etc\/fstab line/)
+      assert.ok(!res.payload.includes('wo\\054rds') && !res.payload.includes('pass=wo'), res.payload)
+      assert.equal(await readFile(fstabPath, 'utf8'), text)
+      await assert.rejects(readFile(join(dir, 'creds', credsFileName(MP('/mnt/q1g'))), 'utf8'))
     })
   })
 
@@ -1646,10 +1677,11 @@ describe('mount routes — POST /v1/mounts/test reaches the mount stage (seam)',
     })
     assert.equal(res.statusCode, 200)
     const probe = h!.executor.calls.find(c => c.command === TIMEOUT)!
-    // argv: timeout 15 /usr/bin/mount -t cifs -o <opts> <spec> <probeDir>
+    // argv: timeout 15 /usr/bin/mount -t cifs -o <opts> -- <spec> <probeDir> (cr3.mounts L8: `--` before the spec)
     assert.equal(probe.args[4], '-o')
     assert.equal(probe.args[5], 'vers=3.1.1,guest')
-    assert.equal(probe.args[6], '//127.0.0.1/pictures')
+    assert.equal(probe.args[6], '--')
+    assert.equal(probe.args[7], '//127.0.0.1/pictures')
   })
 
   it('a credentials probe still authenticates from a temp file; rejection is auth-failed with its advice', async () => {
@@ -1682,11 +1714,15 @@ describe('PUT /v1/mounts — credentials are proven before anything is committed
 
   beforeEach(async () => {
     h = await createEditServer(cifsFstab, [findmntJson([])])
+    // cr3.mounts follow-up: the rotation's probe mount point lives under the
+    // daemon's runtime dir — a private stand-in for /run/anas here.
+    process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR = join(h.dir, 'run')
     await mkdir(h.credsDir, { recursive: true, mode: 0o700 })
     await writeFile(join(h.credsDir, 'mnt-edit-cifs.cred'), OLD_CREDS, { mode: 0o600 })
   })
 
   afterEach(async () => {
+    delete process.env.ANAS_MOUNT_PROBE_RUNTIME_DIR
     await h?.app.close()
     await rm(h!.dir, { recursive: true, force: true })
     h = undefined

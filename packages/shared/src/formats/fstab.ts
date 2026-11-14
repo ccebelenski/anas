@@ -180,17 +180,21 @@ export const X_ANAS_DISABLED_AUTOMOUNT_TOKEN = 'x-anas.disabled-automount'
  * secret values in the raw line a response carries) and cr.2's
  * `MountExtraOptions` refusal (never written into a line). The names are
  * mount.cifs(8)'s on Debian 13 (cifs-utils 7.4): `password`/`pass` and
- * `password2` (the second password a server-side rotation uses) carry a
- * SECRET; `username`/`user` and `domain`/`dom`/`workgroup` are the account
- * METADATA (shown, never secret); `credentials` names the file holding them.
+ * `password2`/`pass2` (the alternate password a server-side rotation uses)
+ * carry a SECRET; `username`/`user` and `domain`/`dom`/`workgroup` are the
+ * account METADATA (shown, never secret); `credentials`/`cred` names the file
+ * holding them. cr3.mounts review 2: `pass2` and `cred` were missing — the
+ * aliases are in the PVE 9 node's own `man mount.cifs` (cifs-utils
+ * 2:7.4-1+deb13u2), so a `pass2=` secret was shown and passed as argv, and a
+ * `cred=` line read as guest.
  * Keys compare case-insensitively ({@link cifsCredentialKeyKind}): the reader
  * hides `PASSWORD=` exactly as it hides `password=`.
  */
 export const CIFS_CREDENTIAL_OPTION_KEYS = {
-  secret: ['password', 'pass', 'password2'],
+  secret: ['password', 'pass', 'password2', 'pass2'],
   username: ['username', 'user'],
   domain: ['domain', 'dom', 'workgroup'],
-  file: ['credentials'],
+  file: ['credentials', 'cred'],
 } as const
 
 /** Which credential an option key carries ({@link CIFS_CREDENTIAL_OPTION_KEYS}). */
@@ -208,6 +212,26 @@ export function cifsCredentialKeyKind(key: string): CifsCredentialKeyKind | null
       return kind
   }
   return null
+}
+
+/**
+ * cr3.mounts L15 — option keys that undo the forced `nofail`. systemd.mount(5):
+ * `nofail` makes the mount only WANTED by local-fs.target / remote-fs.target,
+ * so a dead server never fails the boot; `x-systemd.required-by=<unit>` adds
+ * a RequiredBy= of its own (and drops those default dependencies), so a share
+ * that does not answer fails that unit — `local-fs.target` is emergency mode.
+ * ANAS refuses to WRITE one; a hand-written token already on a line is the
+ * operator's and is kept (an untouched edit stays byte-identical, §2).
+ */
+export const NOFAIL_DEFEATING_OPTION_KEYS = ['x-systemd.required-by'] as const
+
+/** The sentence refusing `token` when it is a {@link NOFAIL_DEFEATING_OPTION_KEYS} option, else null. */
+export function nofailDefeatingOption(token: string): string | null {
+  const eq = token.indexOf('=')
+  const key = (eq === -1 ? token : token.slice(0, eq)).toLowerCase()
+  if (!(NOFAIL_DEFEATING_OPTION_KEYS as readonly string[]).includes(key))
+    return null
+  return `'${token}' makes another unit REQUIRE this mount, which undoes the forced nofail: a share that does not answer would fail that unit (local-fs.target is emergency mode at boot) — ANAS does not write it`
 }
 
 /** One fstab option token (see {@link isFstabOptionToken}). */
