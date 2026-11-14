@@ -82,11 +82,17 @@ export function isInventoryDisk(dev: { type: string, name: string }): boolean {
  * @param json raw lsblk JSON output (string or pre-parsed object)
  * @param byIdMap mapping of kernel names to by-id identifiers (from disk-by-id parser)
  * @param poolDisks map of KERNEL names to the ZFS pool they belong to
+ * @param systemPools ZFS pools holding a filesystem mounted at a system path
+ *   (disks.r1, from `readSystemMountPools`). A member of one is the node's
+ *   boot disk even when no lsblk partition says so — the ZFS-root case, where
+ *   `/` is a dataset and the ESP is not mounted. Absent/empty labels nothing:
+ *   a caller that does not pass the fact keeps every disk's existing status.
  */
 export function parseLsblk(
   json: string | LsblkOutput,
   byIdMap: ByIdMap,
   poolDisks: Map<string, string> = new Map(),
+  systemPools: ReadonlySet<string> = new Set(),
 ): Disk[] {
   const data: LsblkOutput = typeof json === 'string' ? JSON.parse(json) : json
 
@@ -95,11 +101,17 @@ export function parseLsblk(
     .map((dev) => {
       const id = byIdMap.get(dev.name) ?? dev.serial ?? dev.name
       const partitions = parsePartitions(dev.children ?? [])
-      const isSystem = isSystemDisk(dev, partitions)
       // Pool membership is matched on the KERNEL name: the caller canonicalizes
       // each zpool-status leaf (whose ZFS-chosen by-id may differ from the one
       // we display) to its kernel device, so both sides join on `dev.name`.
       const poolName = poolDisks.get(dev.name) ?? null
+      // disks.r1: the mount table's own answer joins the lsblk signal. On a
+      // ZFS-root node no partition of the boot disk is mounted at `/` (the
+      // dataset is), so this is the only fact that can label it — and it is a
+      // LABEL only: the disk keeps poolName/vdev/role/errors/health exactly as
+      // a pool member has them. A disk with no pool can never match the set.
+      const isSystem = isSystemDisk(dev, partitions)
+        || (poolName !== null && systemPools.has(poolName))
       let status: DiskUsageStatus = 'available'
       if (isSystem)
         status = 'system'

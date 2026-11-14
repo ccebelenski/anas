@@ -10,6 +10,7 @@ import { isSmartctlStandby, parseSmartctl, standbySmartData } from '../parsers/s
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { iscsiServedSerials, normalizeSerial } from '../services/iscsi-held.js'
+import { readSystemMountPools } from '../services/system-mounts.js'
 
 const BY_ID_PATH_RE = /^\/dev\/disk\/by-(?:id|partuuid)\/(.+)$/
 const KERNEL_PATH_RE = /^\/dev\/([a-z0-9]+)$/
@@ -220,7 +221,7 @@ export async function collectDisks(
   diskIdentityCache: DiskIdentityCache,
   iscsiPaths: IscsiPaths = {},
 ): Promise<Disk[]> {
-  const [lsblkResult, byIdResult, byPartuuidResult, statusResult, ahrPools, servedSerials] = await Promise.all([
+  const [lsblkResult, byIdResult, byPartuuidResult, statusResult, ahrPools, servedSerials, systemMountPools] = await Promise.all([
     executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
     executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
     // Some pools reference vdev members by GPT partition GUID (`zpool status`
@@ -246,6 +247,14 @@ export async function collectDisks(
     // on a node with no LIO (the read layer short-circuits before it touches
     // ZFS, PVE or the network) and fail-opens to an empty set.
     iscsiServedSerials(executor, iscsiPaths),
+    // Which ZFS pools hold a filesystem at a system path (disks.r1) — the
+    // mount table's own answer, read through the ONE strict findmnt reader.
+    // Fail-soft on EVERY failure including a timeout, deliberately SOFTER than
+    // the AHR read above: this fact only LABELS a disk `system` (it does not
+    // decide membership), so "no system pools" on an unread table leaves every
+    // disk exactly as it reads today. A label may never take the disks endpoint
+    // down, and it may never make a disk read `available`.
+    readSystemMountPools(executor).catch(() => null),
   ])
 
   const byIdMap = parseDiskByIdListing(byIdResult.stdout)
@@ -338,7 +347,11 @@ export async function collectDisks(
     }
   }
 
-  const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks)
+  // A null (unreadable) mount table labels nothing: the set stays empty and
+  // every disk keeps the status it has today (disks.r1 — a label, never a gate).
+  const systemPools = new Set<string>(systemMountPools ? systemMountPools.zfs.keys() : [])
+
+  const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks, systemPools)
 
   // Lazy-load identity cache for all disks in parallel. The list doubles as
   // the topology refresh, which may prune entries — but only when it can

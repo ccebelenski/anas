@@ -178,3 +178,47 @@ describe('parseLsblk — Ceph OSD disks (issue #29)', () => {
     assert.equal(disks.filter(d => d.status === 'ceph_osd').length, 0)
   })
 })
+
+/**
+ * disks.r1 — the boot disk of a ZFS-root node. Ground truth is the captured
+ * `lsblk-zfs-root.json`: no partition of `sda` is mounted (`sda2` is an
+ * unmounted ESP, `sda3` a `zfs_member`), so lsblk alone cannot name it the
+ * system disk. The mount table's answer (`fixtures/mounts/findmnt-zfs-root.json`:
+ * `/` on `rpool/ROOT/pve-1`) is handed in as the fourth parameter by the route.
+ * A disk that does not pass the set keeps exactly the status it had before the
+ * story — the parameter is additive.
+ */
+describe('parseLsblk — a ZFS-root boot disk reads system (disks.r1)', () => {
+  function zfsRootDisks(poolDisks: Map<string, string>, systemPools?: Set<string>) {
+    const byIdMap = parseDiskByIdListing(loadText('disk-by-id-zfs-root.txt'))
+    const disks = parseLsblk(loadJson('lsblk-zfs-root.json'), byIdMap, poolDisks, systemPools)
+    return new Map(disks.map(d => [d.name, d]))
+  }
+
+  it('a member of a pool mounted at a system path reads system, keeping its pool name', () => {
+    const sda = zfsRootDisks(new Map([['sda', 'rpool']]), new Set(['rpool'])).get('sda')!
+    assert.equal(sda.status, 'system')
+    assert.equal(sda.poolName, 'rpool')
+  })
+
+  it('with no system pools the same disk stays pool_member (today\'s answer, pinned)', () => {
+    const sda = zfsRootDisks(new Map([['sda', 'rpool']]), new Set()).get('sda')!
+    assert.equal(sda.status, 'pool_member')
+    assert.equal(sda.poolName, 'rpool')
+  })
+
+  it('the data disks are other either way', () => {
+    for (const systemPools of [new Set(['rpool']), new Set<string>()]) {
+      const disks = zfsRootDisks(new Map([['sda', 'rpool']]), systemPools)
+      assert.equal(disks.get('sdb')!.status, 'other')
+      assert.equal(disks.get('sdc')!.status, 'other')
+    }
+  })
+
+  it('a pool in the set that no disk belongs to changes nothing', () => {
+    const sda = zfsRootDisks(new Map([['sda', 'rpool']]), new Set(['rpool', 'nosuchpool'])).get('sda')!
+    assert.equal(sda.status, 'system')
+    const sdb = zfsRootDisks(new Map([['sda', 'rpool']]), new Set(['rpool', 'nosuchpool'])).get('sdb')!
+    assert.equal(sdb.status, 'other')
+  })
+})

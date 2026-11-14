@@ -15573,9 +15573,44 @@ function ahrCacheDisksChecks() {
   ok('cache(disks): it never reads "Other"', !/Other/.test(cell), cell)
 }
 
+/**
+ * disks.r1 — the boot disk of a ZFS-root node reads `system` AND keeps its
+ * pool attribution: the Usage cell reads "System (rpool / mirror-0)", and a
+ * system disk with no pool (an ext4-root node's boot disk) still reads exactly
+ * "System". The parts are the pool_member branch's own, through one builder.
+ */
+function systemPoolDisksChecks() {
+  const ANAS = loadSource('40-disks.js', { 'GET /disks': { data: [] } })
+  const gridCfg = ANAS.views['disks'].factory('n1').items[0]
+  const usageCol = gridCfg.columns.find(c => c.dataIndex === 'status')
+  ok('system-pool(disks): the Usage column exists', !!usageCol)
+  if (!usageCol) { return }
+  const render = (v, data) => usageCol.renderer(v, {}, makeRecord(data))
+
+  const withVdev = render('system', { status: 'system', poolName: 'rpool', vdevName: 'mirror-0' })
+  ok('system-pool(disks): a system disk with a pool and vdev reads "System (rpool / mirror-0)"',
+    withVdev === 'System (rpool / mirror-0)', withVdev)
+
+  const poolOnly = render('system', { status: 'system', poolName: 'rpool' })
+  ok('system-pool(disks): a system disk with a pool only reads "System (rpool)"',
+    poolOnly === 'System (rpool)', poolOnly)
+
+  const noPool = render('system', { status: 'system' })
+  ok('system-pool(disks): a system disk with no pool reads exactly "System"',
+    noPool === 'System', noPool)
+
+  // The shared builder leaves the plain pool_member cell byte-identical.
+  const member = render('pool_member', { status: 'pool_member', poolName: 'rpool', vdevName: 'mirror-0', vdevRole: 'data' })
+  ok('system-pool(disks): a plain pool member still reads "rpool / mirror-0 / data"',
+    member === 'rpool / mirror-0 / data', member)
+}
+
 warnings.length = 0
 created.windows.length = 0
 await ahrCacheBlockChecks()
+
+// disks.r1 — the boot disk of a ZFS-root node keeps its pool attribution.
+systemPoolDisksChecks()
 
 warnings.length = 0
 created.windows.length = 0

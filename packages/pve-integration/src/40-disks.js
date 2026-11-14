@@ -366,18 +366,25 @@
         return renderUsageBase(v, meta, rec) + handsOffBadge(rec.data);
     }
 
+    // The "<pool> / <vdev> / <role>" parts of a ZFS member's usage cell — ONE
+    // builder for the pool_member branch below and for the boot disk of a
+    // ZFS-root node (disks.r1), so the two labels cannot drift apart.
+    function zfsUsageParts(d) {
+        var parts = [];
+        parts.push(d.poolName || '?');
+        if (d.vdevName) {
+            parts.push(d.vdevName);
+        }
+        if (d.vdevRole) {
+            parts.push(t(ROLE_LABELS[d.vdevRole] || d.vdevRole));
+        }
+        return parts;
+    }
+
     function renderUsageBase(v, meta, rec) {
         var d = rec.data;
         if (d.status === 'pool_member') {
-            var parts = [];
-            parts.push(d.poolName || '?');
-            if (d.vdevName) {
-                parts.push(d.vdevName);
-            }
-            if (d.vdevRole) {
-                parts.push(t(ROLE_LABELS[d.vdevRole] || d.vdevRole));
-            }
-            return enc(parts.join(' / '));
+            return enc(zfsUsageParts(d).join(' / '));
         }
         // AHR member: "pool / array" — the AHR parallel to the ZFS pool/vdev
         // rendering above (never "Other").
@@ -393,6 +400,13 @@
             case 'available':
                 return t('Available');
             case 'system':
+                // The boot disk of a ZFS-root node is ALSO a pool member
+                // (disks.r1): name the pool/vdev/role it sits on beside the
+                // label, exactly as the pool_member branch renders those parts.
+                // No poolName (an ext4-root node's boot disk) reads "System".
+                if (d.poolName) {
+                    return t('System') + ' (' + enc(zfsUsageParts(d).join(' / ')) + ')';
+                }
                 return t('System');
             case 'ceph_osd':
                 return t('Ceph OSD');
