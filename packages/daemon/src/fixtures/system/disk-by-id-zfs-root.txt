@@ -1,0 +1,22 @@
+total 0
+drwxr-xr-x 2 root root 420 Nov 13 23:26 .
+drwxr-xr-x 9 root root 180 Nov 13 23:25 ..
+lrwxrwxrwx 1 root root   9 Nov 13 21:59 ata-QEMU_DVD-ROM_QM00003 -> ../../sr0
+lrwxrwxrwx 1 root root  10 Nov 13 23:26 dm-name-zr1-zr1--vol -> ../../dm-0
+lrwxrwxrwx 1 root root  10 Nov 13 23:26 dm-uuid-LVM-JyUWPNN2kRC6HJHkcwXddM12fi2W4f83VyQA1TJEuwr0FU4ztexgYZI51pz9cQop -> ../../dm-0
+lrwxrwxrwx 1 root root  11 Nov 13 23:26 lvm-pv-uuid-ElmAl4-luaD-h9mO-I1qc-Ievw-9y7T-cANpMs -> ../../md127
+lrwxrwxrwx 1 root root  11 Nov 13 23:25 md-name-anas-zfs:zr1-r1 -> ../../md127
+lrwxrwxrwx 1 root root  11 Nov 13 23:25 md-uuid-7c3c1347:e295e33a:97e8f224:3a9cec68 -> ../../md127
+lrwxrwxrwx 1 root root   9 Nov 13 21:59 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1 -> ../../sdb
+lrwxrwxrwx 1 root root  10 Nov 13 22:00 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1 -> ../../sdb1
+lrwxrwxrwx 1 root root   9 Nov 13 21:59 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2 -> ../../sdc
+lrwxrwxrwx 1 root root   9 Nov 13 23:25 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3 -> ../../sdd
+lrwxrwxrwx 1 root root  10 Nov 13 23:25 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3-part1 -> ../../sdd1
+lrwxrwxrwx 1 root root   9 Nov 13 23:25 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT4 -> ../../sde
+lrwxrwxrwx 1 root root  10 Nov 13 23:25 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT4-part1 -> ../../sde1
+lrwxrwxrwx 1 root root   9 Nov 13 23:25 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT5 -> ../../sdf
+lrwxrwxrwx 1 root root  10 Nov 13 23:25 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT5-part1 -> ../../sdf1
+lrwxrwxrwx 1 root root   9 Nov 13 21:59 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0 -> ../../sda
+lrwxrwxrwx 1 root root  10 Nov 13 21:59 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0-part1 -> ../../sda1
+lrwxrwxrwx 1 root root  10 Nov 13 21:59 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0-part2 -> ../../sda2
+lrwxrwxrwx 1 root root  10 Nov 13 21:59 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0-part3 -> ../../sda3

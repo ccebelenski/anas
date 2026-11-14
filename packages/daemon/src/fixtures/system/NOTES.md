@@ -30,3 +30,22 @@ patching values into them.
 `lsblk.json`, `lsblk-ceph.json` and `disk-by-id.txt` predate this file and carry no
 recorded provenance. Nothing here should be read as a claim that they are real captures;
 label them the next time one of them is touched for a story.
+
+## The ZFS-root node (disks.r1, captured 2026-11-14)
+
+`lsblk-zfs-root.json`, `zpool-status-zfs-root.json` and `disk-by-id-zfs-root.txt` are verbatim
+stdout from one PVE 9 test VM that boots from ZFS, taken in one sitting:
+
+| File | Command |
+|------|---------|
+| `lsblk-zfs-root.json` | `lsblk -Jb -o NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,FSTYPE,MOUNTPOINT,ROTA,PHY-SEC,LOG-SEC,WWN,VENDOR,REV` (the daemon's own `LSBLK_ARGS`) |
+| `zpool-status-zfs-root.json` | `zpool status -jv` |
+| `disk-by-id-zfs-root.txt` | `ls -la /dev/disk/by-id/` |
+
+The mount table of the same node is `../mounts/findmnt-zfs-root.json` (`findmnt --json`).
+
+What the capture settles: the boot disk `sda` has NO partition mounted anywhere (`sda1` BIOS
+boot, `sda2` an unmounted vfat ESP, `sda3` a `zfs_member`), so nothing in lsblk says it is the
+system disk; the only fact is the mount table's `/` on `rpool/ROOT/pve-1` plus `sda3` being a
+leaf of `rpool`. `sdb` (ext4 partition) and `sdc` (whole-disk ext4) are data mounts; `sdd`-`sdf`
+are an AHR pool.

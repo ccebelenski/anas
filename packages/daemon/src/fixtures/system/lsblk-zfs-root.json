@@ -1,0 +1,338 @@
+{
+   "blockdevices": [
+      {
+         "name": "sda",
+         "type": "disk",
+         "size": 34359738368,
+         "model": "QEMU HARDDISK",
+         "serial": "drive-scsi0-0-0-0",
+         "tran": null,
+         "fstype": null,
+         "mountpoint": null,
+         "rota": true,
+         "phy-sec": 512,
+         "log-sec": 512,
+         "wwn": null,
+         "vendor": "QEMU    ",
+         "rev": "2.5+",
+         "children": [
+            {
+               "name": "sda1",
+               "type": "part",
+               "size": 1031168,
+               "model": null,
+               "serial": null,
+               "tran": null,
+               "fstype": null,
+               "mountpoint": null,
+               "rota": true,
+               "phy-sec": 512,
+               "log-sec": 512,
+               "wwn": null,
+               "vendor": null,
+               "rev": null
+            },{
+               "name": "sda2",
+               "type": "part",
+               "size": 536870912,
+               "model": null,
+               "serial": null,
+               "tran": null,
+               "fstype": "vfat",
+               "mountpoint": null,
+               "rota": true,
+               "phy-sec": 512,
+               "log-sec": 512,
+               "wwn": null,
+               "vendor": null,
+               "rev": null
+            },{
+               "name": "sda3",
+               "type": "part",
+               "size": 33821801984,
+               "model": null,
+               "serial": null,
+               "tran": null,
+               "fstype": "zfs_member",
+               "mountpoint": null,
+               "rota": true,
+               "phy-sec": 512,
+               "log-sec": 512,
+               "wwn": null,
+               "vendor": null,
+               "rev": null
+            }
+         ]
+      },{
+         "name": "sdb",
+         "type": "disk",
+         "size": 2147483648,
+         "model": "QEMU HARDDISK",
+         "serial": "ANAS_HOT1",
+         "tran": null,
+         "fstype": null,
+         "mountpoint": null,
+         "rota": true,
+         "phy-sec": 512,
+         "log-sec": 512,
+         "wwn": null,
+         "vendor": "QEMU    ",
+         "rev": "2.5+",
+         "children": [
+            {
+               "name": "sdb1",
+               "type": "part",
+               "size": 2146418176,
+               "model": null,
+               "serial": null,
+               "tran": null,
+               "fstype": "ext4",
+               "mountpoint": "/mnt/pve/virtssd",
+               "rota": true,
+               "phy-sec": 512,
+               "log-sec": 512,
+               "wwn": null,
+               "vendor": null,
+               "rev": null
+            }
+         ]
+      },{
+         "name": "sdc",
+         "type": "disk",
+         "size": 1073741824,
+         "model": "QEMU HARDDISK",
+         "serial": "ANAS_HOT2",
+         "tran": null,
+         "fstype": "ext4",
+         "mountpoint": "/mnt/extra",
+         "rota": true,
+         "phy-sec": 512,
+         "log-sec": 512,
+         "wwn": null,
+         "vendor": "QEMU    ",
+         "rev": "2.5+"
+      },{
+         "name": "sdd",
+         "type": "disk",
+         "size": 1073741824,
+         "model": "QEMU HARDDISK",
+         "serial": "ANAS_HOT3",
+         "tran": null,
+         "fstype": null,
+         "mountpoint": null,
+         "rota": true,
+         "phy-sec": 512,
+         "log-sec": 512,
+         "wwn": null,
+         "vendor": "QEMU    ",
+         "rev": "2.5+",
+         "children": [
+            {
+               "name": "sdd1",
+               "type": "part",
+               "size": 1072676352,
+               "model": null,
+               "serial": null,
+               "tran": null,
+               "fstype": "linux_raid_member",
+               "mountpoint": null,
+               "rota": true,
+               "phy-sec": 512,
+               "log-sec": 512,
+               "wwn": null,
+               "vendor": null,
+               "rev": null,
+               "children": [
+                  {
+                     "name": "md127",
+                     "type": "raid5",
+                     "size": 2135949312,
+                     "model": null,
+                     "serial": null,
+                     "tran": null,
+                     "fstype": "LVM2_member",
+                     "mountpoint": null,
+                     "rota": true,
+                     "phy-sec": 512,
+                     "log-sec": 512,
+                     "wwn": null,
+                     "vendor": null,
+                     "rev": null,
+                     "children": [
+                        {
+                           "name": "zr1-zr1--vol",
+                           "type": "lvm",
+                           "size": 2134900736,
+                           "model": null,
+                           "serial": null,
+                           "tran": null,
+                           "fstype": "btrfs",
+                           "mountpoint": "/mnt/anas-ahr/zr1",
+                           "rota": true,
+                           "phy-sec": 512,
+                           "log-sec": 512,
+                           "wwn": null,
+                           "vendor": null,
+                           "rev": null
+                        }
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "sde",
+         "type": "disk",
+         "size": 1073741824,
+         "model": "QEMU HARDDISK",
+         "serial": "ANAS_HOT4",
+         "tran": null,
+         "fstype": null,
+         "mountpoint": null,
+         "rota": true,
+         "phy-sec": 512,
+         "log-sec": 512,
+         "wwn": null,
+         "vendor": "QEMU    ",
+         "rev": "2.5+",
+         "children": [
+            {
+               "name": "sde1",
+               "type": "part",
+               "size": 1072676352,
+               "model": null,
+               "serial": null,
+               "tran": null,
+               "fstype": "linux_raid_member",
+               "mountpoint": null,
+               "rota": true,
+               "phy-sec": 512,
+               "log-sec": 512,
+               "wwn": null,
+               "vendor": null,
+               "rev": null,
+               "children": [
+                  {
+                     "name": "md127",
+                     "type": "raid5",
+                     "size": 2135949312,
+                     "model": null,
+                     "serial": null,
+                     "tran": null,
+                     "fstype": "LVM2_member",
+                     "mountpoint": null,
+                     "rota": true,
+                     "phy-sec": 512,
+                     "log-sec": 512,
+                     "wwn": null,
+                     "vendor": null,
+                     "rev": null,
+                     "children": [
+                        {
+                           "name": "zr1-zr1--vol",
+                           "type": "lvm",
+                           "size": 2134900736,
+                           "model": null,
+                           "serial": null,
+                           "tran": null,
+                           "fstype": "btrfs",
+                           "mountpoint": "/mnt/anas-ahr/zr1",
+                           "rota": true,
+                           "phy-sec": 512,
+                           "log-sec": 512,
+                           "wwn": null,
+                           "vendor": null,
+                           "rev": null
+                        }
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "sdf",
+         "type": "disk",
+         "size": 1073741824,
+         "model": "QEMU HARDDISK",
+         "serial": "ANAS_HOT5",
+         "tran": null,
+         "fstype": null,
+         "mountpoint": null,
+         "rota": true,
+         "phy-sec": 512,
+         "log-sec": 512,
+         "wwn": null,
+         "vendor": "QEMU    ",
+         "rev": "2.5+",
+         "children": [
+            {
+               "name": "sdf1",
+               "type": "part",
+               "size": 1072676352,
+               "model": null,
+               "serial": null,
+               "tran": null,
+               "fstype": "linux_raid_member",
+               "mountpoint": null,
+               "rota": true,
+               "phy-sec": 512,
+               "log-sec": 512,
+               "wwn": null,
+               "vendor": null,
+               "rev": null,
+               "children": [
+                  {
+                     "name": "md127",
+                     "type": "raid5",
+                     "size": 2135949312,
+                     "model": null,
+                     "serial": null,
+                     "tran": null,
+                     "fstype": "LVM2_member",
+                     "mountpoint": null,
+                     "rota": true,
+                     "phy-sec": 512,
+                     "log-sec": 512,
+                     "wwn": null,
+                     "vendor": null,
+                     "rev": null,
+                     "children": [
+                        {
+                           "name": "zr1-zr1--vol",
+                           "type": "lvm",
+                           "size": 2134900736,
+                           "model": null,
+                           "serial": null,
+                           "tran": null,
+                           "fstype": "btrfs",
+                           "mountpoint": "/mnt/anas-ahr/zr1",
+                           "rota": true,
+                           "phy-sec": 512,
+                           "log-sec": 512,
+                           "wwn": null,
+                           "vendor": null,
+                           "rev": null
+                        }
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "sr0",
+         "type": "rom",
+         "size": 1073741312,
+         "model": "QEMU DVD-ROM",
+         "serial": "QM00003",
+         "tran": "sata",
+         "fstype": null,
+         "mountpoint": null,
+         "rota": false,
+         "phy-sec": 512,
+         "log-sec": 512,
+         "wwn": null,
+         "vendor": "QEMU    ",
+         "rev": "2.5+"
+      }
+   ]
+}
