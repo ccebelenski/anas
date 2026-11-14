@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { DatasetPath, ISODateTime, NotifyMode, PoolName, SingleLine } from './common.js'
+import { DatasetPath, excludeShapeIssue, ISODateTime, NotifyMode, PoolName, SingleLine } from './common.js'
 import { TaskTimeOfDay, TaskWeekday } from './task-cadence.js'
 import { ScanFunction } from './zfs.js'
 
@@ -236,31 +236,20 @@ export const SnapshotSchedule = z.object({
   notify: NotifyMode.default('on-failure'),
 }).superRefine((s, ctx) => {
   snapshotFireShapeIssues(s).forEach(i => ctx.addIssue({ code: 'custom', path: [i.path], message: i.message }))
-  // snapx.1: the exclude list's shape rules, stated once so both boundaries
-  // (the request body and the stored unit JSON) hold them. Whether each entry
-  // EXISTS is the daemon route's question (it reads the live tree).
-  const exclude = s.exclude ?? []
-  if (exclude.length === 0)
+  // snapx.1: the exclude list's shape rules, stated once in
+  // {@link excludeShapeIssue} so every schema that carries a list (the schedule,
+  // and since rrep.1a a recursive replication) holds them identically. Whether
+  // each entry EXISTS is the daemon route's question (it reads the live tree).
+  // The kind rule is this schedule's alone — a replication needs no such sentence.
+  if ((s.exclude?.length ?? 0) === 0)
     return
   if (s.target.kind !== 'zfs') {
     ctx.addIssue({ code: 'custom', path: ['exclude'], message: 'Exclude applies to ZFS dataset schedules only' })
     return
   }
-  if (s.recursive !== true) {
-    ctx.addIssue({ code: 'custom', path: ['exclude'], message: 'Exclude requires a recursive schedule' })
-    return
-  }
-  const prefix = `${s.target.dataset}/`
-  for (const name of exclude) {
-    if (!name.startsWith(prefix)) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['exclude'],
-        message: `Exclude '${name}' is not a child dataset of '${s.target.dataset}'`,
-      })
-      return
-    }
-  }
+  const issue = excludeShapeIssue(s.target.dataset, s.recursive, s.exclude, 'schedule')
+  if (issue)
+    ctx.addIssue({ code: 'custom', path: ['exclude'], message: issue })
 })
 export type SnapshotSchedule = z.infer<typeof SnapshotSchedule>
 

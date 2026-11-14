@@ -44,3 +44,6 @@ Facts the captures and the run settle:
   send '<ds>@<snap>': dataset key must be loaded" and sends nothing;
   `keystatus` reads `unavailable` on it and `-` on an unencrypted dataset.
 - A zvol replicates like a filesystem; `readonly=on` is accepted on it.
+- Sending an incremental whose snapshot the replica already has (2026-11-14,
+  same pair): the receive prints "snap <target>@<snap> already exists;
+  ignoring", "received 0B stream", and both ends exit 0.

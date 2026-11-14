@@ -313,6 +313,7 @@ export {
   DatasetPath,
   DevicePath,
   DiskId,
+  excludeShapeIssue,
   fmtBytes,
   hasControlChars,
   ISODateTime,
@@ -334,6 +335,7 @@ export {
   SnapshotName,
   UUID,
 } from './schemas/common.js'
+export type { ExcludeOwner } from './schemas/common.js'
 
 // Dashboard schemas (Epic 2)
 export {

@@ -95,6 +95,59 @@ export const NewDatasetPath = DatasetPath.superRefine((path, ctx) => {
     ctx.addIssue({ code: 'custom', message: reservedDatasetSegmentMessage(seg) })
 })
 
+// --- Recursive exclude lists ---
+
+/** What an exclude list belongs to — names what has to be recursive about it. */
+export type ExcludeOwner = 'schedule' | 'replication'
+
+/**
+ * The SHAPE rules an exclude list is held to, stated once for every schema that
+ * carries one (snapx.1 (#71) put them on the recursive snapshot schedule;
+ * rrep.1a moves them out of that schema's `superRefine` into here because a
+ * recursive replication takes the same list over the same sweep): an exclude
+ * needs a recursive target, and every entry is a STRICT descendant of the root
+ * it excludes from. Returns the message for the FIRST violation, or null when
+ * the list is shaped legally — each caller adds the issue at its own path, so
+ * each keeps its own validation report.
+ *
+ * An absent or empty list is the plain recursive operation and is never an
+ * issue, recursive or not (a schedule stored before the field parses back
+ * without it, and an empty list means "nothing skipped"). Whether an entry
+ * EXISTS on the live tree stays the route's question — a schema never reads ZFS.
+ *
+ * `rootDataset` is the full dataset name the list excludes from: a schedule's
+ * `target.dataset`, a replication task's pool-rooted source. Pass null where the
+ * boundary cannot know it — the one-off replicate request, whose source is in
+ * the URL — which checks the recursive rule and leaves the child rule to the
+ * route that has the name (rrep.1's run branch).
+ *
+ * `owner` decides only which "requires" sentence the recursive rule speaks, so
+ * both callers keep their own product wording verbatim:
+ * 'Exclude requires a recursive schedule' / 'Exclude requires a recursive replication'.
+ */
+export function excludeShapeIssue(
+  rootDataset: string | null,
+  recursive: boolean | undefined,
+  exclude: string[] | undefined,
+  owner: ExcludeOwner,
+): string | null {
+  if (!exclude || exclude.length === 0)
+    return null
+  if (recursive !== true) {
+    return owner === 'schedule'
+      ? 'Exclude requires a recursive schedule'
+      : 'Exclude requires a recursive replication'
+  }
+  if (rootDataset === null)
+    return null
+  const prefix = `${rootDataset}/`
+  for (const name of exclude) {
+    if (!name.startsWith(prefix))
+      return `Exclude '${name}' is not a child dataset of '${rootDataset}'`
+  }
+  return null
+}
+
 /** Snapshot name */
 export const SnapshotName = z
   .string()

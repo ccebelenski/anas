@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { DatasetPath, hasControlChars, ISODateTime, NotifyMode, PoolName, SingleLine, SnapshotName } from './common.js'
+import { DatasetPath, excludeShapeIssue, hasControlChars, ISODateTime, NotifyMode, PoolName, SingleLine, SnapshotName } from './common.js'
 
 /**
  * A replication dataset field: a validated ZFS DatasetPath, OR the empty string.
@@ -92,6 +92,62 @@ export const ReplicatePlan = z.object({
 })
 export type ReplicatePlan = z.infer<typeof ReplicatePlan>
 
+// --- Recursive replication (rrep.1, #84): the fields and the rules both bodies hold --
+
+/**
+ * R3 — recursive replication sends ONE snapshot name across the tree (R4: the
+ * newest snapshot of the source root), i.e. the snapshots a recursive snapshot
+ * SCHEDULE takes. Snapshot-first would take a fresh one per run under the
+ * manual `snapshot-<iso>` name, which nothing prunes (#80) and which the
+ * operator cannot select recursively anyway; the dialog disables the field
+ * while "Include child datasets" is checked (R11). One sentence, both schemas.
+ */
+const RECURSIVE_SNAPSHOT_FIRST_REFUSAL = 'Recursive replication sends the snapshots a recursive snapshot schedule takes — turn off \'Take a fresh snapshot before each run\' and schedule the source recursively in the Snapshots menu'
+
+/** The recursion fields, as both replication bodies carry them (R10). */
+interface RecursionFields {
+  recursive?: boolean
+  exclude?: string[]
+  snapshotFirst?: boolean
+}
+
+/** A schema-level refusal of the recursion fields, at the field that caused it. */
+interface RecursionIssue {
+  path: ['exclude'] | ['snapshotFirst']
+  message: string
+}
+
+/**
+ * What the recursion fields refuse at the SCHEMA boundary: R10's exclude shape
+ * (the schedule's own sentences, through the one shared helper) and R3's
+ * snapshot-first pairing. Returns every issue it can see — the exclude list's
+ * FIRST violation plus the R3 pairing, so a body wrong in both ways says both.
+ *
+ * `sourceFull` is the pool-rooted source a TASK knows: pool + `/` + dataset, or
+ * the pool alone for a pool-root source — the same name the daemon derives in
+ * `resolveTaskDatasets` (`services/replication-units.ts`), which stays the one
+ * place a task's full names are built for the ZFS commands; the shared package
+ * cannot import the daemon, so the join is restated here (and pinned by a test
+ * of the not-a-child sentence on a pool-root and a nested source).
+ * The one-off request passes null: its source is in the URL, so the child rule
+ * is the run branch's (rrep.1) — the request checks only "exclude requires
+ * recursive", exactly as the brief's R10 half at this boundary says.
+ */
+function recursionIssues(body: RecursionFields, sourceFull: string | null): RecursionIssue[] {
+  const issues: RecursionIssue[] = []
+  const shape = excludeShapeIssue(sourceFull, body.recursive, body.exclude, 'replication')
+  if (shape)
+    issues.push({ path: ['exclude'], message: shape })
+  if (body.recursive === true && body.snapshotFirst === true)
+    issues.push({ path: ['snapshotFirst'], message: RECURSIVE_SNAPSHOT_FIRST_REFUSAL })
+  return issues
+}
+
+/** The pool-rooted source dataset of a task, as `resolveTaskDatasets` builds it. */
+function taskSourceFull(source: { pool: string, dataset: string }): string {
+  return source.dataset ? `${source.pool}/${source.dataset}` : source.pool
+}
+
 /**
  * Run a replication (202 → job). Same fields as the plan request, plus an
  *  optional snapshot-first convenience.
@@ -120,6 +176,24 @@ export const ReplicateRequest = z.object({
    * `notify` keeps the failure-only behaviour rather than erroring.
    */
   notify: NotifyMode.default('on-failure'),
+  /**
+   * Replicate the source's whole tree, one `zfs send | zfs recv` per dataset
+   *  (rrep.1, #84). ABSENT IS ABSENT, never defaulted: R0 — a request without
+   *  the field runs today's single-dataset path, so an old client parses and
+   *  behaves exactly as before (and a daemon that does not know the field can
+   *  never be talked into a recursive run, R12).
+   */
+  recursive: z.boolean().optional(),
+  /**
+   * Child datasets of the source the recursive run skips, each with its whole
+   *  subtree — the shape a recursive snapshot schedule already takes
+   *  ({@link excludeShapeIssue}). Only meaningful with `recursive`; whether an
+   *  entry EXISTS is the route's question, as it is for a schedule.
+   */
+  exclude: z.array(DatasetPath).optional(),
+}).superRefine((r, ctx) => {
+  for (const issue of recursionIssues(r, null))
+    ctx.addIssue({ code: 'custom', path: issue.path, message: issue.message })
 })
 export type ReplicateRequest = z.infer<typeof ReplicateRequest>
 
@@ -138,8 +212,21 @@ export const ReplicationTaskName = z
   .regex(/^[a-z0-9][a-z0-9-]*$/, 'lowercase alphanumerics and dashes')
 export type ReplicationTaskName = z.infer<typeof ReplicationTaskName>
 
-/** A configured recurring replication (one systemd service+timer pair). */
-export const ReplicationTask = z.object({
+/**
+ * The FIELDS of a configured recurring replication (one systemd service+timer
+ * pair), WITHOUT the recursion rules — the plain base both ReplicationTask and
+ * LenientReplicationTask build from.
+ *
+ * Why a base object rather than refining inline: a recursive ZodObject refuses
+ * `.extend()` in this repo's zod (4.3.6 throws "Cannot overwrite keys on object
+ * schemas containing refinements. Use `.safeExtend()` instead."), and
+ * `.safeExtend()` INHERITS the checks — which is exactly what the lenient
+ * read-back must not carry (its purpose is parsing a stored task the strict
+ * rules refuse). So: rules are added to the base ONCE (ReplicationTask's
+ * `superRefine`), and the lenient variant extends the bare base and stays
+ * rule-free, exactly as when it extended a plain object.
+ */
+const ReplicationTaskFields = z.object({
   name: ReplicationTaskName,
   /** Source dataset, pool-rooted ('' dataset = the pool root). */
   source: z.object({ pool: PoolName, dataset: ReplicationDataset }),
@@ -161,6 +248,22 @@ export const ReplicationTask = z.object({
    */
   notify: NotifyMode.default('on-failure'),
   /**
+   * Replicate the source's whole tree, one `zfs send | zfs recv` per dataset
+   *  (rrep.1, #84). ABSENT IS ABSENT, never defaulted: R0 — a task stored (or
+   *  a client speaking) without the field runs today's single-dataset path,
+   *  exactly as before. R12: the CREATE/UPDATE route must refuse to save a
+   *  non-recursive task carrying an exclude list, never silently strip it.
+   */
+  recursive: z.boolean().optional(),
+  /**
+   * Child datasets of the source this task's recursive runs skip, each with its
+   *  whole subtree — the same list shape a recursive snapshot schedule takes
+   *  ({@link excludeShapeIssue}); the child rule is checked against the
+   *  source's pool-rooted name. Whether an entry EXISTS on the live tree is the
+   *  route's question, as it is for a schedule.
+   */
+  exclude: z.array(DatasetPath).optional(),
+  /**
    * Read-path ONLY: set true (with a reason) when a STORED task failed STRICT
    * validation but parsed leniently — e.g. a dataset that no longer matches the
    * narrowed ReplicationDataset regex. Such a task stays VISIBLE in the list so
@@ -172,6 +275,19 @@ export const ReplicationTask = z.object({
   /** Why the stored task failed strict validation (paired with `invalid`). */
   invalidReason: z.string().optional(),
 })
+
+/**
+ * A task as the CREATE/UPDATE gate accepts it: the fields above plus the
+ * recursion rules (R10's exclude shape against the pool-rooted source name,
+ * R3's snapshot-first pairing). Because `snapshotFirst` DEFAULTS to true, a
+ * body of `{ recursive: true }` with no `snapshotFirst` hits the R3 refusal —
+ * intended (the field can only mean "snapshot first" here, and R3 forbids
+ * that pairing), and pinned by a test.
+ */
+export const ReplicationTask = ReplicationTaskFields.superRefine((t, ctx) => {
+  for (const issue of recursionIssues(t, taskSourceFull(t.source)))
+    ctx.addIssue({ code: 'custom', path: issue.path, message: issue.message })
+})
 export type ReplicationTask = z.infer<typeof ReplicationTask>
 
 /**
@@ -179,10 +295,13 @@ export type ReplicationTask = z.infer<typeof ReplicationTask>
  * fields relax to plain single-line strings (still control-char-free — they
  * flow into `zfs`/`ssh`/systemd argv on the read/status path) so a STORED task
  * whose dataset no longer passes the narrowed ReplicationDataset regex stays
- * parseable and VISIBLE (flagged `invalid`). Read path only; strict
+ * parseable and VISIBLE (flagged `invalid`). Built from
+ * {@link ReplicationTaskFields}, so it carries NO recursion rules — a task
+ * stored before R3/R10 existed, or stored by a newer daemon under rules a
+ * downgrade no longer knows, still parses. Read path only; strict
  * ReplicationTask remains the create/update gate.
  */
-export const LenientReplicationTask = ReplicationTask.extend({
+export const LenientReplicationTask = ReplicationTaskFields.extend({
   source: z.object({ pool: SingleLine, dataset: SingleLine }),
   target: ReplicationTarget.extend({ pool: SingleLine, dataset: SingleLine.optional() }),
 })
