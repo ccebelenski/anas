@@ -5,7 +5,8 @@ import { getZpoolStatus, poolExists, skipIfFixtureMissing, sshExec } from './fix
 /**
  * Stories 13.9–13.14 — the native ExtJS panels, verified end-to-end through the
  * real PVE UI on the stunt node: PVE login → ANAS node menu → panels rendering
- * real data → the scrub job flow → the "not installed" degrade path.
+ * real data → the scrub job flow → the degrade path with the gateway stopped
+ * (since cr3.core CORE-L6: "could not be reached", never "not installed").
  *
  * Contracts under test (DESIGN.md → "UI: Native PVE Panels", "PVE UI Integration"):
  *   - The node menu gains an expanded ANAS group with items Dashboard, Pools,
@@ -15,8 +16,11 @@ import { getZpoolStatus, poolExists, skipIfFixtureMissing, sshExec } from './fix
  *   - The Pools grid shows the real pool `testpool`; Start Scrub drives
  *     POST /api/nodes/<node>/v1/pools/testpool/scrub → 202 and zpool status
  *     shows the scrub.
- *   - With the anas service stopped, opening an ANAS item renders the friendly
- *     "ANAS is not installed on this node" panel (the Ceph pattern).
+ *   - With the anas service stopped, opening an ANAS item renders the
+ *     "ANAS on node ... could not be reached" panel with the failure's own
+ *     sentence (cr3.core CORE-L6; before it, the "ANAS is not installed on
+ *     this node" install hint, which is now reserved for the gateway's
+ *     ANAS_NOT_INSTALLED answer).
  *
  * ExtJS boot + panel render is slow, so timeouts are generous throughout.
  */
@@ -142,7 +146,7 @@ test.describe('ANAS native panels (stunt node)', () => {
 })
 
 /**
- * "Not installed" degrade path — MUST run last and in isolation. It stops the
+ * Degrade path with the gateway stopped — MUST run last and in isolation. It stops the
  * anas service, so it's serialized and always restarts the service afterward
  * (even on assertion failure) to avoid poisoning any spec that follows.
  */
@@ -155,15 +159,27 @@ test.describe.serial('ANAS not installed (service stopped)', () => {
     await sshExec('systemctl start anas')
   })
 
-  test('opening an ANAS item shows the not-installed panel', async ({ page }) => {
-    // Simulate a node where ANAS isn't running: the panel's health probe to the
-    // gateway fails and it must render the friendly degrade panel (Ceph pattern).
+  test('opening an ANAS item with the gateway stopped says ANAS could not be reached, never "not installed"', async ({ page }) => {
+    // ANAS is installed but its gateway is not running: the panel's health
+    // probe fails. Since cr3.core (CORE-L6, e2849a422) only the gateway's own
+    // ANAS_NOT_INSTALLED answer (a peer whose :8006 has no /anas hook) renders
+    // the install hint; every other failure renders the "could not be
+    // reached" panel with the failure's own sentence, so an installed node is
+    // never sent to reinstall.
     await sshExec('systemctl stop anas')
 
     await loginToPve(page)
     await openAnasItem(page, 'Pools')
 
-    await expect(page.getByText('ANAS is not installed on this node'))
-      .toBeVisible({ timeout: 30_000 })
+    const panel = page.locator('.anas-view-unreachable')
+    await expect(panel).toBeVisible({ timeout: 30_000 })
+    await expect(panel.getByText(`ANAS on node "${NODE_NAME}" could not be reached`)).toBeVisible()
+    // The failure in its own words: with the gateway stopped, PVE's /anas
+    // hook (AnasProxy.pm) answers 502 UPSTREAM_UNREACHABLE "ANAS gateway not
+    // ready (no proxy key)" (node pass 2026-11-14).
+    await expect(panel.getByText('ANAS gateway not ready (no proxy key)', { exact: true })).toBeVisible()
+    await expect(panel.getByText('HTTP 502 UPSTREAM_UNREACHABLE', { exact: true })).toBeVisible()
+    await expect(panel.getByText('Reload the page to try again. If your session has expired, log in to Proxmox again.')).toBeVisible()
+    await expect(page.getByText('ANAS is not installed on this node')).toHaveCount(0)
   })
 })

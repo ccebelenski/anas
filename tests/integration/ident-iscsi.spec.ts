@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { expect, test } from '@playwright/test'
 import { apiCtx, awaitJob, V1 } from './fixtures/cloud-api'
 import { STUNT_HOST } from './fixtures/pve-ui'
-import { poolExists, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
+import { lioInstalled, poolExists, skipIfFixtureMissing, sshExec } from './fixtures/stunt-node'
 
 /**
  * LIVE PROOF for story ident.2 — iSCSI LUNs and whole-image restore act on the
@@ -189,6 +189,7 @@ test.describe('ident.2 — the served device is the LUN\'s identity', () => {
   test.beforeAll(async ({ playwright }) => {
     ctx = await apiCtx(playwright)
     skipIfFixtureMissing(!(await poolExists(POOL)), `pool ${POOL} is not on the node`)
+    skipIfFixtureMissing(!(await lioInstalled()), 'the LIO target stack is not installed on the node (apt install targetcli-fb python3-rtslib-fb)')
     await cleanup(ctx)
   })
 

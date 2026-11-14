@@ -22,8 +22,10 @@ import { datasetExists, poolExists, releaseHolds, skipIfFixtureMissing, sshExec 
  *     whole tree, stamped `anas:schedule=<this id>` as the schedule's own
  *     takes are since ident.1) are cleared from the excluded child and its
  *     grandchild, while a held sibling snapshot survives and is reported; the
- *     excluded PVE-owned storage root is cleared of them too (they are ANAS's
- *     own leftovers, proven by the stamp).
+ *     excluded PVE-owned storage root KEEPS them, noted "N left: PVE-owned,
+ *     hands-off (<reason>)" (cr3.datasets L3, 896bf42a0: PVE territory is
+ *     read-only and hands-off whatever stamp a snapshot carries; before cr3
+ *     the stamp made them ANAS's to clear).
  *
  * The nested storage root (`pvfix/media/guests`, registered with pvesm for the
  * duration of the spec) is the #71 shape: a pool carrying ANAS datasets and
@@ -244,8 +246,9 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
       // Excluded child and its grandchild: cleared.
       expect(await anasSnapshots(CHILD)).toEqual([])
       expect(await anasSnapshots(GRANDCHILD)).toEqual([])
-      // The PVE-owned excluded storage root: our own (stamped) leftovers are cleared too.
-      expect(await anasSnapshots(NESTED_ROOT)).toEqual([])
+      // The PVE-owned excluded storage root: hands-off since cr3.datasets L3
+      // (896bf42a0) — even our own (stamped) leftovers stay, and the run says so.
+      expect((await anasSnapshots(NESTED_ROOT)).sort()).toEqual([OLD_A, OLD_B])
 
       // The result reports it per dataset; the held one is named.
       expect(done.result?.skippedHeld).toContain(`${SIBLING}@${OLD_A}`)
@@ -256,8 +259,8 @@ test.describe('snapx.1 — exclude on a recursive schedule, through the API (stu
       expect(of(SIBLING)).toMatchObject({ scope: 'sweep', pruned: siblingBefore - 1, held: 1 })
       expect(of(CHILD)).toMatchObject({ scope: 'excluded', pruned: 2, held: 0 })
       expect(of(GRANDCHILD)).toMatchObject({ scope: 'excluded', pruned: 2, held: 0 })
-      expect(of(NESTED_ROOT)).toMatchObject({ scope: 'excluded', pruned: 2, held: 0 })
-      expect(of(NESTED_ROOT)?.note).toBeUndefined()
+      expect(of(NESTED_ROOT)).toMatchObject({ scope: 'excluded', pruned: 0, held: 0 })
+      expect(of(NESTED_ROOT)?.note).toBe(`2 left: PVE-owned, hands-off (PVE storage '${NESTED_STORAGE}' owns ${NESTED_ROOT} as a storage root)`)
     }
     finally {
       await releaseHolds(SIBLING)

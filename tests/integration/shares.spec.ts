@@ -1,6 +1,6 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
-import { loginToPve, openAnasItem } from './fixtures/pve-ui'
+import { loginToPve, openAnasItem, selectGridRow } from './fixtures/pve-ui'
 import {
   makeDir,
   nfsExportExists,
@@ -328,7 +328,12 @@ test.describe('ANAS contextual Share… from a dataset (stunt node)', () => {
     await expect(page.locator('.anas-grid-datasets')).toBeVisible({ timeout: 45_000 })
 
     // Select the filesystem dataset 'share1' (mountpoint /testpool/share1).
-    await page.locator('.anas-grid-datasets').getByText('share1', { exact: true }).first().click()
+    // Retried until ExtJS marks it selected: share1 is the tree's last row and
+    // can sit below the view's visible bottom, where one click is lost (see
+    // selectGridRow).
+    const share1 = page.locator('.anas-grid-datasets').getByText('share1', { exact: true }).first()
+    await expect(share1).toBeVisible({ timeout: 45_000 })
+    await selectGridRow(share1)
 
     // Open the "Share…" split menu and pick SMB.
     const shareBtn = page.locator('.anas-btn-ds-share')

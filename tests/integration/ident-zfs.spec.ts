@@ -77,8 +77,33 @@ async function deleteSchedule(ctx: APIRequestContext, id: string): Promise<void>
     await waitJob(ctx, ((await res.json()) as JobRes).job.id)
 }
 
-async function createSchedule(ctx: APIRequestContext, body: Record<string, unknown>): Promise<void> {
-  const done = await accepted(ctx, await ctx.post(`${V1}/schedules`, { data: { enabled: false, ...body } }))
+/**
+ * Create a schedule. `adopts` = the snapshots already stamped with this id
+ * that the create must ADOPT: since cr3.datasets (896bf42a0, H2) a create
+ * whose id is already stamped on snapshots under its target is confirm-gated
+ * (409 CONFIRMATION_REQUIRED naming the count and the datasets); the confirmed
+ * resend carries the code. Without `adopts` the create must be a plain 202.
+ */
+async function createSchedule(
+  ctx: APIRequestContext,
+  body: Record<string, unknown> & { id: string, target: { dataset: string } },
+  adopts?: { count: number },
+): Promise<void> {
+  const data = { enabled: false, ...body }
+  let headers: Record<string, string> | undefined
+  if (adopts) {
+    const first = await ctx.post(`${V1}/schedules`, { data })
+    expect(first.status(), await first.text()).toBe(409)
+    const err = (await first.json()).error as { code: string, message: string, warnings: string[] }
+    expect(err.code).toBe('CONFIRMATION_REQUIRED')
+    expect(err.message).toBe(`Snapshot schedule id '${body.id}' is already stamped on existing snapshots — this schedule will own them`)
+    const ds = body.target.dataset
+    expect(err.warnings[0]).toBe(`${adopts.count} snapshot(s) on 1 dataset(s) under '${ds}' already carry the schedule id '${body.id}' — left by an earlier schedule of that id: ${ds} (${adopts.count}).`)
+    const code = first.headers()['x-anas-confirm-code']
+    expect(code, 'the challenge carries a confirm code').toBeTruthy()
+    headers = { 'x-anas-confirm': code }
+  }
+  const done = await accepted(ctx, await ctx.post(`${V1}/schedules`, { data, ...(headers ? { headers } : {}) }))
   expect(done.status, JSON.stringify(done.error ?? '')).toBe('completed')
 }
 
@@ -198,20 +223,23 @@ test.describe('ident.1 — ZFS ownership stamps, stable-id confirms, wipe-by-ide
       `for s in ${hours.join(' ')}; do zfs snapshot -o anas:schedule=${SCHED_STD} ${PAIR}@$s; done`,
       `for s in ${days.join(' ')}; do zfs snapshot -o anas:schedule=${SCHED_MIN} ${PAIR}@$s; done`,
     ].join('\n'))
+    // The seeds carry each schedule's id, so each create ADOPTS them: the
+    // confirm names exactly its own (40 hourlies / 9 dailies), never the
+    // other schedule's.
     await createSchedule(ctx, {
       id: SCHED_STD,
       name: 'ident1 standard',
       target: { kind: 'zfs', dataset: PAIR },
       cadence: 'hourly',
       retention: { hourly: 36, daily: 30, monthly: 12 },
-    })
+    }, { count: hours.length })
     await createSchedule(ctx, {
       id: SCHED_MIN,
       name: 'ident1 minimal',
       target: { kind: 'zfs', dataset: PAIR },
       cadence: 'daily',
       retention: { daily: 7, weekly: 4 },
-    })
+    }, { count: days.length })
 
     // Minimal first: before ident.1 its "keep 0" for the absent hourly bucket
     // erased every standard hourly but the newest.

@@ -73,6 +73,17 @@ async function existsOnNode(probe: string): Promise<boolean> {
 }
 
 /**
+ * Is the LIO iSCSI target stack installed on the node (`targetcli` on PATH,
+ * the tool every ANAS iSCSI mutation drives)? Without it the daemon refuses
+ * every target create 409 `lio-not-installed`. No fixture script installs it
+ * (the ext4 stunt node is provisioned without it): `apt install targetcli-fb
+ * python3-rtslib-fb` on the node is the operator's step.
+ */
+export async function lioInstalled(): Promise<boolean> {
+  return existsOnNode('command -v targetcli')
+}
+
+/**
  * Check if a ZFS dataset exists.
  */
 export async function datasetExists(dataset: string): Promise<boolean> {

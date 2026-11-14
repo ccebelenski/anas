@@ -318,10 +318,18 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       const before = (await poolDetail(ctx)).cache!.hits!
       await sshExec(`cd ${MOUNT} && for i in 1 2 3 4; do dd if=/dev/urandom of=c$i.bin bs=1M count=8 status=none; done && sync`)
       // The page cache is dropped between passes, so the second pass really
-      // reaches the block layer — and therefore the cache.
-      for (let pass = 0; pass < 3; pass++)
+      // reaches the block layer — and therefore the cache. smq promotes a
+      // block only once it reads as hot, and how many passes that takes on a
+      // blank cache varies run to run (cr3 node pass: 0 hits after three
+      // passes in 2 of 4 runs, on code whose cache read cr3 did not touch), so
+      // the passes repeat until the hits climb, bounded at twelve.
+      let after = (await poolDetail(ctx)).cache!
+      for (let pass = 0; pass < 12 && !(after.hits! > before); pass++) {
         await sshExec(`echo 3 > /proc/sys/vm/drop_caches && cat ${MOUNT}/c*.bin > /dev/null`)
-      const after = (await poolDetail(ctx)).cache!
+        if (pass >= 2)
+          after = (await poolDetail(ctx)).cache!
+      }
+      after = (await poolDetail(ctx)).cache!
       expect(after.hits!, 'read hits climbed over repeated reads').toBeGreaterThan(before)
       expect(after.usedBlocks!).toBeGreaterThan(0)
       expect(after.dirtyBlocks).toBe(0)
@@ -416,7 +424,11 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       const list = await ctx.get(`${V1}/ahr`)
       expect((await list.json()).data).toEqual([])
       expect(await sshExec('lvs --noheadings; pvs --noheadings; vgs --noheadings; mdadm --detail --scan')).toBe('')
-      expect(await sshExec(`grep -c anas-ahr /etc/fstab || true`)).toBe('0')
+      // THIS pool's fstab line is gone (matched on the mount-point field). Not
+      // "no anas-ahr line at all": the stunt node can carry another pool's
+      // line (cr3 node pass: a hand-made /mnt/anas-ahr/sr1 line from
+      // 2026-11-06 failed the old file-wide count).
+      expect(await sshExec(`awk '$2 == "${MOUNT}"' /etc/fstab | wc -l`)).toBe('0')
 
       // All THREE disks — the two band members and the cache SSD — come back
       // selectable. The cache disk only does because destroy zapped its slice
@@ -587,7 +599,15 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       // sitting in the file.
       const reader = await sshExec(`cat ${READER_LOG}`)
       expect(reader, 'the reader loop met the EIO window').toContain('rc=1')
-      expect(reader.trim().split('\n').at(-1), 'and came back after it').toContain('rc=0')
+      // "On its next pass": the API can read the pool uncached while the
+      // reader is still inside the EIO window (cr3 node pass: the last line
+      // read 1 s after the uncache was still rc=1, and the log was read only
+      // once), so the newest line is polled until a pass after the window
+      // lands, bounded at 30 s — a reader that never recovers still fails.
+      await expect.poll(
+        async () => (await sshExec(`tail -n 1 ${READER_LOG}`)).trim(),
+        { timeout: 30_000, intervals: [500, 1_000], message: 'and came back after it' },
+      ).toContain('rc=0')
 
       // --- 5. The notification really went out -----------------------------
       const notified = await notificationsSince(cursor)

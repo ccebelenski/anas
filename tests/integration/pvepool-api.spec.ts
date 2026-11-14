@@ -4,6 +4,7 @@ import { NODE_NAME, PVE_URL, STUNT_HOST } from './fixtures/pve-ui'
 import {
   datasetExists,
   destroyDataset,
+  lioInstalled,
   poolExists,
   skipIfFixtureMissing,
   sshExec,
@@ -501,6 +502,7 @@ test.describe('iSCSI add-LUN on a PVE pool', () => {
   })
 
   test('a zvol on the sibling is accepted; a PVE guest volume is refused with the guest sentence', async ({ playwright }) => {
+    skipIfFixtureMissing(!(await lioInstalled()), 'the LIO target stack is not installed on the node (apt install targetcli-fb python3-rtslib-fb)')
     const ctx = await apiContext(playwright)
     try {
       // Pre-clean a target a crashed earlier run may have leaked.

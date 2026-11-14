@@ -167,6 +167,13 @@ test.describe('taskstatus.1 — last run and verdict survive a reboot (stunt nod
     await removeQuietly(ctx, `${V1}/schedules/${SCHED_ID}`)
     await removeQuietly(ctx, `${V1}/cloud/tasks/${TASK}`)
     await removeQuietly(ctx, `${V1}/cloud/remotes/${REMOTE}`)
+    // An earlier run's take that afterAll never reached (an interrupted run)
+    // still carries this spec's schedule id. Since cr3.datasets (896bf42a0,
+    // H2) a create whose id is already stamped under its target is
+    // confirm-gated (409 "...already stamped on existing snapshots — this
+    // schedule will own them"), so a leftover would turn this spec's create
+    // into a refusal: clear ONLY snapshots stamped with this spec's own id.
+    await sshExec(`zfs list -H -r -t snapshot -o name,anas:schedule ${POOL} | awk -F'\\t' '$2 == "${SCHED_ID}" { print $1 }' | xargs -r -n1 zfs destroy`)
   })
 
   test.afterAll(async () => {

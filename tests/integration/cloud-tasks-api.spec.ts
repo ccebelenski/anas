@@ -2,7 +2,7 @@ import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { apiContext, expect, test } from './fixtures/auth'
-import { readJob } from './fixtures/cloud-api'
+import { CLOUD_JOB_OPERATIONS, readJob } from './fixtures/cloud-api'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
 
@@ -479,7 +479,7 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
       // b.bin as a would-be delete — rclone's own `skipped: delete` object,
       // counted in its own `deletes` counter.
       // cr.48: a READ job; its result is the old body.
-      const previewJob = await readJob(ctx, `${V1}/cloud/tasks/preview`, { name: 'gtsync' })
+      const previewJob = await readJob(ctx, `${V1}/cloud/tasks/preview`, { name: 'gtsync' }, CLOUD_JOB_OPERATIONS.savedTaskPreview)
       expect(previewJob.status, previewJob.error?.message).toBe('completed')
       const preview = previewJob.result
       expect(preview.truncated, 'the look finished inside the ceiling').toBe(false)
@@ -629,8 +629,10 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
       // The FAILING PREVIEW (rclone.2 addendum, fix batch 2026-09-24). It
       // belongs with the preview test above, but BAD_REMOTE is created here —
       // and the spec is serial, so this is the first place it exists. The
-      // shape under test: a dry run that fails is still 200 (a preview is a
-      // read), and its `errors` carry rclone's OWN sentence. A preview that
+      // shape under test: a dry run that fails is still a COMPLETED job (an
+      // inline preview is the Sys.Modify job `cloud.task.preview` since
+      // cr3.cloud; it still changes nothing), and its `errors` carry rclone's
+      // OWN sentence. A preview that
       // answered zero counters with an empty `errors` would be
       // byte-identical to an honest "nothing to do", which is the one lie
       // this endpoint must never tell.
@@ -639,8 +641,8 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
         remote: BAD_REMOTE,
         path: 'dst/fail',
         mode: 'copy',
-      })
-      expect(failedPreview.status, 'a failing dry run is still a COMPLETED read: its errors carry rclone\'s sentence').toBe('completed')
+      }, CLOUD_JOB_OPERATIONS.inlineTaskPreview)
+      expect(failedPreview.status, 'a failing dry run is still a COMPLETED job: its errors carry rclone\'s sentence').toBe('completed')
       const bad = failedPreview.result
       expect(bad.errors.length, 'the failure is reported, not swallowed').toBeGreaterThan(0)
       expect(bad.errors[0]).toMatch(/NewFs|couldn't connect SSH/)

@@ -84,3 +84,54 @@ export async function openAnasItem(page: Page, item: string): Promise<void> {
   await expect(menuItem).toBeVisible({ timeout: 20_000 })
   await menuItem.click()
 }
+
+/**
+ * The ExtJS grid/tree ROW (`tr.x-grid-row`) holding `inRow` (the row itself,
+ * or any element inside it). The class test is word-exact: a focused cell
+ * carries `x-grid-item-focused`, which a plain `contains(@class, ...)` would
+ * mistake for the row.
+ */
+function gridRowOf(inRow: Locator): Locator {
+  return inRow.locator('xpath=ancestor-or-self::tr[contains(concat(" ", normalize-space(@class), " "), " x-grid-row ")][1]')
+}
+
+/**
+ * Bring a tree/grid row into the view's visible area, then act on it, retried
+ * until the row reads the expected state. Why (cr3 node pass, measured on the
+ * stunt node 2026-11-14 at 2560x1080): with six pools in the Datasets tree the
+ * content (600 px) is taller than the tree view (471 px), so testpool/share1
+ * sits BELOW the view's visible bottom. A plain Playwright click on such a row
+ * scrolls it into view and clicks in the same breath; ExtJS's scroller has
+ * not settled, the mousedown and mouseup land on different rows, and the click
+ * is lost (mousedown events fire, no itemclick, no selection, no expand: 2 of 2
+ * plain clicks lost, 2 of 2 scroll-first clicks selected). The state the
+ * action must leave behind is the oracle, never the click.
+ */
+async function actOnRowUntil(inRow: Locator, act: () => Promise<void>, done: () => Promise<boolean>): Promise<void> {
+  await expect(async () => {
+    await inRow.scrollIntoViewIfNeeded({ timeout: 2_000 })
+    if (!(await done()))
+      await act()
+    await expect.poll(done, { timeout: 2_000 }).toBe(true)
+  }).toPass({ timeout: 30_000, intervals: [250, 500, 1_000] })
+}
+
+/** Select the tree/grid row holding `inRow`; returns once ExtJS marks it selected. */
+export async function selectGridRow(inRow: Locator): Promise<void> {
+  const item = gridRowOf(inRow).locator('xpath=ancestor::table[1]')
+  await actOnRowUntil(
+    inRow,
+    () => inRow.click({ timeout: 2_000 }),
+    async () => /(^|\s)x-grid-item-selected(\s|$)/.test(await item.getAttribute('class') ?? ''),
+  )
+}
+
+/** Expand the tree row holding `inRow` (by its own expander); returns once it reads expanded. */
+export async function expandTreeRow(inRow: Locator): Promise<void> {
+  const row = gridRowOf(inRow)
+  await actOnRowUntil(
+    inRow,
+    () => row.locator('.x-tree-expander').first().click({ timeout: 2_000 }),
+    async () => (await row.getAttribute('aria-expanded')) === 'true',
+  )
+}

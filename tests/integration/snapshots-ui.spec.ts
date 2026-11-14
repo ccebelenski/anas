@@ -1,6 +1,6 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
-import { loginToPve, openAnasItem } from './fixtures/pve-ui'
+import { expandTreeRow, loginToPve, openAnasItem, selectGridRow } from './fixtures/pve-ui'
 import { createSnapshot, destroySnapshot, listSnapshots, poolExists, skipIfFixtureMissing } from './fixtures/stunt-node'
 
 /**
@@ -49,18 +49,22 @@ async function openDatasets(page: Page): Promise<void> {
   await expect(page.locator('.anas-grid-datasets')).toBeVisible({ timeout: 45_000 })
 }
 
+/** The 'share1' dataset's name cell in the Datasets tree. */
+function share1Node(page: Page) {
+  return page.locator('.anas-grid-datasets .x-tree-node-text', { hasText: /^share1$/ })
+}
+
 /**
  * Expand the 'share1' dataset node in the Datasets tree so its snapshot children
  * render. Clicks the row's tree expander (ExtJS renders '.x-tree-expander' on
- * every expandable row).
+ * every expandable row) until the row reads expanded: share1 is the tree's last
+ * row and can sit below the view's visible bottom, where a single click is
+ * lost (see expandTreeRow).
  */
 async function expandShare1(page: Page): Promise<void> {
-  const grid = page.locator('.anas-grid-datasets')
-  const node = grid.locator('.x-tree-node-text', { hasText: /^share1$/ })
+  const node = share1Node(page)
   await expect(node).toBeVisible({ timeout: 45_000 })
-  // The expander sits in the same tree row; walk up to the row, then click it.
-  const row = node.locator('xpath=ancestor::*[contains(@class, "x-grid-item")][1]')
-  await row.locator('.x-tree-expander').first().click()
+  await expandTreeRow(node)
 }
 
 test.describe('ANAS snapshots appear under a dataset (stunt node)', () => {
@@ -119,7 +123,7 @@ test.describe('ANAS snapshots appear under a dataset (stunt node)', () => {
 
     const snapRow = page.locator('.anas-grid-datasets .anas-snap-row').first()
     await expect(snapRow).toBeVisible({ timeout: 30_000 })
-    await snapRow.click()
+    await selectGridRow(snapRow)
 
     // With a snapshot selected, the destructive/edit actions become enabled.
     for (const sel of ['.anas-btn-snap-rollback', '.anas-btn-snap-rename', '.anas-btn-snap-destroy'])
@@ -130,7 +134,8 @@ test.describe('ANAS snapshots appear under a dataset (stunt node)', () => {
     await openDatasets(page)
     // Select a dataset, open Create Snapshot; the name is pre-filled for speed
     // (a sortable timestamp) and overridable.
-    await page.locator('.anas-grid-datasets .x-tree-node-text', { hasText: /^share1$/ }).click()
+    await expect(share1Node(page)).toBeVisible({ timeout: 45_000 })
+    await selectGridRow(share1Node(page))
     await page.locator('.anas-btn-snap-create').click()
     await expect(page.locator('.anas-win-snap-create')).toBeVisible({ timeout: 20_000 })
     const value = await page.locator('.anas-fld-snap-name input').inputValue()
@@ -180,12 +185,17 @@ test.describe('ANAS snapshot overflow node (many snapshots)', () => {
     // Scroll it into the tree's visible area first: at 2560x1080 the expanded
     // share1 rows can push it under PVE's bottom task panel, where a click at
     // the row's centre lands on the task log instead (no itemclick fires).
+    // Retried until the popup is up: a click on a row that was just scrolled
+    // into view can be lost the same way (see expandTreeRow).
     const more = page.locator('.anas-grid-datasets .anas-snap-more')
-    await more.scrollIntoViewIfNeeded()
-    await more.click()
-
     const win = page.locator('.anas-win-snapshots')
-    await expect(win).toBeVisible({ timeout: 30_000 })
+    await expect(async () => {
+      if (!(await win.isVisible())) {
+        await more.scrollIntoViewIfNeeded({ timeout: 2_000 })
+        await more.click({ timeout: 2_000 })
+      }
+      await expect(win).toBeVisible({ timeout: 3_000 })
+    }).toPass({ timeout: 30_000, intervals: [250, 500, 1_000] })
     const grid = win.locator('.anas-grid-snapshots')
     await expect(grid).toBeVisible({ timeout: 30_000 })
 

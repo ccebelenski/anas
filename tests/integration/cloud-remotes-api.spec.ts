@@ -2,7 +2,7 @@ import type { APIRequestContext } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { apiContext, expect, test } from './fixtures/auth'
-import { readJob } from './fixtures/cloud-api'
+import { CLOUD_JOB_OPERATIONS, readJob } from './fixtures/cloud-api'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 import { getMode, sshExec } from './fixtures/stunt-node'
 
@@ -125,6 +125,12 @@ async function storeSection(name: string): Promise<string> {
 
 test.describe('Cloud remotes (rclone.1)', () => {
   test.setTimeout(180_000)
+  // SERIAL: every test after the first works on the remote 'gt' the first one
+  // created. Without it a failure restarts the worker, which runs afterAll
+  // (fixture down: the store goes back to NO file) and then beforeAll again,
+  // so every later test fails on a missing remote or file instead of its own
+  // assertion (cr3 node pass: four cascade failures from two).
+  test.describe.configure({ mode: 'serial' })
 
   test.beforeAll(async () => {
     await execFileAsync(FIXTURE_SH, ['up'])
@@ -214,7 +220,7 @@ test.describe('Cloud remotes (rclone.1)', () => {
     const ctx = await apiContext(playwright)
     try {
       for (const body of [{ name: REMOTE }, { name: REMOTE, path: 'dst' }]) {
-        const job = await readJob(ctx, `${V1}/cloud/remotes/test`, body)
+        const job = await readJob(ctx, `${V1}/cloud/remotes/test`, body, CLOUD_JOB_OPERATIONS.savedRemoteTest)
         expect(job.status, job.error?.message).toBe('completed')
         expect(job.result).toEqual({ verdict: 'ok', message: '' })
       }
@@ -232,7 +238,7 @@ test.describe('Cloud remotes (rclone.1)', () => {
       // 2026-09-24). For a SAVED remote that is ANAS's own file, appended to
       // that remote's own section — a foreign key the INI writer keeps and
       // the API shows, rather than silently dropping on the next edit.
-      const job = await readJob(ctx, `${V1}/cloud/remotes/test`, { name: REMOTE })
+      const job = await readJob(ctx, `${V1}/cloud/remotes/test`, { name: REMOTE }, CLOUD_JOB_OPERATIONS.savedRemoteTest)
       expect(job.result?.verdict).toBe('ok')
 
       const section = await storeSection(REMOTE)
@@ -258,7 +264,7 @@ test.describe('Cloud remotes (rclone.1)', () => {
           options: { host: '127.0.0.1', user: USER, pass: 'wrong-password' },
         },
         path: 'dst',
-      })
+      }, CLOUD_JOB_OPERATIONS.unsavedRemoteTest)
       expect(job.result?.verdict).toBe('auth')
 
       // The env-defined remote's own shell detection would land in the
@@ -280,8 +286,9 @@ test.describe('Cloud remotes (rclone.1)', () => {
       // bounded (the 45 s `timeout` wrapper), classified as unreachable, not
       // hang the request.
       const start = Date.now()
-      // cr.48: a READ job now; rclone's own --contimeout 10s still ends a
-      // dead host long before the job's 120 s ceiling.
+      // cr.48: a job now (cr3.cloud: an unsaved Test is the Sys.Modify job
+      // `cloud.remote.test`, not a read); rclone's own --contimeout 10s still
+      // ends a dead host long before the job's 120 s ceiling.
       const job = await readJob(ctx, `${V1}/cloud/remotes/test`, {
         remote: {
           name: 'draft',
@@ -289,7 +296,7 @@ test.describe('Cloud remotes (rclone.1)', () => {
           options: { host: '192.0.2.1', user: USER, pass: PASS },
         },
         path: 'dst',
-      })
+      }, CLOUD_JOB_OPERATIONS.unsavedRemoteTest)
       expect(job.result?.verdict).toBe('unreachable')
       expect(Date.now() - start).toBeLessThan(60_000)
     }
@@ -301,7 +308,7 @@ test.describe('Cloud remotes (rclone.1)', () => {
   test('Test the saved remote with a missing path: not-found', async ({ playwright }) => {
     const ctx = await apiContext(playwright)
     try {
-      const job = await readJob(ctx, `${V1}/cloud/remotes/test`, { name: REMOTE, path: 'no-such-dir' })
+      const job = await readJob(ctx, `${V1}/cloud/remotes/test`, { name: REMOTE, path: 'no-such-dir' }, CLOUD_JOB_OPERATIONS.savedRemoteTest)
       expect(job.result?.verdict).toBe('not-found')
     }
     finally {
@@ -312,7 +319,7 @@ test.describe('Cloud remotes (rclone.1)', () => {
   test('Test a saved name the file does not carry: the read job FAILS naming it (cr.48)', async ({ playwright }) => {
     const ctx = await apiContext(playwright)
     try {
-      const job = await readJob(ctx, `${V1}/cloud/remotes/test`, { name: 'nosuchremote' })
+      const job = await readJob(ctx, `${V1}/cloud/remotes/test`, { name: 'nosuchremote' }, CLOUD_JOB_OPERATIONS.savedRemoteTest)
       expect(job.status).toBe('failed')
       expect(job.error?.message).toContain('nosuchremote')
     }

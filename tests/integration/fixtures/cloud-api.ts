@@ -44,20 +44,38 @@ export async function awaitJob(
 }
 
 /**
- * cr.48 — one of the three slow READS (the cloud preview, the remote Test,
- * the catalog listing): POST, require the 202 with a `read.*` job, and wait
- * for it. The answer the door used to give is `job.result`.
+ * The job operations the slow cloud doors answer with. A SAVED remote's Test
+ * and a SAVED task's preview are reads (`read.*`, cr.48); since cr3.cloud
+ * (1116cb4ff) the Test of an UNSAVED remote and the preview of an UNSAVED
+ * (inline) task are NOT reads: the options typed in the dialog can act on the
+ * node, so the queue and the cancel door hold them to Sys.Modify
+ * (routes/cloud.ts UNSAVED_TEST_OPERATION / INLINE_PREVIEW_OPERATION).
+ */
+export const CLOUD_JOB_OPERATIONS = Object.freeze({
+  savedRemoteTest: 'read.cloud.remote.test',
+  unsavedRemoteTest: 'cloud.remote.test',
+  savedTaskPreview: 'read.cloud.preview',
+  inlineTaskPreview: 'cloud.task.preview',
+})
+
+/**
+ * cr.48 — one of the slow cloud doors (the cloud preview, the remote Test):
+ * POST, require the 202 with EXACTLY the job operation the door must answer
+ * with (a read for saved work, a Sys.Modify job for unsaved work, see
+ * CLOUD_JOB_OPERATIONS), and wait for it. The answer the door used to give is
+ * `job.result`.
  */
 export async function readJob(
   ctx: APIRequestContext,
   url: string,
   data: unknown,
+  operation: string,
   timeout = 150_000,
 ): Promise<{ status: string, error?: any, result?: any, [k: string]: any }> {
   const res = await ctx.post(url, { data })
   expect(res.status(), await res.text()).toBe(202)
   const accepted = (await res.json()).job
-  expect(String(accepted.operation)).toMatch(/^read\./)
+  expect(String(accepted.operation)).toBe(operation)
   return awaitJob(ctx, accepted.id, timeout)
 }
 
