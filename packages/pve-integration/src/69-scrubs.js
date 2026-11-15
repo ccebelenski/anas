@@ -162,7 +162,7 @@
     // run wrote what must change first.
     var NOT_EXAMINED_WORDS = {
         'inline-extent': 'now stored inline in the file\'s metadata: run a scrub to refresh the findings',
-        'hole': 'now a hole: run a scrub to refresh the findings',
+        'hole': 'now a hole: a scrub no longer names the file for it, and counts the old block as an error that names no file until the file is rewritten whole or deleted',
         'owner-scan-truncated': 'the extent list was incomplete: run a scrub to refresh the findings',
         'band-unreadable': 'the band\'s md facts could not be read: run Repair from parity again once the AHR panel shows the band clean',
         'unresolvable': 'ANAS could not confirm where the block is: this result is final for this run, report it with the job\'s result',
@@ -1666,8 +1666,11 @@
                     + t('could not be read, so nothing judged them and nothing was written. Run a scrub (Scrubs → Run now). '
                         + 'If it names a file again, run Repair from parity on it from that finding. If the repair stops here '
                         + 'a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the '
-                        + 'file twice, so restore it (the job\'s PVE notification says how). If the scrub does not name the file, '
-                        + 'nothing remains to do.')));
+                        + 'file twice, so restore it (the job\'s PVE notification says how). If the scrub reports no errors, '
+                        + 'nothing remains to do. If it reports uncorrectable errors that name no file, both copies of a '
+                        + 'metadata block are damaged: the pool keeps working while it is mounted and may not mount again '
+                        + 'after it is unmounted or the node restarts, so copy off what you need now and plan to restore '
+                        + 'the pool from backup.')));
             }
         }
         if (Number(res.mappingAbort || 0) > 0) {

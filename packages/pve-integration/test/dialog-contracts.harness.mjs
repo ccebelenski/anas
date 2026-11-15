@@ -9798,7 +9798,7 @@ async function repairFromParityChecks() {
   ok('repair: the not-examined count rides the headline as its OWN number (F3)',
     /0 repaired · 0 unrepairable · 0 above md · 0 not corrupt at the mapped location · 1 not examined/.test(panel.html), panel.html)
   ok('repair: …with the reason in words and what to do (cr3.heal.paths)',
-    /1 block\(s\) were not examined, and nothing was written to them: now a hole: run a scrub to refresh the findings\./.test(panel.html), panel.html)
+    /1 block\(s\) were not examined, and nothing was written to them: now a hole: a scrub no longer names the file for it, and counts the old block as an error that names no file until the file is rewritten whole or deleted\./.test(panel.html), panel.html)
   ok('repair: …and no sentence that says what the result is not, no restore',
     !/neither a clean bill|nothing is known/.test(panel.html)
       && !/restore this file from backup/.test(panel.html)
@@ -9933,8 +9933,8 @@ async function repairFromParityChecks() {
   ok('repair: a csum-unreadable file says the checksum could not be read',
     /The checksum btrfs keeps for blocks of .* could not be read, so nothing judged them and nothing was written\./.test(panel.html), panel.html)
   ok('repair: …and says to scrub, repair from its finding, and restore only after a second stop (review R3)',
-    /Run a scrub \(Scrubs → Run now\)\. If it names a file again, run Repair from parity on it from that finding\. If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the file twice, so restore it \(the job(&#39;|')s PVE notification says how\)\. If the scrub does not name the file, nothing remains to do\./.test(panel.html)
-      && !/errors that name no file/.test(panel.html), panel.html)
+    /Run a scrub \(Scrubs → Run now\)\. If it names a file again, run Repair from parity on it from that finding\. If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the file twice, so restore it \(the job(&#39;|')s PVE notification says how\)\. If the scrub reports no errors, nothing remains to do\. If it reports uncorrectable errors that name no file, both copies of a metadata block are damaged: the pool keeps working while it is mounted and may not mount again after it is unmounted or the node restarts, so copy off what you need now and plan to restore the pool from backup\./.test(panel.html)
+      && !/reports errors that name no file/.test(panel.html), panel.html)
   ok('repair: …and NEVER tells the operator to restore data never proven bad',
     !/restore this file from backup/.test(panel.html), panel.html)
   ok('repair: …naming the file it applies to', panel.html.includes(FINDING_A.path), panel.html)

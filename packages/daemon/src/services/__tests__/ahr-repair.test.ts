@@ -71,7 +71,7 @@ const MAPPING_ABORT_2 = '2 block(s) pass their stored checksum where they sit on
 // Review R3 (safety): the restore is offered only after the scrub named the
 // file again AND the repair stopped at the same place a second time.
 const CSUM_UNREADABLE_FILE = 'the checksum btrfs keeps for these blocks could not be read, so nothing judged them and nothing was written. '
-  + 'Run a scrub (Scrubs → Run now). If it names this file again, run Repair from parity on it from that finding. If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the file twice, so restore this file from a backup if one exists. If the scrub does not name the file, nothing remains to do.'
+  + 'Run a scrub (Scrubs → Run now). If it names this file again, run Repair from parity on it from that finding. If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the file twice, so restore this file from a backup if one exists. If the scrub reports no errors, nothing remains to do. If it reports uncorrectable errors that name no file, both copies of a metadata block are damaged: the pool keeps working while it is mounted and may not mount again after it is unmounted or the node restarts, so copy off what you need now and plan to restore the pool from backup.'
 
 describe('AHR repair job — the four honest counts (review R9)', () => {
   it('sorts every verdict into repaired / unrepairable / aboveMd / mappingAbort, each as itself', async () => {
@@ -428,6 +428,34 @@ describe('AHR repair job — the one notification', () => {
     assert.doesNotMatch(notify.body, /restore this file from backup/)
   })
 
+  it('node capture 2026-11-15: an unreadable checksum record never says "nothing remains to do" without "reports no errors"', async () => {
+    // A scrub that reports no errors while both copies of a metadata block are
+    // damaged is not "nothing remains to do" — the pool may not mount again.
+    // The old sentence read the silent scrub as all clear; the node capture
+    // proved the opposite, so the reassurance is now conditional on the exact
+    // scrub verdict and the failure it hides names itself.
+    const exec = executor()
+    await repairAhrFiles(
+      exec,
+      pool(),
+      [{ path: '/a.bin', blocks: [1] }],
+      () => {},
+      {
+        repair: async (_e, req) => outcome(
+          req.file,
+          req.block,
+          'unrepairable',
+          'the metadata copy holding the checksum is damaged',
+          SELFHEAL_CSUM_UNREADABLE,
+        ),
+      },
+    )
+    const notify = notification(exec)!
+    assert.ok(notify.body.includes('If the scrub reports no errors, nothing remains to do.'), notify.body)
+    assert.ok(notify.body.includes('may not mount again'), notify.body)
+    assert.ok(!notify.body.includes('does not name the file, nothing remains'), notify.body)
+  })
+
   it('a LUN image whose unrepairable blocks are ALL csum-unreadable is NOT told to restore (N5)', async () => {
     // Both facts are true of this file, and they are not the same kind of fact.
     // "It is a LUN" says WHICH restore verb would apply; "the checksum could
@@ -468,8 +496,8 @@ describe('AHR repair job — the one notification', () => {
     assert.doesNotMatch(notify.body, /restore this file from backup/)
     assert.ok(notify.body.includes(`  ${LUN}: this block backs iSCSI LUN iqn.2026-01.org.anas:storage.tank/3, and the checksum btrfs keeps for these blocks `
       + 'could not be read, so nothing judged them and nothing was written. Run a scrub (Scrubs → Run now). If it names this file again, run Repair from parity on it from that finding. If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the file twice, so '
-      + 'restore the LUN image from a PBS backup (Backup → Restore as new LUN) or the guest\'s own backup, if one exists. If the scrub does not name the file, nothing remains to do.'), notify.body)
-    assert.doesNotMatch(notify.body, /errors that name no file/, 'review R3: unrelated I/O errors never send the reader to a restore')
+      + 'restore the LUN image from a PBS backup (Backup → Restore as new LUN) or the guest\'s own backup, if one exists. If the scrub reports no errors, nothing remains to do. If it reports uncorrectable errors that name no file, both copies of a metadata block are damaged: the pool keeps working while it is mounted and may not mount again after it is unmounted or the node restarts, so copy off what you need now and plan to restore the pool from backup.'), notify.body)
+    assert.doesNotMatch(notify.body, /reports errors that name no file/, 'review R3: unrelated I/O errors never send the reader to a restore')
   })
 
   it('a LUN image with a MIXED unrepairable file still gets the LUN restore advice (N5, the other side)', async () => {
@@ -682,7 +710,7 @@ describe('AHR repair job — the not-examined bucket (F3)', () => {
   const REPORT = 'This result is final for this run. Report it with this job\'s result.'
   const REASONS: [string, string][] = [
     ['inline-extent', 'Run a scrub (Scrubs → Run now) to refresh the findings: the extent the scrub named is no longer part of this file, and damage in the file now is named afresh.'],
-    ['hole', 'Run a scrub (Scrubs → Run now) to refresh the findings: btrfs keeps no checksum for a hole.'],
+    ['hole', 'Run a scrub (Scrubs → Run now): it no longer names this file for that block. The scrub still counts the old block as an error that names no file until the file is rewritten whole or deleted.'],
     ['owner-scan-truncated', REPORT],
     ['band-unreadable', 'Run Repair from parity again once the AHR panel shows that band clean. If it stops here again while the band shows clean, report it with this job\'s result.'],
     ['unresolvable', REPORT],
@@ -735,7 +763,7 @@ describe('AHR repair job — the not-examined bucket (F3)', () => {
       { repair: async (_e, req) => outcome(req.file, req.block, 'not-examined', 'stopped.', req.block === 1 ? 'hole' : 'inline-extent') },
     )
     const body = notification(exec)!.body
-    assert.match(body, /stopped\. Run a scrub \(Scrubs → Run now\) to refresh the findings: btrfs keeps no checksum for a hole\./)
+    assert.match(body, /stopped\. Run a scrub \(Scrubs → Run now\): it no longer names this file for that block\. The scrub still counts the old block as an error that names no file until the file is rewritten whole or deleted\./)
     assert.match(body, /stopped\. Run a scrub \(Scrubs → Run now\) to refresh the findings: the extent the scrub named is no longer part of this file/)
   })
 })

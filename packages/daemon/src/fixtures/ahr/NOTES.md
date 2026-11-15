@@ -179,3 +179,14 @@ Both files carry their commands, exit codes and what they settle in their own he
 |------|-----------------|
 | `btrfs-subvol-list-nested-mounted.txt` | On a `subvol=/@data` mount, `btrfs subvolume list` prints a subvolume below the mounted one relative to it (`sv`, `plain/sv2`, `sv/deep`) |
 | `btrfs-subvol-list-newline-names.txt` | A user without privileges can create a subvolume; the list prints a name's line break raw, so a name can forge a whole list line; btrfs-progs 6.14 has no `--format json` for `subvolume list`; a subvolume root is inode 256 on a device number of its own, an ordinary folder is not; `find <mount> -inum 256 -name '*[[:cntrl:]]*'` lists the subvolumes with a control character in their names |
+
+## Genuine captures — story cr3.heal.paths node captures (added 2026-11-15)
+
+Captured 2026-11-15 on the ext4-root test node (kernel 7.0.14-28-pve) on a
+throwaway loop-device rig — 3-member md RAID5 → LVM → btrfs (`-m dup`) — built,
+corrupted and torn down by the scripts described in the NODE3B write-up; the
+rig never touched a real pool and the node returned to its captured baseline.
+
+| File | Source | What it is |
+|------|--------|------------|
+| `selfheal-node-captures-2026-11-15.txt` | live, rows 2–5 of NODE3B | What the filesystem actually reports for the states our self-heal diagnostics advise about: after a hole is punched over a bad block the scrub no longer names the file but still counts the old block as an unnamed error (the extent stays allocated); replacing the whole file frees it and the scrub reports no errors; an md rebuild over a rotten data block blesses the rot (`mismatch_cnt` 8 → 0) while the scrub still names the file; with BOTH DUP copies of a csum-tree leaf damaged the scrub names no file, reports uncorrectable errors, the fs stays mounted read-write, and a fresh mount then fails (`open_ctree failed: -5`). These are the captures the corrected hole and unreadable-checksum sentences are pinned to |

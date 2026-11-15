@@ -115,7 +115,10 @@ function csumUnreadableSentence(restore: string): string {
   return 'the checksum btrfs keeps for these blocks could not be read, so nothing judged them and nothing was written. '
     + 'Run a scrub (Scrubs → Run now). If it names this file again, run Repair from parity on it from that finding. '
     + 'If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: '
-    + `the scrub has named the file twice, so ${restore}. If the scrub does not name the file, nothing remains to do.`
+    + `the scrub has named the file twice, so ${restore}. If the scrub reports no errors, nothing remains to do. `
+    + 'If it reports uncorrectable errors that name no file, both copies of a metadata block are damaged: '
+    + 'the pool keeps working while it is mounted and may not mount again after it is unmounted or the node '
+    + 'restarts, so copy off what you need now and plan to restore the pool from backup.'
 }
 
 /**
@@ -181,7 +184,7 @@ function mappingAbortSentence(blocks: number): string {
  */
 const NOT_EXAMINED_ADVICE: Record<string, string> = {
   'inline-extent': 'Run a scrub (Scrubs → Run now) to refresh the findings: the extent the scrub named is no longer part of this file, and damage in the file now is named afresh.',
-  'hole': 'Run a scrub (Scrubs → Run now) to refresh the findings: btrfs keeps no checksum for a hole.',
+  'hole': 'Run a scrub (Scrubs → Run now): it no longer names this file for that block. The scrub still counts the old block as an error that names no file until the file is rewritten whole or deleted.',
   'band-unreadable': BAND_UNREADABLE_ADVICE,
   'unresolvable': REPORT_IT_ADVICE,
   // Review R5: true of both branches (another file at the path, or none).

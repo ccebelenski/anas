@@ -1,0 +1,397 @@
+# cr3.heal.paths node captures — what btrfs and md actually report after the
+# mutations the self-heal path advises, captured 2026-11-15 on the ext4-root
+# test node, kernel 7.0.14-28-pve, on a loop-device rig: 3-member md RAID5
+# (64K chunk, left-symmetric) -> LVM -> btrfs (-m dup, single data profile),
+# subvolume @data. Built, corrupted and torn down by the scripts described in
+# NODE3B (the node-pass write-up; raw captures: NODE3B.md, row2.out, row3.out,
+# row4.out, row5.out). The rig and its loops were removed after each row and
+# the node returned to its captured baseline.
+# Sanitised: ssh host-key/address lines were removed; every other line below
+# is verbatim output. The `open_ctree failed` block and the write-after-
+# corruption line are quoted from NODE3B.md itself (row5.out ends before the
+# umount). The Verdict paragraphs are copied from NODE3B.md; the ellipsis
+# characters they contain are written here as three dots.
+
+## ROW 2
+
+**Verdict ROW 2.** After a hole is punched over the bad block the scrub **DOES
+NOT name the file again** — there is no `(path: f1.bin)` line — **but it DOES
+still report a checksum error at the same logical/physical**: `csum=1`,
+`Uncorrectable: 1`, logged as `scrub: unable to fixup (regular) error at
+logical 14860288 ... physical 14860288`. The restore control (writing the original
+bytes back to the member) makes the same scrub report `no errors found`, so the
+post-punch `csum=1` is exactly that physical block, not a stale counter.
+Mechanism seen here: `fallocate -p` removed the file's logical mapping for block
+300 (filefrag shows the hole) but the 4 MiB physical extent stayed allocated
+(extent tree unchanged) and the csum still covers the logical, so the scrub keeps
+reading and failing it — it just has no file (no extent backref at that offset)
+to name.
+
+# row2.out, FIRST scrub (before the punch): the scrub names the file
+##### FIRST scrub: does it name the file? #####
+=== btrfs scrub start -B /mnt/node3b  [row2-first] ===
+ERROR: there are 1 uncorrectable errors
+Starting scrub on devid 1
+scrub done for cabeb3f7-9ae5-4835-9dbb-a3201ba3cad0
+Scrub started:    Sun Nov 15 06:28:35 2026
+Status:           finished
+Duration:         0:00:00
+Total to scrub:   8.31MiB
+Rate:             8.31MiB/s
+Error summary:    csum=1
+  Corrected:      0
+  Uncorrectable:  1
+  Unverified:     0
+scrub rc=3
+--- NEW dmesg lines since scrub start (full):
+[ 7023.653602] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7023.656302] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 14860288 on dev /dev/mapper/node3b-data physical 14860288
+[ 7023.656766] BTRFS warning (device dm-0): scrub: checksum error at logical 14860288 on dev /dev/mapper/node3b-data, physical 14860288 root 256 inode 257 offset 1228800 length 4096 links 1 (path: f1.bin)
+[ 7023.656778] BTRFS error (device dm-0): bdev /dev/mapper/node3b-data errs: wr 0, rd 0, flush 0, corrupt 1, gen 0
+[ 7023.668622] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+
+# row2.out, the punch: filefrag shows the hole, the extent tree still holds the whole 4 MiB
+##### punch a hole over the bad block: fallocate -p -o 1228800 -l 4096 #####
+fallocate rc=0
+--- filefrag -v after the punch (block 300 is a hole):
+Filesystem type is: 9123683e
+File size of /mnt/node3b/@data/f1.bin is 4194304 (1024 blocks of 4096 bytes)
+ ext:     logical_offset:        physical_offset: length:   expected: flags:
+   0:        0..     299:       3328..      3627:    300:            
+   1:      301..    1023:       3629..      4351:    723:             last,eof
+/mnt/node3b/@data/f1.bin: 1 extent found
+--- extent tree after the punch (physical extent of f1):
+	item 0 key (13631488 EXTENT_ITEM 4194304) itemoff 16230 itemsize 53
+	item 2 key (17825792 EXTENT_ITEM 4194304) itemoff 16153 itemsize 53
+
+# row2.out, SECOND scrub (16 s after the punch): same csum error, no path
+##### wait 16 s past the btrfs ratelimit window, then the SECOND scrub #####
+=== btrfs scrub start -B /mnt/node3b  [row2-second] ===
+ERROR: there are 1 uncorrectable errors
+Starting scrub on devid 1
+scrub done for cabeb3f7-9ae5-4835-9dbb-a3201ba3cad0
+Scrub started:    Sun Nov 15 06:28:52 2026
+Status:           finished
+Duration:         0:00:00
+Total to scrub:   8.31MiB
+Rate:             8.31MiB/s
+Error summary:    csum=1
+  Corrected:      0
+  Uncorrectable:  1
+  Unverified:     0
+scrub rc=3
+--- NEW dmesg lines since scrub start (full):
+[ 7039.843567] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7039.848314] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 14860288 on dev /dev/mapper/node3b-data physical 14860288
+[ 7039.848339] BTRFS error (device dm-0): bdev /dev/mapper/node3b-data errs: wr 0, rd 0, flush 0, corrupt 2, gen 0
+[ 7039.851229] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+
+# row2.out, CONTROL: restore the original physical bytes, scrub again
+##### CONTROL: restore the original physical bytes, scrub again (expect no errors) #####
+=== btrfs scrub start -B /mnt/node3b  [row2-control] ===
+Starting scrub on devid 1
+scrub done for cabeb3f7-9ae5-4835-9dbb-a3201ba3cad0
+Scrub started:    Sun Nov 15 06:28:54 2026
+Status:           finished
+Duration:         0:00:00
+Total to scrub:   8.31MiB
+Rate:             8.31MiB/s
+Error summary:    no errors found
+scrub rc=0
+--- NEW dmesg lines since scrub start (full):
+[ 7042.020534] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7042.043485] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+--- filter (checksum/fixup/read errors + BTRFS msgs):
+[ 7042.020534] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7042.043485] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+
+## ROW 3
+
+**Verdict ROW 3.** After the file is replaced by a 500-byte inline file at the
+same path the scrub **DOES NOT name the file again** and reports **`no errors
+found`**: the whole 4 MiB data extent was freed (`Total to scrub` fell from
+8.31 MiB to 4.31 MiB) and the inline file has no on-disk 4 KiB data block to
+check. Contrast with ROW 2: a 4 KiB middle punch leaves the 4 MiB physical
+extent allocated and still scrubbed (unnamed); replacing the whole file frees it
+and the scrub stops checking it. (The truncate-rewrite kept inode 258 — the same
+inode number, unlike the rm+re-create in ROW 1.)
+
+# row3.out, FIRST scrub (before the replacement): the scrub names the file
+##### FIRST scrub: does it name the file? #####
+=== btrfs scrub start -B /mnt/node3b  [row3-first] ===
+ERROR: there are 1 uncorrectable errors
+Starting scrub on devid 1
+scrub done for cabeb3f7-9ae5-4835-9dbb-a3201ba3cad0
+Scrub started:    Sun Nov 15 06:30:00 2026
+Status:           finished
+Duration:         0:00:00
+Total to scrub:   8.31MiB
+Rate:             8.31MiB/s
+Error summary:    csum=1
+  Corrected:      0
+  Uncorrectable:  1
+  Unverified:     0
+scrub rc=3
+--- NEW dmesg lines since scrub start (full):
+[ 7107.827867] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7107.836689] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 19054592 on dev /dev/mapper/node3b-data physical 19054592
+[ 7107.836774] BTRFS warning (device dm-0): scrub: checksum error at logical 19054592 on dev /dev/mapper/node3b-data, physical 19054592 root 256 inode 258 offset 1228800 length 4096 links 1 (path: f2.bin)
+[ 7107.836793] BTRFS error (device dm-0): bdev /dev/mapper/node3b-data errs: wr 0, rd 0, flush 0, corrupt 3, gen 0
+[ 7107.849219] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+
+# row3.out, the replacement: a 500-byte inline file at the same path
+##### replace the file with a 500-byte inline file at the same path #####
+new size = 500 bytes; inode = 258
+--- filefrag -v (expect an inline extent):
+Filesystem type is: 9123683e
+File size of /mnt/node3b/@data/f2.bin is 500 (1 block of 4096 bytes)
+ ext:     logical_offset:        physical_offset: length:   expected: flags:
+   0:        0..    4095:          0..      4095:   4096:             last,not_aligned,inline,eof
+/mnt/node3b/@data/f2.bin: 1 extent found
+
+# row3.out, SECOND scrub: no errors; Total to scrub fell 8.31MiB -> 4.31MiB
+##### SECOND scrub: does it name the file again? #####
+=== btrfs scrub start -B /mnt/node3b  [row3-second] ===
+Starting scrub on devid 1
+scrub done for cabeb3f7-9ae5-4835-9dbb-a3201ba3cad0
+Scrub started:    Sun Nov 15 06:30:00 2026
+Status:           finished
+Duration:         0:00:00
+Total to scrub:   4.31MiB
+Rate:             4.31MiB/s
+Error summary:    no errors found
+scrub rc=0
+--- NEW dmesg lines since scrub start (full):
+[ 7108.002809] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7108.007107] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+--- filter (checksum/fixup/read errors + BTRFS msgs):
+[ 7108.002809] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7108.007107] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+
+## ROW 4
+
+**Verdict ROW 4.** After the rebuild the array's parity **DOES agree with the
+rotten block**, and the scrub **DOES still name the file**. Plainly: failing the
+parity member and rebuilding the spare recomputed that parity from the rotten
+data, so `mismatch_cnt` fell **8 → 0** and the rebuilt parity row equals
+`XOR(slot0, slot2_rot)` — md-level consistency is restored over corrupt data. The
+data itself was never touched, so a `btrfs scrub` still reports
+`checksum error ... (path: f1.bin)` and `csum=1`. A rebuild (and a clean `md check`)
+therefore blesses the rot; only the filesystem checksum still names the file.
+
+# row4.out, scrub after corrupting T on its member: the scrub names the file
+##### scrub: does it name the file? #####
+=== btrfs scrub start -B /mnt/node3b  [row4-postcorrupt] ===
+ERROR: there are 1 uncorrectable errors
+Starting scrub on devid 1
+scrub done for b266eae5-eb18-4567-88f0-7bacbf012038
+Scrub started:    Sun Nov 15 06:30:52 2026
+Status:           finished
+Duration:         0:00:00
+Total to scrub:   4.31MiB
+Rate:             4.31MiB/s
+Error summary:    csum=1
+  Corrected:      0
+  Uncorrectable:  1
+  Unverified:     0
+scrub rc=3
+--- NEW dmesg lines since scrub start (full):
+[ 7160.521303] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7160.523457] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 14860288 on dev /dev/mapper/node3b-data physical 14860288
+[ 7160.523488] BTRFS warning (device dm-0): scrub: checksum error at logical 14860288 on dev /dev/mapper/node3b-data, physical 14860288 root 256 inode 257 offset 1228800 length 4096 links 1 (path: f1.bin)
+[ 7160.523492] BTRFS error (device dm-0): bdev /dev/mapper/node3b-data errs: wr 0, rd 0, flush 0, corrupt 1, gen 0
+[ 7160.526031] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+
+# row4.out, full md check BEFORE the fail: md sees the stripe disagree
+##### full md check BEFORE the fail (expect mismatch_cnt > 0) #####
+mismatch_cnt before check = 0
+check rc=0
+mismatch_cnt after check = 8
+sync_action=idle
+
+# row4.out, fail + remove the PARITY member, add the spare, rebuild
+##### fail + remove a DIFFERENT member: the PARITY slot 1 (/dev/loop7) #####
+mdadm: hot removed /dev/loop7 from /dev/md127
+--- /proc/mdstat after remove:
+Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] 
+md127 : active raid5 loop8[2] loop6[0]
+      407552 blocks super 1.2 level 5, 64k chunk, algorithm 2 [3/2] [U_U]
+      
+unused devices: <none>
+
+##### add the spare and wait for the rebuild #####
+mdadm: added /dev/loop9
+add rc=0
+wait_idle rc=0
+--- /proc/mdstat after rebuild:
+Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] 
+md127 : active raid5 loop9[3] loop8[2] loop6[0]
+      407552 blocks super 1.2 level 5, 64k chunk, algorithm 2 [3/3] [UUU]
+      
+unused devices: <none>
+--- mdadm --detail:
+/dev/md127:
+           Version : 1.2
+     Creation Time : Sun Nov 15 06:30:51 2026
+        Raid Level : raid5
+        Array Size : 407552 (398.00 MiB 417.33 MB)
+     Used Dev Size : 203776 (199.00 MiB 208.67 MB)
+      Raid Devices : 3
+     Total Devices : 3
+       Persistence : Superblock is persistent
+
+       Update Time : Sun Nov 15 06:30:56 2026
+             State : clean 
+    Active Devices : 3
+   Working Devices : 3
+    Failed Devices : 0
+     Spare Devices : 0
+
+            Layout : left-symmetric
+        Chunk Size : 64K
+
+Consistency Policy : resync
+
+
+# row4.out, (i) full check AFTER the rebuild: md is now fully consistent
+##### (i) full check AFTER the rebuild: mismatch_cnt #####
+mismatch_cnt before check = 8
+check rc=0
+mismatch_cnt after check = 0
+sync_action=idle
+
+# row4.out, (ii) scrub AFTER the rebuild: the file is still named
+##### (ii) scrub AFTER the rebuild: is the file still named? #####
+=== btrfs scrub start -B /mnt/node3b  [row4-postrebuild] ===
+ERROR: there are 1 uncorrectable errors
+Starting scrub on devid 1
+scrub done for b266eae5-eb18-4567-88f0-7bacbf012038
+Scrub started:    Sun Nov 15 06:30:59 2026
+Status:           finished
+Duration:         0:00:00
+Total to scrub:   4.31MiB
+Rate:             4.31MiB/s
+Error summary:    csum=1
+  Corrected:      0
+  Uncorrectable:  1
+  Unverified:     0
+scrub rc=3
+--- NEW dmesg lines since scrub start (full):
+[ 7166.930308] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7166.932246] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 14860288 on dev /dev/mapper/node3b-data physical 14860288
+[ 7166.932291] BTRFS warning (device dm-0): scrub: checksum error at logical 14860288 on dev /dev/mapper/node3b-data, physical 14860288 root 256 inode 257 offset 1228800 length 4096 links 1 (path: f1.bin)
+[ 7166.932300] BTRFS error (device dm-0): bdev /dev/mapper/node3b-data errs: wr 0, rd 0, flush 0, corrupt 2, gen 0
+[ 7166.932655] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+
+# row4.out, (iii) read T's stripe row from every member: the rebuilt parity equals XOR(data, rot)
+##### (iii) read T's stripe row from every member with dd iflag=direct #####
+slot 0 (/dev/loop6 -> /root/node3b/m0) row sha256=dbe716a778a87193
+slot 1 (/dev/loop9 -> /root/node3b/m3) row sha256=353c27a5465563ef
+slot 2 (/dev/loop8 -> /root/node3b/m2) row sha256=8352289cad1765b7
+--- XOR identity on the rebuilt array (parity slot 1):
+array=/dev/md127 level=raid5 raid_disks=3 member_offset=9027584 present_slots=[0, 1, 2]
+  slot 0: /dev/loop6 -> /root/node3b/m0  sha256[:16]=dbe716a778a87193
+  slot 1: /dev/loop9 -> /root/node3b/m3  sha256[:16]=353c27a5465563ef
+  slot 2: /dev/loop8 -> /root/node3b/m2  sha256[:16]=8352289cad1765b7
+  parity slot 1: (XOR of the other 2 rows) == parity row ? True
+
+## ROW 5
+
+**Verdict ROW 5.** With **both** DUP copies of the csum-tree root leaf damaged,
+`btrfs scrub` on the already-mounted fs reports **8 uncorrectable verify errors**
+(`verify=8`, `Corrected: 0`), naming `tree block 30638080` on **both** `mirror 1`
+(physical 39026688) and `mirror 2` (physical 72581120) as `metadata leaf (level 0)
+in tree 7`. The filesystem **stays mounted read-write** for the running session
+(reads and writes still succeed from cached metadata), but the corruption is
+**fatal on a fresh metadata read**: a plain `umount` + `mount` fails with
+`failed to load root csum` / `open_ctree failed: -5`. The two DUP copies were
+located with certainty (chunk tree + mapping chain, corroborated by oracle scans
+hitting both copies at moff+48), not guessed.
+
+# row5.out, locate + corrupt BOTH DUP copies of the csum-tree root leaf
+##### locate + corrupt BOTH copies of the csum root leaf #####
+=== ROW5: csum tree root leaf ===
+first tree-block line: leaf 30638080
+leaf bytenr = 30638080
+chunk: logical 30408704..63963135 type=METADATA|DUP stripe offsets=[38797312, 72351744]
+stripe 0 copy: LV 39026688 -> md 40075264 -> /dev/loop8 moff 21069824
+stripe 1 copy: LV 72581120 -> md 73629696 -> /dev/loop7 moff 37847040
+oracle scan for leaf-bytenr bytes: [('/dev/loop6', 1575803), ('/dev/loop6', 21086484), ('/dev/loop6', 21166299), ('/dev/loop7', 35130235), ('/dev/loop7', 37847088), ('/dev/loop7', 37863700), ('/dev/loop7', 37943515), ('/dev/loop8', 1575803), ('/dev/loop8', 21069872), ('/dev/loop8', 21086484), ('/dev/loop8', 21166299), ('/dev/loop8', 35130235), ('/dev/loop8', 37863700), ('/dev/loop8', 37943515)]
+pre: stripe0 sha=8a399243621c417f stripe1 sha=8a399243621c417f equal=True
+header csum on INTACT stripe 1: nodesize=16384 stored=0x269bdfb2 match=True
+corrupting last 4 KiB of stripe 0 copy /dev/loop8 at 21082112
+corrupting last 4 KiB of stripe 1 copy /dev/loop7 at 37859328
+post-corruption:
+  stripe 0 (corrupt) /dev/loop8@21069824: sha=7f7e02ca7e3664e5 (changed vs pre: True)
+    stored(bytes 0..3)=0x269bdfb2 crc32c(bytes 32..?)=n/a match=False
+  stripe 1 (corrupt) /dev/loop7@37847040: sha=7f7e02ca7e3664e5 (changed vs pre: True)
+    stored(bytes 0..3)=0x269bdfb2 crc32c(bytes 32..?)=n/a match=False
+corruption verified: BOTH copies changed
+
+# row5.out, findmnt BEFORE the scrub
+##### findmnt options BEFORE scrub #####
+rw,relatime,space_cache=v2,subvolid=5,subvol=/
+
+# row5.out, drop caches, then scrub: 8 uncorrectable verify errors
+##### drop caches, then scrub #####
+scrub rc=3
+ERROR: there are 1 uncorrectable errors
+Starting scrub on devid 1
+scrub done for a738ab60-d18a-4c66-a53a-1ad8f2ef8edf
+Scrub started:    Sun Nov 15 06:36:28 2026
+Status:           finished
+Duration:         0:00:00
+Total to scrub:   4.31MiB
+Rate:             4.31MiB/s
+Error summary:    verify=8
+  Corrected:      0
+  Uncorrectable:  8
+  Unverified:     0
+
+# row5.out, dmesg since scrub start: both mirrors, tree 7, nothing fixable
+--- NEW dmesg since scrub start:
+[ 7496.029753] BTRFS info (device dm-0): scrub: started on devid 1
+[ 7496.044661] BTRFS warning (device dm-0): scrub: tree block 30638080 mirror 1 has bad csum, has 0xb2df9b26 want 0x9f34fc46
+[ 7496.044947] BTRFS warning (device dm-0): scrub: tree block 30638080 mirror 1 has bad csum, has 0xb2df9b26 want 0x9f34fc46
+[ 7496.045063] BTRFS warning (device dm-0): scrub: tree block 30638080 mirror 1 has bad csum, has 0xb2df9b26 want 0x9f34fc46
+[ 7496.045207] BTRFS warning (device dm-0): scrub: tree block 30638080 mirror 1 has bad csum, has 0xb2df9b26 want 0x9f34fc46
+[ 7496.045218] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 30638080 on dev /dev/mapper/node3b-data physical 39026688
+[ 7496.045230] BTRFS warning (device dm-0): scrub: header error at logical 30638080 on dev /dev/mapper/node3b-data, physical 39026688: metadata leaf (level 0) in tree 7
+[ 7496.045241] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 30642176 on dev /dev/mapper/node3b-data physical 39030784
+[ 7496.045249] BTRFS warning (device dm-0): scrub: header error at logical 30642176 on dev /dev/mapper/node3b-data, physical 39030784: metadata leaf (level 0) in tree 7
+[ 7496.045257] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 30646272 on dev /dev/mapper/node3b-data physical 39034880
+[ 7496.045263] BTRFS warning (device dm-0): scrub: header error at logical 30646272 on dev /dev/mapper/node3b-data, physical 39034880: metadata leaf (level 0) in tree 7
+[ 7496.045270] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 30650368 on dev /dev/mapper/node3b-data physical 39038976
+[ 7496.045276] BTRFS warning (device dm-0): scrub: header error at logical 30650368 on dev /dev/mapper/node3b-data, physical 39038976: metadata leaf (level 0) in tree 7
+[ 7496.045874] BTRFS warning (device dm-0): scrub: tree block 30638080 mirror 2 has bad csum, has 0xb2df9b26 want 0x9f34fc46
+[ 7496.046060] BTRFS warning (device dm-0): scrub: tree block 30638080 mirror 2 has bad csum, has 0xb2df9b26 want 0x9f34fc46
+[ 7496.046300] BTRFS warning (device dm-0): scrub: tree block 30638080 mirror 2 has bad csum, has 0xb2df9b26 want 0x9f34fc46
+[ 7496.046410] BTRFS warning (device dm-0): scrub: tree block 30638080 mirror 2 has bad csum, has 0xb2df9b26 want 0x9f34fc46
+[ 7496.046419] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 30638080 on dev /dev/mapper/node3b-data physical 72581120
+[ 7496.046428] BTRFS warning (device dm-0): scrub: header error at logical 30638080 on dev /dev/mapper/node3b-data, physical 72581120: metadata leaf (level 0) in tree 7
+[ 7496.046435] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 30642176 on dev /dev/mapper/node3b-data physical 72585216
+[ 7496.046442] BTRFS warning (device dm-0): scrub: header error at logical 30642176 on dev /dev/mapper/node3b-data, physical 72585216: metadata leaf (level 0) in tree 7
+[ 7496.046449] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 30646272 on dev /dev/mapper/node3b-data physical 72589312
+[ 7496.046455] BTRFS warning (device dm-0): scrub: header error at logical 30646272 on dev /dev/mapper/node3b-data, physical 72589312: metadata leaf (level 0) in tree 7
+[ 7496.046462] BTRFS error (device dm-0): scrub: unable to fixup (regular) error at logical 30650368 on dev /dev/mapper/node3b-data physical 72593408
+[ 7496.046468] BTRFS warning (device dm-0): scrub: header error at logical 30650368 on dev /dev/mapper/node3b-data, physical 72593408: metadata leaf (level 0) in tree 7
+[ 7496.046490] BTRFS info (device dm-0): scrub: finished on devid 1 with status: 0
+
+# row5.out, findmnt AFTER the scrub: still read-write; a read still works
+##### findmnt options AFTER scrub (still rw?) #####
+rw,relatime,space_cache=v2,subvolid=5,subvol=/
+--- /proc/mounts line for the mount:
+/dev/mapper/node3b-data /mnt/node3b btrfs rw,relatime,space_cache=v2,subvolid=5,subvol=/ 0 0
+
+##### can a file still be read through the fs? #####
+read f1 block0: OK
+
+# NODE3B.md, the write through the mounted fs after the corruption: write rc=0: OK
+# NODE3B.md, Extra (forces a fresh metadata read): umount then mount FAILS
+umount rc=0
+mount: /mnt/node3b: can't read superblock on /dev/mapper/node3b-data.
+remount: FAILED rc=32
+BTRFS warning (device dm-0): checksum verify failed on logical 30638080 mirror 1 wanted 0xb2df9b26 found 0x9f34fc46 level 0
+BTRFS warning (device dm-0): checksum verify failed on logical 30638080 mirror 2 wanted 0xb2df9b26 found 0x9f34fc46 level 0
+BTRFS error (device dm-0 state C): failed to load root csum
+BTRFS error (device dm-0 state C): open_ctree failed: -5
