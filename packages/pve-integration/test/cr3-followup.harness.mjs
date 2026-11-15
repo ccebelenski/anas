@@ -241,30 +241,37 @@ function panelWin(id) {
     }
     // ---- (b) no-checksum ---------------------------------------------------------
     const nc = repair([{ block: 1, outcome: 'not-examined', reasonCode: 'no-checksum', reason: 'btrfs stores no checksum' }], { notExamined: 1 })
-    ok('(b) no-checksum: "scrub again"', /scrub again/.test(nc), nc)
+    ok('(b) no-checksum: "run a scrub" (cr3.heal.paths)', /1 block\(s\) were not examined, and nothing was written to them: btrfs keeps no checksum for them now: run a scrub, and repair from what it names\./.test(nc), nc)
     ok('(b) ...and no restore advice', !/[Rr]estore this file|from backup\./.test(nc), nc)
     const ncU = repair([{ block: 1, outcome: 'unrepairable', reasonCode: 'no-checksum', reason: 'x' }], { unrepairable: 1 })
     ok('(b) a no-checksum block in the unrepairable bucket earns no restore advice either', !/Restore this file from backup/.test(ncU), ncU)
 
+    // ---- review R5 — inode-changed words true of both branches -------------------
+    // (the stat-failed branch has no file at the path at all)
+    const ic = repair([{ block: 1, outcome: 'not-examined', reasonCode: 'inode-changed', reason: '/f could not be stat\'ed' }], { notExamined: 1 })
+    ok('review R5: inode-changed says the file the scrub named is no longer at this path', /1 block\(s\) were not examined, and nothing was written to them: the file the scrub named is no longer at this path: run a scrub, and repair from what it names\./.test(ic)
+      && !/a different file is at this path/.test(ic), ic)
+
     // ---- (c) write-unconfirmed ---------------------------------------------------
     const wu = repair([{ block: 1, outcome: 'not-examined', reasonCode: 'write-unconfirmed', reason: 'dd exited 1' }], { notExamined: 1 })
     ok('(c) write-unconfirmed never reads "Nothing was written"', !/Nothing was written/.test(wu), wu)
-    ok('(c) ...it says the write could not be confirmed and the next scrub decides', /could not be confirmed/.test(wu) && /next scrub decides/.test(wu), wu)
-    ok('(c) ...and is no reason to restore', /not a reason to restore/.test(wu) && !/Restore this file from backup/.test(wu), wu)
+    // cr3.heal.paths: the scrub is the confirmation, with both of its results said.
+    ok('(c) ...it says the write could not be confirmed and what the scrub shows', /1 block\(s\) were written through md and the write could not be confirmed\. Run a scrub \(Scrubs → Run now\)\. If it no longer names them, the write landed\. If it names them again, run Repair from parity again once the AHR panel shows the band clean\. If the write fails again while the band shows clean, check that member(&#39;|')s SMART data in Disks \(the file(&#39;|')s Repair cell names it\)\./.test(wu), wu)
+    ok('(c) ...and carries no restore advice', !/[Rr]estore this file|reason to restore/.test(wu), wu)
     const mix = repair([
       { block: 1, outcome: 'not-examined', reasonCode: 'write-unconfirmed', reason: 'dd exited 1' },
       { block: 2, outcome: 'not-examined', reasonCode: 'run-stopped', reason: 'a gate refused' },
     ], { notExamined: 2 })
-    ok('(c) a mix: the run-stopped block keeps "Nothing was written" with its own count', /1 block\(s\) could not be EXAMINED \(the run stopped before reaching them\)\. Nothing was written/.test(mix), mix)
+    ok('(c) a mix: the run-stopped block keeps "nothing was written" with its own count', /1 block\(s\) were not examined, and nothing was written to them: the run stopped before a verdict: the tooltip on each file(&#39;|')s Repair cell says what to do\./.test(mix), mix)
     ok('(c) ...and the unconfirmed block its own sentence', /1 block\(s\) were written through md and the write could not be confirmed/.test(mix), mix)
 
     // ---- (d) postcheckSkipped ----------------------------------------------------
     const ps = repair([{ block: 4, outcome: 'repaired', reason: 'repaired', postcheckSkipped: `md took a recover ${XSS}` }], { repaired: 1 })
-    ok('(d) a repaired block whose post-check was skipped: "repaired; re-scrub to confirm"', /repaired; re-scrub to confirm/.test(ps), ps)
+    ok('(d) a repaired block whose post-check was skipped: "run a scrub to confirm them"', /1 block\(s\) were written with bytes that match their stored checksum; the check after the write did not finish: .*\. Run a scrub \(Scrubs → Run now\) to confirm them: a confirmed block is no longer named\./.test(ps), ps)
     ok('(d) ...with the daemon\'s note, encoded', ps.includes(XSS_ENC) && !ps.includes('<img'), ps)
     const fileOutcome = typeof S.fileOutcome === 'function' ? S.fileOutcome : () => ({})
     const fo = fileOutcome({ path: '/f', blocks: [{ block: 4, outcome: 'repaired', reason: 'r', postcheckSkipped: 'recover' }] })
-    ok('(d) the file\'s Repair cell reads "repaired; re-scrub to confirm" in warn, never ok', /re-scrub to confirm/.test(fo.text) && fo.level === 'warn', JSON.stringify(fo))
+    ok('(d) the file\'s Repair cell reads "repaired; run a scrub to confirm" in warn, never ok', fo.text === '1 repaired; run a scrub to confirm' && fo.level === 'warn', JSON.stringify(fo))
     const fc = fileOutcome({ path: '/f', blocks: [{ block: 4, outcome: 'repaired', reason: 'r' }] })
     ok('(d) control: a confirmed repair stays ok', fc.level === 'ok' && fc.text === '1 repaired', JSON.stringify(fc))
 
@@ -286,7 +293,7 @@ function panelWin(id) {
       { block: 9, outcome: 'unrepairable', reason: 'two bad blocks in one stripe' },
     ], { aboveMd: 1, unrepairable: 2 })
     ok('(e2) a mix: both daemon sentences, and the generic restore line for the plain unrepairable block',
-      /above-md sentence for 7/.test(amdRot) && /rot sentence for 8/.test(amdRot) && /Restore this file from backup/.test(amdRot), amdRot)
+      /above-md sentence for 7/.test(amdRot) && /rot sentence for 8/.test(amdRot) && /Unrepairable: \/f.*\./.test(amdRot) && /The job(&#39;|')s PVE notification says what to restore, per file\./.test(amdRot), amdRot)
   }
 
   // ---- (f) scrub-unproven refusals; (g) writtenAt ---------------------------

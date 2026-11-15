@@ -156,10 +156,20 @@
     // `scrub-unproven`: Rewrite parity / Reconcile mirror refused because the
     // checksum pass they stand on delivered no verdict.
     var SCRUB_UNPROVEN = 'scrub-unproven';
-    // The not-examined reason codes said in words; others read as their code.
+    // cr3.heal.paths: every not-examined code in words, each with what to do
+    // (the daemon's notification says the same per file, at more length).
+    // `run-stopped` points at the file's own reason: the site that stopped the
+    // run wrote what must change first.
     var NOT_EXAMINED_WORDS = {
-        'run-stopped': 'the run stopped before reaching them',
-        'no-checksum': 'btrfs stores no checksum for them now: scrub again'
+        'inline-extent': 'now stored inline in the file\'s metadata: run a scrub to refresh the findings',
+        'hole': 'now a hole: run a scrub to refresh the findings',
+        'owner-scan-truncated': 'the extent list was incomplete: run a scrub to refresh the findings',
+        'band-unreadable': 'the band\'s md facts could not be read: run Repair from parity again once the AHR panel shows the band clean',
+        'unresolvable': 'ANAS could not confirm where the block is: this result is final for this run, report it with the job\'s result',
+        // Review R5: true of both branches (a different file, or none, at the path).
+        'inode-changed': 'the file the scrub named is no longer at this path: run a scrub, and repair from what it names',
+        'run-stopped': 'the run stopped before a verdict: the tooltip on each file\'s Repair cell says what to do',
+        'no-checksum': 'btrfs keeps no checksum for them now: run a scrub, and repair from what it names'
     };
     // Every not-examined code (shared SELFHEAL_NOT_EXAMINED_REASONS): a block
     // carrying one reached no verdict on its bytes, so it never earns restore
@@ -885,8 +895,8 @@
             if (corrected) {
                 var n = Number(corrected.count) || 0;
                 var correctedTip = t('btrfs corrected') + ' ' + n + ' '
-                    + t('metadata read(s) from the mirror copy during that scrub. A member is returning bad '
-                        + 'metadata. Check that disk\'s SMART data in Disks.');
+                    + t('metadata read(s) from the mirror copy during that scrub. Check SMART for each disk '
+                        + 'of this pool in Disks.');
                 spans.push('<span class="anas-scrub-corrected" style="color:var(--anas-warn,#b06a12);" title="'
                     + enc(correctedTip) + '">'
                     + enc(n + ' ' + (n === 1 ? t('metadata read corrected') : t('metadata reads corrected')))
@@ -1578,22 +1588,21 @@
         if (Number(res.unrepairable || 0) > 0 || Number(res.aboveMd || 0) > 0) {
             // D3/D10 — the advice splits on the engine's reason CODE, not on
             // the reason text: a file whose unrepairable blocks ALL read
-            // `csum-unreadable` had nothing to arbitrate against yet (the
-            // metadata holding the checksum is itself damaged, and metadata is
-            // DUP, so a btrfs scrub repairs its copies). Telling the operator
-            // to restore THAT file overwrites data never proven bad. The same
-            // per-file rule the daemon's notification uses (ahr-repair.ts).
+            // `csum-unreadable` had nothing judge it (the checksum that would
+            // could not be read). The same per-file rule the daemon's
+            // notification uses (ahr-repair.ts).
             var csumFiles = [];
-            var restoreFiles = 0;
             var sawRunStopped = false;
             // cr3.followup: the daemon's own sentence for each block the array
             // rebuilds as the same failing bytes: it says why the restore.
             // cr3.sentences: an above-md block's sentence rides here too, and
             // such a block needs no generic "Unrepairable:" line beside it.
             var rotReasons = [];
-            var plainRestore = 0;
+            // cr3.heal.paths: the files the plain restore line names.
+            var plainFiles = [];
             for (var f = 0; f < files.length; f++) {
                 var bad = [];
+                var plainHere = false;
                 var fb = files[f].blocks || [];
                 for (var b = 0; b < fb.length; b++) {
                     // Restore advice rides only a block that was EXAMINED and
@@ -1607,7 +1616,7 @@
                         if ((fb[b].outcome === 'above-md' || fb[b].reasonCode === ARRAY_REBUILDS_ROT) && fb[b].reason) {
                             rotReasons.push(String(fb[b].reason));
                         } else if (fb[b].reasonCode !== CSUM_UNREADABLE) {
-                            plainRestore += 1;
+                            plainHere = true;
                         }
                     }
                 }
@@ -1622,34 +1631,49 @@
                 }
                 if (allCsum) {
                     csumFiles.push(files[f].path);
-                }
-                else {
-                    restoreFiles += 1;
+                } else if (plainHere) {
+                    plainFiles.push(files[f].path);
                 }
             }
             // A result without per-block detail keeps the count's advice, as
             // before — unless a run-stopped block shows the count is not proof.
             // A file whose restore blocks all carry the daemon's own sentence
             // (array-rebuilds-rot, above md) is advised by that sentence alone.
-            if (plainRestore > 0 || (Number(res.unrepairable || 0) > 0 && !restoreFiles
-                && !rotReasons.length && !csumFiles.length && !sawRunStopped)) {
-                lines.push(enc(t('Unrepairable: nothing below the checksum tree can be proven right for '
-                    + 'those blocks. Restore this file from backup.')));
+            // Review D3: WHICH restore applies is per file (a file restore,
+            // or a LUN image restored as a LUN), and only the daemon knows a
+            // LUN; its notification says it per file. One result, one advice,
+            // so the panel names no restore verb of its own.
+            var restoreNote = false;
+            if (plainFiles.length) {
+                lines.push(enc(t('Unrepairable:') + ' ' + plainFiles.join(', ') + '.'));
+                restoreNote = true;
+            } else if (Number(res.unrepairable || 0) > 0 && !rotReasons.length && !csumFiles.length && !sawRunStopped) {
+                lines.push(enc(t('Unrepairable: the files above.')));
+                restoreNote = true;
             }
             for (var rr = 0; rr < rotReasons.length; rr++) {
                 lines.push(enc(rotReasons[rr]));
+                restoreNote = true;
+            }
+            if (restoreNote) {
+                lines.push(enc(t('The job\'s PVE notification says what to restore, per file.')));
             }
             if (csumFiles.length) {
-                lines.push(enc(t('The checksum could not be read reliably for')
-                    + ' ' + csumFiles.join(', ') + '. '
-                    + t('Nothing about those blocks is known yet, so do NOT restore from backup. '
-                        + 'A btrfs scrub repairs metadata copies, so re-scrub after the metadata is repaired.')));
+                lines.push(enc(t('The checksum btrfs keeps for blocks of') + ' ' + csumFiles.join(', ') + ' '
+                    // Review R3: restore only after the scrub named the file
+                    // again and the repair stopped at the same place twice;
+                    // which restore is the notification's (review D3).
+                    + t('could not be read, so nothing judged them and nothing was written. Run a scrub (Scrubs → Run now). '
+                        + 'If it names a file again, run Repair from parity on it from that finding. If the repair stops here '
+                        + 'a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the '
+                        + 'file twice, so restore it (the job\'s PVE notification says how). If the scrub does not name the file, '
+                        + 'nothing remains to do.')));
             }
         }
         if (Number(res.mappingAbort || 0) > 0) {
-            lines.push(enc(Number(res.mappingAbort || 0) + ' ' + t('block(s) were not corrupt at the mapped location. '
-                + 'Nothing was written, nothing to restore: the bytes there still pass their stored '
-                + 'checksum, so the finding no longer describes them.')));
+            lines.push(enc(Number(res.mappingAbort || 0) + ' ' + t('block(s) pass their stored checksum where they sit on disk, '
+                + 'so nothing was written to them. Run a scrub (Scrubs → Run now) to confirm them: a block that passes is '
+                + 'no longer named. If the scrub names one again, ANAS located it wrongly: report it with this job\'s result.')));
         }
         // Seventh pass, F3 — the blocks NOBODY LOOKED AT. "Nothing was written"
         // is all they share with a mapping-abort; "the bytes are fine" is true
@@ -1682,20 +1706,20 @@
             }
             var unexamined = Number(res.notExamined || 0) - unconfirmedWrites;
             if (unexamined > 0) {
-                lines.push(enc(unexamined + ' ' + t('block(s) could not be EXAMINED')
-                    + (why.length ? ' (' + why.join(', ') + ')' : '') + '. '
-                    + t('Nothing was written, and nothing is known about those bytes. This is neither a clean '
-                        + 'bill of health nor a reason to restore. Re-scrub once the reason no longer applies.')));
+                lines.push(enc(unexamined + ' ' + t('block(s) were not examined, and nothing was written to them')
+                    + (why.length ? ': ' + why.join('; ') : '') + '.'));
             }
             if (unconfirmedWrites > 0) {
                 lines.push(enc(unconfirmedWrites + ' ' + t('block(s) were written through md and the write could '
-                    + 'not be confirmed: the bytes, checked against the stored checksum, may or may not have landed. '
-                    + 'The next scrub decides: a block it still names is repaired again. This is not a reason to restore.')));
+                    + 'not be confirmed. Run a scrub (Scrubs → Run now). If it no longer names them, the write landed. '
+                    + 'If it names them again, run Repair from parity again once the AHR panel shows the band clean. '
+                    + 'If the write fails again while the band shows clean, check that member\'s SMART data in Disks '
+                    + '(the file\'s Repair cell names it).')));
             }
         }
         // cr3.followup: blocks written with bytes proven against their stored
         // checksum whose confirmation after the write (post-check, cold read)
-        // did not run. Repaired, not confirmed: a re-scrub confirms them.
+        // did not run. Repaired, not confirmed: a scrub confirms them.
         var unconfirmed = [];
         for (var u = 0; u < files.length; u++) {
             var ub = files[u].blocks || [];
@@ -1707,21 +1731,79 @@
             }
         }
         if (unconfirmed.length) {
-            lines.push(enc(unconfirmed.length + ' ' + t('block(s) repaired; re-scrub to confirm. The confirmation after '
-                + 'the write did not run') + ': ' + unconfirmed.join('; ')));
+            lines.push(enc(unconfirmed.length + ' ' + t('block(s) were written with bytes that match their stored '
+                + 'checksum; the check after the write did not finish') + ': ' + unconfirmed.join('; ') + '. '
+                + t('Run a scrub (Scrubs → Run now) to confirm them: a confirmed block is no longer named.')));
         }
         // Seventh pass, F2 — blocks that were repaired and PROVEN while md still
-        // counts mismatching stripes on their band. The file is right; the
-        // band's parity is not, and Rewrite parity is the verb for that.
+        // counts mismatching stripes on their band. cr3.heal.paths (7b/7c):
+        // the panel offers Rewrite parity only where its evidence gate will
+        // take this run (md counted the band, and the run left no block
+        // unrepaired, above md or not examined); otherwise it says what comes
+        // first. A count of 0 is never a Rewrite-parity row.
         var residuals = res.parityResiduals || [];
-        if (residuals.length) {
-            var bands = [];
-            for (var r = 0; r < residuals.length; r++) {
-                bands.push(residuals[r].band + ' (' + t('mismatch_cnt') + ' ' + residuals[r].mismatchCnt + ')');
+        // Review D1: the verb follows the band's level, as the parity
+        // mismatch window's own buttons do (Rewrite parity for RAID5/6,
+        // Reconcile mirror for RAID1, neither for an unknown level).
+        var countedParity = [];
+        var countedMirror = [];
+        var countedUnknown = [];
+        var uncounted = [];
+        for (var r = 0; r < residuals.length; r++) {
+            var label = residuals[r].band + ' (' + t('mismatch_cnt') + ' ' + residuals[r].mismatchCnt + ')';
+            if (!(Number(residuals[r].mismatchCnt) > 0)) {
+                if (uncounted.indexOf(residuals[r].band) < 0) {
+                    uncounted.push(residuals[r].band);
+                }
+            } else if (residuals[r].level === 'raid1') {
+                countedMirror.push(label);
+            } else if (residuals[r].level === 'raid5' || residuals[r].level === 'raid6') {
+                countedParity.push(label);
+            } else {
+                countedUnknown.push(label);
             }
-            lines.push(enc(t('Repaired, and md still counts mismatching stripes on') + ' ' + bands.join(', ')
-                + '. ' + t('The data is right, and the parity (or Q) member is what disagrees. '
-                    + 'Rewrite parity on that band. No fresh scrub is needed, because this run measured it.')));
+        }
+        for (var ru = 0; ru < files.length; ru++) {
+            var rb = files[ru].blocks || [];
+            for (var rk = 0; rk < rb.length; rk++) {
+                var pr = rb[rk].parityResidual;
+                if (pr && pr.bandIndex !== null && pr.bandIndex !== undefined && !(Number(pr.mismatchCnt) > 0)
+                    && uncounted.indexOf(pr.band) < 0) {
+                    uncounted.push(pr.band);
+                }
+            }
+        }
+        var unrepairedAny = Number(res.unrepairable || 0) + Number(res.aboveMd || 0) + Number(res.notExamined || 0);
+        var firstStep = unrepairedAny > 0
+            ? t('Deal with the files above, run a scrub (Scrubs → Run now)')
+            : t('Run a scrub (Scrubs → Run now)');
+        var refusedWhile = t('refuses while this run left blocks unrepaired, above md or not examined.');
+        if (countedParity.length) {
+            lines.push(enc(unrepairedAny === 0
+                ? t('Repaired, and md still counts mismatching stripes on') + ' ' + countedParity.join(', ') + ', '
+                    + t('so their parity (or Q) disagrees with the data. Run Rewrite parity on each '
+                        + '(Scrubs → the pool\'s parity mismatch → Rewrite parity).')
+                : t('md still counts mismatching stripes on') + ' ' + countedParity.join(', ') + ', '
+                    + t('and Rewrite parity') + ' ' + refusedWhile + ' '
+                    + firstStep + t(', then run Rewrite parity from that scrub\'s parity mismatch.')));
+        }
+        if (countedMirror.length) {
+            lines.push(enc(unrepairedAny === 0
+                ? t('Repaired, and md still counts stripes where the mirror legs differ on') + ' ' + countedMirror.join(', ') + '. '
+                    + t('Run Reconcile mirror on each (Scrubs → the pool\'s parity mismatch → Reconcile mirror).')
+                : t('md still counts stripes where the mirror legs differ on') + ' ' + countedMirror.join(', ') + ', '
+                    + t('and Reconcile mirror') + ' ' + refusedWhile + ' '
+                    + firstStep + t(', then run Reconcile mirror from that scrub\'s parity mismatch.')));
+        }
+        if (countedUnknown.length) {
+            lines.push(enc(t('md still counts mismatching stripes on') + ' ' + countedUnknown.join(', ') + ', '
+                + t('and their RAID level is not known here, so no verb is offered.') + ' '
+                + firstStep + t(': its parity mismatch window offers the verb for each band.')));
+        }
+        if (uncounted.length) {
+            lines.push(enc(t('A direct read found') + ' ' + uncounted.join(', ') + ' '
+                + t('inconsistent after the repair, and md\'s check counted no mismatch there.') + ' '
+                + firstStep + ' ' + t('so md counts it, then run the verb its parity mismatch window offers for that band.')));
         }
         panel.update(lines.join('<br>'));
     }
@@ -1739,7 +1821,7 @@
             // cr3.followup: written and proven, but the confirmation after the
             // write did not run — not the same as a confirmed repair.
             if (kind === 'repaired' && blocks[i].postcheckSkipped) {
-                kind = t('repaired; re-scrub to confirm');
+                kind = t('repaired; run a scrub to confirm');
             }
             if (!byKind[kind]) {
                 byKind[kind] = 0;

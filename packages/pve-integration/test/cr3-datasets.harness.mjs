@@ -181,14 +181,14 @@ if (typeof S.showMirrorResult === 'function' && typeof S.showRepairResult === 'f
 
   const r = panelWin('#repairResult')
   S.showRepairResult(r.win, { status: 'completed', result: { blocks: 2, repaired: 0, unrepairable: 0, aboveMd: 0, mappingAbort: 0, notExamined: 2, files: [{ path: '/a', blocks: [{ block: 1, outcome: 'not-examined', reasonCode: 'run-stopped', reason: 'a gate refused' }, { block: 2, outcome: 'not-examined', reasonCode: 'run-stopped', reason: 'x' }] }] } })
-  ok('run-stopped renders as not examined, with its reason', /could not be EXAMINED \(the run stopped before reaching them\)/.test(r.panel.html), r.panel.html)
+  ok('run-stopped renders as not examined, pointing at its reason', /2 block\(s\) were not examined, and nothing was written to them: the run stopped before a verdict/.test(r.panel.html), r.panel.html)
   ok('...and never restore-from-backup advice', !/Restore this file from backup/.test(r.panel.html), r.panel.html)
   const r2 = panelWin('#repairResult')
   S.showRepairResult(r2.win, { status: 'completed', result: { blocks: 1, repaired: 0, unrepairable: 1, aboveMd: 0, mappingAbort: 0, notExamined: 0, files: [{ path: '/a', blocks: [{ block: 1, outcome: 'unrepairable', reasonCode: 'run-stopped', reason: 'stopped' }] }] } })
   ok('an unrepairable count whose blocks are run-stopped carries no restore advice', !/Restore this file from backup/.test(r2.panel.html), r2.panel.html)
   const r3 = panelWin('#repairResult')
   S.showRepairResult(r3.win, { status: 'completed', result: { blocks: 1, repaired: 0, unrepairable: 1, aboveMd: 0, mappingAbort: 0, notExamined: 0, files: [{ path: '/a', blocks: [{ block: 1, outcome: 'unrepairable', reasonCode: 'both-fail', reason: 'proven lost' }] }] } })
-  ok('an examined, proven-lost block still carries restore advice', /Restore this file from backup/.test(r3.panel.html), r3.panel.html)
+  ok('an examined, proven-lost block still carries restore advice', /Unrepairable: \/a\./.test(r3.panel.html) && /The job(&#39;|')s PVE notification says what to restore, per file\./.test(r3.panel.html), r3.panel.html)
 }
 else {
   ok('scrub result renderers reachable', false)

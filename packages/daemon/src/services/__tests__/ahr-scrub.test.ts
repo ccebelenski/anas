@@ -17,6 +17,7 @@ import {
   correctedReadsFromMessages,
   countErrorSummary,
   findingPath,
+  findingsBody,
   journalSince,
   kernelJournalMessages,
   metadataCorrectedSentence,
@@ -479,7 +480,10 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     assert.ok(notify, 'findings must notify')
     assert.equal(notify!.args[2], 'warning')
     assert.equal(notify!.args[3], 'AHR scrub found errors')
-    assert.ok(notify!.args[4].includes('csum=2'))
+    // cr3.heal.paths (report S1/S2): nothing named, so no repair is offered;
+    // SMART is the check for errors that name no file.
+    assert.ok(notify!.args[4].startsWith('btrfs scrub on pool \'t2\' reported: csum=2. Check SMART for each disk of pool \'t2\' in Disks.'), notify!.args[4])
+    assert.doesNotMatch(notify!.args[4], /Latent corruption|No per-file attribution/)
   })
 
   // Bug #7 (code review): a `resync=PENDING` md check (syncPending set, sync
@@ -1070,7 +1074,11 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     assert.equal(result.btrfsErrors, null)
     const warn = executor.calls.filter(c => c.command === '/usr/bin/perl').at(-1)!
     assert.equal(warn.args[2], 'warning')
-    assert.match(warn.args[4], /not a clean bill/)
+    // cr3.heal.paths: no sentence that says what a result is NOT; the
+    // instruction instead.
+    // Review R4: the rerun has a stop.
+    assert.match(warn.args[4], /Nothing in this run proved the files' checksums\. Run the scrub again \(Scrubs → Run now\) when the cause named above has passed\. If the scrub ends the same way again, report it with this job's result\./)
+    assert.doesNotMatch(warn.args[4], /not a clean bill/)
   })
 
   it('refuses an unmounted pool', async () => {
@@ -1757,7 +1765,31 @@ describe('scrubAhrPool — findings (story selfheal.3)', () => {
     assert.ok(!e.calls.some(c => c.command === '/usr/bin/dd' && c.args[0].includes('@snapshots')))
 
     const body = e.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
-    assert.ok(body.includes('in a snapshot, outside the mounted tree'), body)
+    // Review D2: neither file is one Repair from parity accepts (the findings
+    // window's `repairableFinding`), so no repair instruction; each line says
+    // why in the window's own words.
+    assert.equal(body.split('\n\nNot checked')[0], 'btrfs scrub on pool \'t2\' reported: csum=2. Repair from parity cannot work on any file it named; each line below says why.\n\n'
+    + 'Affected files (2 of 2 reported error(s) attributed):\n'
+    + `  ${NESTED}: cannot be repaired: no bad block could be named for this corruption: extent could not be resolved (findmnt found no filesystem at ${MOUNTPOINT})\n`
+    + '  @snapshots/nightly/f1.bin: cannot be repaired: this finding is inside a snapshot, outside the pool\'s mounted tree. Repair works on the live @data tree only')
+  })
+
+  it('review D2: a mix names Repair from parity for the repairable files only, and says why for the rest', () => {
+    const result = {
+      findings: [
+        { path: `${MOUNTPOINT}/ok.bin`, badBlocks: [3, 4] },
+        { path: `${MOUNTPOINT}/gone.bin`, badBlocks: [], missing: true },
+        { path: `${MOUNTPOINT}/healed.bin`, badBlocks: [] },
+      ],
+      errorsReported: 3,
+      errorsAttributed: 3,
+    } as unknown as Parameters<typeof findingsBody>[2]
+    assert.equal(findingsBody(pool(), 'csum=3', result), 'btrfs scrub on pool \'t2\' reported: csum=3. '
+    + 'Run Repair from parity on the 1 file(s) below listed with bad blocks (Scrubs → the pool\'s findings). The others cannot be repaired; each line says why.\n\n'
+    + 'Affected files (3 of 3 reported error(s) attributed):\n'
+    + `  ${MOUNTPOINT}/ok.bin: 2 bad 4K block(s)\n`
+    + `  ${MOUNTPOINT}/gone.bin: cannot be repaired: the file no longer exists: it was deleted since the scrub named it\n`
+    + `  ${MOUNTPOINT}/healed.bin: cannot be repaired: no block inside the reported stripe failed to read. There is nothing to repair`)
   })
 
   it('a FLAT pool mounts the top level — the resolved subvolume IS a directory under it', async () => {
@@ -2116,7 +2148,9 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     assert.equal(executor.calls.filter(c => c.command === '/usr/bin/dd' && c.args[0] === `if=${F}`).length, 512)
 
     const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
-    assert.ok(body.includes('block not identified'), body)
+    // Review D2: the findings window's words, and no repair instruction.
+    assert.ok(body.includes('cannot be repaired: no bad block could be named for this corruption: '), body)
+    assert.ok(!body.includes('Run Repair from parity'), body)
   })
 
   /**
@@ -2194,7 +2228,9 @@ describe('scrubAhrPool — compressed-extent findings (selfheal.8)', () => {
     assert.match(finding?.reason ?? '', /extent could not be resolved/)
     assert.equal(finding?.probedUnverified, true, 'the window it looked in was never verified either')
     const body = executor.calls.find(c => c.command === '/usr/bin/perl')!.args[4]
-    assert.ok(body.includes('block not identified'), body)
+    // Review D2: the findings window's words, and no repair instruction.
+    assert.ok(body.includes('cannot be repaired: no bad block could be named for this corruption: '), body)
+    assert.ok(!body.includes('Run Repair from parity'), body)
     // The unidentified arm already names the reason as its block text — the
     // unverified suffix must not print the same reason a second time (fourth pass).
     assert.ok(!body.includes('search window unverified'), body)
@@ -2390,6 +2426,10 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     assert.equal(warns[0].args[3], 'AHR scrub: parity mismatch on t2-r1')
     assert.equal(warns[1].args[3], 'AHR scrub found errors')
     assert.ok(warns[1].args[4].includes('f1.bin'))
+    // cr3.heal.paths (report S1), review D2: the file named here has no bad
+    // block identified, so the verb is not offered and the line says why.
+    assert.match(warns[1].args[4], /^btrfs scrub on pool 't2' reported: [^\n]+\. Repair from parity cannot work on any file it named; each line below says why\./)
+    assert.match(warns[1].args[4], /f1\.bin: cannot be repaired: no bad block could be named for this corruption/)
   })
 
   it('parity mismatch and errors that name NO file: the second notification refuses to call the data clean', async () => {
@@ -2407,15 +2447,13 @@ describe('scrub per-band record and notifications (D1/D8)', () => {
     assert.equal(warns[0].args[3], 'AHR scrub: parity mismatch on t2-r1')
     assert.equal(warns[1].args[3], 'AHR scrub found errors')
     assert.equal(warns[2].args[3], 'AHR scrub: parity mismatch on t2-r1')
-    assert.ok(warns[2].args[4].includes('cannot tell whether the rot is in parity or in data'), warns[2].args[4])
-    // N6: the parity ASSERTION belongs only to the clean arm — this one does
-    // not know where the rot is, so it must not claim the parity member…
-    assert.ok(!warns[2].args[4].includes('The rot is in the PARITY'), warns[2].args[4])
-    // …and it says what to do FIRST rather than offering the verb.
-    assert.ok(warns[2].args[4].includes('Do the data first'), warns[2].args[4])
-    assert.ok(warns[2].args[4].includes('scrub pool \'t2\' again'), warns[2].args[4])
-    assert.ok(warns[2].args[4].includes('Rewrite parity is refused while a finding stands'), warns[2].args[4])
-    assert.ok(!warns[2].args[4].includes('Nothing in ANAS repairs parity'), warns[2].args[4])
+    // N6: the parity ASSERTION belongs only to the clean arm. cr3.heal.paths
+    // (report S6): this arm named no file, so it never says "repair the files
+    // a scrub names"; it names the check (SMART) and what a later scrub must
+    // show before Rewrite parity is offered.
+    assert.equal(warns[2].args[4], 'Parity mismatch on t2-r1 (8). The checksum scrub reported errors that name no file, '
+    + 'so this run cannot say whether the rot is in parity or in data. Check SMART for each disk of pool \'t2\' in Disks. '
+    + 'Rewrite parity is offered once a scrub of the pool (Scrubs → Run now) reports no checksum errors.')
   })
 
   it('a band md never started is recorded, not coverage — checkedArrays stays honest', async () => {
@@ -2584,7 +2622,7 @@ describe('corrected metadata reads (selfheal.12, GT-20)', () => {
     assert.equal(notify!.args[3], 'AHR scrub: metadata corrected from the mirror')
     assert.ok(notify!.args[4].includes(
       'btrfs corrected 1 metadata read(s) from the mirror copy during this run. '
-      + 'A member is returning bad metadata. Check that disk\'s SMART data in Disks.',
+      + 'Check SMART for each disk of pool \'t2\' in Disks.',
     ), notify!.args[4])
     assert.equal(e.calls.filter(c => c.command === '/usr/bin/perl').length, 1, 'one notification')
   })
@@ -2598,7 +2636,7 @@ describe('corrected metadata reads (selfheal.12, GT-20)', () => {
     const result = await liveScrubPass(e, scrubAhrPool(e, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 }))
     assert.equal(result.metadataCorrected, undefined)
     assert.equal(e.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'a truly clean scrub stays silent (§7.3)')
-    assert.equal(metadataCorrectedSentence({ count: 3, devices: [] }).includes('btrfs corrected 3 metadata read(s)'), true)
+    assert.equal(metadataCorrectedSentence({ count: 3, devices: [] }, 'tank').includes('btrfs corrected 3 metadata read(s)'), true)
   })
 
   it('the sentence rides the EXISTING notification when the scrub already found errors', async () => {

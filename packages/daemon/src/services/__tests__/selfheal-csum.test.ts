@@ -308,6 +308,8 @@ describe('selfheal csum — reading it off the LV', () => {
         assert.ok(error instanceof CsumUnreadableError)
         assert.equal(error.reasonCode, 'csum-unreadable')
         assert.match(error.message, /failed its own checksum on both copies/)
+        // cr3.heal.paths: a fact, no negative; the job's sentence says what to do.
+        assert.ok(error.message.endsWith('). The data block was not judged.'), error.message)
         assert.doesNotMatch(error.message, /Restore .* from backup/)
         return true
       },

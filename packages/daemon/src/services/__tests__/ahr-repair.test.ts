@@ -1,8 +1,11 @@
-import type { AhrPool, SelfhealOutcome, SelfhealOutcomeKind, SelfhealReasonCode } from '@anas/shared'
+import type { AhrPool, Job, SelfhealOutcome, SelfhealOutcomeKind, SelfhealReasonCode } from '@anas/shared'
+import type { MdGeometry } from '../selfheal-map.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { AhrRepairRequest, AhrRepairResult, SELFHEAL_CSUM_UNREADABLE, SELFHEAL_RUN_STOPPED, SELFHEAL_WRITE_UNCONFIRMED } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
+import { mirrorReconcileEvidence } from '../ahr-mirror-reconcile.js'
+import { parityRewriteArrayRefusal, parityRewriteEvidence } from '../ahr-parity-rewrite.js'
 import { repairAhrFiles } from '../ahr-repair.js'
 import { SelfhealRunError } from '../selfheal-repair.js'
 
@@ -53,6 +56,22 @@ function notification(exec: MockExecutor): { severity: string, title: string, bo
     return null
   return { severity: call.args[2], title: call.args[3], body: call.args[4] }
 }
+
+/** cr3.heal.paths — the job paragraph for agreeing-bad blocks (coordinator decision 1), one block. */
+const AGREEING_BAD_1 = 'Every copy the array holds of 1 block(s) gives the same bytes, and those bytes fail their stored checksum: '
+  + 'they were already wrong when md wrote them, so this result is final. Nothing was written to them. '
+  + 'Test the node\'s memory with memtest86+ (a boot menu entry where the package is installed), then restore the files listed above from a backup if one exists.'
+
+/** cr3.heal.paths — the mapping-abort paragraph, two blocks. */
+const MAPPING_ABORT_2 = '2 block(s) pass their stored checksum where they sit on disk, so nothing was written to them. '
+  + 'Run a scrub (Scrubs → Run now) to confirm them: a block that passes is no longer named. '
+  + 'If the scrub names one again, ANAS located it wrongly: report it with this job\'s result.'
+
+/** cr3.heal.paths — the per-file csum-unreadable line for an ordinary file. */
+// Review R3 (safety): the restore is offered only after the scrub named the
+// file again AND the repair stopped at the same place a second time.
+const CSUM_UNREADABLE_FILE = 'the checksum btrfs keeps for these blocks could not be read, so nothing judged them and nothing was written. '
+  + 'Run a scrub (Scrubs → Run now). If it names this file again, run Repair from parity on it from that finding. If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the file twice, so restore this file from a backup if one exists. If the scrub does not name the file, nothing remains to do.'
 
 describe('AHR repair job — the four honest counts (review R9)', () => {
   it('sorts every verdict into repaired / unrepairable / aboveMd / mappingAbort, each as itself', async () => {
@@ -112,7 +131,9 @@ describe('AHR repair job — the four honest counts (review R9)', () => {
     const bad = result.files[0].blocks.find(b => b.block === 2)!
     assert.equal(bad.outcome, 'not-examined')
     assert.equal(bad.reasonCode, SELFHEAL_RUN_STOPPED)
-    assert.equal(bad.reason, 'btrfs tree walk died')
+    // cr3.heal.paths (coordinator decision 4): no rerun is offered for a
+    // thrown error — nothing names what would change.
+    assert.equal(bad.reason, 'btrfs tree walk died. Nothing was written. This result is final for this run. Report it with this job\'s result.')
   })
 
   it('cr3 AHR-HEAL-H1: a block the engine threw on AFTER its write is REPAIRED with the confirmation skipped — never a restore', async () => {
@@ -149,8 +170,9 @@ describe('AHR repair job — the four honest counts (review R9)', () => {
     )
     const body = notification(exec)!.body
     assert.doesNotMatch(body, /restore this file from backup/)
-    assert.match(body, /stopped before it reached a verdict \(cannot pin \/mnt: snapshot failed\)/)
-    assert.match(body, /run the repair again/)
+    assert.ok(body.includes('  /a.bin: cannot pin /mnt: snapshot failed. Nothing was written. '
+      + 'This result is final for this run. Report it with this job\'s result.'), body)
+    assert.doesNotMatch(body, /run the repair again|Run Repair from parity again/i)
   })
 
   it('runs strictly one block at a time, in the order they were asked for', async () => {
@@ -250,9 +272,12 @@ describe('AHR repair job — the one notification', () => {
     assert.equal(notify.severity, 'warning')
     assert.match(notify.body, /\/a\.bin: restore this file from backup/)
     // cr3.sentences: the above-md file is on the restore list, with "if one
-    // exists", and the cause above the disks is said for the job.
-    assert.match(notify.body, /\/b\.bin: every copy the array holds of this block gives the same failing bytes, .*restore this file from a backup if one exists/)
-    assert.match(notify.body, /Every copy the array holds of 1 block\(s\) gives the same bytes, and those bytes fail the stored checksum\. Nothing was written to them\. Disks that agree on bytes that fail their checksum point to a cause above the disks: memory, the controller or software\. Check those before trusting new writes\./)
+    // exists", and the cause is said for the job. cr3.heal.paths: final, and
+    // the memory test is the one check named.
+    assert.ok(notify.body.includes('  /b.bin: every copy the array holds of these blocks gives the same failing bytes, and this result is final: '
+      + 'restore this file from a backup if one exists'), notify.body)
+    assert.ok(notify.body.includes(AGREEING_BAD_1), notify.body)
+    assert.doesNotMatch(notify.body, /controller or software|checksum record is what is wrong/)
     // An implication, never a certainty.
     assert.doesNotMatch(notify.body, /proves|definitely/)
   })
@@ -271,11 +296,11 @@ describe('AHR repair job — the one notification', () => {
     const notify = notification(exec)!
     assert.equal(notify.severity, 'warning')
     assert.equal(notify.title, 'AHR repair from parity left blocks unrepaired')
-    assert.ok(notify.body.includes('Above-md blocks have no source of truth left below the checksum tree. What to restore, per file:\n'
-      + '  /b.bin: every copy the array holds of this block gives the same failing bytes, so the repair cannot fix it and '
-      + 'running it again will not change that. The file is damaged at this block unless the checksum record is what is wrong: '
+    assert.ok(notify.body.includes('ANAS could not repair these blocks from the array. What to do, per file '
+      + '(a file restore is Backup → the backup task → Restore, or Restore from repository):\n'
+      + '  /b.bin: every copy the array holds of these blocks gives the same failing bytes, and this result is final: '
       + 'restore this file from a backup if one exists'), notify.body)
-    assert.match(notify.body, /point to a cause above the disks: memory, the controller or software/)
+    assert.ok(notify.body.includes(AGREEING_BAD_1), notify.body)
     assert.doesNotMatch(notify.body, /reason to restore|need no restore|Unrepairable blocks/, notify.body)
   })
 
@@ -295,7 +320,9 @@ describe('AHR repair job — the one notification', () => {
       },
     )
     const notify = notification(exec)!
-    assert.match(notify.body, /this block backs iSCSI LUN iqn\.2026-01\.org\.anas:storage\.tank\/3\. Restore the LUN image from a PBS backup \(Backup → Restore as new LUN\) or the guest's own backup, if one exists: every copy the array holds of this block gives the same failing bytes/)
+    assert.ok(notify.body.includes(`  ${LUN}: every copy the array holds of these blocks gives the same failing bytes, and this block backs `
+      + 'iSCSI LUN iqn.2026-01.org.anas:storage.tank/3. Restore the LUN image from a PBS backup (Backup → Restore as new LUN) '
+      + 'or the guest\'s own backup, if one exists'), notify.body)
     assert.doesNotMatch(notify.body, /restore this file from/)
   })
 
@@ -316,8 +343,9 @@ describe('AHR repair job — the one notification', () => {
     // But the advice is the opposite of "restore from backup", and it reads the
     // ONE number (review R9).
     assert.doesNotMatch(notify.body, /restore this file from backup/)
-    assert.match(notify.body, /still pass their stored checksum/)
-    assert.match(notify.body, /they need no restore/)
+    // cr3.heal.paths: a scrub confirms, and a block it names again is reported.
+    assert.ok(notify.body.includes(MAPPING_ABORT_2), notify.body)
+    assert.equal(notify.title, 'AHR repair from parity completed; run a scrub to confirm')
   })
 
   it('a mix keeps each sentence with the blocks it belongs to (selfheal.7 F2, R9)', async () => {
@@ -340,7 +368,7 @@ describe('AHR repair job — the one notification', () => {
     assert.match(notify.body, /0 repaired, 1 unrepairable, 0 above md, 1 not corrupt at the mapped location/)
     // "restore from backup" belongs to the TRUE unrepairable only.
     assert.match(notify.body, /restore this file from backup/)
-    assert.match(notify.body, /they need no restore/)
+    assert.ok(notify.body.includes('1 block(s) pass their stored checksum where they sit on disk'), notify.body)
   })
 
   // Design review 2026-09-14, D10 — "restore this file from backup" was wrong
@@ -396,7 +424,7 @@ describe('AHR repair job — the one notification', () => {
       },
     )
     const notify = notification(exec)!
-    assert.match(notify.body, /\/a\.bin: the file's checksum could not be read reliably. Re-scrub after the metadata is repaired/)
+    assert.ok(notify.body.includes(`  /a.bin: ${CSUM_UNREADABLE_FILE}`), notify.body)
     assert.doesNotMatch(notify.body, /restore this file from backup/)
   })
 
@@ -434,14 +462,14 @@ describe('AHR repair job — the one notification', () => {
       },
     )
     const notify = notification(exec)!
-    // No restore verb of any kind…
+    // No plain file restore; the LUN restore is offered only in the branch
+    // where the scrub shows the checksum record itself is damaged
+    // (cr3.heal.paths), with the LUN identity composed in.
     assert.doesNotMatch(notify.body, /restore this file from backup/)
-    assert.doesNotMatch(notify.body, /Restore as new LUN/)
-    assert.doesNotMatch(notify.body, /restore the LUN image/)
-    // …and the re-scrub advice stands, with the LUN identity composed in so the
-    // operator still knows what the file is.
-    assert.match(notify.body, /the file's checksum could not be read reliably. Re-scrub after the metadata is repaired/)
-    assert.match(notify.body, /backs iSCSI LUN iqn\.2026-01\.org\.anas:storage\.tank\/3/)
+    assert.ok(notify.body.includes(`  ${LUN}: this block backs iSCSI LUN iqn.2026-01.org.anas:storage.tank/3, and the checksum btrfs keeps for these blocks `
+      + 'could not be read, so nothing judged them and nothing was written. Run a scrub (Scrubs → Run now). If it names this file again, run Repair from parity on it from that finding. If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the file twice, so '
+      + 'restore the LUN image from a PBS backup (Backup → Restore as new LUN) or the guest\'s own backup, if one exists. If the scrub does not name the file, nothing remains to do.'), notify.body)
+    assert.doesNotMatch(notify.body, /errors that name no file/, 'review R3: unrelated I/O errors never send the reader to a restore')
   })
 
   it('a LUN image with a MIXED unrepairable file still gets the LUN restore advice (N5, the other side)', async () => {
@@ -513,7 +541,7 @@ describe('AHR repair job — the one notification', () => {
       },
     )
     const notify = notification(exec)!
-    assert.match(notify.body, /Re-scrub after the metadata is repaired/)
+    assert.ok(notify.body.includes(CSUM_UNREADABLE_FILE), notify.body)
     assert.doesNotMatch(notify.body, /restore this file from backup/)
   })
 
@@ -574,7 +602,8 @@ describe('AHR repair job — the one notification', () => {
       { repair: async (_e, req) => outcome(req.file, req.block, 'repaired', 'ok') },
     )
     const notify = notification(exec)!
-    assert.match(notify.body, /…and 3 more/)
+    assert.match(notify.body, /\n {2}and 3 more/)
+    assert.doesNotMatch(notify.body, /…/, 'no ellipsis character (product voice)')
     assert.ok(notify.body.includes('/f19.bin'), 'the 20th file is listed')
     assert.ok(!notify.body.includes('/f20.bin'), 'the 21st is not')
   })
@@ -647,13 +676,17 @@ describe('AHR repair schemas — round trips', () => {
  * a reassurance about blocks nobody looked at.
  */
 describe('AHR repair job — the not-examined bucket (F3)', () => {
-  const REASONS: [string, RegExp][] = [
-    ['inline-extent', /Re-scrub after the file is rewritten/],
-    ['hole', /every LUN image ANAS creates is sparse/],
-    ['owner-scan-truncated', /the back-reference scan hit its bound/],
-    ['band-unreadable', /the array was not answering/],
-    ['unresolvable', /the mapping and the array agree again/],
-    ['inode-changed', /a fresh scrub has named the file that is at this path now/],
+  // cr3.heal.paths: the engine's reason is the fact, the advice the one
+  // instruction after it — full strings. `owner-scan-truncated` has no entry
+  // (only the scrub raises it) and falls back to `unresolvable`'s.
+  const REPORT = 'This result is final for this run. Report it with this job\'s result.'
+  const REASONS: [string, string][] = [
+    ['inline-extent', 'Run a scrub (Scrubs → Run now) to refresh the findings: the extent the scrub named is no longer part of this file, and damage in the file now is named afresh.'],
+    ['hole', 'Run a scrub (Scrubs → Run now) to refresh the findings: btrfs keeps no checksum for a hole.'],
+    ['owner-scan-truncated', REPORT],
+    ['band-unreadable', 'Run Repair from parity again once the AHR panel shows that band clean. If it stops here again while the band shows clean, report it with this job\'s result.'],
+    ['unresolvable', REPORT],
+    ['inode-changed', 'Run a scrub (Scrubs → Run now) and repair from what it names: the file the scrub named is no longer at this path.'],
   ]
 
   for (const [code, advice] of REASONS) {
@@ -670,10 +703,9 @@ describe('AHR repair job — the not-examined bucket (F3)', () => {
       assert.equal(result.mappingAbort, 0, 'never folded into the bucket that says the bytes are fine')
       assert.equal(result.unrepairable, 0, 'and never into the bucket that advises a restore')
       const body = notification(exec)!.body
-      assert.match(body, /could not be EXAMINED/)
-      assert.match(body, new RegExp(`could not be examined: ${code}`))
-      assert.match(body, advice)
-      assert.ok(!/need no restore/.test(body), body)
+      assert.ok(body.includes('The repair reached no verdict on 1 block(s). Nothing was written to them. What to do, per file:\n'
+        + `  /a.bin: the chain stopped here. ${advice}`), body)
+      assert.ok(!/need no restore|nothing is known/.test(body), body)
     })
   }
 
@@ -690,7 +722,7 @@ describe('AHR repair job — the not-examined bucket (F3)', () => {
     const notify = notification(exec)!
     assert.equal(notify.severity, 'warning')
     assert.ok(!/restore this file from backup/.test(notify.body), notify.body)
-    assert.match(notify.body, /nothing is known about this file's bytes/)
+    assert.doesNotMatch(notify.body, /nothing is known|neither a clean bill/)
   })
 
   it('one file with two different reasons gets both sentences', async () => {
@@ -703,8 +735,8 @@ describe('AHR repair job — the not-examined bucket (F3)', () => {
       { repair: async (_e, req) => outcome(req.file, req.block, 'not-examined', 'stopped.', req.block === 1 ? 'hole' : 'inline-extent') },
     )
     const body = notification(exec)!.body
-    assert.match(body, /could not be examined: hole/)
-    assert.match(body, /could not be examined: inline-extent/)
+    assert.match(body, /stopped\. Run a scrub \(Scrubs → Run now\) to refresh the findings: btrfs keeps no checksum for a hole\./)
+    assert.match(body, /stopped\. Run a scrub \(Scrubs → Run now\) to refresh the findings: the extent the scrub named is no longer part of this file/)
   })
 })
 
@@ -778,9 +810,147 @@ describe('AHR repair job — parity residuals (F2)', () => {
     await repairAhrFiles(exec, BANDED, [{ path: '/a.bin', blocks: [1] }], () => {}, { repair: withResidual(2, 8) as never })
     const notify = notification(exec)!
     assert.equal(notify.severity, 'warning', 'every block repaired is not a clean run while a band still mismatches')
-    assert.match(notify.body, /Run Rewrite parity on:/)
-    assert.match(notify.body, /tank-r2 \(\/dev\/md127\): mismatch_cnt 8/)
+    assert.equal(notify.title, 'AHR repair from parity completed: rewrite parity on tank-r2')
+    assert.ok(notify.body.includes('The blocks on the bands below were repaired and proven cold against their stored checksum, and md still counts '
+      + 'mismatching stripes there, so their parity (or Q) disagrees with the data. '
+      + 'Run Rewrite parity on each (Scrubs → the pool\'s parity mismatch → Rewrite parity):\n  tank-r2 (/dev/md127): mismatch_cnt 8'), notify.body)
     assert.ok(!/restore/i.test(notify.body), notify.body)
+  })
+})
+
+/**
+ * cr3.heal.paths — the three defects the coordinator verified in code (7a/7b/7c).
+ * The notification must say what the product will actually accept: Rewrite
+ * parity's evidence gate (`parityRewriteEvidence` → `repairEvidence`) is the
+ * oracle, read here on the very result the job produced.
+ */
+describe('AHR repair job — residual advice the product accepts (cr3.heal.paths 7a/7b/7c)', () => {
+  const BANDED = pool({ arrays: [{ band: 2, device: '/dev/md/tank-r2', level: 'raid6', kernelName: 'md127' }] as unknown as AhrPool['arrays'] })
+
+  function asJob(result: unknown): Job {
+    return { id: 'job-r', status: 'completed', operation: 'ahr.repair', progress: null, createdAt: '2026-11-15T00:00:00.000Z', createdBy: 'root@pam', startedAt: null, completedAt: null, result, error: null }
+  }
+
+  function residualOn(file: string, block: number, mismatchCnt: number): SelfhealOutcome {
+    return {
+      ...outcome(file, block, 'repaired', 'repaired, band still mismatching'),
+      parityResidual: { array: '/dev/md127', band: 'tank-r2', bandIndex: 2, mismatchCnt },
+    }
+  }
+
+  it('7a: every block repaired with a parity residual is titled by the residual, never "left blocks unrepaired"', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(exec, BANDED, [{ path: '/a.bin', blocks: [1, 2] }], () => {}, {
+      repair: async (_e, req) => residualOn(req.file, req.block, 8),
+    })
+    const notify = notification(exec)!
+    assert.equal(notify.severity, 'warning')
+    assert.equal(notify.title, 'AHR repair from parity completed: rewrite parity on tank-r2')
+    assert.equal(parityRewriteEvidence('tank', asJob(result), 2).ok, true, 'and Rewrite parity accepts what the title offers')
+  })
+
+  it('7b: a residual md counted 0 on is not a Rewrite-parity row — the notification says to scrub first', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(exec, BANDED, [{ path: '/a.bin', blocks: [1] }], () => {}, {
+      repair: async (_e, req) => residualOn(req.file, req.block, 0),
+    })
+    // The gate refuses a zero, so no row offers the verb (the Scrubs parity
+    // cell reads these rows); the per-block fact stays.
+    assert.deepEqual(result.parityResiduals, [])
+    assert.equal(result.files[0].blocks[0].parityResidual?.mismatchCnt, 0)
+    assert.equal(parityRewriteEvidence('tank', asJob(result), 2).ok, false)
+    const notify = notification(exec)!
+    assert.equal(notify.title, 'AHR repair from parity completed: run a scrub, then rewrite parity on tank-r2')
+    assert.ok(notify.body.includes('A direct read found the parity (or Q) of tank-r2 disagreeing with the repaired data, '
+      + 'and md\'s check counted no mismatch there. Run a scrub (Scrubs → Run now) so md counts it, then run Rewrite parity from that scrub\'s parity mismatch.'), notify.body)
+    assert.doesNotMatch(notify.body, /mismatch_cnt 0|Run Rewrite parity on/)
+  })
+
+  it('7c: a residual beside an unrepaired block names the refusal and what comes first, never "Run Rewrite parity on"', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(exec, BANDED, [{ path: '/a.bin', blocks: [1] }, { path: '/b.bin', blocks: [2] }], () => {}, {
+      repair: async (_e, req) => req.file === '/a.bin' ? residualOn(req.file, req.block, 8) : outcome(req.file, req.block, 'unrepairable', 'both legs unreadable'),
+    })
+    const evidence = parityRewriteEvidence('tank', asJob(result), 2)
+    assert.equal(evidence.ok, false)
+    assert.equal(evidence.ok ? null : evidence.code, 'data-findings-present', 'the oracle: Rewrite parity refuses this run')
+    const notify = notification(exec)!
+    assert.equal(notify.title, 'AHR repair from parity left blocks unrepaired')
+    assert.ok(notify.body.includes('md still counts mismatching stripes on the bands below, and Rewrite parity refuses while this run left '
+      + 'blocks unrepaired, above md or not examined. Deal with the files above, run a scrub (Scrubs → Run now), '
+      + 'then run Rewrite parity from that scrub\'s parity mismatch:\n  tank-r2 (/dev/md127): mismatch_cnt 8'), notify.body)
+    assert.doesNotMatch(notify.body, /Run Rewrite parity on/)
+  })
+
+  it('7c: a mapping-abort beside a residual is not an unrepaired block — the gate accepts the run, and so does the advice', async () => {
+    // `repairEvidence` counts unrepairable + above md + not examined, and NOT
+    // mapping-abort: such a block passes its checksum where it sits, and the
+    // rewrite's own first phase is a fresh checksum scrub of the whole pool.
+    const exec = executor()
+    const result = await repairAhrFiles(exec, BANDED, [{ path: '/a.bin', blocks: [1] }, { path: '/b.bin', blocks: [2] }], () => {}, {
+      repair: async (_e, req) => req.file === '/a.bin' ? residualOn(req.file, req.block, 8) : outcome(req.file, req.block, 'mapping-abort', 'not corrupt here'),
+    })
+    assert.equal(parityRewriteEvidence('tank', asJob(result), 2).ok, true)
+    const notify = notification(exec)!
+    assert.equal(notify.title, 'AHR repair from parity completed: rewrite parity on tank-r2')
+    assert.match(notify.body, /Run Rewrite parity on each \(Scrubs → the pool's parity mismatch → Rewrite parity\):\n {2}tank-r2 \(\/dev\/md127\): mismatch_cnt 8/)
+  })
+})
+
+/**
+ * Review D1 — the verb the notification names is the one the gate for THAT
+ * band's level accepts: Rewrite parity refuses a mirror band
+ * (`parityRewriteArrayRefusal`, `not-a-parity-band`), Reconcile mirror refuses
+ * a parity band (`mirrorReconcileEvidence`, `not-a-mirror-band`).
+ */
+describe('AHR repair job — a residual is offered the verb its band level accepts (review D1)', () => {
+  const MIXED = pool({ arrays: [
+    { band: 2, device: '/dev/md/tank-r2', level: 'raid6', kernelName: 'md127' },
+    { band: 3, device: '/dev/md/tank-r3', level: 'raid1', kernelName: 'md126' },
+  ] as unknown as AhrPool['arrays'] })
+
+  function asJob(result: unknown): Job {
+    return { id: 'job-r', status: 'completed', operation: 'ahr.repair', progress: null, createdAt: '2026-11-15T00:00:00.000Z', createdBy: 'root@pam', startedAt: null, completedAt: null, result, error: null }
+  }
+
+  function residualOn(file: string, block: number, band: 2 | 3, mismatchCnt: number): SelfhealOutcome {
+    return {
+      ...outcome(file, block, 'repaired', 'repaired, band still mismatching'),
+      parityResidual: { array: band === 2 ? '/dev/md127' : '/dev/md126', band: `tank-r${band}`, bandIndex: band, mismatchCnt },
+    }
+  }
+
+  const MIRROR_PARAGRAPH = 'The blocks on the mirror bands below were repaired and proven cold against their stored checksum, and md still counts '
+    + 'stripes there where the mirror legs differ. Run Reconcile mirror on each (Scrubs → the pool\'s parity mismatch → Reconcile mirror):\n'
+    + '  tank-r3 (/dev/md126): mismatch_cnt 4'
+
+  it('review D1: a RAID1 residual names Reconcile mirror and the legs, never Rewrite parity', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(exec, MIXED, [{ path: '/a.bin', blocks: [1] }], () => {}, {
+      repair: async (_e, req) => residualOn(req.file, req.block, 3, 4),
+    })
+    const notify = notification(exec)!
+    assert.equal(notify.title, 'AHR repair from parity completed: reconcile mirror on tank-r3')
+    assert.ok(notify.body.includes(MIRROR_PARAGRAPH), notify.body)
+    assert.doesNotMatch(notify.body, /Rewrite parity|parity \(or Q\) disagrees/)
+    // The oracle: the mirror verb accepts this run, the parity verb refuses the band.
+    assert.equal(mirrorReconcileEvidence('tank', asJob(result), 3).ok, true)
+    assert.equal((await parityRewriteArrayRefusal({ raid1: true, device: '/dev/md126' } as MdGeometry))?.code, 'not-a-parity-band')
+  })
+
+  it('review D1: a run with a RAID6 and a RAID1 residual lists each under its own verb', async () => {
+    const exec = executor()
+    const result = await repairAhrFiles(exec, MIXED, [{ path: '/a.bin', blocks: [1, 2] }], () => {}, {
+      repair: async (_e, req) => residualOn(req.file, req.block, req.block === 1 ? 2 : 3, req.block === 1 ? 8 : 4),
+    })
+    const notify = notification(exec)!
+    assert.equal(notify.title, 'AHR repair from parity completed: rewrite parity on tank-r2; reconcile mirror on tank-r3')
+    assert.ok(notify.body.includes('Run Rewrite parity on each (Scrubs → the pool\'s parity mismatch → Rewrite parity):\n  tank-r2 (/dev/md127): mismatch_cnt 8'), notify.body)
+    assert.ok(notify.body.includes(MIRROR_PARAGRAPH), notify.body)
+    assert.doesNotMatch(notify.body, /tank-r3 \(\/dev\/md126\): mismatch_cnt 4\n?.*Rewrite/)
+    assert.equal(parityRewriteEvidence('tank', asJob(result), 2).ok, true)
+    assert.equal(mirrorReconcileEvidence('tank', asJob(result), 2).ok, false)
+    assert.equal(mirrorReconcileEvidence('tank', asJob(result), 3).ok, true)
   })
 })
 
@@ -845,7 +1015,7 @@ describe('AHR repair job — corrected metadata reads in its own window (selfhea
     const notify = exec.calls.find(c => c.command === '/usr/bin/perl')!
     assert.ok(notify.args[4].includes(
       'btrfs corrected 2 metadata read(s) from the mirror copy during this run. '
-      + 'A member is returning bad metadata. Check that disk\'s SMART data in Disks.',
+      + 'Check SMART for each disk of pool \'tank\' in Disks.',
     ), notify.args[4])
   })
 
@@ -888,13 +1058,17 @@ describe('AHR repair job — corrected metadata reads in its own window (selfhea
 })
 
 describe('AHR repair job — the sentences a repeat and an unconfirmed write get (cr3 second review 5(b)(c))', () => {
-  it('run-stopped says what a REPEAT of the same reason means', async () => {
+  it('cr3.heal.paths: run-stopped adds no advice of its own — the reason from its site says what to do (decision 5)', async () => {
     const exec = executor()
+    const reason = '/dev/md127 is busy (sync_action=check). Nothing was examined or written. '
+      + 'Run Repair from parity again when the AHR panel shows /dev/md127 clean, with no check, build or rebuild in progress.'
     await repairAhrFiles(exec, pool(), [{ path: '/a.bin', blocks: [7] }], () => {}, {
-      repair: async () => outcome('/a.bin', 7, 'not-examined', 'read /dev/loop3 @4308992: dd exit 1: Input/output error', SELFHEAL_RUN_STOPPED),
+      repair: async () => outcome('/a.bin', 7, 'not-examined', reason, SELFHEAL_RUN_STOPPED),
     })
     const body = notification(exec)!.body
-    assert.match(body, /If a second run stops with the same reason, it will not pass by waiting/)
+    assert.ok(body.includes(`  /a.bin: ${reason}`), body)
+    assert.equal(body.match(/Run Repair from parity again/g)?.length, 1, body)
+    assert.doesNotMatch(body, /Wait until|it will not pass by waiting|needs looking at directly/)
   })
 
   it('write-unconfirmed gives its advice ONCE', async () => {
@@ -903,7 +1077,13 @@ describe('AHR repair job — the sentences a repeat and an unconfirmed write get
       repair: async () => outcome('/a.bin', 7, 'not-examined', 'the write of /a.bin block 7 through /dev/md127 at md byte 4096 was issued and then reported a failure (dd: fsync failed). The arbitrated bytes may have landed or may not.', SELFHEAL_WRITE_UNCONFIRMED),
     })
     const body = notification(exec)!.body
-    assert.equal(body.match(/next scrub/g)?.length, 1, body)
-    assert.equal(body.match(/reason to restore/g)?.length, 1, body)
+    assert.ok(body.includes('The repair reached no verdict on 1 block(s). A block whose write could not be confirmed may have been written; '
+      + 'nothing was written to the others. What to do, per file:\n'
+      + '  /a.bin: the write of /a.bin block 7 through /dev/md127 at md byte 4096 was issued and then reported a failure (dd: fsync failed). '
+      + 'The arbitrated bytes may have landed or may not. Run a scrub (Scrubs → Run now). If it no longer names this block, the write landed. '
+      + 'If it names it again, run Repair from parity again once the AHR panel shows the band clean.'
+      // Review R4: the rerun has a stop.
+      + ' If the write fails again while the band shows clean, check that member\'s SMART data in Disks.'), body)
+    assert.equal(body.match(/Run a scrub/g)?.length, 1, body)
   })
 })

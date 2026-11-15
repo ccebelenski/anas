@@ -8561,7 +8561,7 @@ async function scrubFindingsChecks() {
     /2 metadata reads corrected/.test(correctedCell), correctedCell)
   ok('scrubs: …with what happened, what it means and what to do as the tooltip',
     /btrfs corrected 2 metadata read\(s\) from the mirror copy/.test(correctedCell)
-    && /Check that disk's SMART data in Disks/.test(correctedCell), correctedCell)
+    && /Check SMART for each disk of this pool in Disks\./.test(correctedCell), correctedCell)
   ok('scrubs: …and a count-only scrub names no file, so there is no findings link',
     !/anas-scrub-findings-link/.test(correctedCell), correctedCell)
   ok('scrubs: …and it still says the record is the last completed scrub since the daemon started',
@@ -9748,7 +9748,8 @@ async function repairFromParityChecks() {
   await settle()
   eq('repair: the result appears in the window the request was made from', panel.hidden, false)
   ok('repair: the three buckets are counted', /1 repaired · 1 unrepairable · 1 above md/.test(panel.html), panel.html)
-  ok('repair: unrepairable says restore from backup', /Restore this file from backup/.test(panel.html), panel.html)
+  ok('repair: unrepairable says restore from backup, naming the file and the screen (cr3.heal.paths)',
+    panel.html.includes(`Unrepairable: ${FINDING_D.path}.`) && /The job(&#39;|')s PVE notification says what to restore, per file\./.test(panel.html), panel.html)
   // cr3.sentences: the panel shows the daemon's own above-md sentence (no copy
   // of its own), and it is an implication, never a proof.
   ok('repair: above md says the daemon\'s sentence, a cause above the disks, as an implication',
@@ -9772,8 +9773,8 @@ async function repairFromParityChecks() {
   await settle()
   ok('repair: the mapping-abort count rides the headline, its OWN number',
     /0 repaired · 0 unrepairable · 0 above md · 1 not corrupt at the mapped location/.test(panel.html), panel.html)
-  ok('repair: mapping-abort says nothing was written and nothing needs a restore',
-    /1 block\(s\) were not corrupt at the mapped location. Nothing was written, nothing to restore/.test(panel.html), panel.html)
+  ok('repair: mapping-abort says nothing was written, and a scrub confirms (cr3.heal.paths)',
+    /1 block\(s\) pass their stored checksum where they sit on disk, so nothing was written to them\. Run a scrub \(Scrubs → Run now\) to confirm them: a block that passes is no longer named\. If the scrub names one again, ANAS located it wrongly: report it with this job(&#39;|')s result\./.test(panel.html), panel.html)
   ok('repair: …and the restore advice stays reserved for the TRUE unrepairable',
     !/restore this file from backup/.test(panel.html), panel.html)
 
@@ -9796,11 +9797,10 @@ async function repairFromParityChecks() {
   await settle()
   ok('repair: the not-examined count rides the headline as its OWN number (F3)',
     /0 repaired · 0 unrepairable · 0 above md · 0 not corrupt at the mapped location · 1 not examined/.test(panel.html), panel.html)
-  ok('repair: …with the reason code, and nothing is known about the bytes',
-    /could not be EXAMINED \(hole\)/.test(panel.html)
-      && /nothing is known about those bytes/.test(panel.html), panel.html)
-  ok('repair: …neither a clean bill of health nor a reason to restore',
-    /neither a clean bill of health nor a reason to restore/.test(panel.html)
+  ok('repair: …with the reason in words and what to do (cr3.heal.paths)',
+    /1 block\(s\) were not examined, and nothing was written to them: now a hole: run a scrub to refresh the findings\./.test(panel.html), panel.html)
+  ok('repair: …and no sentence that says what the result is not, no restore',
+    !/neither a clean bill|nothing is known/.test(panel.html)
       && !/restore this file from backup/.test(panel.html)
       && !/need no restore/.test(panel.html), panel.html)
 
@@ -9821,10 +9821,99 @@ async function repairFromParityChecks() {
   await settle()
   ok('repair: a parity residual is reported, naming the band and md\'s count (F2)',
     /Repaired, and md still counts mismatching stripes on ahr0-r1 \(mismatch_cnt 8\)/.test(panel.html), panel.html)
-  ok('repair: …and points at Rewrite parity, never a restore',
-    /Rewrite parity on that band/.test(panel.html)
-      && /No fresh scrub is needed/.test(panel.html)
+  ok('repair: …and points at Rewrite parity, never a restore (cr3.heal.paths)',
+    /Repaired, and md still counts mismatching stripes on ahr0-r1 \(mismatch_cnt 8\), so their parity \(or Q\) disagrees with the data\. Run Rewrite parity on each \(Scrubs → the pool(&#39;|')s parity mismatch → Rewrite parity\)\./.test(panel.html)
+      && !/No fresh scrub is needed/.test(panel.html)
       && !/restore/i.test(panel.html), panel.html)
+
+  // cr3.heal.paths (7b) — a residual md counted 0 on is never offered
+  // Rewrite parity (its gate refuses a zero): a scrub comes first.
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'repaired', reason: 'repaired', parityResidual: { band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 0 } }] },
+    ],
+    repaired: 1,
+    unrepairable: 0,
+    aboveMd: 0,
+    mappingAbort: 0,
+    notExamined: 0,
+    parityResiduals: [],
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: 7b — an uncounted residual says scrub first, then Rewrite parity',
+    /A direct read found ahr0-r1 inconsistent after the repair, and md(&#39;|')s check counted no mismatch there\. Run a scrub \(Scrubs → Run now\) so md counts it, then run the verb its parity mismatch window offers for that band\./.test(panel.html)
+      && !/Run Rewrite parity on each/.test(panel.html), panel.html)
+
+  // cr3.heal.paths (7c) — a residual beside an unrepaired block: Rewrite
+  // parity refuses the run (data-findings-present), so the panel says what
+  // comes first and never offers the verb as the next step.
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'repaired', reason: 'repaired; the band still has a parity/Q mismatch' }] },
+      { path: FINDING_D.path, blocks: [{ block: 12, outcome: 'unrepairable', reason: 'two bad blocks in one stripe' }] },
+    ],
+    repaired: 1,
+    unrepairable: 1,
+    aboveMd: 0,
+    mappingAbort: 0,
+    notExamined: 0,
+    parityResiduals: [{ band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' }],
+    blocks: 2,
+  }))
+  await settle()
+  ok('repair: 7c — a residual beside an unrepaired block names the refusal and what comes first',
+    /md still counts mismatching stripes on ahr0-r1 \(mismatch_cnt 8\), and Rewrite parity refuses while this run left blocks unrepaired, above md or not examined\. Deal with the files above, run a scrub \(Scrubs → Run now\), then run Rewrite parity from that scrub(&#39;|')s parity mismatch\./.test(panel.html)
+      && !/Run Rewrite parity on each/.test(panel.html), panel.html)
+
+  // Review D1 — a RAID1 band's residual is offered Reconcile mirror (the verb
+  // the window lights for a mirror), never Rewrite parity; a mixed run lists
+  // each band under its own verb.
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: FINDING_A.path, blocks: [{ block: 300, outcome: 'repaired', reason: 'repaired' }] },
+    ],
+    repaired: 1,
+    unrepairable: 0,
+    aboveMd: 0,
+    mappingAbort: 0,
+    notExamined: 0,
+    parityResiduals: [
+      { band: 'ahr0-r1', bandIndex: 1, array: '/dev/md/ahr0-r1', mismatchCnt: 8, level: 'raid5' },
+      { band: 'ahr0-r2', bandIndex: 2, array: '/dev/md/ahr0-r2', mismatchCnt: 4, level: 'raid1' },
+    ],
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: review D1 — a mirror band is offered Reconcile mirror, with the legs as the fact',
+    /Repaired, and md still counts stripes where the mirror legs differ on ahr0-r2 \(mismatch_cnt 4\)\. Run Reconcile mirror on each \(Scrubs → the pool(&#39;|')s parity mismatch → Reconcile mirror\)\./.test(panel.html), panel.html)
+  ok('repair: review D1 — …and the parity band keeps Rewrite parity, naming only itself',
+    /Repaired, and md still counts mismatching stripes on ahr0-r1 \(mismatch_cnt 8\), so their parity \(or Q\) disagrees with the data\. Run Rewrite parity on each/.test(panel.html)
+      && !/ahr0-r2 \(mismatch_cnt 4\), so their parity/.test(panel.html), panel.html)
+
+  // Review D3 — an iSCSI LUN image is restored as a LUN (the daemon's
+  // notification says "Restore as new LUN"); the panel has no LUN facts, so it
+  // names no restore verb of its own and points at the notification's.
+  sent.onComplete(repairJob({
+    pool: 'ahr0',
+    files: [
+      { path: '/mnt/anas-ahr/ahr0/lun-images/win.lun', blocks: [{ block: 4, outcome: 'unrepairable', reason: 'no candidate could be reconstructed for /mnt/anas-ahr/ahr0/lun-images/win.lun block 4. Nothing was written.' }] },
+    ],
+    repaired: 0,
+    unrepairable: 1,
+    aboveMd: 0,
+    mappingAbort: 0,
+    notExamined: 0,
+    blocks: 1,
+  }))
+  await settle()
+  ok('repair: review D3 — an unrepairable file names no restore menu of the panel\'s own',
+    panel.html.includes('Unrepairable: /mnt/anas-ahr/ahr0/lun-images/win.lun.')
+      && /The job(&#39;|')s PVE notification says what to restore, per file\./.test(panel.html)
+      && !/Backup → the backup task → Restore/.test(panel.html), panel.html)
 
   // --- D3/D10 — the csum-unreadable verdict does NOT say restore -------------
   sent.onComplete(repairJob({
@@ -9842,9 +9931,10 @@ async function repairFromParityChecks() {
   }))
   await settle()
   ok('repair: a csum-unreadable file says the checksum could not be read',
-    /checksum could not be read reliably/.test(panel.html), panel.html)
-  ok('repair: …and says re-scrub after the metadata is repaired',
-    /re-scrub after the metadata is repaired/.test(panel.html), panel.html)
+    /The checksum btrfs keeps for blocks of .* could not be read, so nothing judged them and nothing was written\./.test(panel.html), panel.html)
+  ok('repair: …and says to scrub, repair from its finding, and restore only after a second stop (review R3)',
+    /Run a scrub \(Scrubs → Run now\)\. If it names a file again, run Repair from parity on it from that finding\. If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the file twice, so restore it \(the job(&#39;|')s PVE notification says how\)\. If the scrub does not name the file, nothing remains to do\./.test(panel.html)
+      && !/errors that name no file/.test(panel.html), panel.html)
   ok('repair: …and NEVER tells the operator to restore data never proven bad',
     !/restore this file from backup/.test(panel.html), panel.html)
   ok('repair: …naming the file it applies to', panel.html.includes(FINDING_A.path), panel.html)
@@ -9867,9 +9957,9 @@ async function repairFromParityChecks() {
   }))
   await settle()
   ok('repair: a MIXED unrepairable file keeps the ordinary restore advice',
-    /Restore this file from backup/.test(panel.html), panel.html)
+    panel.html.includes(`Unrepairable: ${FINDING_D.path}.`) && /The job(&#39;|')s PVE notification says what to restore, per file\./.test(panel.html), panel.html)
   ok('repair: …and does not claim the checksum was unreadable for it',
-    !/checksum could not be read reliably/.test(panel.html), panel.html)
+    !/The checksum btrfs keeps for blocks of/.test(panel.html), panel.html)
 
   // --- The honest "not finished" --------------------------------------------
   sent.onComplete({ id: 'rj2', status: 'running' })

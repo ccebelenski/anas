@@ -1509,7 +1509,7 @@ export async function resolveBlock(
   if (extent.type === 'inline' || extent.diskByte === undefined || extent.diskLength === undefined)
     throw new SelfhealMapError(`block ${block} of ${file} is an inline extent — its bytes live in the metadata tree, not in a data chunk`, 'inline-extent')
   if (extent.diskByte === 0)
-    throw new SelfhealMapError(`block ${block} of ${file} is a hole — there is nothing on disk to repair`, 'hole')
+    throw new SelfhealMapError(`block ${block} of ${file} is a hole now: the file stores no data there`, 'hole')
 
   const { compressed, blobLogical, blobSectors, logicalByte } = repairUnitFor(extent, block)
 

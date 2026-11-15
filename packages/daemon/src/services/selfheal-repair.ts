@@ -28,6 +28,7 @@ import {
 import { crc32c, csumHex, CsumUnreadableError, readStoredCsum } from './selfheal-csum.js'
 import {
   BLOCK_BYTES,
+  DirectReadError,
   dropCaches,
   MD_DEFAULT_SYNC_MAX,
   MD_DEFAULT_SYNC_MIN,
@@ -225,15 +226,35 @@ export class SelfhealRunError extends Error {
    */
   readonly written: string | null
 
+  /**
+   * What the reader does next, when the site that threw knows its cause
+   * (review R1): a member that could not be read, a bounded check that did not
+   * finish, a pin that failed. Absent, the job says "final for this run,
+   * report it".
+   */
+  readonly advice: string | null
+
   constructor(
     message: string,
     readonly steps: SelfhealStep[],
     readonly diagnostics: SelfhealDiagnostics,
-    options?: { cause?: unknown, written?: string | null },
+    options?: { cause?: unknown, written?: string | null, advice?: string | null },
   ) {
     super(message, options?.cause !== undefined ? { cause: options.cause } : undefined)
     this.name = 'SelfhealRunError'
     this.written = options?.written ?? null
+    this.advice = options?.advice ?? null
+  }
+}
+
+/**
+ * md's bounded check over a stripe did not finish within its cap (review R1).
+ * Typed so the run that met it can name the band to watch.
+ */
+export class CheckTimeoutError extends Error {
+  constructor(message: string, readonly device: string) {
+    super(message)
+    this.name = 'CheckTimeoutError'
   }
 }
 
@@ -273,6 +294,28 @@ export function poolLayout(pool: AhrPool | null | undefined): 'subvol' | 'flat' 
     return 'unknown'
   return 'flat'
 }
+
+/**
+ * What the reader does after a band whose md facts could not be read
+ * (cr3.heal.paths): the read that failed is named in the reason before it.
+ */
+export const BAND_UNREADABLE_ADVICE = 'Run Repair from parity again once the AHR panel shows that band clean. '
+  + 'If it stops here again while the band shows clean, report it with this job\'s result.'
+
+/** The sentence every result ANAS cannot explain ends with (cr3.heal.paths, coordinator decision 4). */
+export const REPORT_IT_ADVICE = 'This result is final for this run. Report it with this job\'s result.'
+
+/**
+ * A sentence that opens with a fragment (review R6: the gate sentences lost
+ * their "refused:" prefix): its first letter capitalised. A path opens as it
+ * is.
+ */
+function asSentenceStart(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1)
+}
+
+/** `/dev/mdN` → `mdN`, the key `AhrArray.kernelName` carries. */
+const DEV_PREFIX_RE = /^\/dev\//
 
 /** The sentence a repair and a sweep stop with on an unknown layout. */
 function unknownLayoutSentence(pool: AhrPool): string {
@@ -516,7 +559,7 @@ export async function boundedWindowCheck(
       left = `sync knobs not restored: ${errorText(error)}`
     }
     retireCheckIssued(geo.kernel)
-    throw new Error(`bounded md check over stripe ${stripe} did not settle within ${cap}s${left ? ` (${left})` : ''}`)
+    throw new CheckTimeoutError(`bounded md check over stripe ${stripe} did not settle within ${cap}s${left ? ` (${left})` : ''}`, geo.device)
   }
 
   await sleep(options?.settleMs ?? MISMATCH_SETTLE_MS)
@@ -1021,17 +1064,17 @@ export async function repairBlock(
         live = (await stat(file)).ino
       }
       catch (error) {
-        fail('not-examined', `${file} could not be stat'ed to confirm it is the file the scrub examined (inode ${request.inode}): ${errorText(error)}. Nothing was written.`, 'inode-changed')
+        fail('not-examined', `${file} could not be stat'ed to confirm it is the file the scrub named (inode ${request.inode}): ${errorText(error)}. Nothing was written.`, 'inode-changed')
       }
       if (live !== request.inode) {
-        fail('not-examined', `the file at ${file} is inode ${live}, not the inode ${request.inode} the scrub examined — this is not the file the finding describes. Nothing was written, and nothing is known about this file's bytes.`, 'inode-changed')
+        fail('not-examined', `the file at ${file} is inode ${live}; the scrub named inode ${request.inode}. Nothing was written.`, 'inode-changed')
       }
     }
     // cr3: a pool whose layout could not be read is not guessed at — the pin
     // shape depends on it. `run-stopped`: nothing was looked at, and the
     // repair runs once the mount table answers.
     if (request.pool && poolLayout(request.pool) === 'unknown')
-      fail('not-examined', `refused: ${unknownLayoutSentence(request.pool)}. Nothing was pinned, examined or written.`, SELFHEAL_RUN_STOPPED)
+      fail('not-examined', `${asSentenceStart(unknownLayoutSentence(request.pool))}. Nothing was pinned, examined or written. Run Repair from parity again once \`findmnt ${request.pool.mountpoint}\` lists the pool.`, SELFHEAL_RUN_STOPPED)
     const context = await resolveContext(executor, mountpoint)
     const refusal = await gateRefusal(executor, context, request.pool ?? null, options)
     // cr3 AHR-HEAL-H1 — a gate refusal is a block NOBODY LOOKED AT. It used to
@@ -1039,7 +1082,7 @@ export async function repairBlock(
     // backup": advice to overwrite a file on the strength of an array that was
     // busy at the time.
     if (refusal)
-      fail('not-examined', `refused: ${refusal}. Nothing was examined and nothing was written.`, SELFHEAL_RUN_STOPPED)
+      fail('not-examined', `${asSentenceStart(refusal.reason)}. Nothing was examined or written. ${refusal.advice}`, SELFHEAL_RUN_STOPPED)
 
     // ---- pin ------------------------------------------------------------
     await step('pin')
@@ -1047,7 +1090,9 @@ export async function repairBlock(
       pin = await takePin(executor, mountpoint, file, request.pool ?? null, diagnostics, options)
     }
     catch (error) {
-      throw new SelfhealRunError(`cannot pin ${mountpoint}: ${errorText(error)}`, steps, diagnostics, { cause: error })
+      // Review R1: what failed is said; nothing visible names when a rerun
+      // would differ, so it goes back with the job (never "final").
+      throw new SelfhealRunError(`cannot pin ${mountpoint}: ${errorText(error)}`, steps, diagnostics, { cause: error, advice: 'Report it with this job\'s result.' })
     }
     note(pin.describe)
 
@@ -1130,9 +1175,9 @@ export async function repairBlock(
       }
       if (mirrorAgreement === 'stale-cache') {
         diagnostics.staleCache = true
-        fail('unrepairable', `${verdict.abort.reason} md's bounded check over ${mirrorGeo.device} reports mismatch_cnt=0, but md's cached view of this stripe was stale; the direct member read shows the mismatch — ${mirrorDirect.detail}. The legs disagree with each other and neither matches the stored csum. Restore ${file} from backup.`)
+        fail('unrepairable', `${verdict.abort.reason} md's bounded check over ${mirrorGeo.device} reports mismatch_cnt=0, but md's cached view of this stripe was stale; the direct member read shows the mismatch — ${mirrorDirect.detail}. The legs disagree with each other and neither matches the stored csum: the fault is below md. Restore ${file} from backup, and check both disks' SMART data in Disks.`)
       }
-      fail('unrepairable', `${verdict.abort.reason} md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es) and ${mirrorDirect.detail}, so the legs disagree with each other and neither matches the stored csum. Restore ${file} from backup.`)
+      fail('unrepairable', `${verdict.abort.reason} md's bounded check over ${mirrorGeo.device} counts ${legs} mismatch(es) and ${mirrorDirect.detail}, so the legs disagree with each other and neither matches the stored csum: the fault is below md. Restore ${file} from backup, and check both disks' SMART data in Disks.`)
     }
     const target = guardTarget
     const geo = target.geometry
@@ -1227,15 +1272,17 @@ export async function repairBlock(
       if (badBlocked.length > 0)
         fail('unrepairable', `${plan.refusal} ${badBlockNote(liveGeo, badBlocked)}`, SELFHEAL_BAD_BLOCKS_PRESENT)
       // cr3 AHR-HEAL-H1 — md kicked a member while this run was working: the
-      // array changed under it. That is a reason to run the repair again once
-      // md has rebuilt, never a reason to restore the file.
-      fail('not-examined', plan.refusal, SELFHEAL_RUN_STOPPED)
+      // array changed under it, and nothing was decided about this block.
+      // cr3.heal.paths: no rerun is offered. md rebuilds the kicked member's
+      // row from the bytes this block holds now, so after the rebuild the
+      // scrub decides (coordinator decision 6).
+      fail('not-examined', `${plan.refusal} ${memberLostAdvice(bandShown(geo.device, request.pool), geo.sys, await readSyncAction(geo))}`, SELFHEAL_RUN_STOPPED)
     }
     if (badBlocked.length > 0)
       note(badBlockNote(liveGeo, badBlocked))
     const candidates = await reconstruct(executor, geo, target, plan)
     if (candidates.length === 0)
-      fail('unrepairable', `no candidate could be reconstructed for ${file} block ${request.block}`)
+      fail('unrepairable', `no candidate could be reconstructed for ${file} block ${request.block}. Nothing was written. Restore ${file} from a backup if one exists.`)
     note(candidates.map(c => c.how).join(', '))
 
     // ---- arbitrate ------------------------------------------------------
@@ -1256,7 +1303,7 @@ export async function repairBlock(
     if (!winner) {
       // cr3 second review 5(a): what ANAS tried and what it did not — never a
       // claim that the array itself cannot rebuild the block.
-      fail('unrepairable', `no reconstruction ANAS tries matches the stored csum ${csumHex(storedCsum)} (tried ${tried.join(', ')}). ANAS rebuilds one missing block per stripe (RAID5: the XOR of the other members; RAID6: from P, then from Q alone); a second damaged block in this stripe would explain the miss, and a RAID6 solve for two damaged blocks is not attempted. Nothing was written. The array was not shown unable to rebuild this block; ANAS could not. If nothing else recovers it, restore ${file} from a backup if one exists.`)
+      fail('unrepairable', `no reconstruction ANAS tries matches the stored csum ${csumHex(storedCsum)} (tried ${tried.join(', ')}). ANAS rebuilds one missing block per stripe (RAID5: the XOR of the other members; RAID6: from P, then from Q alone) and does not solve for two; a second damaged block in this stripe would explain the miss. Nothing was written, and this result is final. Restore ${file} from a backup if one exists.`)
     }
 
     // ---- write ----------------------------------------------------------
@@ -1266,11 +1313,11 @@ export async function repairBlock(
     // `recover`. Writing through md then lands the block in a stripe that is
     // being rebuilt underneath it.
     await step('write')
-    const changed = await preWriteRefusal(geo)
+    const changed = await preWriteRefusalOf(geo)
     // cr3 AHR-HEAL-H1 — the array changed under the run: no verdict, and not
     // the restore bucket.
     if (changed)
-      fail('not-examined', `array state changed mid-repair: ${changed}, nothing written`, SELFHEAL_RUN_STOPPED)
+      fail('not-examined', `the array changed during the repair: ${changed.reason}. Nothing was written. ${arrayRefusalAdvice(bandShown(geo.device, request.pool), geo.sys, changed)}`, SELFHEAL_RUN_STOPPED)
     // The read-back guard again, at the last instant (cr3 W1). It ran straight
     // after the re-verify (L7), and the pre-check, the rmw knob and the
     // reconstruction have taken real time since: the md block about to be
@@ -1286,7 +1333,7 @@ export async function repairBlock(
       // (a failed fsync is the usual shape). The bytes may have landed:
       // "nothing written" is not known to be true, and neither is "repaired".
       // The facts only; the job says what to do, once (cr3 second review 5(c)).
-      fail('not-examined', `the write of ${file} block ${request.block} through ${geo.device} at md byte ${target.mdByte} was issued and then reported a failure (${errorText(error)}). The arbitrated bytes, verified against the stored csum ${csumHex(storedCsum)}, may have landed or may not.`, SELFHEAL_WRITE_UNCONFIRMED)
+      fail('not-examined', `the write of ${file} block ${request.block} through ${geo.device} (member ${diagnostics.mapping?.memberDevice ?? target.memberDevice}) at md byte ${target.mdByte} was issued and then reported a failure (${errorText(error)}). The arbitrated bytes, verified against the stored csum ${csumHex(storedCsum)}, may have landed or may not.`, SELFHEAL_WRITE_UNCONFIRMED)
     }
     const repaired = `${file} block ${request.block} reconstructed from ${winner.detail} and verified against the stored csum ${csumHex(storedCsum)}`
     // F5 — from here on, "nothing written" is a FALSE sentence. The post-check
@@ -1322,7 +1369,7 @@ export async function repairBlock(
     // not a verb that would be turned away.
     const residualAdvice = (band: string): string => after !== 0
       ? `Run Rewrite parity on ${band}.`
-      : `Re-scrub the pool so the band's mismatch is counted, then run Rewrite parity on ${band}.`
+      : `Run a scrub (Scrubs → Run now) so md counts the band's mismatch, then run Rewrite parity on ${band}.`
     if (after !== 0 || !directAfter.consistent) {
       // F2 — a non-zero post-check AFTER a successful write is a different
       // verdict from one before it. The RAID6 shape that produces it: rot in
@@ -1361,7 +1408,7 @@ export async function repairBlock(
       return outcome('repaired', `${repaired} (post-check passed; cold read skipped: ${cold.reason})`)
     }
     if (cold.bad.length > 0) {
-      fail('unrepairable', `the repaired region still reads back with an error through a fresh snapshot (blocks ${cold.bad.join(', ')})`)
+      fail('unrepairable', `the repaired region still reads back with an error through a fresh snapshot (blocks ${cold.bad.join(', ')}). Restore ${file} from a backup if one exists.`)
     }
     note('read back clean through the pin snapshot')
 
@@ -1383,13 +1430,21 @@ export async function repairBlock(
       if (written !== null) {
         return outcome(
           'repaired',
-          `${written} — the block was written and matches its checksum; the post-check could not run (${error.message}). Re-scrub to confirm parity.`,
+          `${written} — the block was written and matches its checksum; the post-check could not run (${error.message}). Run a scrub (Scrubs → Run now) to confirm it.`,
           undefined,
           { postcheckSkipped: error.message },
         )
       }
       // cr3 AHR-HEAL-H1 — md changed the array under the run: no verdict.
-      return outcome('not-examined', `array state changed mid-repair: ${error.message}, nothing written`, SELFHEAL_RUN_STOPPED)
+      // cr3.heal.paths: a recovery means md lost a member; any other
+      // operation ends, and the panel shows when.
+      const recovering = error.action === 'recover' || error.action === 'recovery'
+      return outcome(
+        'not-examined',
+        `md started ${error.action ?? 'an operation whose sync_action could not be read'} on ${error.device} during the repair. Nothing was written. `
+        + `${recovering ? memberLostAdvice(bandShown(error.device, request.pool), '', error.action) : arrayRefusalAdvice(bandShown(error.device, request.pool), `/sys/block/${error.device.replace(DEV_PREFIX_RE, '')}/md`, { cause: 'busy', action: error.action })}`,
+        SELFHEAL_RUN_STOPPED,
+      )
     }
     if (written !== null) {
       // cr3 AHR-HEAL-H1 (A) — ANY failure after the write is classified by
@@ -1407,7 +1462,7 @@ export async function repairBlock(
       }
       return outcome(
         'repaired',
-        `${written} — the block was written and matches its checksum; the confirmation after the write could not complete (${errorText(error)}). Re-scrub to confirm parity.`,
+        `${written} — the block was written and matches its checksum; the confirmation after the write could not complete (${errorText(error)}). Run a scrub (Scrubs → Run now) to confirm it.`,
         undefined,
         { postcheckSkipped: errorText(error) },
       )
@@ -1416,9 +1471,12 @@ export async function repairBlock(
       // F3 — a map failure is a block NOBODY LOOKED AT. `mapping-abort` asserts
       // the opposite (the bytes there were read and passed their checksum), and
       // it is raised in exactly one place: the re-verify, which established it.
-      return outcome('not-examined', error.message, error.reasonCode)
+      // cr3.heal.paths: the map's sentence is a fact; the job adds, by
+      // code, what to do about it.
+      return outcome('not-examined', `${error.message}. Nothing was written.`, error.reasonCode)
     }
-    throw new SelfhealRunError(errorText(error), steps, diagnostics, { cause: error })
+    // Review R1: a throw whose site knows its cause says what to do here.
+    throw new SelfhealRunError(errorText(error), steps, diagnostics, { cause: error, advice: thrownAdvice(error, outcomeBand, request.pool) })
   }
   finally {
     await cleanup()
@@ -1512,17 +1570,19 @@ async function gateRefusal(
   ctx: SelfhealContext,
   pool: AhrPool | null,
   options?: SelfhealRepairOptions,
-): Promise<string | null> {
+): Promise<{ reason: string, advice: string } | null> {
   for (const band of ctx.bands) {
     // A band whose geometry could not be read is carried, not thrown, since F6
     // (the attribution pass must survive one unreadable band). A REPAIR still
     // refuses the whole pool for it: which band the block is on is not known
     // yet, and a band nothing can be read from is not one to write near.
     if (band.geometry === null)
-      return `${band.device}: ${band.error ?? 'its geometry could not be read'}`
-    const refusal = await arrayRefusal(band.geometry)
+      return { reason: `${band.device}: ${band.error ?? 'its geometry could not be read'}`, advice: BAND_UNREADABLE_ADVICE }
+    // cr3.heal.paths: each refusal carries what must change before a rerun,
+    // picked by the cause the gate found (coordinator decision 5).
+    const refusal = await arrayRefusalOf(band.geometry)
     if (refusal)
-      return refusal
+      return { reason: refusal.reason, advice: arrayRefusalAdvice(bandShown(band.geometry.device, pool), band.geometry.sys, refusal) }
   }
 
   // An in-flight pvmove replaces the LV's linear target with a mirror and moves
@@ -1531,8 +1591,12 @@ async function gateRefusal(
   if (tables.exitCode === 0) {
     for (const line of tables.stdout.split('\n')) {
       const name = line.split(':')[0].trim()
-      if (name.startsWith('pvmove'))
-        return `a pvmove is in flight (${name}) — the physical extents under this pool are moving`
+      if (name.startsWith('pvmove')) {
+        return {
+          reason: `a pvmove (${name}) is moving the physical extents under this pool`,
+          advice: 'Run Repair from parity again when the pvmove has finished (`dmsetup table` lists no pvmove device).',
+        }
+      }
     }
   }
   // Re-parse the pool's own table: a non-linear target here is the other face
@@ -1543,7 +1607,9 @@ async function gateRefusal(
       parseDmTable(own.stdout)
     }
     catch (error) {
-      return errorText(error)
+      // No rerun: nothing names what would change (a striped or mirrored LV
+      // stays one), so the result is final and goes back with the job.
+      return { reason: errorText(error), advice: REPORT_IT_ADVICE }
     }
   }
 
@@ -1554,8 +1620,12 @@ async function gateRefusal(
   // that says why. Check before pinning rather than racing.
   if (pool && poolLayout(pool) === 'subvol') {
     const mnt = topLevelMountPath(pool, options?.ahrSnapshotOptions)
-    if ((await executor.exec(FINDMNT, ['--mountpoint', mnt])).exitCode === 0)
-      return `the top-level mount for pool '${pool.name}' is already held at ${mnt} — a backup or snapshot job is in flight. Repair needs that mount to itself; retry when the other job has finished`
+    if ((await executor.exec(FINDMNT, ['--mountpoint', mnt])).exitCode === 0) {
+      return {
+        reason: `a backup or snapshot job holds the top-level mount of pool '${pool.name}' at ${mnt}, and Repair from parity needs that mount to itself`,
+        advice: `Run Repair from parity again when that job has finished (\`findmnt --mountpoint ${mnt}\` prints nothing).`,
+      }
+    }
   }
   return null
 }
@@ -1572,15 +1642,23 @@ async function gateRefusal(
  * question with this function rather than a second copy of it.
  */
 export async function preWriteRefusal(geo: MdGeometry): Promise<string | null> {
+  return (await preWriteRefusalOf(geo))?.reason ?? null
+}
+
+/**
+ * {@link preWriteRefusal} with the cause it found (cr3.heal.paths): the repair
+ * names what must change before a rerun by the cause, never by its sentence.
+ */
+export async function preWriteRefusalOf(geo: MdGeometry): Promise<ArrayRefusal | null> {
   const degraded = await readMdAttrOrNull(geo.sys, 'degraded')
   if (degraded !== null && degraded !== '0')
-    return `${geo.device} is now degraded (${degraded} member${degraded === '1' ? '' : 's'} missing)`
+    return { cause: 'member-missing', action: await readSyncAction(geo), reason: `${geo.device} is now degraded (${degraded} member${degraded === '1' ? '' : 's'} missing)` }
   const action = await readSyncAction(geo)
   if (!isIdleSyncAction(action))
-    return `${geo.device} is now running ${action ?? 'an operation whose sync_action could not be read'}`
+    return { cause: 'busy', action, reason: `${geo.device} is now running ${action ?? 'an operation whose sync_action could not be read'}` }
   const reshape = await readMdAttrOrNull(geo.sys, 'reshape_position')
   if (reshape !== null && reshape !== 'none')
-    return `${geo.device} is now mid-reshape (reshape_position=${reshape})`
+    return { cause: 'reshape', reason: `${geo.device} is now mid-reshape (reshape_position=${reshape})` }
   return null
 }
 
@@ -1669,25 +1747,122 @@ export function reconstructionPlan(
  * repair, and the operator should read the same sentence either way.
  */
 export async function arrayRefusal(geo: MdGeometry): Promise<string | null> {
+  return (await arrayRefusalOf(geo))?.reason ?? null
+}
+
+/**
+ * What an array refusal is about (cr3.heal.paths). The sentence is shared with
+ * the parity rewrite and the mirror reconcile; what a reader does next is the
+ * caller's, and the repair picks it by this cause.
+ */
+export type ArrayRefusalCause = 'member-missing' | 'busy' | 'reshape' | 'state'
+
+export interface ArrayRefusal {
+  cause: ArrayRefusalCause
+  reason: string
+  /** md's `sync_action` when the refusal was read (review R2): whether a rebuild is already running. */
+  action?: string | null
+}
+
+/** {@link arrayRefusal} with the cause it found. */
+export async function arrayRefusalOf(geo: MdGeometry): Promise<ArrayRefusal | null> {
   const degraded = await readMdAttrOrNull(geo.sys, 'degraded')
   if (degraded !== null && degraded !== '0') {
-    return `${geo.device} is degraded (${degraded} member${degraded === '1' ? '' : 's'} missing) — a reconstruction needs every other member of the stripe`
+    return { cause: 'member-missing', action: await readSyncAction(geo), reason: `${geo.device} is degraded (${degraded} member${degraded === '1' ? '' : 's'} missing) — a reconstruction needs every other member of the stripe` }
   }
   if (geo.members.includes(null))
-    return `${geo.device} is missing a member — a reconstruction needs every other member of the stripe`
+    return { cause: 'member-missing', action: await readSyncAction(geo), reason: `${geo.device} is missing a member — a reconstruction needs every other member of the stripe` }
 
   const action = await readMdAttr(geo.sys, 'sync_action')
   if (action !== 'idle')
-    return `${geo.device} is busy (sync_action=${action}) — resync, recovery, reshape and check all move or re-read the bytes this repair depends on`
+    return { cause: 'busy', action, reason: `${geo.device} is busy (sync_action=${action}) — resync, recovery, reshape and check all move or re-read the bytes this repair depends on` }
 
   const reshape = await readMdAttrOrNull(geo.sys, 'reshape_position')
   if (reshape !== null && reshape !== 'none')
-    return `${geo.device} is mid-reshape (reshape_position=${reshape}) — the layout under this block is changing`
+    return { cause: 'reshape', reason: `${geo.device} is mid-reshape (reshape_position=${reshape}) — the layout under this block is changing` }
 
   const state = await readMdAttr(geo.sys, 'array_state')
   if (REFUSED_ARRAY_STATES[state])
-    return `${geo.device}: ${REFUSED_ARRAY_STATES[state]} (array_state=${state})`
+    return { cause: 'state', reason: `${geo.device}: ${REFUSED_ARRAY_STATES[state]} (array_state=${state})` }
   return null
+}
+
+/**
+ * What the reader does after a repair stopped on an array refusal
+ * (cr3.heal.paths): the rerun is offered with the change that must come first
+ * and where the reader sees it. A lost member is the one cause whose rerun is
+ * never offered: md rebuilds the lost member's row from the bytes the block
+ * holds now, so after the rebuild a scrub decides.
+ */
+function arrayRefusalAdvice(device: string, sys: string, refusal: Pick<ArrayRefusal, 'cause' | 'action'>): string {
+  const cause = refusal.cause
+  switch (cause) {
+    case 'member-missing':
+      return memberLostAdvice(device, sys, refusal.action ?? null)
+    case 'busy':
+      // Review R2: a reshape and a frozen sync are named as what to wait for.
+      if (refusal.action === 'reshape')
+        return `Run Repair from parity again when the AHR panel shows ${device} clean, with the reshape finished.`
+      if (refusal.action === 'frozen')
+        return `Run Repair from parity again once \`cat ${sys}/sync_action\` no longer reads frozen.`
+      return `Run Repair from parity again when the AHR panel shows ${device} clean, with no check, build or rebuild in progress.`
+    case 'reshape':
+      return `Run Repair from parity again when the AHR panel shows ${device} clean, with the reshape finished.`
+    case 'state':
+      return `Run Repair from parity again once \`cat ${sys}/array_state\` reads clean or active.`
+  }
+}
+
+/**
+ * What the reader does after a throw whose site knows its cause (review R1),
+ * or null when it does not (the job then says "final for this run, report
+ * it"). A member that could not be read is a disk to check and maybe replace;
+ * a bounded check that did not finish is a band to watch until it is idle.
+ */
+function thrownAdvice(error: unknown, band: MdGeometry | null, pool: AhrPool | null | undefined): string | null {
+  if (error instanceof DirectReadError && band && band.members.includes(error.device)) {
+    return `Check SMART for the disk holding ${error.device} in Disks, and replace it (AHR panel → Replace disk) if it is failing. `
+      + 'Then run a scrub (Scrubs → Run now) and repair from what it names. If the same member fails to read again, replace that disk.'
+  }
+  if (error instanceof CheckTimeoutError) {
+    return `md's check did not finish in time. Run Repair from parity again when the AHR panel shows ${bandShown(error.device, pool)} `
+      + 'with no check in progress. If it stops here a second time with the band idle, report it with this job\'s result.'
+  }
+  return null
+}
+
+/**
+ * A band named as the AHR panel shows it (review D4): `/dev/md/<pool>-r<n>`
+ * (ahr-topology.ts, rendered by 39-ahr.js), with the kernel name the engine
+ * read it by in parentheses. A run with no pool (the loop-device rigs) names
+ * the kernel device alone, which is all it has.
+ */
+function bandShown(device: string, pool: AhrPool | null | undefined): string {
+  const kernel = device.replace(DEV_PREFIX_RE, '')
+  const array = pool?.arrays.find(a => a.kernelName === kernel || a.device === device)
+  return array && array.device !== device ? `${array.device} (${device})` : device
+}
+
+/** A member md lost under the repair (cr3.heal.paths, coordinator decision 6). */
+function memberLostAdvice(device: string, sys: string, action: string | null): string {
+  // Review R2: "Replace the failed disk" only where no rebuild is running;
+  // a rebuild, a reshape or a frozen sync is named as what to wait for.
+  const scrub = 'run a scrub (Scrubs → Run now): a block the scrub still names needs a restore.'
+  if (action === 'recover' || action === 'recovery')
+    return `md is rebuilding ${device}. When the AHR panel shows it clean, ${scrub}`
+  if (action === 'reshape') {
+    return `md is reshaping ${device} with a member missing. When the AHR panel no longer shows it reshaping, replace the failed disk `
+      + `(AHR panel → Replace disk); when it shows clean again, ${scrub}`
+  }
+  if (action === 'frozen') {
+    return `md has frozen sync on ${device} with a member missing. Once \`cat ${sys}/sync_action\` no longer reads frozen, replace the failed disk `
+      + `(AHR panel → Replace disk) unless the AHR panel shows the band rebuilding; when it shows clean again, ${scrub}`
+  }
+  if (action === null) {
+    return `Unless the AHR panel shows ${device} rebuilding, replace the failed disk (AHR panel → Replace disk). `
+      + `When it shows clean again, ${scrub}`
+  }
+  return `Replace the failed disk (AHR panel → Replace disk). When the AHR panel shows ${device} clean again, ${scrub}`
 }
 
 // ---------------------------------------------------------------------------
@@ -2040,7 +2215,7 @@ async function reverify(
           // FAILED, so a block with none now is a stale finding or a file
           // that keeps no checksums. Scrub again; never "restore".
           kind: 'not-examined',
-          reason: `btrfs stores no checksum for logical byte ${location.logical} of ${resolved.file} now. A scrub names only blocks whose checksum failed, so the finding is stale (the file changed since that scrub) or the file keeps no checksums (NOCOW, a preallocated range, nodatasum). There is nothing to arbitrate a reconstruction against, and nothing was written.`,
+          reason: `btrfs keeps no checksum for logical byte ${location.logical} of ${resolved.file} now, so this range has changed since the scrub named it. Nothing was written.`,
           code: SELFHEAL_NO_CHECKSUM,
         },
       }
@@ -2102,7 +2277,7 @@ async function reverify(
       abort: {
         kind: 'unrepairable',
         // cr3 second review 5(a): what ANAS did not attempt, and why.
-        reason: `${badSectors.length} on-disk sectors of one ${resolved.compressed ? 'compressed blob' : 'extent'} of ${resolved.file} fail their stored csum (sectors ${badSectors.join(', ')}). ANAS reconstructs one sector per run and did not attempt several in one repair unit, so whether the array could rebuild them was not tested. Nothing was written. If nothing else recovers them, restore the file from a backup if one exists.`,
+        reason: `${badSectors.length} on-disk sectors of one ${resolved.compressed ? 'compressed blob' : 'extent'} of ${resolved.file} fail their stored csum (sectors ${badSectors.join(', ')}). ANAS repairs one sector per run and does not repair an extent with several, so this result is final. Nothing was written. Restore ${resolved.file} from a backup if one exists.`,
       },
     }
   }
@@ -2150,7 +2325,7 @@ async function readBackGuard(
       ? { ok: true, detail: `the md block at ${target.mdByte} is the bytes read from ${target.memberDevice}` }
       : {
           ok: false,
-          detail: `read-back guard failed: the md block at ${target.mdByte} does not match the bytes read from ${target.memberDevice} at ${target.memberOffset}. The mapping and the array disagree; nothing was written, and nothing is known about this file's bytes.`,
+          detail: `read-back guard failed: the md block at ${target.mdByte} does not hold the bytes read from ${target.memberDevice} at ${target.memberOffset}, so ANAS cannot confirm where this block is. Nothing was written.`,
         }
   }
   for (const leg of target.mirrors) {
@@ -2163,7 +2338,7 @@ async function readBackGuard(
   }
   return {
     ok: false,
-    detail: `read-back guard failed: the md block at ${target.mdByte} matches NO leg of this mirror at its own offset. The mapping and the array disagree; nothing was written, and nothing is known about this file's bytes.`,
+    detail: `read-back guard failed: the md block at ${target.mdByte} matches no leg of this mirror at its own offset, so ANAS cannot confirm where this block is. Nothing was written.`,
   }
 }
 
@@ -2318,15 +2493,17 @@ async function readBadBlockLists(geo: MdGeometry): Promise<MdGeometry['badBlocks
  * the array holds of the block gives the same bytes, and those bytes fail the
  * stored checksum. `array-rebuilds-rot` (md counts a mismatch elsewhere in its
  * window) and `above-md` (md counts none) each say BOTH facts: there is no
- * good copy to restore from on the array, and agreeing copies of bad bytes
- * point above the disks. The wording is the operator's (approved 2026-11-14);
- * the sentences after the second are shared, word for word.
+ * good copy to restore from on the array, and the bytes were already wrong
+ * when md wrote them. The wording was approved 2026-11-14 and changed by
+ * cr3.heal.paths (coordinator decision 1): "the controller or software" had no
+ * path to check, "unless the checksum record is what is wrong" had no check
+ * (a restore rewrites both), and the result is final, so it says so and names
+ * the one test the reader can run. The closing sentences are shared, word
+ * for word.
  */
-const NO_GOOD_COPY_SENTENCE = 'No copy on the array holds a good version of this block, '
-  + 'so the repair cannot fix it and running it again will not change that.'
-const CHECK_AND_RESTORE_SENTENCES = 'memory, the controller or software. Check those before trusting new writes. '
-  + 'The file is damaged at this block unless the checksum record is what is wrong. '
-  + 'Restore it from a backup if one exists. Nothing was written.'
+export const MEMORY_TEST_SENTENCE = 'Test the node\'s memory with memtest86+ (a boot menu entry where the package is installed)'
+const FINAL_AGREEING_BAD_SENTENCES = 'No copy on the array holds a good version of this block, so nothing was written, and this result is final. '
+  + `${MEMORY_TEST_SENTENCE}, then restore the file from a backup if one exists.`
 
 /**
  * The `array-rebuilds-rot` sentence (cr3 review item 1) — what was read, and
@@ -2334,12 +2511,11 @@ const CHECK_AND_RESTORE_SENTENCES = 'memory, the controller or software. Check t
  */
 function arrayRebuildsRotSentence(file: string, block: number, shape: 'parity' | 'mirror', directDetail: string, mdMismatch: number): string {
   const copies = shape === 'parity'
-    ? `Rebuilding this row from parity gives the same failing bytes (${directDetail})`
-    : `Every mirror leg holds the same failing bytes (${directDetail})`
-  return `${file} block ${block} fails its stored checksum. `
-    + `${copies}, and md's check counts ${mdMismatch} mismatch(es) elsewhere in its window. `
-    + `${NO_GOOD_COPY_SENTENCE} `
-    + `Disks that agree on bytes that fail their checksum point to a cause above the disks: ${CHECK_AND_RESTORE_SENTENCES}`
+    ? 'rebuilding this row from parity gives the same bytes'
+    : 'every mirror leg holds the same bytes'
+  return `${file} block ${block} fails its stored checksum, and ${copies} `
+    + `(${directDetail}; md's check counts ${mdMismatch} mismatch(es) elsewhere in its window), `
+    + `so they were already wrong when md wrote them. ${FINAL_AGREEING_BAD_SENTENCES}`
 }
 
 /**
@@ -2350,12 +2526,10 @@ function arrayRebuildsRotSentence(file: string, block: number, shape: 'parity' |
  */
 function aboveMdSentence(file: string, block: number, shape: 'parity' | 'mirror', where: string, directDetail: string): string {
   const reading = shape === 'parity'
-    ? `md's check over stripe ${where} counts no mismatch and ${directDetail}, so parity agrees with the bad bytes.`
-    : `md's check over ${where} counts no mismatch and ${directDetail}, so the mirror legs agree with each other and with the bad bytes.`
-  const cause = shape === 'parity'
-    ? 'Parity that agrees with bad data points to a cause above the disks: '
-    : 'Legs that agree on bad data point to a cause above the disks: '
-  return `${file} block ${block} fails its stored checksum. ${reading} ${NO_GOOD_COPY_SENTENCE} ${cause}${CHECK_AND_RESTORE_SENTENCES}`
+    ? `parity agrees with those bytes (md's check over stripe ${where} counts no mismatch and ${directDetail})`
+    : `the mirror legs agree with each other and with those bytes (md's check over ${where} counts no mismatch and ${directDetail})`
+  return `${file} block ${block} fails its stored checksum, and ${reading}, `
+    + `so they were already wrong when md wrote them. ${FINAL_AGREEING_BAD_SENTENCES}`
 }
 
 /** What to say about the bad-blocked members — the operator's own sentence. */

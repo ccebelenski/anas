@@ -1326,46 +1326,74 @@ export async function readCorrectedReads(
  * by the scrub and the repair notifications so the two windows say it in the
  * same words. Only ever composed when `count` is above zero.
  */
-export function metadataCorrectedSentence(corrected: { count: number, devices: string[] }): string {
+export function metadataCorrectedSentence(corrected: { count: number, devices: string[] }, pool: string): string {
   const n = corrected.count
+  // cr3.heal.paths: the journal line names the pool's device-mapper volume,
+  // never a member (GT-20), so the instruction covers every disk of the pool.
   return `btrfs corrected ${n} metadata read(s) from the mirror copy during this run. `
-    + 'A member is returning bad metadata. Check that disk\'s SMART data in Disks.'
+    + `Check SMART for each disk of pool '${pool}' in Disks.`
+}
+
+/**
+ * Can Repair from parity work on this finding? The SAME rule the findings
+ * window lights its verb by (`repairableFinding` in 69-scrubs.js): a live file
+ * under the mountpoint with a bad block the probe named (review D2).
+ */
+function findingRepairable(f: NonNullable<AhrScrubResult['findings']>[number]): boolean {
+  return !f.missing && !f.outsideMount && !f.unidentified && f.badBlocks.length > 0
+}
+
+/** Why a finding cannot be repaired, in the findings window's words (`repairBlockedReason`, 69-scrubs.js). */
+function findingBlockedReason(f: NonNullable<AhrScrubResult['findings']>[number]): string {
+  if (f.outsideMount)
+    return 'this finding is inside a snapshot, outside the pool\'s mounted tree. Repair works on the live @data tree only'
+  if (f.missing)
+    return 'the file no longer exists: it was deleted since the scrub named it'
+  if (f.unidentified)
+    return `no bad block could be named for this corruption${f.reason ? `: ${f.reason}` : ''}`
+  return 'no block inside the reported stripe failed to read. There is nothing to repair'
 }
 
 /** The notification body: the summary sentence, then the files it is about. */
-function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult): string {
-  const head = `btrfs scrub on pool '${pool.name}' reported: ${btrfsErrors}. `
-    + `Latent corruption was found. Check 'btrfs scrub status ${pool.mountpoint}' and the pool's disks.`
+export function findingsBody(pool: AhrPool, btrfsErrors: string, result: AhrScrubResult): string {
   const findings = result.findings ?? []
+  // cr3.heal.paths: errors that name no file have no file to repair; SMART is
+  // the check the reader can run for them.
+  const smart = `Check SMART for each disk of pool '${pool.name}' in Disks.`
   if (findings.length === 0) {
     // Errors with nothing to name: rate-limited kernel warnings, or errors the
     // kernel never attached a path to. Say which, rather than print an empty list.
     const unattributed = result.unattributed
-      ? `\n\n${result.unattributed} error(s) name no file (read/IO or metadata errors). No per-file attribution is possible.`
+      ? `\n\n${result.unattributed} error(s) name no file (read/IO or metadata errors).`
       : ''
-    return `${head}${unattributed}${skippedSection(result.bandsSkipped)}`
+    return `btrfs scrub on pool '${pool.name}' reported: ${btrfsErrors}. ${smart}${unattributed}${skippedSection(result.bandsSkipped)}`
   }
+  // Review D2: the repair instruction is given only for files the verb will
+  // take, and the others say why in the findings window's words.
+  const repairable = findings.filter(findingRepairable).length
+  const instruction = repairable === 0
+    ? 'Repair from parity cannot work on any file it named; each line below says why.'
+    : repairable === findings.length
+      ? 'Run Repair from parity on the files below (Scrubs → the pool\'s findings).'
+      : `Run Repair from parity on the ${repairable} file(s) below listed with bad blocks (Scrubs → the pool's findings). The others cannot be repaired; each line says why.`
+  const head = `btrfs scrub on pool '${pool.name}' reported: ${btrfsErrors}. `
+    + `${instruction}${result.unattributed ? ` For the errors that name no file: ${smart}` : ''}`
   const lines = findings.slice(0, NOTIFY_PATH_LIMIT).map((f) => {
-    const blocks = f.outsideMount
-      ? 'in a snapshot, outside the mounted tree'
-      : f.missing
-        ? 'deleted since the scrub'
-        : f.compressed && f.extentBlocks
-          ? `compressed extent, ${f.extentBlocks.count} blocks`
-          : f.unidentified
-            ? `block not identified (${f.reason ?? 'no reason recorded'})`
-            : `${f.badBlocks.length} bad 4K block(s)`
+    if (!findingRepairable(f))
+      return `  ${f.path}: cannot be repaired: ${findingBlockedReason(f)}`
+    const blocks = f.compressed && f.extentBlocks
+      ? `compressed extent, ${f.extentBlocks.count} blocks`
+      : `${f.badBlocks.length} bad 4K block(s)`
     // T7's fact, carried to the reader (fourth pass): a probe made without the
     // mapping searched an unverified window, so the blocks listed are real but
-    // not known to be complete. The `unidentified` arm already names the
-    // reason as its block text — repeating it in the suffix would say it twice.
-    const unverified = f.probedUnverified && !f.unidentified
+    // not known to be complete.
+    const unverified = f.probedUnverified
       ? ` (search window unverified: ${f.reason ?? 'no reason recorded'})`
       : ''
     return `  ${f.path}: ${blocks}${unverified}`
   })
   if (findings.length > NOTIFY_PATH_LIMIT)
-    lines.push(`  …and ${findings.length - NOTIFY_PATH_LIMIT} more`)
+    lines.push(`  and ${findings.length - NOTIFY_PATH_LIMIT} more`)
   const counts = [
     `${result.errorsAttributed ?? 0} of ${result.errorsReported ?? 0} reported error(s) attributed`,
     ...(result.unattributed ? [`${result.unattributed} naming no file`] : []),
@@ -1414,10 +1442,11 @@ function parityBody(pool: AhrPool, parity: { band: string, mismatchCnt: number }
       + `Rewrite it from the pool's Scrubs row: Scrubs → parity mismatch → Rewrite parity (a fresh checksum scrub runs first, and any finding aborts the run before md is touched). `
       + `Until that runs, at the next disk failure in this band md would reconstruct from the wrong parity.`
   }
-  return `Parity mismatch on ${bands}. The checksum scrub reported errors but named no file, so this scrub cannot tell whether the rot is in parity or in data. `
-    + `Do the data first: repair from parity any file a scrub names (Scrubs → the pool's findings), then scrub pool '${pool.name}' again and see what the second run says. `
-    + `Rewrite parity is refused while a finding stands. md recomputes parity from the data as it is, so running it over rot would make that rot permanent and invisible. `
-    + `At the next disk failure in this band, md would reconstruct from parity nothing has proven right.`
+  // cr3.heal.paths: this arm named no file, so it never tells the reader to
+  // repair one. What it can say is what the reader checks, and what a later
+  // scrub must show before Rewrite parity is offered.
+  return `Parity mismatch on ${bands}. The checksum scrub reported errors that name no file, so this run cannot say whether the rot is in parity or in data. `
+    + `Check SMART for each disk of pool '${pool.name}' in Disks. Rewrite parity is offered once a scrub of the pool (Scrubs → Run now) reports no checksum errors.`
 }
 
 /** The skipped-bands notification body (D8): what was not looked at, and why. */
@@ -2073,7 +2102,7 @@ export async function scrubAhrPool(
   const findings = result.findings ?? []
   const parity = result.parityMismatches ?? []
   const skipped = result.bandsSkipped ?? []
-  const correctedSuffix = metadataCorrected ? `\n\n${metadataCorrectedSentence(metadataCorrected)}` : ''
+  const correctedSuffix = metadataCorrected ? `\n\n${metadataCorrectedSentence(metadataCorrected, pool.name)}` : ''
   if (unproven !== null) {
     // ONE warning, and never the clean-data parity arm: nothing in this run
     // proved the files' checksums.
@@ -2084,7 +2113,7 @@ export async function scrubAhrPool(
       executor,
       'warning',
       'AHR scrub: the checksum pass has no verdict',
-      `The btrfs checksum pass of pool '${pool.name}' has no verdict: ${unproven}. Phase 1 (md parity) is reported as measured.${phase1} Nothing in this run proved the files' checksums, so this is not a clean bill.${skippedSection(result.bandsSkipped)}${correctedSuffix}`,
+      `The btrfs checksum pass of pool '${pool.name}' has no verdict: ${unproven}. Phase 1 (md parity) is reported as measured.${phase1} Nothing in this run proved the files' checksums. Run the scrub again (Scrubs → Run now) when the cause named above has passed. If the scrub ends the same way again, report it with this job's result.${skippedSection(result.bandsSkipped)}${correctedSuffix}`,
     )
   }
   else if (btrfsErrors !== null) {
@@ -2106,7 +2135,7 @@ export async function scrubAhrPool(
   else if (metadataCorrected) {
     // A CLEAN scrub that corrected metadata (the exact GT-20 shape): the
     // summary says nothing, so this is the only notification the run gets.
-    await pveNotify(executor, 'warning', 'AHR scrub: metadata corrected from the mirror', metadataCorrectedSentence(metadataCorrected))
+    await pveNotify(executor, 'warning', 'AHR scrub: metadata corrected from the mirror', metadataCorrectedSentence(metadataCorrected, pool.name))
   }
 
   return result

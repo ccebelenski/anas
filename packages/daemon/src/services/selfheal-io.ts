@@ -104,6 +104,18 @@ export async function writeMdAttr(mdSys: string, key: string, value: string): Pr
 }
 
 /**
+ * A direct read the device itself failed (dd's own exit), named by device so
+ * a caller that knows the device is a member can say which disk to check
+ * (review R1). The message is the one this read always threw.
+ */
+export class DirectReadError extends Error {
+  constructor(message: string, readonly device: string, readonly byteOffset: number) {
+    super(message)
+    this.name = 'DirectReadError'
+  }
+}
+
+/**
  * Read `length` bytes at `byteOffset` with O_DIRECT.
  *
  * Both must be multiples of {@link BLOCK_BYTES} — the caller's offsets come
@@ -133,7 +145,7 @@ export async function readDirect(
     ['-w', '0'],
   )
   if (r.leftExitCode !== 0)
-    throw new Error(`read ${device} @${byteOffset}: dd exit ${r.leftExitCode}: ${r.leftStderr.trim()}`)
+    throw new DirectReadError(`read ${device} @${byteOffset}: dd exit ${r.leftExitCode}: ${r.leftStderr.trim()}`, device, byteOffset)
   if (r.rightExitCode !== 0)
     throw new Error(`read ${device} @${byteOffset}: base64 exit ${r.rightExitCode}: ${r.rightStderr.trim()}`)
 

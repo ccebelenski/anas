@@ -271,7 +271,7 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     assert.equal(notifies[0].args[2], 'warning')
     assert.equal(notifies[0].args[3], 'AHR scrub: the checksum pass has no verdict')
     assert.match(notifies[0].args[4], /was aborted/)
-    assert.match(notifies[0].args[4], /not a clean bill/)
+    assert.match(notifies[0].args[4], /Run the scrub again \(Scrubs → Run now\) when the cause named above has passed\. If the scrub ends the same way again, report it with this job's result\./)
   })
 })
 

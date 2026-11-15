@@ -760,7 +760,7 @@ nodes:
     next: [S64]
   - id: S61
     kind: notification
-    label: 'warning "AHR scrub found errors": the summary, then up to 20 paths with their bad-block counts, then "…and N more"'
+    label: 'warning "AHR scrub found errors": the summary, then up to 20 paths with their bad-block counts, then "…and N more". Review D2 (2026-11-15) corrects this: the summary is followed by "Run Repair from parity on the files below (Scrubs → the pool''s findings)" only when every listed file is one the findings window lets Repair take (`repairableFinding`); with some it reads "Run Repair from parity on the <k> file(s) below listed with bad blocks (Scrubs → the pool''s findings). The others cannot be repaired; each line says why."; with none "Repair from parity cannot work on any file it named; each line below says why.". A file Repair cannot take reads "cannot be repaired: <the findings window''s reason>"; the list ends "and N more".'
     code: 'packages/daemon/src/services/ahr-scrub.ts:findingsBody'
     test: "packages/daemon/src/services/__tests__/ahr-scrub.test.ts:carries the paths in the SAME warning notification \u2014 never a second one"
     gt: GT-3
@@ -978,7 +978,14 @@ nodes:
     code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRefusal'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES while md is busy, reshaping, or the array is not writable'
     gt: GT-17
-    next: [E02]
+    next: [E02, E01p]
+  - id: E01p
+    kind: refusal
+    label: 'cr3.heal.paths (2026-11-15): every run-stopped site writes what must change before a rerun, by the cause it found (`arrayRefusalOf` / `preWriteRefusalOf`): busy or mid-reshape "Run Repair from parity again when the AHR panel shows <md> clean, with no check, build or rebuild in progress" (or "with the reshape finished"); an `array_state` that bars a write "once `cat <sys>/array_state` reads clean or active"; a held top-level mount "when that job has finished (`findmnt --mountpoint <mnt>` prints nothing)"; a pvmove "when the pvmove has finished"; an unknown layout "once `findmnt <mountpoint>` lists the pool". A lost member (degraded at the gate, degraded before the write, kicked during the reconstruction, md recovering) never offers a rerun: "Replace the failed disk (AHR panel → Replace disk). When the AHR panel shows <md> clean again, run a scrub (Scrubs → Run now): a block it still names needs a restore." A non-linear dm table offers none: final for this run, report it. Review D4 (2026-11-15): the band the reader watches is named as the AHR panel shows it, `/dev/md/<pool>-r<n>`, with the kernel name in parentheses ("when the AHR panel shows /dev/md/tank-r1 (/dev/md127) clean"); a run with no pool names the kernel device alone. Review R2 (2026-11-15): "Replace the failed disk" is said only where no rebuild is running. With md rebuilding (`sync_action` recover): "md is rebuilding <band>. When the AHR panel shows it clean, run a scrub (Scrubs → Run now): a block the scrub still names needs a restore."; a reshape or a frozen sync is named as what the reader waits for (a frozen sync: once `cat <sys>/sync_action` no longer reads frozen); an unreadable `sync_action` reads "Unless the AHR panel shows <band> rebuilding, replace the failed disk". Review R6 (2026-11-15): the gate sentences lose the "refused:" prefix and open as plain sentences ("A backup or snapshot job holds the top-level mount of pool ''<p>'' at <mnt>, and Repair from parity needs that mount to itself. Nothing was examined or written. ..."; "A pvmove (<name>) is moving the physical extents under this pool."; "The mount state of pool ''<p>'' could not be read, ...").'
+    code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRefusalAdvice'
+    test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES while md is busy, reshaping, or the array is not writable — each naming what must change first (cr3.heal.paths)'
+    gt: GT-17
+    next: [J47]
   - id: E01a
     kind: refusal
     label: 'degraded, or a member missing: a reconstruction needs every OTHER member of the stripe'
@@ -1099,7 +1106,7 @@ nodes:
     next: [E05a]
   - id: E04c
     kind: refusal
-    label: 'both DUP copies fail, or btrfs-progs refuses the csum-tree walk itself (`dump-tree -b` fails its own node check): CsumUnreadableError with reason code `csum-unreadable` — nothing is known about the data block, and the words "restore from backup" are deliberately absent'
+    label: 'both DUP copies fail, or btrfs-progs refuses the csum-tree walk itself (`dump-tree -b` fails its own node check): CsumUnreadableError with reason code `csum-unreadable` — nothing is known about the data block, and the words "restore from backup" are deliberately absent. cr3.heal.paths (2026-11-15) corrects this: the reason ends "The data block was not judged." in place of "do NOT restore from backup on the strength of this"; J42 says what to do.'
     code: 'packages/daemon/src/services/selfheal-csum.ts:CsumUnreadableError'
     test: 'packages/daemon/src/services/__tests__/selfheal-csum.test.ts:REFUSES a csum leaf that fails its own node checksum, on both DUP copies'
     gt: GT-20
@@ -1127,7 +1134,7 @@ nodes:
     next: [E04f1, E04f2]
   - id: E04f1
     kind: decision
-    label: 'mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows every leg holding the same bytes: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault. Parallel construction: one fault, one reading, on both band types. The sentence carries both facts (cr3.sentences): no copy on the array holds a good version, so restore the file from a backup if one exists; legs that agree on bad data point to a cause above the disks (memory, the controller or software), checked before trusting new writes. Nothing written'
+    label: 'mismatch_cnt = 0 AND a direct read of the legs at their own offsets shows every leg holding the same bytes: the legs AGREE and are both wrong - `above-md`, the same diagnosis a parity band gets from the same fault. Parallel construction: one fault, one reading, on both band types. The sentence carries both facts (cr3.sentences): no copy on the array holds a good version, so restore the file from a backup if one exists; legs that agree on bad data point to a cause above the disks (memory, the controller or software), checked before trusting new writes. Nothing written. cr3.heal.paths (2026-11-15) corrects this: true now: "<file> block <b> fails its stored checksum, and the mirror legs agree with each other and with those bytes (<readings>), so they were already wrong when md wrote them. No copy on the array holds a good version of this block, so nothing was written, and this result is final. Test the node''s memory with memtest86+ (a boot menu entry where the package is installed), then restore the file from a backup if one exists."'
     code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt 0 — the legs AGREE and are both wrong: ABOVE MD'
     gt: GT-16
@@ -1148,7 +1155,7 @@ nodes:
     next: [J40]
   - id: E04f4
     kind: refusal
-    label: 'mismatch_cnt > 0 while every leg holds the SAME failing bytes: `unrepairable` / `array-rebuilds-rot` - no copy on the array holds a good version, so the repair cannot fix it and a rerun will not change that; disks that agree on bytes that fail their checksum point to a cause above the disks (memory, the controller or software), checked before trusting new writes; the file is damaged unless the checksum record is what is wrong: restore it from a backup if one exists. Nothing written, and NEVER `above-md` (which md''s own count denies)'
+    label: 'mismatch_cnt > 0 while every leg holds the SAME failing bytes: `unrepairable` / `array-rebuilds-rot` - no copy on the array holds a good version, so the repair cannot fix it and a rerun will not change that; disks that agree on bytes that fail their checksum point to a cause above the disks (memory, the controller or software), checked before trusting new writes; the file is damaged unless the checksum record is what is wrong: restore it from a backup if one exists. Nothing written, and NEVER `above-md` (which md''s own count denies). cr3.heal.paths (2026-11-15) corrects this: true now: "... and every mirror leg holds the same bytes (<readings>; md''s check counts <m> mismatch(es) elsewhere in its window), so they were already wrong when md wrote them." and the same closing sentences as E04f1.'
     code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRebuildsRotSentence'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:mismatch_cnt > 0 over legs that hold the SAME bytes: md and the direct read disagree (GT-23)'
     gt: GT-23
@@ -1183,14 +1190,14 @@ nodes:
     next: [E06]
   - id: E05b
     kind: decision
-    label: 'mismatch_cnt = 0 AND the direct member read says the parity group agrees with itself, while the block fails its stored csum: `above-md` — parity agrees with the bad bytes, so no copy on the array holds a good version and the repair cannot fix it; parity that agrees with bad data points to a cause above the disks (memory, the controller or software), checked before trusting new writes; the file is damaged unless the checksum record is what is wrong: restore it from a backup if one exists (cr3.sentences). Nothing written.'
+    label: 'mismatch_cnt = 0 AND the direct member read says the parity group agrees with itself, while the block fails its stored csum: `above-md` — parity agrees with the bad bytes, so no copy on the array holds a good version and the repair cannot fix it; parity that agrees with bad data points to a cause above the disks (memory, the controller or software), checked before trusting new writes; the file is damaged unless the checksum record is what is wrong: restore it from a backup if one exists (cr3.sentences). Nothing written. cr3.heal.paths (2026-11-15) corrects this: true now: "<file> block <b> fails its stored checksum, and parity agrees with those bytes (md''s check over stripe <s> counts no mismatch and <direct reading>), so they were already wrong when md wrote them." and the closing sentences of E04f1 (final, the memory test, restore if one exists).'
     code: 'packages/daemon/src/services/selfheal-repair.ts:repairBlock'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:diagnoses ABOVE MD when parity agrees with the bad data'
     gt: GT-6
     next: [J43]
   - id: E05e
     kind: refusal
-    label: 'md counts the stripe while the direct member read says the row agrees with itself: `unrepairable` / `array-rebuilds-rot` - rebuilding the row from parity gives the same failing bytes, so no copy on the array holds a good version and a rerun will not change that; disks that agree on bytes that fail their checksum point to a cause above the disks (memory, the controller or software), checked before trusting new writes; restore the file from a backup if one exists. Nothing written, and NEVER `above-md` (which md''s own count denies)'
+    label: 'md counts the stripe while the direct member read says the row agrees with itself: `unrepairable` / `array-rebuilds-rot` - rebuilding the row from parity gives the same failing bytes, so no copy on the array holds a good version and a rerun will not change that; disks that agree on bytes that fail their checksum point to a cause above the disks (memory, the controller or software), checked before trusting new writes; restore the file from a backup if one exists. Nothing written, and NEVER `above-md` (which md''s own count denies). cr3.heal.paths (2026-11-15) corrects this: true now: "... and rebuilding this row from parity gives the same bytes (<direct reading>; md''s check counts <m> mismatch(es) elsewhere in its window), so they were already wrong when md wrote them." and the closing sentences of E04f1.'
     code: 'packages/daemon/src/services/selfheal-repair.ts:arrayRebuildsRotSentence'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES when md counts the stripe and the member rows agree — never above-md'
     gt: GT-23
@@ -1294,7 +1301,7 @@ nodes:
     next: [E05a]
   - id: E09a
     kind: refusal
-    label: 'guard failed: the mapping and the array disagree, so NOTHING about this file has been established - `not-examined` with reason code `unresolvable`, never the bucket that advises a restore'
+    label: 'guard failed: the mapping and the array disagree, so NOTHING about this file has been established - `not-examined` with reason code `unresolvable`, never the bucket that advises a restore. cr3.heal.paths (2026-11-15) corrects this: the reason is "read-back guard failed: the md block at <x> does not hold the bytes read from <member> at <offset>, so ANAS cannot confirm where this block is. Nothing was written." and the job adds "This result is final for this run. Report it with this job''s result." (the guard runs twice in one run, so a rerun is determined).'
     code: 'packages/daemon/src/services/selfheal-repair.ts:readBackGuard'
     test: 'packages/daemon/src/services/__tests__/selfheal-repair.test.ts:REFUSES: the md offset is not where these member bytes live'
     gt: none
@@ -1431,14 +1438,14 @@ nodes:
   # ===========================================================================
   - id: J31
     kind: decision
-    label: 'the engine THREW rather than reaching a verdict: classified by PHASE (cr3 AHR-HEAL-H1) — after the write `repaired` with `postcheckSkipped` (not clean; the warning says re-scrub to confirm); before it `not-examined` / `run-stopped`; never `unrepairable`. The remaining blocks still get their attempt'
+    label: 'the engine THREW rather than reaching a verdict: classified by PHASE (cr3 AHR-HEAL-H1) — after the write `repaired` with `postcheckSkipped` (not clean; the warning says re-scrub to confirm); before it `not-examined` / `run-stopped`; never `unrepairable`. The remaining blocks still get their attempt. cr3.heal.paths (2026-11-15) corrects this: before the write the reason is the error and "Nothing was written. This result is final for this run. Report it with this job''s result." — no rerun is offered, because nothing names what would change; after it, "Run a scrub (Scrubs → Run now) to confirm it" replaces "Re-scrub to confirm parity". Review R1 (2026-11-15) revises this: a thrown error is "final for this run, report it" only where its site cannot say more. A member read dd fails on (`DirectReadError`, a member of the band) ends "Check SMART for the disk holding <member> in Disks, and replace it (AHR panel → Replace disk) if it is failing. Then run a scrub (Scrubs → Run now) and repair from what it names. If the same member fails to read again, replace that disk."; a bounded check that does not finish (`CheckTimeoutError`) "md''s check did not finish in time. Run Repair from parity again when the AHR panel shows <band> with no check in progress. If it stops here a second time with the band idle, report it with this job''s result."; a pin that fails "Report it with this job''s result." (never "final").'
     code: 'packages/daemon/src/services/ahr-repair.ts:repairAhrFiles'
     test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:a block the engine THROWS on before its write is run-stopped with the error text, never unrepairable — the job carries on'
     gt: none
     next: [J47, J53]
   - id: J40
     kind: refusal
-    label: 'the restore list, advised per file: the `unrepairable` bucket and (cr3.sentences) every `above-md` block. "restore this file from backup"; a file whose restore-list blocks are ALL `array-rebuilds-rot` or `above-md` gets the cause ("every copy the array holds of this block gives the same failing bytes, so the repair cannot fix it and running it again will not change that. The file is damaged at this block unless the checksum record is what is wrong") and "restore this file from a backup if one exists"; a LUN image gets the LUN restore sentence plus ", if one exists: <cause>". The job says once, for every such block, that disks agreeing on bytes that fail their checksum point to a cause above the disks: memory, the controller or software'
+    label: 'the restore list, advised per file: the `unrepairable` bucket and (cr3.sentences) every `above-md` block. "restore this file from backup"; a file whose restore-list blocks are ALL `array-rebuilds-rot` or `above-md` gets the cause ("every copy the array holds of this block gives the same failing bytes, so the repair cannot fix it and running it again will not change that. The file is damaged at this block unless the checksum record is what is wrong") and "restore this file from a backup if one exists"; a LUN image gets the LUN restore sentence plus ", if one exists: <cause>". The job says once, for every such block, that disks agreeing on bytes that fail their checksum point to a cause above the disks: memory, the controller or software. cr3.heal.paths (2026-11-15) corrects this: the "running it again will not change that" / "unless the checksum record is what is wrong" cause and "memory, the controller or software" are retired. True now: the restore list opens "ANAS could not repair these blocks from the array. What to do, per file (a file restore is Backup → the backup task → Restore, or Restore from repository)"; an all-agreeing-bad file reads "every copy the array holds of these blocks gives the same failing bytes, and this result is final: restore this file from a backup if one exists" (a LUN: "..., and <the LUN restore sentence>, if one exists"); the job paragraph says the result is final and names the memory test (J43).'
     action: restore-from-backup-advice
     code: 'packages/daemon/src/services/ahr-repair.ts:RESTORE_FILE_SENTENCE'
     test: "packages/daemon/src/services/__tests__/ahr-repair.test.ts:anything unrepairable or above md notifies at warning, in the epic's words"
@@ -1446,29 +1453,29 @@ nodes:
     next: [J50]
   - id: J41
     kind: refusal
-    label: 'the `mapping-abort` bucket: "nothing was written and nothing needs a restore — the bytes there still pass their stored checksum"'
-    code: 'packages/daemon/src/services/ahr-repair.ts:MAPPING_ABORT_SENTENCE'
+    label: 'the `mapping-abort` bucket: "nothing was written and nothing needs a restore — the bytes there still pass their stored checksum". cr3.heal.paths (2026-11-15) corrects this: "nothing needs a restore" retired (a sentence about what the result is not). True now: "<n> block(s) pass their stored checksum where they sit on disk, so nothing was written to them. Run a scrub (Scrubs → Run now) to confirm them: a block that passes is no longer named. If the scrub names one again, ANAS located it wrongly: report it with this job''s result." A mapping-abort is not counted as unrepaired by the title (as `repairEvidence` does not count it).'
+    code: 'packages/daemon/src/services/ahr-repair.ts:mappingAbortSentence'
     test: "packages/daemon/src/services/__tests__/ahr-repair.test.ts:a mapping-abort is never told to restore from backup \u2014 it means the block is FINE (selfheal.7 F2, R9)"
     gt: none
     action: not-corrupt-here-advice
     next: [J50]
   - id: J42
     kind: refusal
-    label: '`csum-unreadable`: re-scrub after the metadata is repaired (a btrfs scrub repairs metadata copies), and explicitly do NOT restore'
-    code: 'packages/daemon/src/services/ahr-repair.ts:CSUM_UNREADABLE_SENTENCE'
+    label: '`csum-unreadable`: re-scrub after the metadata is repaired (a btrfs scrub repairs metadata copies), and explicitly do NOT restore. cr3.heal.paths (2026-11-15) corrects this: "re-scrub after the metadata is repaired" (GT-20 showed the RW read path, not a scrub, repaired one bad copy, and the reader cannot bring the repair about) and "do NOT restore" are retired. True now: "the checksum btrfs keeps for these blocks could not be read, so nothing judged them and nothing was written. Run a scrub (Scrubs → Run now). If it reports errors that name no file, the checksum record itself is damaged and ANAS has no repair for it: restore this file from a backup if one exists. Otherwise run Repair from parity again on this file.". Review R3 (2026-11-15, safety) retires the "errors that name no file ... restore" branch: unrelated I/O errors pass that test, and the reader would restore over data nothing judged. True now: "Run a scrub (Scrubs → Run now). If it names this file again, run Repair from parity on it from that finding. If the repair stops here a second time, the checksum record is damaged and ANAS has no repair for it: the scrub has named the file twice, so restore this file from a backup if one exists. If the scrub does not name the file, nothing remains to do." (a LUN image keeps the LUN restore verb; the panel says "restore it (the job''s PVE notification says how)").'
+    code: 'packages/daemon/src/services/ahr-repair.ts:csumUnreadableSentence'
     test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:a csum-unreadable unrepairable block is told to re-scrub, not restore (D10)'
     gt: GT-20
     next: [J50]
   - id: J43
     kind: decision
-    label: 'the `above-md` count: its blocks go on the restore list with "if one exists" (cr3.sentences: the same evidence and advice as `array-rebuilds-rot`), and the job says "disks that agree on bytes that fail their checksum point to a cause above the disks: memory, the controller or software. Check those before trusting new writes", which stays an implication'
-    code: 'packages/daemon/src/services/ahr-repair.ts:ABOVE_DISKS_SENTENCE'
+    label: 'the `above-md` count: its blocks go on the restore list with "if one exists" (cr3.sentences: the same evidence and advice as `array-rebuilds-rot`), and the job says "disks that agree on bytes that fail their checksum point to a cause above the disks: memory, the controller or software. Check those before trusting new writes", which stays an implication. cr3.heal.paths (2026-11-15) corrects this: the job paragraph is now "Every copy the array holds of <n> block(s) gives the same bytes, and those bytes fail their stored checksum: they were already wrong when md wrote them, so this result is final. Nothing was written to them. Test the node''s memory with memtest86+ (a boot menu entry where the package is installed), then restore the files listed above from a backup if one exists." "The controller or software" and "check those before trusting new writes" are retired: no path checks them.'
+    code: 'packages/daemon/src/services/ahr-repair.ts:agreeingBadSentence'
     test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:cr3.sentences: an above-md block is on the restore list, "if one exists", and nothing beside it says not to restore'
     gt: GT-6
     next: [J40]
   - id: J44
     kind: refusal
-    label: 'ForeignSyncOpError before the write, at the job level: `not-examined` / `run-stopped`, "array state changed mid-repair", with the operation named - never `unrepairable`'
+    label: 'ForeignSyncOpError before the write, at the job level: `not-examined` / `run-stopped`, "array state changed mid-repair", with the operation named - never `unrepairable`. cr3.heal.paths (2026-11-15) corrects this: the sentence is now "md started <action> on <md> during the repair. Nothing was written." followed by the rerun condition (the AHR panel shows the band clean with nothing in progress), or, for a recovery, the lost-member advice (E01p).'
     code: 'packages/daemon/src/services/selfheal-repair.ts:ForeignSyncOpError'
     test: "packages/daemon/src/services/__tests__/selfheal-repair.test.ts:stops the bounded check itself rather than narrowing a recovery's window"
     gt: GT-19
@@ -1497,18 +1504,25 @@ nodes:
     next: [J51]
   - id: J47
     kind: refusal
-    label: 'the `not-examined` bucket: "this block could not be examined: <reason>; nothing was written; re-scrub after <what would change>". Its own count, its own paragraph, and never the mapping-abort sentence. `run-stopped` adds that a second run stopping with the same reason will not pass by waiting; `no-checksum` advises "Scrub again"; with a `write-unconfirmed` block the paragraph opens "Blocks below reached no verdict. Those that could not be EXAMINED were not written; a block whose write could not be confirmed may have been."'
+    label: 'the `not-examined` bucket: "this block could not be examined: <reason>; nothing was written; re-scrub after <what would change>". Its own count, its own paragraph, and never the mapping-abort sentence. `run-stopped` adds that a second run stopping with the same reason will not pass by waiting; `no-checksum` advises "Scrub again"; with a `write-unconfirmed` block the paragraph opens "Blocks below reached no verdict. Those that could not be EXAMINED were not written; a block whose write could not be confirmed may have been.". cr3.heal.paths (2026-11-15) corrects this: the paragraph is now "The repair reached no verdict on <n> block(s). Nothing was written to them. What to do, per file:" (with a write-unconfirmed block: "A block whose write could not be confirmed may have been written; nothing was written to the others."); each line is the engine''s fact followed by ONE instruction per code (NOT_EXAMINED_ADVICE). `run-stopped` adds nothing of its own: the site that stopped the run wrote what must change first (E01p). `unresolvable`: "This result is final for this run. Report it with this job''s result." `owner-scan-truncated` has no entry (only the scrub raises it). Review R4 (2026-11-15): every rerun has a stop. A write that could not be confirmed names its member in the engine''s reason ("through <md> (member <dev>) at md byte <x>") and its advice ends "If the write fails again while the band shows clean, check that member''s SMART data in Disks."; the scrub with no checksum verdict ends "If the scrub ends the same way again, report it with this job''s result.". Review R5 (2026-11-15): `inode-changed` covers a stat that failed (no file at the path) as well as a different inode, so its words are true of both: the job "Run a scrub (Scrubs → Run now) and repair from what it names: the file the scrub named is no longer at this path.", the panel "the file the scrub named is no longer at this path: run a scrub, and repair from what it names".'
     code: 'packages/daemon/src/services/ahr-repair.ts:notExaminedSentence'
     test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:a not-examined block never carries restore advice, and keeps the run a warning'
     gt: none
     next: [J50]
   - id: J54
     kind: action
-    label: 'AhrRepairResult.parityResiduals: one `parityMismatches`-shaped row per band, carrying the highest count seen - the shape the Scrubs indicator and Rewrite parity already read, so a residual this run measured is actionable without a fresh multi-hour scrub'
+    label: 'AhrRepairResult.parityResiduals: one `parityMismatches`-shaped row per band, carrying the highest count seen - the shape the Scrubs indicator and Rewrite parity already read, so a residual this run measured is actionable without a fresh multi-hour scrub. cr3.heal.paths (2026-11-15) corrects this: a residual md counted 0 on (GT-23 stale cache) is no longer promoted to a row: a row offers Rewrite parity, whose gate refuses a zero (J60).'
     code: 'packages/daemon/src/services/ahr-repair.ts:repairAhrFiles'
     test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:rolls the residual up into a parityMismatches-shaped row, with the band level'
     gt: none
-    next: [J50, U02r]
+    next: [J50, U02r, J60]
+  - id: J60
+    kind: notification
+    label: 'cr3.heal.paths (2026-11-15): the residual advice and the title read the rule Rewrite parity''s evidence gate applies (`repairEvidence`): only a band md COUNTED, and only from a run that left no block unrepaired, above md or not examined, is offered the verb ("Run Rewrite parity on each (Scrubs → the pool''s parity mismatch → Rewrite parity)", title "AHR repair from parity completed: rewrite parity on <bands>"). Beside an unrepaired block: "Rewrite parity refuses while this run left blocks unrepaired, above md or not examined. Deal with the files above, run a scrub (Scrubs → Run now), then run Rewrite parity from that scrub''s parity mismatch". A band md counted 0 on: "run a scrub so md counts it, then run Rewrite parity". "left blocks unrepaired" is the title only when a block was; a mapping-abort is not one (the gate does not count it either). Review D1 (2026-11-15): the verb follows each band''s level, as the gates do: a RAID1 band is offered Reconcile mirror ("md still counts stripes there where the mirror legs differ. Run Reconcile mirror on each (Scrubs → the pool''s parity mismatch → Reconcile mirror)"; title "reconcile mirror on <band>"), a RAID5/6 band Rewrite parity, a band of unknown level neither; a run with both lists each under its own verb.'
+    code: 'packages/daemon/src/services/ahr-repair.ts:residualAdvice'
+    test: 'packages/daemon/src/services/__tests__/ahr-repair.test.ts:7c: a residual beside an unrepaired block names the refusal and what comes first, never "Run Rewrite parity on"'
+    gt: none
+    next: [J50]
   - id: U02r
     kind: ui
     label: 'the Scrubs parity indicator reads the NEWER of the pool''s last completed scrub and its last completed repair, so the residual opens the same door a scrub''s row does'
@@ -1524,7 +1538,7 @@ nodes:
     next: [J52]
   - id: J52
     kind: ui
-    label: 'the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts'
+    label: 'the outcome is rendered back into the window the request was made from — per-file verdicts on their own rows, and the four counts. Review D3 (2026-11-15): the panel names no restore verb of its own. A plain unrepairable file reads "Unrepairable: <files>.", and any restore advice is followed once by "The job''s PVE notification says what to restore, per file." (the job result carries no per-file advice, and only the daemon knows a LUN image is restored as a LUN).'
     code: 'packages/pve-integration/src/69-scrubs.js:showRepairResult'
     test: 'packages/pve-integration/test/dialog-contracts.harness.mjs:repair: the result appears in the window the request was made from'
     gt: none

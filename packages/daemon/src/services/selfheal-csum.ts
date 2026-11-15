@@ -289,7 +289,7 @@ async function readFreshRoots(executor: CommandExecutor, device: string): Promis
   }
   catch (error) {
     if (error instanceof SelfhealTreeError)
-      throw new CsumUnreadableError(`this file's checksum could not be read reliably: the tree roots could not be re-read (${error.message}). Nothing is known about the data block itself: do NOT restore from backup on the strength of this.`)
+      throw new CsumUnreadableError(`this file's checksum could not be read reliably: the tree roots could not be re-read (${error.message}). The data block was not judged.`)
     throw error
   }
 }
@@ -339,7 +339,7 @@ export async function readStoredCsum(
     // data block: it carries the code that keeps the words "restore from
     // backup" away from it.
     if (error instanceof SelfhealTreeError)
-      throw new CsumUnreadableError(`this file's checksum could not be read reliably: the checksum tree could not be walked to logical byte ${logical} (${error.message}). Nothing is known about the data block itself: do NOT restore from backup on the strength of this.`)
+      throw new CsumUnreadableError(`this file's checksum could not be read reliably: the checksum tree could not be walked to logical byte ${logical} (${error.message}). The data block was not judged.`)
     throw error
   }
   if (!location)
@@ -369,6 +369,6 @@ export async function readStoredCsum(
   throw new CsumUnreadableError(
     `this file's checksum could not be read reliably (csum tree leaf ${location.item.leaf} failed its own checksum on `
     + `${copies.length > 1 ? 'both copies' : 'its only copy'} — ${failures.join('; ')}). `
-    + `Nothing is known about the data block itself: do NOT restore from backup on the strength of this.`,
+    + `The data block was not judged.`,
   )
 }
