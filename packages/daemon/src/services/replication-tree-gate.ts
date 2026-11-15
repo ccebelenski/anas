@@ -62,20 +62,6 @@ export interface TreeGatePass {
   driftNotes: string[]
   /** repl.drift: what the run records about its changed or writable copies. */
   driftRecords: RecordedDrift[]
-  /**
-   * Review P3: copies found up to date and not read-only — the run sets each
-   * read-only once every refusal is behind it, and its sentence and record
-   * follow what that answered (so they are in neither list above).
-   */
-  exposedUpToDate: ExposedCopy[]
-}
-
-/** An up-to-date copy the run sets read-only (review P3), with what its read said. */
-export interface ExposedCopy {
-  target: string
-  base: string
-  readonly: string
-  readonlySource?: string
 }
 
 export type TreeGateResult
@@ -116,8 +102,8 @@ export interface TreeDriftDeps {
  * let it go ahead with a warning or a note. A copy whose newest snapshot is
  * its base is judged from the tree read alone.
  */
-async function judgeTreeDrift(deps: TreeDriftDeps | undefined, checks: TreeDriftCheck[]): Promise<{ refusals: string[], warnings: string[], notes: string[], records: RecordedDrift[], drifts: ReplicationTargetDrift[], exposedUpToDate: ExposedCopy[] }> {
-  const out = { refusals: [] as string[], warnings: [] as string[], notes: [] as string[], records: [] as RecordedDrift[], drifts: [] as ReplicationTargetDrift[], exposedUpToDate: [] as ExposedCopy[] }
+async function judgeTreeDrift(deps: TreeDriftDeps | undefined, checks: TreeDriftCheck[]): Promise<{ refusals: string[], warnings: string[], notes: string[], records: RecordedDrift[], drifts: ReplicationTargetDrift[] }> {
+  const out = { refusals: [] as string[], warnings: [] as string[], notes: [] as string[], records: [] as RecordedDrift[], drifts: [] as ReplicationTargetDrift[] }
   if (deps === undefined)
     return out
   for (const check of checks) {
@@ -135,10 +121,6 @@ async function judgeTreeDrift(deps: TreeDriftDeps | undefined, checks: TreeDrift
       readHeld: () => deps.readHeld(check.dataset, check.target, check.base),
     })
     out.drifts.push(drift)
-    if (drift.state === 'exposed' && !check.sends && read.ok) {
-      out.exposedUpToDate.push({ target: check.target, base: check.base, readonly: read.readonly, ...(read.readonlySource ? { readonlySource: read.readonlySource } : {}) })
-      continue
-    }
     const record = recordOf(drift, { sealed: check.sends })
     if (record)
       out.records.push(record)
@@ -291,5 +273,5 @@ export async function gateTreeRun(
       return { ok: false, refusals }
   }
 
-  return { ok: true, plan, sweep, excludeMissing, driftWarnings: drift.warnings, driftNotes: drift.notes, driftRecords: drift.records, exposedUpToDate: drift.exposedUpToDate }
+  return { ok: true, plan, sweep, excludeMissing, driftWarnings: drift.warnings, driftNotes: drift.notes, driftRecords: drift.records }
 }

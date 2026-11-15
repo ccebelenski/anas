@@ -275,62 +275,14 @@ const KEEPS_READ_ONLY = 'A replication task keeps its target read-only: to use t
 /**
  * The `exposed` sentence. `sealed`: this run's receive set it read-only
  * again (ruling 1: every receive passes `-o readonly=on`); otherwise nothing
- * was received, and the next run that completes sets it (review 2, P3: its
- * receive when the copy is behind, the run itself when it is up to date).
+ * was received and the next send will.
  */
 export function exposedSentence(input: DriftSentenceInput & { readonly: string, readonlySource?: string, sealed?: boolean }): string {
   const { target, where } = input
   const shown = readonlyShown(input.readonly, input.readonlySource)
   if (input.sealed)
     return `Target '${target}'${where} was not read-only (${shown}); this run's receive set it read-only again. ${KEEPS_READ_ONLY}`
-  return `Target '${target}'${where} is not read-only (${shown}): ${writeOrAtimeRead('stops the next send')}. The next replication run that completes sets it read-only again: its receive does when the copy is behind, and the run itself when the copy is up to date. 'zfs set readonly=on ${target}' on the target does it now, and neither undoes a change already made. ${KEEPS_READ_ONLY}`
-}
-
-/** What setting a target read-only answered (review P3). */
-export type SealResult = { ok: true } | { ok: false, reason: string }
-
-/**
- * Review P3: the argv that sets a target read-only — the same property every
- * receive sets with `-o readonly=on` (ruling 1), set by the run itself when
- * it finds the target up to date and not read-only (nothing is received, so
- * no receive would). `--` before the operands, the idiom of every `zfs set`
- * here.
- */
-export function sealTargetArgs(dataset: string): string[] {
-  return ['set', '--', 'readonly=on', dataset]
-}
-
-/** Set the target read-only where it lives; a failure is its reason, never a throw. */
-export async function sealTarget(run: ZfsRunner, dataset: string): Promise<SealResult> {
-  try {
-    const r = await run(sealTargetArgs(dataset))
-    return r.exitCode === 0 ? { ok: true } : { ok: false, reason: failureLine(r) }
-  }
-  catch (err) {
-    return { ok: false, reason: err instanceof Error ? err.message : String(err) }
-  }
-}
-
-/** `zfs get`'s source column for an inherited value: `inherited from <parent>`. */
-const INHERITED_FROM_RE = /^inherited from (\S+)$/
-
-/**
- * The sentence of an up-to-date `exposed` target after the run tried to set it
- * read-only (review P3). Review 2: `zfs set` sets the property ON the dataset,
- * so a value it inherited before (the read's source column) is now its own,
- * and every dataset below it that inherits the property becomes read-only too.
- * A recursive run judges its copies from the tree read, which has no source
- * column: then only the always-true part is said.
- */
-export function exposedSetSentence(input: DriftSentenceInput & { readonly: string, readonlySource?: string, seal: SealResult }): string {
-  const { target, where } = input
-  const shown = readonlyShown(input.readonly, input.readonlySource)
-  if (input.seal.ok) {
-    const parent = INHERITED_FROM_RE.exec(input.readonlySource ?? '')?.[1]
-    const inherited = parent ? `, where the property was inherited from '${parent}' before` : ''
-    return `Target '${target}'${where} was not read-only (${shown}); this run set it read-only on '${target}' itself ('zfs set readonly=on ${target}')${inherited}; datasets below it that inherit the property are read-only too. ${KEEPS_READ_ONLY}`
-  }
-  return `Target '${target}'${where} is not read-only (${shown}), and this run could not set it read-only: ${input.seal.reason}. Until it is read-only, ${writeOrAtimeRead('stops the next send')}; 'zfs set readonly=on ${target}' on the target sets it now, and does not undo a change already made. ${KEEPS_READ_ONLY}`
+  return `Target '${target}'${where} is not read-only (${shown}): replication into it keeps working only while nothing touches it, and with access-time updates on, even reading a file there counts as a change. The next send sets it read-only again; 'zfs set readonly=on ${target}' on the target does it now, and neither undoes a change already made. ${KEEPS_READ_ONLY}`
 }
 
 /** The `unknown` sentence. */
@@ -381,13 +333,6 @@ export interface DriftCheckInput extends DriftSentenceInput {
   readHeld?: () => Promise<BaseHeld>
   /** What this run did to its holds before this judgement (review D2); absent: nothing. */
   holdActs?: HoldActs
-  /**
-   * Review P3: an `exposed` target this run does NOT receive into (it is up
-   * to date) is set read-only by the run: this sets it, and the sentence says
-   * what it answered. Asked for `exposed` only — never for `modified` or
-   * `unknown`, and never when `sends` (the receive does it).
-   */
-  seal?: () => Promise<SealResult>
 }
 
 /** Turn one read into the four-state answer with its sentence. */
@@ -399,10 +344,6 @@ export async function judgeTargetState(read: TargetStateRead, input: DriftCheckI
   const common = { dataset: target, base, writtenBytes: read.written, readonly: read.readonly }
   if (state === 'clean')
     return { state, ...common }
-  if (state === 'exposed' && input.sends !== true && input.seal) {
-    const seal = await input.seal()
-    return { state, ...common, message: exposedSetSentence({ ...input, readonly: read.readonly, ...(read.readonlySource ? { readonlySource: read.readonlySource } : {}), seal }) }
-  }
   if (state === 'exposed')
     return { state, ...common, message: exposedSentence({ ...input, readonly: read.readonly, ...(read.readonlySource ? { readonlySource: read.readonlySource } : {}), sealed: input.sends === true }) }
   const newer = snapshotsNewerThan(input.targetSnaps, base)
@@ -460,9 +401,8 @@ export interface RecordedDrift {
 
 /**
  * The record of one judged target, or null for a state that is not recorded:
- * clean, unknown, and an `exposed` target this run sealed — by its receive
- * (ruling 1) or, up to date, by setting it read-only (review P3): it is
- * read-only again, so the dashboard has nothing to say about it.
+ * clean, unknown, and an `exposed` target this run's receive sealed (ruling
+ * 1: it is read-only again, so the dashboard has nothing to say about it).
  */
 export function recordOf(d: ReplicationTargetDrift, opts: { sealed?: boolean } = {}): RecordedDrift | null {
   if (d.state === 'exposed' && opts.sealed === true)

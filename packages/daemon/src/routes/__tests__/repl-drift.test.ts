@@ -81,8 +81,6 @@ interface World {
   targetState?: ExecResult
   /** The drift read rejects (a deadline), as the executor does on a timeout. */
   targetThrows?: true
-  /** Review P3: the local `zfs set` answer (default: exit 0). */
-  setAnswer?: ExecResult
 }
 
 /** A clean read-only replica's answer to the drift read (the captured rows' shape). */
@@ -138,8 +136,6 @@ function fakeExecutor(world: World, log: string[]): CommandExecutor {
       return ok('size\t1000\n')
     if (cmd === ZFS && args[0] === 'snapshot')
       return ok()
-    if (cmd === ZFS && args[0] === 'set')
-      return world.setAnswer ?? ok()
     if (cmd === ZFS && args[0] === 'get') {
       if (world.targetThrows)
         throw new Error('zfs get: had not answered after 300 s')
@@ -526,84 +522,16 @@ describe('repl.drift — a writable target (exposed)', () => {
     assert.ok(!r.log.some(l => l.startsWith(`${ZFS} set`)), 'ANAS never sets the property itself')
   })
 
-  // Review P3 (proposed; its own commit): an up-to-date exposed target is
-  // set read-only by the run, said once and notified once at warning.
-  it('an up-to-date exposed target: the run sets it read-only itself, says so once, notifies once at warning, records nothing', async () => {
+  it('an up-to-date exposed target cannot be sealed (nothing is received): it warns, every run, and ANAS sets nothing', async () => {
     const world = upToDateWorld()
     world.targetState = ok(`written@Sn\t0\t-\nreadonly\toff\tlocal\n`)
     const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
-    assert.deepEqual(r.log.filter(l => l.startsWith(`${ZFS} set`)), [`${ZFS} set -- readonly=on ${TGT}`])
-    assert.deepEqual((r.result as { warnings?: string[] }).warnings, ['Target \'backup/data\' was not read-only (readonly=off, local); this run set it read-only on \'backup/data\' itself (\'zfs set readonly=on backup/data\'); datasets below it that inherit the property are read-only too. A replication task keeps its target read-only: to use this copy as a live dataset, remove the replication task into it.'])
+    assert.deepEqual((r.result as { warnings?: string[] }).warnings, ['Target \'backup/data\' is not read-only (readonly=off, local): replication into it keeps working only while nothing touches it, and with access-time updates on, even reading a file there counts as a change. The next send sets it read-only again; \'zfs set readonly=on backup/data\' on the target does it now, and neither undoes a change already made. A replication task keeps its target read-only: to use this copy as a live dataset, remove the replication task into it.'])
     assert.equal(r.notifications.length, 1)
     assert.ok(r.notifications[0].includes(' warning replication tank/data -> backup/data completed with warnings '), 'exposed is informational: a warning')
-    assert.equal((r.result as { targetDrift?: unknown }).targetDrift, undefined, 'set read-only: nothing to record')
-    assert.deepEqual(pipes(r.log), [])
-    // The order: the settle, the read, then the set.
-    const verbs = r.log.filter(l => / (?:hold|get|set) /.test(l) && l.startsWith(ZFS))
-    assert.deepEqual(verbs.map(l => l.split(' ')[1]), ['hold', 'hold', 'get', 'set'])
-  })
-
-  // Review 2: `zfs set` sets the property ON the target; a value it
-  // inherited before is now its own, and what inherits from it follows.
-  it('an up-to-date exposed target whose readonly was INHERITED: the sentence says it is now set on the target itself, and what was inherited before', async () => {
-    const world = upToDateWorld()
-    world.targetState = ok(`written@Sn\t0\t-\nreadonly\toff\tinherited from backup\n`)
-    const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
-    assert.deepEqual(r.log.filter(l => l.startsWith(`${ZFS} set`)), [`${ZFS} set -- readonly=on ${TGT}`])
-    assert.deepEqual((r.result as { warnings?: string[] }).warnings, ['Target \'backup/data\' was not read-only (readonly=off, inherited from backup); this run set it read-only on \'backup/data\' itself (\'zfs set readonly=on backup/data\'), where the property was inherited from \'backup\' before; datasets below it that inherit the property are read-only too. A replication task keeps its target read-only: to use this copy as a live dataset, remove the replication task into it.'])
-  })
-
-  it('the next run reads it read-only (clean): silent', async () => {
-    const world = upToDateWorld()
-    world.targetState = ok(`written@Sn\t0\t-\nreadonly\ton\tlocal\n`)
-    const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
-    assert.deepEqual(r.notifications, [])
-    assert.deepEqual(r.log.filter(l => l.startsWith(`${ZFS} set`)), [])
-  })
-
-  it('a set that fails says it failed and why, warns, and the target stays recorded', async () => {
-    const world = upToDateWorld()
-    world.targetState = ok(`written@Sn\t0\t-\nreadonly\toff\tlocal\n`)
-    world.setAnswer = { stdout: '', stderr: 'cannot set property for \'backup/data\': permission denied\n', exitCode: 1 }
-    const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
-    assert.deepEqual((r.result as { warnings?: string[] }).warnings, ['Target \'backup/data\' is not read-only (readonly=off, local), and this run could not set it read-only: cannot set property for \'backup/data\': permission denied. Until it is read-only, a write there, or a read with access-time updates on, stops the next send; \'zfs set readonly=on backup/data\' on the target sets it now, and does not undo a change already made. A replication task keeps its target read-only: to use this copy as a live dataset, remove the replication task into it.'])
     assert.deepEqual((r.result as { targetDrift?: unknown }).targetDrift, [{ state: 'exposed', dataset: TGT, base: 'Sn' }])
-    assert.equal(r.notifications.length, 1)
-  })
-
-  it('a remote target is set over the same ssh argv as its read', async () => {
-    const world = upToDateWorld()
-    world.holds.clear()
-    hold(world, `${SRC}@Sn`, REMOTE_TAG)
-    world.remote = new Map([
-      [`zfs list -H -o name -- ${TGT}`, ok(`${TGT}\n`)],
-      [`zfs list -H -t snapshot -o name,creation -s createtxg -- ${TGT}`, ok(`${TGT}@Sbase\tMon Jul 13 10:00 2026\n${TGT}@S0\tMon Jul 13 11:00 2026\n${TGT}@Sn\tMon Jul 13 12:00 2026\n`)],
-      [`zfs get -Hp -o property,value,source written@Sn,readonly -- ${TGT}`, ok(`written@Sn\t0\t-\nreadonly\toff\tlocal\n`)],
-      [`zfs set -- readonly=on ${TGT}`, ok('')],
-      [`zfs hold -- ${REMOTE_TAG} ${TGT}@Sn`, ok('')],
-    ])
-    const r = await run(world, { target: { pool: 'backup', dataset: 'data', location: REMOTE } })
-    assert.equal(r.error, undefined, r.error?.message)
-    const sets = r.log.filter(l => l.startsWith('/usr/bin/ssh') && l.includes(' set '))
-    assert.equal(sets.length, 1)
-    assert.match(sets[0], / -- root@10\.0\.0\.9 zfs set -- readonly=on backup\/data$/)
-    assert.match((r.result as { warnings?: string[] }).warnings?.at(-1) ?? '', /^Target 'backup\/data' on remote 'nas1' was not read-only \(readonly=off, local\); this run set it read-only/)
-  })
-
-  it('modified and unknown never trigger a set', async () => {
-    for (const answer of [ok(`written@Sn\t12288\tlocal\nreadonly\toff\tlocal\n`), { stdout: '', stderr: 'cannot open \'backup/data\': dataset does not exist', exitCode: 1 }]) {
-      const world = upToDateWorld()
-      world.targetState = answer
-      const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
-      assert.deepEqual(r.log.filter(l => l.startsWith(`${ZFS} set`)), [])
-    }
-  })
-
-  it('a target that is BEHIND and exposed is sealed by its receive, never by a separate set', async () => {
-    const world = behindWorld()
-    world.targetState = state('S0', 0, 'off')
-    const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
-    assert.deepEqual(r.log.filter(l => l.startsWith(`${ZFS} set`)), [])
+    assert.deepEqual(pipes(r.log), [])
+    assert.ok(!r.log.some(l => l.startsWith(`${ZFS} set`)), 'no separate zfs set')
   })
 })
 

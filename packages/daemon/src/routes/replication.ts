@@ -3,7 +3,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor, ExecResult, PipelineResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { PveFootprint } from '../services/pve-footprint.js'
-import type { BaseHeld, RecordedDrift, SealResult, ZfsRunner } from '../services/replication-drift.js'
+import type { BaseHeld, ZfsRunner } from '../services/replication-drift.js'
 import type { SettleActs } from '../services/replication-holds.js'
 import type { ReplicationNotifyContext } from '../services/replication-notify.js'
 import type { TargetPlacement } from '../services/replication-target.js'
@@ -13,7 +13,7 @@ import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
 import { GuardRefusalError, sendRefusal, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { ownershipRefusal } from '../services/pve-footprint.js'
-import { checkTargetDrift, exposedSetSentence, nextIncrementalBase, readBaseHeld, recordOf, sealTarget } from '../services/replication-drift.js'
+import { checkTargetDrift, nextIncrementalBase, readBaseHeld, recordOf } from '../services/replication-drift.js'
 import { legacyReleasableOnSource, readLocalHoldsChecked, replicationHoldTag, settleReplicationHolds } from '../services/replication-holds.js'
 import { notifyReplicationRun, singleLine } from '../services/replication-notify.js'
 import { newestReplicable, readLocalSnapshots, readRemoteSnapshotNames } from '../services/replication-snapshots.js'
@@ -714,7 +714,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             : d.mode === 'incremental' ? d.baseSnapshot : undefined
           const checkDrift = driftBase === undefined
             ? undefined
-            : (holdActs?: SettleActs, seal?: () => Promise<SealResult>) => checkTargetDrift(targetZfs(loc), {
+            : (holdActs?: SettleActs) => checkTargetDrift(targetZfs(loc), {
                 target: targetFull,
                 where: whereLabel(target),
                 base: driftBase,
@@ -722,7 +722,6 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
                 sends: !d.upToDate,
                 readHeld: baseHeld(loc, source, targetFull, driftBase, holdTag),
                 ...(holdActs ? { holdActs } : {}),
-                ...(seal ? { seal } : {}),
               })
 
           // cr3 REPLICATION-M1: the target already has S — nothing is sent.
@@ -777,24 +776,12 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             // notification carries it. Asked after the settle above, so the
             // sentence states the holds as they now are, and (review D2) its
             // first clause says what the settle moved, when it moved any.
-            // Review P3: a target found up to date and NOT read-only is set
-            // read-only by this run (`zfs set -- readonly=on <target>` where
-            // it lives: the property every receive sets), said once in the
-            // result and notified once at warning; the next run reads it
-            // clean. A set that failed says why, and the target stays
-            // recorded. Never for `modified` or `unknown`.
-            let sealed = false
-            const seal = async (): Promise<SealResult> => {
-              const r = await sealTarget(targetZfs(loc), targetFull)
-              sealed = r.ok
-              return r
-            }
-            const drift = checkDrift ? await checkDrift(holdActs, seal) : undefined
+            const drift = checkDrift ? await checkDrift(holdActs) : undefined
             if (drift && (drift.state === 'modified' || drift.state === 'exposed'))
               warnings.push(drift.message!)
             if (drift?.state === 'unknown')
               note = joinNotes(note, drift.message)
-            const upRecord = drift ? recordOf(drift, { sealed }) : null
+            const upRecord = drift ? recordOf(drift) : null
             const result = {
               snapshot: snapName,
               bytesEstimated: 0,
@@ -1179,26 +1166,6 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             }
           }
 
-          // 2b. Review P3: a copy found up to date and not read-only is set
-          //     read-only now — every refusal is behind the run, and nothing
-          //     is received into it that would. Its sentence says what the
-          //     set answered; a copy that could not be set stays recorded.
-          const sealWarnings: string[] = []
-          const sealRecords: RecordedDrift[] = []
-          /** Review 2, defect 2: the copies this run set read-only, named if a later send fails. */
-          const setReadOnly: string[] = []
-          for (const copy of gateNow.exposedUpToDate) {
-            const seal = await sealTarget(targetZfs(jobLoc), copy.target)
-            sealWarnings.push(exposedSetSentence({ target: copy.target, where: whereLabel(target), base: copy.base, readonly: copy.readonly, ...(copy.readonlySource ? { readonlySource: copy.readonlySource } : {}), seal }))
-            if (seal.ok)
-              setReadOnly.push(copy.target)
-            else
-              sealRecords.push({ state: 'exposed', dataset: copy.target, base: copy.base })
-          }
-          const setReadOnlyClause = setReadOnly.length > 0
-            ? `; set read-only this run${whereLabel(target)} (up to date, nothing to send): ${setReadOnly.join(', ')}`
-            : ''
-
           // 3. R6: sends in sweep order, stopping at the first failure. Nothing
           //    is rolled back; the next run continues from each dataset's own
           //    base (a copy that already holds S is up to date).
@@ -1251,10 +1218,8 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             // and RESOLVES with a non-zero exit otherwise — a throw used to
             // escape as a bare `spawn EAGAIN`, naming no dataset and no
             // already-sent list. One sentence builder for both branches.
-            // Review 2, defect 2: a copy set read-only before this send (P3)
-            // is named too — the run changed it, and the failure says so.
             const r6Sentence = (detail: string): string =>
-              `Replication failed at '${planned.dataset}' — ${detail}; already sent this run: ${sent.join(', ') || 'nothing'}${setReadOnlyClause}; the next run continues from each dataset's own base`
+              `Replication failed at '${planned.dataset}' — ${detail}; already sent this run: ${sent.join(', ') || 'nothing'}; the next run continues from each dataset's own base`
             let pipe: PipelineResult
             try {
               pipe = await executor.pipeline(ZFS, sendArgs, recvCmd, recvArgv, { timeoutMs: null, longRunning: 'zfs send | zfs recv: a data mover, hours for a large send' })
@@ -1328,8 +1293,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           // repl.drift: a copy that is not read-only was sent to (ZFS
           // accepted it: nothing had changed) and the run warns, every run
           // while it lasts; a copy whose state could not be read is noted.
-          warnings.push(...gateNow.driftWarnings, ...sealWarnings)
-          const driftRecords = [...gateNow.driftRecords, ...sealRecords]
+          warnings.push(...gateNow.driftWarnings)
           const driftNote = gateNow.driftNotes.length > 0 ? gateNow.driftNotes.join('; ') : undefined
 
           const result = {
@@ -1353,7 +1317,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
             ...(gateNow.excludeMissing.length > 0 ? { excludeMissing: gateNow.excludeMissing } : {}),
             bytesEstimated,
             ...(driftNote ? { note: driftNote } : {}),
-            ...(driftRecords.length > 0 ? { targetDrift: driftRecords } : {}),
+            ...(gateNow.driftRecords.length > 0 ? { targetDrift: gateNow.driftRecords } : {}),
             ...(warnings.length ? { warnings } : {}),
           }
           await notifyReplicationRun(executor, { ...notify, result, elapsedMs: Date.now() - startedAt })
