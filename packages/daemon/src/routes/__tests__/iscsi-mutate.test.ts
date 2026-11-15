@@ -1818,7 +1818,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       const res = await call('POST', `${targetUrl()}/luns`, { name: 'vmdisk9', kind: 'zvol', backing: 'tank/vol2' })
       assert.equal(res.statusCode, 409, JSON.stringify(res.body))
       assert.equal(res.body.error!.reason, 'name-taken')
-      assert.match(res.body.error!.message, /A backstore named 'vmdisk9' already exists on this node, mapped as no LUN/)
+      assert.match(res.body.error!.message, /A backstore named 'vmdisk9' exists on this node and no LUN maps it\. .*: pick another name, or remove that backstore with targetcli\.$/)
     })
 
     it('refuses a name only the SAVED configuration has (it comes back at the next boot)', async () => {

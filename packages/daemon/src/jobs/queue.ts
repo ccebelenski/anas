@@ -224,6 +224,38 @@ interface JobRecord {
   releaseDeferred?: boolean
 }
 
+/** One ended run of a job family, with the params it was submitted with ({@link JobQueue.findEndedRuns}). */
+export interface EndedRun {
+  job: Job
+  params: Readonly<Record<string, unknown>>
+}
+
+/**
+ * A caller's "this finished job is still needed" ({@link JobQueue.pinWhile}):
+ * the job and its submit params in, true to keep it past `maxRetained`.
+ */
+export type PinPredicate = (job: Job, params: Readonly<Record<string, unknown>>) => boolean
+
+/**
+ * One pin predicate's answer for one finished job. A predicate that throws
+ * pins nothing: eviction runs in a job's `finally`, and a throw there would
+ * stop the queue from draining (review 4).
+ */
+function pinSays(predicate: PinPredicate, record: { job: Job, submitter: { params?: Record<string, unknown> } }): boolean {
+  try {
+    return predicate(record.job, record.submitter.params ?? {})
+  }
+  catch {
+    return false
+  }
+}
+
+/** The finished jobs kept past `maxRetained` by default ({@link JobQueue.pinWhile}). */
+export const DEFAULT_MAX_PINNED = 100
+
+/** The finished jobs the queue keeps by default before it evicts the oldest. */
+export const DEFAULT_MAX_RETAINED = 1000
+
 /** Why a queued job cannot start yet: the claim, and the job in its way. */
 interface LockWait {
   claim: LockClaim
@@ -234,6 +266,9 @@ export class JobQueue {
   private jobs = new Map<string, JobRecord>()
   private concurrency: number
   private maxRetained: number
+  /** At most this many pinned finished jobs survive an eviction ({@link pinWhile}). */
+  private maxPinned: number
+  private readonly pins: PinPredicate[] = []
   private running = 0
   /** Slots held by `long` jobs (cr.33). */
   private runningLong = 0
@@ -263,6 +298,8 @@ export class JobQueue {
   constructor(opts?: {
     concurrency?: number
     maxRetained?: number
+    /** Default {@link DEFAULT_MAX_PINNED}: pinned finished jobs kept past `maxRetained`. */
+    maxPinned?: number
     audit?: AuditLogger
     /** Where the executor lists children it could not stop (default: the daemon's one registry). */
     abandoned?: AbandonedRegistry
@@ -272,7 +309,8 @@ export class JobQueue {
     watchSlots?: number
   }) {
     this.concurrency = opts?.concurrency ?? 4
-    this.maxRetained = opts?.maxRetained ?? 1000
+    this.maxRetained = opts?.maxRetained ?? DEFAULT_MAX_RETAINED
+    this.maxPinned = opts?.maxPinned ?? DEFAULT_MAX_PINNED
     this.audit = opts?.audit
     this.abandoned = opts?.abandoned ?? abandonedChildren
     this.longSlots = opts?.longSlots ?? Math.max(1, this.concurrency - 1)
@@ -454,6 +492,56 @@ export class JobQueue {
   }
 
   /**
+   * A job of `operation` that names `target` and is RUNNING now (cr3.lunrestore,
+   * review N5): a queued job has not started writing anything, so only a
+   * running one makes a restore mark read "in progress".
+   */
+  findRunning(operation: string, target: string, paramKey: string = 'name'): Job | undefined {
+    for (const record of this.jobs.values()) {
+      if (record.job.operation === operation && record.submitter.params?.[paramKey] === target && record.job.status === 'running')
+        return record.job
+    }
+    return undefined
+  }
+
+  /**
+   * Every job of `operation` on `target` that RAN and has ended — completed,
+   * failed or cancelled after it started — in SUBMISSION order, oldest first,
+   * each with the params it was submitted with (cr3.lunrestore, review3 1):
+   * "how did each run onto this object end?". A job cancelled while still
+   * queued never ran and is not listed; a running or queued job is not an
+   * ending. In memory like the rest of the queue: after a daemon restart the
+   * list is empty, and an evicted job is not in it (see {@link pinWhile}).
+   */
+  findEndedRuns(operation: string, target: string, paramKey: string = 'name'): EndedRun[] {
+    const out: EndedRun[] = []
+    for (const record of this.jobs.values()) {
+      const { job } = record
+      if (job.operation !== operation || record.submitter.params?.[paramKey] !== target || job.startedAt === null)
+        continue
+      if (job.status !== 'completed' && job.status !== 'failed' && job.status !== 'cancelled')
+        continue
+      out.push({ job, params: record.submitter.params ?? {} })
+    }
+    return out
+  }
+
+  /**
+   * Keep finished jobs a caller still depends on past {@link maxRetained}
+   * (cr3.lunrestore, review3 1). Eviction skips a finished job for which any
+   * registered predicate answers true — up to {@link maxPinned} of them. THE
+   * BOUND: when more than `maxPinned` finished jobs are pinned and the queue is
+   * over `maxRetained`, the OLDEST pinned jobs beyond the bound are evicted like
+   * any other, so the queue never holds more than `maxRetained + maxPinned`
+   * finished jobs. The predicate is the caller's knowledge, not the queue's: it
+   * sees the job and its submit params, is asked only during an eviction, and
+   * must not change the queue.
+   */
+  pinWhile(predicate: PinPredicate): void {
+    this.pins.push(predicate)
+  }
+
+  /**
    * The most recently submitted job for `operation` on `target` that actually
    * COMPLETED — "what did the last successful run of this say?".
    *
@@ -577,20 +665,41 @@ export class JobQueue {
     return out
   }
 
-  /** Evict oldest completed/failed jobs when over maxRetained. */
+  /**
+   * Evict the oldest finished jobs when over maxRetained. A pinned job
+   * ({@link pinWhile}) is skipped, unless more than {@link maxPinned} are
+   * pinned: then the oldest pinned ones beyond the bound go too.
+   */
   private evict(): void {
     if (this.jobs.size <= this.maxRetained)
       return
+
+    const finished = (record: JobRecord) => !record.job.holdsLocks
+      && (record.job.status === 'completed' || record.job.status === 'failed' || record.job.status === 'cancelled')
+    // Asked once, before anything is deleted: a predicate that reads the queue
+    // sees it as it stood.
+    const pinned = new Set<JobRecord>()
+    if (this.pins.length > 0) {
+      for (const record of this.jobs.values()) {
+        if (finished(record) && this.pins.some(p => pinSays(p, record)))
+          pinned.add(record)
+      }
+    }
+    let overBound = Math.max(0, pinned.size - this.maxPinned)
 
     for (const [id, record] of this.jobs) {
       if (this.jobs.size <= this.maxRetained)
         break
       // A finished job still holding its locks (an abandoned child) stays
       // visible: the waiting jobs' progress lines name it.
-      if (record.job.holdsLocks)
+      if (!finished(record))
         continue
-      if (record.job.status === 'completed' || record.job.status === 'failed' || record.job.status === 'cancelled')
-        this.jobs.delete(id)
+      if (pinned.has(record)) {
+        if (overBound === 0)
+          continue
+        overBound--
+      }
+      this.jobs.delete(id)
     }
   }
 

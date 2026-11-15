@@ -368,14 +368,85 @@
             'var(--anas-accent,#3468c0)', t('Initiators logged in right now'));
     }
 
-    function renderEnabled(v, meta, rec) {
-        if (v === true) {
-            return pill('anas-iscsi-state anas-iscsi-state-enabled', t('Enabled'), 'var(--anas-ok,#1f9c56)',
-                t('Accepting logins'));
+    // ---- cr3.lunrestore: the restore mark (the breadcrumb on the volume) ------
+    //
+    // The daemon's health read names every LUN whose volume carries a restore
+    // mark (restoreMarks[]): a restore running onto it, one that did not
+    // finish (a partial image), one whose size was not verified, or a mark that
+    // could not be read. The rows say which; the sentence is the daemon's.
+
+    var MARK_RANK = { 'in-progress': 4, interrupted: 3, unverified: 2, unreadable: 1 };
+
+    /** The most telling mark row for a target (or one LUN of it), or null. */
+    function restoreMarkFor(health, iqn, index) {
+        var rows = (health && isArray(health.restoreMarks)) ? health.restoreMarks : [];
+        var best = null;
+        for (var i = 0; i < rows.length; i++) {
+            var r = rows[i] || {};
+            if (r.targetIqn !== iqn || (index !== undefined && r.lunIndex !== index)) {
+                continue;
+            }
+            if (!best || (MARK_RANK[r.state] || 0) > (MARK_RANK[best.state] || 0)) {
+                best = r;
+            }
         }
-        return pill('anas-iscsi-state anas-iscsi-state-disabled', t('Disabled'), 'var(--anas-muted,gray)',
-            t('Refusing new logins and hidden from discovery. The portal socket stays open and '
-                + 'an established session keeps running.'));
+        return best;
+    }
+
+    /** The pill a mark renders as — label by state, the daemon's sentence as the tip. */
+    function restoreMarkPill(m) {
+        if (!m) {
+            return '';
+        }
+        var detail = '' + (m.detail || '');
+        if (m.state === 'in-progress') {
+            return pill('anas-iscsi-restore anas-iscsi-restore-running', t('Restore running'), 'var(--anas-accent,#3468c0)', detail);
+        }
+        if (m.state === 'unreadable') {
+            return pill('anas-iscsi-restore anas-iscsi-restore-unknown', t('Restore mark unreadable'), 'var(--anas-warn,#c9820b)', detail);
+        }
+        if (m.state === 'unverified') {
+            return pill('anas-iscsi-restore anas-iscsi-restore-unverified', t('Image not verified'), 'var(--anas-warn,#c9820b)', detail);
+        }
+        return pill('anas-iscsi-restore anas-iscsi-restore-partial', t('Partial image'), 'var(--anas-bad,#c62828)', detail);
+    }
+
+    /** Stamp each target row with its mark from the health read (both load orders). */
+    function markTargetRows(grid) {
+        var health = grid && grid.anasHealth;
+        try {
+            grid.getStore().each(function (r) {
+                var m = restoreMarkFor(health, r.get('iqn'));
+                if (m !== (r.get('restoreMark') || null)) {
+                    r.set('restoreMark', m);
+                    r.commit();
+                }
+            });
+        } catch (e) {
+            // a decoration must never break the grid
+        }
+        // The toolbar reads the mark too (Enable while a restore runs). A
+        // decoration never breaks the caller: a grid that cannot answer is left.
+        try {
+            updateButtons(grid);
+        } catch (e2) {
+            // non-fatal
+        }
+    }
+
+    // review2 (8): the State column shows BOTH facts — whether the target is
+    // serving and what the restore mark says — because the critical case is
+    // the two together: an ENABLED target whose LUN holds an image no restore
+    // proved is serving it now.
+    function renderEnabled(v, meta, rec) {
+        var mark = rec && rec.get ? rec.get('restoreMark') : null;
+        var state = v === true
+            ? pill('anas-iscsi-state anas-iscsi-state-enabled', t('Enabled'), 'var(--anas-ok,#1f9c56)',
+                t('Accepting logins'))
+            : pill('anas-iscsi-state anas-iscsi-state-disabled', t('Disabled'), 'var(--anas-muted,gray)',
+                t('Refusing new logins and hidden from discovery. The portal socket stays open and '
+                    + 'an established session keeps running.'));
+        return mark ? state + ' ' + restoreMarkPill(mark) : state;
     }
 
     function renderAuth(v, meta, rec) {
@@ -546,6 +617,7 @@
             return;
         }
         grid.anasHealth = health || null;
+        markTargetRows(grid);
         if (grid.anasInstalled === false) {
             return;
         }
@@ -689,6 +761,7 @@
             } catch (e2) {
                 ANAS.warn('iscsi grid load failed: ' + ANAS.errText(e2));
             }
+            markTargetRows(grid);
             applyEnvelope(view, env);
             // This node's own initiator IQN for the target dialog's "Add this
             // node" button. `undefined` (an older daemon that does not send the
@@ -754,6 +827,12 @@
     ANAS.iscsi.renderLunSessions = renderLunSessions;
     ANAS.iscsi.lunBackupMenuItems = lunBackupMenuItems;
     ANAS.iscsi.applyHealth = applyHealth;
+    ANAS.iscsi.restoreMarkFor = restoreMarkFor;
+    ANAS.iscsi.restoreMarkPill = restoreMarkPill;
+    ANAS.iscsi.renderEnabled = renderEnabled;
+    ANAS.iscsi.renderLunName = renderLunName;
+    ANAS.iscsi.toggleTarget = toggleTarget;
+    ANAS.iscsi.updateButtons = updateButtons;
 
     // ---- Toolbar state -----------------------------------------------------
 
@@ -818,8 +897,14 @@
                 ? t('Delete its ') + luns + (luns === 1 ? t(' LUN') : t(' LUNs')) + t(' first')
                 : '');
 
+        // review2 D (4a): a whole-image restore writing a LUN of a DISABLED
+        // target — an image file's too — makes the daemon refuse Enable until
+        // it ends; the button does not invite it. The daemon stays the
+        // authority (its 409 says the same); this only says it first.
+        var mark = has ? rec.get('restoreMark') : null;
+        var restoring = has && rec.get('enabled') !== true && !!mark && mark.state === 'in-progress';
         setDisabled(grid, 'iscsiEdit', !mutable);
-        setDisabled(grid, 'iscsiToggle', !mutable);
+        setDisabled(grid, 'iscsiToggle', !mutable || restoring);
         setDisabled(grid, 'iscsiDelete', !mutable || deleteWhy !== '');
         // Looking at a foreign target's LUNs is READ — always allowed.
         setDisabled(grid, 'iscsiLuns', !has);
@@ -828,7 +913,8 @@
             ? (t('View only — ') + ('' + (rec.get('ownershipDetail') || t('this target is not managed by ANAS'))))
             : '';
         btnSetTip(grid, 'iscsiEdit', foreignTip);
-        btnSetTip(grid, 'iscsiToggle', foreignTip);
+        btnSetTip(grid, 'iscsiToggle', foreign ? foreignTip
+            : (restoring ? t('A whole-image restore is writing a LUN of this target; Enable is refused until the restore ends') : ''));
         btnSetTip(grid, 'iscsiDelete', foreign ? foreignTip : deleteWhy);
         btnSetTip(grid, 'iscsiLuns', foreign ? t('Read-only: this target is not managed by ANAS') : '');
 
@@ -1911,19 +1997,36 @@
         }
         var enabled = rec.get('enabled') === true;
         var action = enabled ? 'disable' : 'enable';
-        ANAS.runJob({
+        // cr3.lunrestore: Enable can answer with a confirm — a LUN of the
+        // target holds an image a restore did not prove: one that did not
+        // finish, or one whose size was not verified (review2 F3: the title
+        // says only what is true of both). The daemon's sentences are the
+        // question.
+        var opts = {
             node: node,
             method: 'post',
             path: '/iscsi/targets/' + encIqn(rec.get('iqn')) + '/state',
             body: { action: action },
             view: view,
+            confirmTitle: 'Enable a target whose LUN image is not proven complete',
+            confirmIntro: t('Enabling this target serves every LUN on it to its initiators:'),
             failTitle: 'State change failed',
             successMsg: t('Target') + ' ' + (enabled ? t('disabled') : t('enabled')) + ': '
                 + (rec.get('name') || rec.get('iqn')),
             onComplete: function () {
                 loadTargets(view, node);
+            },
+            // A refusal (a restore running, a mark that cannot be read) or a
+            // failed job: the rows re-read either way.
+            onFailed: function () {
+                loadTargets(view, node);
             }
-        });
+        };
+        if (enabled) {
+            ANAS.runJob(opts);
+        } else {
+            ANAS.confirmAndRun(opts);
+        }
     }
 
     function deleteTarget(view, node, rec) {
@@ -2397,6 +2500,12 @@
         return enc(bits.join(' · '));
     }
 
+    /** A LUN's name, with its restore-mark pill when its volume carries one (cr3.lunrestore). */
+    function renderLunName(v, meta, rec) {
+        var mark = rec && rec.get ? rec.get('restoreMark') : null;
+        return enc(v == null ? '' : v) + (mark ? ' ' + restoreMarkPill(mark) : '');
+    }
+
     function lunRow(l) {
         l = l || {};
         return {
@@ -2594,8 +2703,11 @@
             win.anasForeign = detail.ownership !== 'anas';
             var list = isArray(detail.luns) ? detail.luns : [];
             var rows = [];
+            var mainGrid = gridOf(win.anasView);
             for (var i = 0; i < list.length; i++) {
-                rows.push(lunRow(list[i]));
+                var row = lunRow(list[i]);
+                row.restoreMark = restoreMarkFor(mainGrid && mainGrid.anasHealth, iqn, row.index);
+                rows.push(row);
             }
             var priorIdx = selectedLun(win);
             var priorN = priorIdx ? priorIdx.get('index') : null;
@@ -2765,6 +2877,7 @@
                 { name: 'backingExists', type: 'auto' },
                 { name: 'backupBy', type: 'auto' },
                 'pool', 'dataset',
+                { name: 'restoreMark', type: 'auto' },
                 { name: 'raw', type: 'auto' }
             ],
             data: [],
@@ -2795,7 +2908,7 @@
                         emptyText: t('This target has no LUNs'),
                         columns: [
                             { text: t('LUN'), dataIndex: 'index', width: 70, align: 'right' },
-                            { text: t('Name (SCSI model)'), dataIndex: 'name', flex: 1, minWidth: 150, renderer: ANAS.enc },
+                            { text: t('Name (SCSI model)'), dataIndex: 'name', flex: 1, minWidth: 150, renderer: renderLunName },
                             { text: t('Kind'), dataIndex: 'kind', width: 130, align: 'center', renderer: renderLunKind },
                             { text: t('Backing'), dataIndex: 'backingPath', flex: 2, minWidth: 220, sortable: false, renderer: renderBacking },
                             { text: t('Backed up by'), dataIndex: 'backupBy', width: 170, sortable: false, menuDisabled: true, renderer: renderBackupBy },
@@ -3786,6 +3899,7 @@
                 { name: 'persisted', type: 'auto' },
                 { name: 'missingLunCount', type: 'auto' },
                 { name: 'portalsWithoutInterfaceCount', type: 'auto' },
+                { name: 'restoreMark', type: 'auto' },
                 { name: 'raw', type: 'auto' }
             ],
             data: [],

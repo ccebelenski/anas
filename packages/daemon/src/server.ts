@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { RESTORE_MARK_PROPERTY } from '@anas/shared'
 import Fastify from 'fastify'
 import { AuditLogger } from './audit/logger.js'
 import { CommandBudgetExecutor } from './executor/command-budgets.js'
@@ -56,6 +57,7 @@ import { deviceStatSeamFromEnv } from './services/iscsi-served.js'
 import { defaultRcloneConfigPaths, RCLONE, rcloneBaseArgs } from './services/rclone-config.js'
 import { defaultRemotesPaths } from './services/replication-remotes.js'
 import { createTransport, defaultMembersFile } from './services/replication-transport.js'
+import { imageRestorePin } from './services/restore-mark.js'
 
 /** Methods that change state — the cr.26 JSON-only rule applies to these. */
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'DELETE', 'PATCH'])
@@ -264,6 +266,10 @@ export function createServer(opts?: ServerOptions) {
 
   const audit = new AuditLogger(server.log)
   const jobQueue = new JobQueue({ audit })
+  // cr3.lunrestore (review3 1): a failed restore onto an image file is, for
+  // that file, the only record that it holds an image not proven whole — kept
+  // past the queue's eviction while it stands (bounded: `maxPinned`).
+  jobQueue.pinWhile(imageRestorePin(jobQueue))
   const baseExecutor: CommandExecutor = opts?.mock
     ? new MockExecutor()
     : new ProdExecutor()
@@ -380,6 +386,14 @@ export function createServer(opts?: ServerOptions) {
     }
     catch { /* best-effort — an unreadable store is disclosed, never fatal */ }
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
+    // cr3.lunrestore: a dev node's volumes carry no restore mark (`zfs get
+    // anas:restore` prints the unset value) — the realistic default; a test
+    // that wants a mark registers an exact-args fixture, which wins.
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      argsMatch: a => a[0] === 'get' && a.includes(RESTORE_MARK_PROPERTY),
+      result: { stdout: '-\t-\n', stderr: '', exitCode: 0 },
+    })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', 'all', '-j'], result: mockFixtures.zpoolGetAll('testpool') })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['scrub', '--', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -1006,7 +1020,7 @@ export function createServer(opts?: ServerOptions) {
   // joined against live configfs. Read-only; every mutation is iscsi.4's. The
   // paths default inside the service to the real host locations and are
   // overridable so tests (and a dev box with no LIO) never read the kernel.
-  server.register(iscsiRoutes, { prefix: '/v1', executor, ...iscsiPaths })
+  server.register(iscsiRoutes, { prefix: '/v1', executor, jobQueue, ...iscsiPaths })
   // iSCSI mutations (story iscsi.4) — targets, portals, ACL/CHAP and LUNs. Every
   // one is a job, every sequence runs under the one daemon-wide LIO mutex, and
   // each ends in `targetcli saveconfig` — never over a degraded restore (GT-22).

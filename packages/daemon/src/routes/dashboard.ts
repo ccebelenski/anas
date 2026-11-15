@@ -50,6 +50,7 @@ import { readConfig } from '../services/config-writer.js'
 import { collectIscsiWarnings } from '../services/iscsi-warnings.js'
 import { collectMountWarnings } from '../services/mounts.js'
 import { buildReplicationWarnings, deriveTaskStatus, driftUnreadTasks, readAllTasksChecked } from '../services/replication-units.js'
+import { restoreJobsOf } from '../services/restore-mark.js'
 import { probeSharePaths } from '../services/share-path.js'
 import { collectScheduleWarnings } from '../services/snapshot-schedule-units.js'
 import { collectDiskInventory } from './disks.js'
@@ -134,20 +135,25 @@ export async function dashboardRoutes(
   const ahrCreateStatus = (pool: AhrPool): AhrPool => withAhrCreateStatus(pool, jobQueue)
 
   /**
-   * Why an ANAS target is disabled, when a retained job still says (live-proof
-   * F12). The image-restore door is the only thing in ANAS that leaves a target
-   * disabled on purpose: after a mid-stream failure the half-written LUN stays
-   * offline and re-enabling is the operator's acknowledgement. That decision is
-   * recorded in exactly one place — the failed job's error text — and jobs are
-   * ephemeral by design, so this is best-effort by construction: no job, no
-   * detail, and the card still says the target is dark.
+   * What a retained failed restore job adds to a disabled target's card (its
+   * error text). cr3.lunrestore: the card's REASON comes from the restore mark
+   * on the LUN's volume (the health read's `restoreMarks`), which survives the
+   * job; the retained job only adds what it said.
    */
   function iscsiDisabledDetail(target: IscsiTargetDetail): string | undefined {
     const job = jobQueue.findByOperation('backup.restore.image', target.iqn, 'target')
     if (job?.status !== 'failed' || !job.error?.message)
       return undefined
-    return `A whole-image restore onto it failed and left it disabled: ${job.error.message}`
+    return `The restore job said: ${job.error.message}`
   }
+
+  /**
+   * cr3.lunrestore (review N5, review2 D): what the job records say about a
+   * backing — a whole-image restore RUNNING onto it now (both restore doors
+   * carry the backing path in their job params; a queued job has written
+   * nothing), and for an image file the retained failed restore.
+   */
+  const iscsiRestoreJobs = restoreJobsOf(jobQueue)
 
   // --- GET /v1/status ------------------------------------------------------
   server.get('/status', async () => {
@@ -196,7 +202,7 @@ export async function dashboardRoutes(
       // that names WHY when a retained job still knows — the image restore that
       // left it dark says so in its own failure text, and nothing else on the
       // system remembers (no shadow state).
-      readSection('iscsi', [] as DashboardWarning[], exec => collectIscsiWarnings(exec, iscsiPaths ?? {}, { disabledDetail: iscsiDisabledDetail })),
+      readSection('iscsi', [] as DashboardWarning[], exec => collectIscsiWarnings(exec, iscsiPaths ?? {}, { disabledDetail: iscsiDisabledDetail, ...iscsiRestoreJobs })),
     ])
     const sections = [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, cloudWarnings, ahrWarnings, ahrPools, scheduleWarnings, iscsiWarnings]
     const unavailable = sections.flatMap(r => (r.unavailable ? [r.unavailable] : []))

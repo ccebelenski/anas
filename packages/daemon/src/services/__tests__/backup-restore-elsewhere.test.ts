@@ -9,9 +9,11 @@ import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { BackupRestoreRequest } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
+import { StreamNotStartedError } from '../../executor/stream-errors.js'
 import { newLunZvolCreateArgs, runNewLunImageRestore, volsizeArgs } from '../backup-restore.js'
 import { buildBackupEnv, PBC } from '../backup-runner.js'
 import { ISCSI_MAX_UNMAP_LBA_COUNT, TARGETCLI, withIscsiLock, ZFS } from '../iscsi-mutate.js'
+import { contextOf, replayLio, targetObjectOf } from './lio-model.js'
 
 /**
  * backup2.10 — "restore elsewhere": the request shape, at the boundary.
@@ -262,6 +264,24 @@ function targetDetail(): IscsiTargetDetail {
   }
 }
 
+/** The source target's own LIO objects — the fixed half of every modelled tree. */
+const SOURCE_BASE = {
+  iqn: IQN,
+  tag: 1,
+  backstores: [{ name: 'vmdisk1', plugin: 'block', dev: '/dev/zvol/tank/vol1', wwn: SOURCE_SERIAL }],
+  luns: [{ iqn: IQN, tag: 1, index: 0, backstore: 'vmdisk1', plugin: 'block' }],
+}
+
+/**
+ * cr3.lunrestore: the after-create re-read as the mock's argv so far left the
+ * kernel target (every recorded call taken as succeeded) — this run's own
+ * backstore is in it, with the serial the run minted.
+ */
+function liveAfterCreate(mock: MockExecutor, target: IscsiTargetDetail = targetDetail()) {
+  const tree = replayLio(mock.calls.map(c => ({ command: c.command, args: c.args, kind: 'exec' as const, exitCode: 0 })))
+  return targetObjectOf(target, contextOf(tree, tree.saved, SOURCE_BASE))
+}
+
 /** One newLun restore's deps — a zvol on `tank` named `newvol`, by default. */
 function deps(mock: MockExecutor, configfsRoot: string, over: Partial<NewLunRestoreDeps> = {}): NewLunRestoreDeps {
   return {
@@ -273,6 +293,9 @@ function deps(mock: MockExecutor, configfsRoot: string, over: Partial<NewLunRest
     imageSize: IMAGE_SIZE,
     target: targetDetail(),
     refresh: async () => targetDetail(),
+    refreshAfterCreate: async () => liveAfterCreate(mock),
+    // cr3.lunrestore (D2): the cleanup's identity re-read — the same model.
+    readLive: async () => liveAfterCreate(mock).state,
     name: 'newvol',
     backing: { path: '/dev/zvol/tank/newvol', plugin: 'block', dataset: 'tank/newvol' },
     env: buildBackupEnv(REPO, 'super-secret'),
@@ -319,6 +342,13 @@ function assertSourceUntouched(mock: MockExecutor): void {
 
 function noop(): void {}
 
+const MARK_VALUE_RE = /^anas:restore=\{.*\}$/
+
+/** The call log with the restore mark's JSON value elided (it carries the start time). */
+function argvOf(mock: MockExecutor): string[] {
+  return mock.calls.map(c => `${c.command} ${c.args.map(a => (MARK_VALUE_RE.test(a) ? 'anas:restore=<mark>' : a)).join(' ')}`)
+}
+
 /** The configfs root every newLun test runs in: the ACL's directory exists, maps nothing. */
 async function withConfigfsRoot(run: (root: string) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'anas-newlun-configfs-'))
@@ -332,7 +362,7 @@ async function withConfigfsRoot(run: (root: string) => Promise<void>): Promise<v
 }
 
 describe('runNewLunImageRestore — the happy sequence, as an exact call log', () => {
-  it('a ZVOL: create -s -V at the manifest size, a FRESH-serial backstore, map at the next free index, grant, stream, read-back, saveconfig LAST', async () => {
+  it('a ZVOL: create -s -V at the manifest size, a FRESH-serial backstore, stream, read-back, and only THEN map at the next free index, grant, saveconfig', async () => {
     await withConfigfsRoot(async (configfsRoot) => {
       const mock = successMock('tank/newvol')
       const result = await runNewLunImageRestore(mock, deps(mock, configfsRoot), noop)
@@ -343,22 +373,26 @@ describe('runNewLunImageRestore — the happy sequence, as an exact call log', (
       assert.notEqual(serial, SOURCE_SERIAL)
       assert.equal(wwnOf(mock), serial, 'the wwn= at create IS the reported serial')
 
-      assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.join(' ')}`), [
+      assert.deepEqual(argvOf(mock), [
         `${ZFS} create -s -V ${IMAGE_SIZE} -- tank/newvol`,
+        // cr3.lunrestore: the breadcrumb, before anything can write to the volume.
+        `${ZFS} set anas:restore=<mark> -- tank/newvol`,
         `${TARGETCLI} /backstores/block create name=newvol dev=/dev/zvol/tank/newvol wwn=${serial}`,
         // Every attribute BEFORE the map — block_size would stop working after it.
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpu=1`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpws=1`,
         `${TARGETCLI} /backstores/block/newvol set attribute max_unmap_lba_count=${ISCSI_MAX_UNMAP_LBA_COUNT.block}`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_write_cache=0`,
-        // Only NOW is it mapped — at the next free index, after the source's 0 —
-        // and granted to the ACL that maps the source.
+        // cr3.lunrestore: the image goes into a backstore no LUN maps,
+        `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
+        // then the read-back proves the new object holds exactly the image,
+        `${ZFS} get -Hp -o value volsize -- tank/newvol`,
+        // the mark goes (the image is complete and verified),
+        `${ZFS} inherit anas:restore -- tank/newvol`,
+        // and only NOW is it mapped — at the next free index, after the
+        // source's 0 — granted to the ACL that maps the source, and saved.
         `${TARGETCLI} /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/newvol lun=1`,
         `${TARGETCLI} /iscsi/${IQN}/tpg1/acls/${INITIATOR} create 1 1`,
-        `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
-        // The read-back proves the new object holds exactly the image…
-        `${ZFS} get -Hp -o value volsize -- tank/newvol`,
-        // …and only NOW is the configuration persisted.
         `${TARGETCLI} saveconfig`,
       ])
 
@@ -381,7 +415,7 @@ describe('runNewLunImageRestore — the happy sequence, as an exact call log', (
     })
   })
 
-  it('a FILE: a sparse image at the manifest size, a fileio backstore, map, grant, stream into the file, saveconfig LAST', async () => {
+  it('a FILE: a sparse image at the manifest size, a fileio backstore, stream into the file, and only THEN map, grant, saveconfig', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'anas-newlun-image-'))
     try {
       const file = join(dir, 'newvol.raw')
@@ -409,9 +443,9 @@ describe('runNewLunImageRestore — the happy sequence, as an exact call log', (
           `${TARGETCLI} /backstores/fileio/newvol set attribute emulate_tpws=1`,
           `${TARGETCLI} /backstores/fileio/newvol set attribute max_unmap_lba_count=${ISCSI_MAX_UNMAP_LBA_COUNT.fileio}`,
           `${TARGETCLI} /backstores/fileio/newvol set attribute emulate_write_cache=0`,
+          `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
           `${TARGETCLI} /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/fileio/newvol lun=1`,
           `${TARGETCLI} /iscsi/${IQN}/tpg1/acls/${INITIATOR} create 1 1`,
-          `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
           `${TARGETCLI} saveconfig`,
         ])
         assert.equal(mock.calls.some(c => c.command === ZFS), false)
@@ -436,7 +470,7 @@ describe('runNewLunImageRestore — the happy sequence, as an exact call log', (
 })
 
 describe('runNewLunImageRestore — a failure undoes what it made, and never saves', () => {
-  it('a mid-stream ENOSPC: unmap, delete the backstore, destroy the zvol — NO saveconfig', async () => {
+  it('a mid-stream ENOSPC: delete the backstore, destroy the zvol — nothing was ever mapped, NO saveconfig', async () => {
     await withConfigfsRoot(async (configfsRoot) => {
       const mock = new MockExecutor()
       mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -450,26 +484,25 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
       await assert.rejects(
         runNewLunImageRestore(mock, deps(mock, configfsRoot), noop),
         (err: Error) => {
-          assert.match(err.message, /the image was partially written \(268435456 of 536870912 bytes reached the new backing \/dev\/zvol\/tank\/newvol\)/)
-          assert.match(err.message, /ANAS has removed LUN 1, backstore 'newvol', volume tank\/newvol/)
+          assert.match(err.message, /the image was partially written \(268435456 of 536870912 bytes reached the new backing \/dev\/zvol\/tank\/newvol\); it was never mapped as a LUN/)
+          assert.match(err.message, /ANAS has removed backstore 'newvol', volume tank\/newvol/)
           assert.match(err.message, /nothing of the failed restore remains/)
           return true
         },
       )
 
       const serial = wwnOf(mock)
-      assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.join(' ')}`), [
+      assert.deepEqual(argvOf(mock), [
         `${ZFS} create -s -V ${IMAGE_SIZE} -- tank/newvol`,
+        `${ZFS} set anas:restore=<mark> -- tank/newvol`,
         `${TARGETCLI} /backstores/block create name=newvol dev=/dev/zvol/tank/newvol wwn=${serial}`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpu=1`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpws=1`,
         `${TARGETCLI} /backstores/block/newvol set attribute max_unmap_lba_count=${ISCSI_MAX_UNMAP_LBA_COUNT.block}`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_write_cache=0`,
-        `${TARGETCLI} /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/newvol lun=1`,
-        `${TARGETCLI} /iscsi/${IQN}/tpg1/acls/${INITIATOR} create 1 1`,
         `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
-        // The undo, in the REVERSE of the order the objects were made:
-        `${TARGETCLI} /iscsi/${IQN}/tpg1/luns delete lun1`,
+        // The undo, in the REVERSE of the order the objects were made (no
+        // unmap: nothing was mapped):
         `${TARGETCLI} /backstores/block delete newvol`,
         `${ZFS} destroy -- tank/newvol`,
       ])
@@ -503,24 +536,32 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
     })
   })
 
-  it('cr3 review2 (4): a size read-back that disagreed or failed is never called "in full", and rides the save-failure error', async () => {
+  it('cr3 review2 (4) + cr3.lunrestore D3: a size read-back that disagreed or failed is never called "in full", is NEVER MAPPED, and NOTHING is destroyed — the mark says "unverified"', async () => {
     for (const [volsize, said] of [
-      [{ stdout: `${IMAGE_SIZE - 4096}\n`, stderr: '', exitCode: 0 }, /is 536866816 bytes after the restore, not the image's 536870912/],
-      [{ stdout: '', stderr: 'cannot open', exitCode: 1 }, /could not re-read the size/],
+      [{ stdout: `${IMAGE_SIZE - 4096}\n`, stderr: '', exitCode: 0 }, /\/dev\/zvol\/tank\/newvol is 536866816 bytes, not the image's 536870912, so it was not mapped as a LUN/],
+      [{ stdout: '', stderr: 'cannot open', exitCode: 1 }, /the size of \/dev\/zvol\/tank\/newvol could not be re-read \(.*\), so it was not mapped as a LUN/],
     ] as const) {
       await withConfigfsRoot(async (configfsRoot) => {
         const mock = new MockExecutor()
-        mock.addFixture({ command: TARGETCLI, args: ['saveconfig'], result: { stdout: '', stderr: 'saveconfig: disk full', exitCode: 1 } })
         mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
         mock.addFixture({ command: ZFS, args: volsizeArgs('tank/newvol'), result: volsize })
         mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
         mock.addStreamFixture({ command: PBC, result: { stderr: 'restore complete (512 MiB processed in 0.6s)    \n', exitCode: 0, bytesWritten: IMAGE_SIZE } })
         await assert.rejects(runNewLunImageRestore(mock, deps(mock, configfsRoot), noop), (err: Error) => {
           assert.ok(!/in full/.test(err.message), err.message)
+          assert.match(err.message, /^the client reported the image complete, but /)
           assert.match(err.message, said)
-          assert.match(err.message, /saving the iSCSI configuration failed: .*disk full/)
+          assert.match(err.message, /tank\/newvol keeps its restore mark, now saying the size was not verified/)
+          assert.match(err.message, /The backstore 'newvol' \(unit serial .*\) and \/dev\/zvol\/tank\/newvol are kept, not mapped as a LUN/)
           return true
         })
+        const argv = argvOf(mock)
+        assert.ok(!argv.some(a => a.includes('/luns create')), 'never mapped')
+        assert.ok(!argv.some(a => a.includes('saveconfig')), 'never saved')
+        assert.ok(!argv.some(a => a.includes(' delete ') || a.startsWith(`${ZFS} destroy`)), 'nothing destroyed after a stream that exited 0')
+        assert.equal(argv.filter(a => a === `${ZFS} set anas:restore=<mark> -- tank/newvol`).length, 2, 'set at the start, set again as unverified')
+        const unverified = mock.calls.filter(c => c.command === ZFS && c.args[0] === 'set').at(-1)!.args[1]
+        assert.match(unverified, /"state":"unverified"/)
       })
     }
   })
@@ -534,13 +575,15 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
       mock.addStreamFixture({ command: PBC, result: { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 } })
       await assert.rejects(runNewLunImageRestore(mock, deps(mock, configfsRoot), noop), (err: Error) => {
         assert.ok(!/nothing of the failed restore remains/.test(err.message), err.message)
-        assert.match(err.message, /ANAS removed LUN 1, volume tank\/newvol\. This was left behind and needs your hand: backstore 'newvol' could not be deleted \(.*backstore busy\)\./)
+        // cr3.lunrestore: the backing is never destroyed under a backstore that still holds it.
+        assert.match(err.message, /ANAS could not remove any of it\. This was left behind and needs your hand: backstore 'newvol' could not be deleted \(.*backstore busy\); volume tank\/newvol is kept, because backstore 'newvol' still holds it\./)
         return true
       })
+      assert.ok(!mock.calls.some(c => c.command === ZFS && c.args[0] === 'destroy'), 'no destroy under a live backstore')
     })
   })
 
-  it('cr3.backup (iSCSI review): a half LUN ANOTHER verb saved mid-stream is saved away after a clean undo; an unrelated save is left alone', async () => {
+  it('cr3.backup (iSCSI review): this run\'s backstore ANOTHER verb saved mid-stream is saved away after a clean undo; an unrelated save is left alone', async () => {
     const enospc = (): MockExecutor => {
       const mock = new MockExecutor()
       mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -551,12 +594,14 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
     await withConfigfsRoot(async (configfsRoot) => {
       // saveconfig.json holds THIS run's backstore (its name and the serial it minted).
       const mock = enospc()
-      let refreshed = 0
+      let reproved = 0
       await assert.rejects(
         runNewLunImageRestore(mock, deps(mock, configfsRoot, {
-          refresh: async () => {
-            refreshed++
-            return targetDetail()
+          // cr3.lunrestore: the save-away re-proves with the after-create gates
+          // (the name gates would refuse on that very saved copy).
+          refreshAfterCreate: async () => {
+            reproved++
+            return liveAfterCreate(mock)
           },
           persistedBackstores: async () => [{ name: 'newvol', wwn: wwnOf(mock) }],
         }), noop),
@@ -568,7 +613,7 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
       )
       const tail = mock.calls.slice(-2).map(c => `${c.command} ${c.args.join(' ')}`)
       assert.deepEqual(tail, [`${ZFS} destroy -- tank/newvol`, `${TARGETCLI} saveconfig`], 'the save comes after the whole undo')
-      assert.ok(refreshed >= 3, 'the target was re-proved under the lock before the save')
+      assert.equal(reproved, 1, 'the target was re-proved under the lock before the save')
 
       // A saved object of the same NAME but another serial is not this run's: no save.
       const other = enospc()
@@ -603,7 +648,7 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
             noop,
           ),
           (err: Error) => {
-            assert.match(err.message, new RegExp(`ANAS has removed LUN 1, backstore 'newvol', image ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+            assert.match(err.message, new RegExp(`ANAS has removed backstore 'newvol', image ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
             assert.match(err.message, /nothing of the failed restore remains/)
             return true
           },
@@ -638,7 +683,7 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
         runNewLunImageRestore(mock, deps(mock, configfsRoot), noop),
         (err: Error) => {
           assert.match(err.message, /Nothing was written to the new backing \/dev\/zvol\/tank\/newvol/)
-          assert.match(err.message, /ANAS has removed LUN 1, backstore 'newvol', volume tank\/newvol/)
+          assert.match(err.message, /ANAS has removed backstore 'newvol', volume tank\/newvol/)
           return true
         },
       )
@@ -684,7 +729,8 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
         // The `result` is the run-time throw's dead weight — the interface needs
         // it, and a throwing fixture never reaches it.
         result: { stderr: '', exitCode: 0, bytesWritten: 0 },
-        throws: new Error('spawn /usr/bin/proxmox-backup-client ENOENT while using super-secret'),
+        // cr3.lunrestore (review2 B): the executor's own "never started" (only it can say so).
+        throws: new StreamNotStartedError('spawn /usr/bin/proxmox-backup-client ENOENT while using super-secret'),
       })
 
       await assert.rejects(
@@ -862,13 +908,20 @@ describe('cr.40 — the new LUN takes its index and grants from the target as re
       now.luns = [sourceLun(), { ...sourceLun(), index: 1, name: 'other', serial: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', backingPath: '/dev/zvol/tank/other' }]
       now.acls = [...now.acls, { ...now.acls[0], initiatorIqn: SECOND, mappedLuns: [0, 1] }]
       let refreshed = 0
+      let reproved = 0
       const result = await runNewLunImageRestore(mock, deps(mock, configfsRoot, {
         refresh: async () => {
           refreshed++
           return now
         },
+        // cr3.lunrestore: the map's index and grants are the after-create read's.
+        refreshAfterCreate: async () => {
+          reproved++
+          return liveAfterCreate(mock, now)
+        },
       }), noop)
-      assert.equal(refreshed, 2, 'once before anything is created, once under the lock before the map')
+      assert.equal(refreshed, 2, 'once before anything is created, once under the lock before the backstore create')
+      assert.equal(reproved, 1, 'once under the lock before the map')
       const argv = mock.calls.map(c => `${c.command} ${c.args.join(' ')}`)
       assert.ok(argv.includes(`${TARGETCLI} /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/newvol lun=2`), argv.join('\n'))
       assert.ok(argv.includes(`${TARGETCLI} /iscsi/${IQN}/tpg1/acls/${INITIATOR} create 2 2`), argv.join('\n'))

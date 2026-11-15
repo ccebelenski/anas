@@ -5,7 +5,7 @@ import { AhrRepairResult as AhrRepairResultSchema, SELFHEAL_ARRAY_REBUILDS_ROT, 
 // One window reader, one sentence: the scrub owns them and the repair reuses
 // them rather than growing second copies (single source of truth).
 import { metadataCorrectedSentence, readCorrectedReads } from './ahr-scrub.js'
-import { heldByLunOnce } from './iscsi-held.js'
+import { heldByLunOnce, heldHolderPhrase } from './iscsi-held.js'
 import { pveNotify } from './pve-notify.js'
 import { repairBlock, SelfhealRunError } from './selfheal-repair.js'
 
@@ -114,6 +114,11 @@ const ARRAY_REBUILDS_ROT_CAUSE = 'every copy the array holds of this block gives
 const ARRAY_REBUILDS_ROT_SENTENCE = `${ARRAY_REBUILDS_ROT_CAUSE}: restore this file from a backup if one exists`
 
 function lunRestoreSentence(held: IscsiHeldByLun): string {
+  // cr3.lunrestore: a backstore no LUN maps has no target and no index.
+  if (held.unmapped === true) {
+    return `this block backs ${heldHolderPhrase(held)} (an interrupted restore, or a LUN removed by hand). Restore the image `
+      + `again from a PBS backup (Backup → Restore as new LUN) or the guest's own backup`
+  }
   return `this block backs iSCSI LUN ${held.targetIqn}/${held.index}. Restore the LUN image `
     + `from a PBS backup (Backup → Restore as new LUN) or the guest's own backup`
 }
@@ -131,6 +136,8 @@ function lunRestoreSentence(held: IscsiHeldByLun): string {
  * without a restore verb.
  */
 function csumUnreadableLunSentence(held: IscsiHeldByLun): string {
+  if (held.unmapped === true)
+    return `this block backs ${heldHolderPhrase(held)}, and ${CSUM_UNREADABLE_SENTENCE}`
   return `this block backs iSCSI LUN ${held.targetIqn}/${held.index}, and ${CSUM_UNREADABLE_SENTENCE}`
 }
 

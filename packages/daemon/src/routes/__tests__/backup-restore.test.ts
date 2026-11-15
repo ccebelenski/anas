@@ -310,6 +310,12 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
 
     server = createServer({ mock: true, logger: false })
     const mock = mockOf()
+    // cr3.lunrestore: a backstore the job creates (or deletes) appears in (or
+    // leaves) the configfs tree the job reads again before the map — the
+    // map's re-read proves the backstore is still this run's own (name,
+    // serial, path), and a mock targetcli changes no tree by itself.
+    if (opts.manifest)
+      liveBackstoresFollow(mock, join(dir, 'target'))
     // pbc: the snapshot-list read. The restore itself goes through
     // `execToStream`, which is fixtured separately below.
     mock.addFixture({
@@ -337,6 +343,33 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       },
     })
     await server.ready()
+  }
+
+  /**
+   * cr3.lunrestore: make a successful `/backstores/<plugin> create name= ... wwn=`
+   * add `core/<plugin>_9/<name>/` (udev_path, the unit serial) to the
+   * materialized configfs tree, and a `/backstores/<plugin> delete <name>`
+   * remove it — the two facts the map's re-read checks.
+   */
+  function liveBackstoresFollow(mock: MockExecutor, root: string): void {
+    const exec = mock.exec.bind(mock)
+    mock.exec = async (command, args, o) => {
+      const r = await exec(command, args, o)
+      if (command !== TARGETCLI || r.exitCode !== 0 || !args[0]?.startsWith('/backstores/'))
+        return r
+      const plugin = args[0].slice('/backstores/'.length) === 'block' ? 'iblock' : args[0].slice('/backstores/'.length)
+      if (args[1] === 'create') {
+        const kv = (k: string) => args.find(a => a.startsWith(`${k}=`))?.slice(k.length + 1) ?? ''
+        const d = join(root, 'core', `${plugin}_9`, kv('name'))
+        await mkdir(join(d, 'wwn'), { recursive: true })
+        await writeFile(join(d, 'wwn', 'vpd_unit_serial'), `T10 VPD Unit Serial Number: ${kv('wwn')}\n`)
+        await writeFile(join(d, 'udev_path'), `${kv('dev') || kv('file_or_dev')}\n`)
+      }
+      else if (args[1] === 'delete') {
+        await rm(join(root, 'core', `${plugin}_9`, args[2] ?? ''), { recursive: true, force: true })
+      }
+      return r
+    }
   }
 
   /** The healthy ANAS tree every gate test runs against. */
@@ -430,6 +463,40 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
   })
 
   // --- (0) schema + the files branch ---------------------------------------
+
+  const ZPOOL = '/usr/sbin/zpool'
+  /** TYPED, as in iscsi-backing-locks.test.ts: the gtiscsi pool's guid. */
+  const GTISCSI_POOL_GUID = '7395061128366427419'
+
+  /** The image LUN's world: the extended manifest, the real sparse file, the re-pointed table. */
+  async function serveImageLun(): Promise<{ imageDir: string, imagePath: string }> {
+    const imageDir = join(dir, 'gtiscsi', 'images')
+    const imagePath = join(imageDir, 'lun2.raw')
+    await mkdir(imageDir, { recursive: true })
+    // A REAL sparse file at the image's size: the door's size equality
+    // stats it, and the served-device seam must name a regular file.
+    await writeFile(imagePath, '')
+    await truncate(imagePath, IMAGE_SIZE)
+
+    // serve() directly, not serveAnas(): serveAnas builds its own manifest
+    // and saveconfig and would drop the fileio LUN 1.
+    await serve({
+      manifest: anasManifest({ fileLunPath: imagePath }),
+      saveconfigText: anasSaveconfig(false, imagePath),
+      backingPresent: `${ZVOL_PATH}:${imagePath}`,
+      deviceStat: `${ZVOL_PATH}=230:16;${imagePath}=file:66306:4242`,
+    })
+    const mock = mockOf()
+    const mounts = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/backup/findmnt-nested.json'), 'utf-8')
+      .replace('"target": "/gtiscsi/images"', `"target": ${JSON.stringify(imageDir)}`)
+    mock.prependFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: mounts, stderr: '', exitCode: 0 } })
+    // The ZFS mountpoint list the iSCSI read classifies the image path by.
+    mock.prependFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: `gtiscsi\t${join(dir, 'gtiscsi')}\ngtiscsi/images\t${imageDir}\n`, stderr: '', exitCode: 0 } })
+    mock.prependFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', 'gtiscsi'], result: { stdout: `${GTISCSI_POOL_GUID}\n`, stderr: '', exitCode: 0 } })
+    return { imageDir, imagePath }
+  }
+
+  const imageBody = () => body({ lun: { targetIqn: ANAS_IQN, index: 1 } })
 
   describe('the request shape', () => {
     it('is identity-gated like every other route', async () => {
@@ -929,6 +996,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       mock.clearFixtures()
       mock.addFixture({ command: PBC, result: { stdout: SNAPSHOT_LIST_JSON, stderr: '', exitCode: 0 } })
       mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, argsMatch: a => a[0] === 'get' && a.includes('anas:restore'), result: { stdout: '-\t-\n', stderr: '', exitCode: 0 } })
       mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
       // pbc fails echoing the credential it was handed: the ROTATED one.
       mock.addStreamFixture({
@@ -1048,9 +1116,6 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
   // `/gtiscsi/images` row re-pointed at that dir (the same one-row adaptation
   // the new-LUN backing-moved test makes at findmnt-full.json).
   describe('cr.64b2-iii (N) — the in-place restore of an IMAGE LUN and the mount table', () => {
-    const ZPOOL = '/usr/sbin/zpool'
-    /** TYPED, as in iscsi-backing-locks.test.ts: the gtiscsi pool's guid. */
-    const GTISCSI_POOL_GUID = '7395061128366427419'
     const IMAGE_LUN_SERIAL = '689844a4-1d20-4cba-8516-bdc52a402645'
 
     /** `findmnt --json` exits 1 (its unreadable-mountinfo line) where `fails(inJob)` says so. */
@@ -1064,36 +1129,6 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       }
     }
     const UNREADABLE = /the mount table could not be read \(findmnt --json exited 1: findmnt: cannot read \/proc\/self\/mountinfo\), so the filesystem .+ lives on cannot be locked — nothing was done; try again/
-
-    /** The image LUN's world: the extended manifest, the real sparse file, the re-pointed table. */
-    async function serveImageLun(): Promise<{ imageDir: string, imagePath: string }> {
-      const imageDir = join(dir, 'gtiscsi', 'images')
-      const imagePath = join(imageDir, 'lun2.raw')
-      await mkdir(imageDir, { recursive: true })
-      // A REAL sparse file at the image's size: the door's size equality
-      // stats it, and the served-device seam must name a regular file.
-      await writeFile(imagePath, '')
-      await truncate(imagePath, IMAGE_SIZE)
-
-      // serve() directly, not serveAnas(): serveAnas builds its own manifest
-      // and saveconfig and would drop the fileio LUN 1.
-      await serve({
-        manifest: anasManifest({ fileLunPath: imagePath }),
-        saveconfigText: anasSaveconfig(false, imagePath),
-        backingPresent: `${ZVOL_PATH}:${imagePath}`,
-        deviceStat: `${ZVOL_PATH}=230:16;${imagePath}=file:66306:4242`,
-      })
-      const mock = mockOf()
-      const mounts = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/backup/findmnt-nested.json'), 'utf-8')
-        .replace('"target": "/gtiscsi/images"', `"target": ${JSON.stringify(imageDir)}`)
-      mock.prependFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: mounts, stderr: '', exitCode: 0 } })
-      // The ZFS mountpoint list the iSCSI read classifies the image path by.
-      mock.prependFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: `gtiscsi\t${join(dir, 'gtiscsi')}\ngtiscsi/images\t${imageDir}\n`, stderr: '', exitCode: 0 } })
-      mock.prependFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'value', 'guid', '--', 'gtiscsi'], result: { stdout: `${GTISCSI_POOL_GUID}\n`, stderr: '', exitCode: 0 } })
-      return { imageDir, imagePath }
-    }
-
-    const imageBody = () => body({ lun: { targetIqn: ANAS_IQN, index: 1 } })
 
     it('findmnt failing at the ROUTE: the restore of the image LUN answers 503 UNAVAILABLE naming the read — no confirm minted, no job, nothing destructive', async () => {
       await serveImageLun()
@@ -1183,7 +1218,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.match(warnings, /OVERWRITES \/dev\/zvol\/tank\/vol1 completely/)
       assert.match(warnings, /WHOLE TARGET goes offline/)
       assert.match(warnings, /auto-reconnects/)
-      assert.match(warnings, /HALF-WRITTEN image and the target stays disabled/)
+      assert.match(warnings, /HALF-WRITTEN image: the target stays disabled and the volume keeps the restore mark anas:restore/)
       assertNothingDestructive()
     })
 
@@ -1261,6 +1296,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       mock.clearFixtures()
       mock.addFixture({ command: PBC, result: { stdout: SNAPSHOT_LIST_JSON, stderr: '', exitCode: 0 } })
       mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, argsMatch: a => a[0] === 'get' && a.includes('anas:restore'), result: { stdout: '-\t-\n', stderr: '', exitCode: 0 } })
       mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
       mock.addStreamFixture({
         command: PBC,
@@ -1285,6 +1321,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       mock.clearFixtures()
       mock.addFixture({ command: PBC, result: { stdout: SNAPSHOT_LIST_JSON, stderr: '', exitCode: 0 } })
       mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, argsMatch: a => a[0] === 'get' && a.includes('anas:restore'), result: { stdout: '-\t-\n', stderr: '', exitCode: 0 } })
       mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
       // A pbc ERROR line that echoes the credential this restore handed it.
       mock.addStreamFixture({
@@ -1316,6 +1353,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       mock.clearFixtures()
       mock.addFixture({ command: PBC, result: { stdout: SNAPSHOT_LIST_JSON, stderr: '', exitCode: 0 } })
       mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, argsMatch: a => a[0] === 'get' && a.includes('anas:restore'), result: { stdout: '-\t-\n', stderr: '', exitCode: 0 } })
       mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
       mock.addStreamFixture({
         command: PBC,
@@ -1470,7 +1508,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         const res = await restore(newLunBody(targetWith({ name: 'newvol' })))
         assert.equal(res.statusCode, 409, JSON.stringify(res.body))
         assert.equal(res.body.error!.reason, 'name-taken', JSON.stringify(res.body))
-        assert.match(res.body.error!.message, /backstore named 'newvol' already exists on this node, mapped as no LUN/)
+        assert.match(res.body.error!.message, /backstore named 'newvol' exists on this node and no LUN maps it\. .*: pick another name, or remove that backstore with targetcli\.$/)
         assertNothingDestructive()
       })
 
@@ -1526,9 +1564,12 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.match(warnings, /NEW LUN 'newvol' backed by \/dev\/zvol\/tank\/newvol at exactly the image's size \(536870912 bytes\)/)
       assert.match(warnings, /FRESH unit serial/)
       assert.match(warnings, /source LUN .* is not touched/)
-      assert.match(warnings, /removes the new LUN, its backstore and its backing/)
-      // cr3 review2 (5): the keep-on-save-failure case is said too.
-      assert.match(warnings, /If only saving the iSCSI configuration fails once the image is written, the LUN, its backstore and its backing are kept/)
+      // cr3.lunrestore: the new truth — no initiator sees it until it is whole.
+      assert.match(warnings, /No initiator sees the new LUN until the whole image is written and its size is verified/)
+      assert.match(warnings, /ANAS removes the backstore and its backing/)
+      assert.ok(!/looking complete/.test(warnings), warnings)
+      // cr3 review2 (5): the keep-on-map-or-save-failure case is said too.
+      assert.match(warnings, /If mapping the LUN or saving the iSCSI configuration fails once the image is written and verified, the image, its backstore and its backing are kept/)
       assertNothingDestructive()
     })
 
@@ -1579,8 +1620,9 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.deepEqual(mock.streamCalls[0].args, ['restore', SNAP, 'vol.img', '-', '--ns', 'gtrestore'])
 
       // The sequence, in order: volume created at the manifest size FIRST,
-      // backstore with the fresh wwn, ALL attributes before the map, the map
-      // at index 1, the grant, the stream, the read-back, saveconfig LAST.
+      // backstore with the fresh wwn, ALL attributes, the stream, the
+      // read-back, and only then (cr3.lunrestore) the map at index 1, the
+      // grant and saveconfig.
       const seq = mock.calls
         .map(c => `${c.command} ${c.args.join(' ')}`)
         .filter(a => a.startsWith(TARGETCLI)
@@ -1594,10 +1636,10 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpws=1`,
         `${TARGETCLI} /backstores/block/newvol set attribute max_unmap_lba_count=524288`,
         `${TARGETCLI} /backstores/block/newvol set attribute emulate_write_cache=0`,
-        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns create storage_object=/backstores/block/newvol lun=1`,
-        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/acls/${INITIATOR} create 1 1`,
         `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
         `${ZFS} get -Hp -o value volsize -- tank/newvol`,
+        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns create storage_object=/backstores/block/newvol lun=1`,
+        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/acls/${INITIATOR} create 1 1`,
         `${TARGETCLI} saveconfig`,
       ], seq.join(' | '))
 
@@ -1609,7 +1651,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.ok(!mock.calls.some(c => c.args.join(' ').includes(ZVOL_PATH)), JSON.stringify(mock.calls))
     })
 
-    // --- cr.38 session B: the target's key, released after the map ----------
+    // --- cr.38 session B: the target's key, released once the backstore exists (cr3.lunrestore) ---
 
     /**
      * Every latch a test made, opened after it — a test that fails part-way
@@ -1635,12 +1677,20 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       return { open, wait, reached, arrive }
     }
 
-    /** Hold the job at the LUN map (inside its iSCSI-lock section) and at the image stream. */
+    /**
+     * Hold the job at the backstore create (inside its iSCSI-lock section), at
+     * the image stream, and at the LUN map (cr3.lunrestore: after the stream).
+     */
     function pauseAtMapAndStream(mock: MockExecutor, stream: ExecStreamResult | null = null) {
+      const atCreate = gate()
       const atMap = gate()
       const atStream = gate()
       const exec = mock.exec.bind(mock)
       mock.exec = async (command, args, opts) => {
+        if (command === TARGETCLI && args[0] === '/backstores/block' && args[1] === 'create') {
+          atCreate.arrive()
+          await atCreate.wait
+        }
         if (command === TARGETCLI && args[0]?.endsWith('/tpg1/luns') && args[1] === 'create') {
           atMap.arrive()
           await atMap.wait
@@ -1657,7 +1707,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         }
         return toStream(command, args, target, opts)
       }
-      return { atMap, atStream }
+      return { atCreate, atMap, atStream }
     }
 
     async function settled(queue: JobQueue, id: string): Promise<void> {
@@ -1665,43 +1715,62 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         await new Promise(resolve => setTimeout(resolve, 5))
     }
 
-    it('cr.38: the job holds the target\'s key until the LUN is mapped, then gives it back — a verb on the target waits only until the map, not for the stream', async () => {
+    it('cr.38 + cr3.lunrestore: the job holds the target\'s key until the BACKSTORE exists, gives it back for the stream, and takes it again before the map', async () => {
       await serveAnas()
       const mock = mockOf()
       mock.addFixture({ command: ZFS, args: volsizeArgs('tank/newvol'), result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
       const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
-      const { atMap, atStream } = pauseAtMapAndStream(mock)
+      const { atCreate, atMap, atStream } = pauseAtMapAndStream(mock)
+      atMap.open()
 
       const first = await restore(newLunBody())
       const res = await restore(newLunBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
       assert.equal(res.statusCode, 202)
       const id = res.body.job!.id
-      await atMap.reached
+      await atCreate.reached
 
-      // Before the map: another verb on the same target waits for the restore.
+      // Before the backstore exists: another verb on the same target waits.
       const probe = queue.submit('iscsi.acl.add', { user: 'test', uid: 0 }, async () => null, { locks: [iscsiTargetClaim(ANAS_IQN)] })
       await new Promise(resolve => setImmediate(resolve))
       assert.equal(queue.get(probe.id)?.status, 'queued')
       assert.equal(queue.get(probe.id)?.progress, `waiting for backup.restore.image (job ${id}) on iSCSI target ${ANAS_IQN}`)
 
-      // The LUN is mapped; the stream starts and is held — the key is back.
-      atMap.open()
+      // The backstore exists (not mapped); the stream starts and is held — the key is back.
+      atCreate.open()
       await atStream.reached
       await settled(queue, probe.id)
       assert.equal(queue.get(probe.id)?.status, 'completed', 'the target verb ran while the image streams')
       assert.equal(queue.get(id)?.status, 'running', 'the restore is still streaming')
       assert.deepEqual(queue.heldLocks(), [], 'nobody holds the target while the image streams')
+      assert.ok(!mock.calls.some(c => c.command === TARGETCLI && c.args[0]?.endsWith('/luns') && c.args[1] === 'create'), 'nothing is mapped while the image streams')
 
+      // A verb that takes the key while the image streams makes the MAP wait.
+      let endHolder!: () => void
+      const holder = queue.submit('iscsi.lun.delete', { user: 'test', uid: 0 }, () => new Promise<void>((resolve) => {
+        endHolder = resolve
+        latches.push(resolve)
+      }), { locks: [iscsiTargetClaim(ANAS_IQN)] })
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(queue.get(holder.id)?.status, 'running')
       atStream.open()
+      for (let i = 0; i < 400 && !(queue.get(id)?.progress ?? '').startsWith('waiting for'); i++)
+        await new Promise(resolve => setTimeout(resolve, 5))
+      assert.equal(queue.get(id)?.progress, `waiting for iscsi.lun.delete (job ${holder.id}) on iSCSI target ${ANAS_IQN}`)
+      assert.ok(!mock.calls.some(c => c.command === TARGETCLI && c.args[0]?.endsWith('/luns') && c.args[1] === 'create'), 'the map waits for the key')
+
+      endHolder()
       const job = await waitForJob(id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.ok(mock.calls.some(c => c.command === TARGETCLI && c.args[0]?.endsWith('/luns') && c.args[1] === 'create'), 'mapped once the key was back')
+      assert.deepEqual(queue.heldLocks(), [])
     })
 
-    it('cr.38: a failed stream takes the target\'s key again before its undo unmaps the LUN — it waits for the verb that took it', async () => {
+    it('cr.38: a failed stream takes the target\'s key again before its undo deletes the backstore — it waits for the verb that took it', async () => {
       await serveAnas()
       const mock = mockOf()
       const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
-      const { atMap, atStream } = pauseAtMapAndStream(mock, { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 })
+      const { atCreate, atMap, atStream } = pauseAtMapAndStream(mock, { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 })
+      atCreate.open()
       atMap.open()
 
       const first = await restore(newLunBody())
@@ -1722,18 +1791,19 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       for (let i = 0; i < 400 && !(queue.get(id)?.progress ?? '').startsWith('waiting for'); i++)
         await new Promise(resolve => setTimeout(resolve, 5))
       assert.equal(queue.get(id)?.progress, `waiting for iscsi.lun.delete (job ${probe.id}) on iSCSI target ${ANAS_IQN}`)
-      const unmap = `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns delete lun1`
-      assert.ok(!mock.calls.some(c => `${c.command} ${c.args.join(' ')}` === unmap), 'the undo has not touched the target yet')
+      const undo = `${TARGETCLI} /backstores/block delete newvol`
+      assert.ok(!mock.calls.some(c => `${c.command} ${c.args.join(' ')}` === undo), 'the undo has not touched LIO yet')
 
       endProbe()
       const job = await waitForJob(id)
       assert.equal(job.status, 'failed')
-      assert.match(job.error!.message, /ANAS has removed LUN 1/)
-      assert.ok(mock.calls.some(c => `${c.command} ${c.args.join(' ')}` === unmap), 'the undo ran, under the key')
+      assert.match(job.error!.message, /ANAS has removed backstore 'newvol'/)
+      assert.ok(mock.calls.some(c => `${c.command} ${c.args.join(' ')}` === undo), 'the undo ran, under the key')
+      assert.ok(!mock.calls.some(c => c.command === TARGETCLI && c.args[1] === 'create' && c.args[0]?.endsWith('/luns')), 'nothing was ever mapped')
       assert.deepEqual(queue.heldLocks(), [])
     })
 
-    it('a mid-stream failure removes the new LUN, its backstore and its backing — and never saves', async () => {
+    it('a mid-stream failure removes the backstore and its backing — nothing was mapped, and nothing is saved', async () => {
       await serveAnas()
       const mock = mockOf()
       mock.clearFixtures()
@@ -1755,15 +1825,17 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       const job = await waitForJob(res.body.job!.id)
       assert.equal(job.status, 'failed')
       assert.match(job.error!.message, /the image was partially written \(268435456 of 536870912 bytes reached the new backing \/dev\/zvol\/tank\/newvol\)/)
-      assert.match(job.error!.message, /ANAS has removed LUN 1, backstore 'newvol', volume tank\/newvol/)
+      assert.match(job.error!.message, /ANAS has removed backstore 'newvol', volume tank\/newvol/)
       assert.match(job.error!.message, /nothing of the failed restore remains/)
 
       // The undo runs in the reverse of the order the objects were made, and
       // nothing is persisted or taken offline along the way.
       const seq = mock.calls.map(c => `${c.command} ${c.args.join(' ')}`)
       const restoreIdx = seq.indexOf(`${PBC} restore ${SNAP} vol.img - --ns gtrestore`)
-      assert.deepEqual(seq.slice(restoreIdx + 1), [
-        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns delete lun1`,
+      assert.ok(!seq.slice(0, restoreIdx).some(a => a.includes('/luns create')), 'nothing was mapped before the stream')
+      // cr3.lunrestore (D2): the undo re-reads the live tree first (reads only);
+      // the ACTS after the stream are these.
+      assert.deepEqual(seq.slice(restoreIdx + 1).filter(a => a.startsWith(TARGETCLI) || a.startsWith(`${ZFS} destroy`)), [
         `${TARGETCLI} /backstores/block delete newvol`,
         `${ZFS} destroy -- tank/newvol`,
       ], seq.join(' | '))
@@ -1772,6 +1844,557 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         mock.calls.filter(c => c.command === TARGETCLI && (c.args.includes('disable') || c.args.includes('enable'))),
         [],
       )
+    })
+
+    // --- cr3.lunrestore Part B: the restore mark, through the routes ---------
+
+    /**
+     * The mock's volumes keep their `anas:restore` mark: `zfs set` stores it,
+     * `zfs inherit` clears it, `zfs get ... anas:restore` answers from it (`-\t-`
+     * when unset), and `unreadable` makes the read fail like a suspended pool.
+     */
+    function marksFollow(mock: MockExecutor): { marks: Map<string, string>, unreadable: Set<string> } {
+      const marks = new Map<string, string>()
+      const unreadable = new Set<string>()
+      const exec = mock.exec.bind(mock)
+      mock.exec = async (command, args, o) => {
+        if (command === ZFS && args[0] === 'set' && (args[1] ?? '').startsWith('anas:restore=')) {
+          mock.calls.push({ command, args })
+          marks.set(args.at(-1)!, args[1].slice('anas:restore='.length))
+          return { stdout: '', stderr: '', exitCode: 0 }
+        }
+        if (command === ZFS && args[0] === 'inherit' && args[1] === 'anas:restore') {
+          mock.calls.push({ command, args })
+          marks.delete(args.at(-1)!)
+          return { stdout: '', stderr: '', exitCode: 0 }
+        }
+        if (command === ZFS && args[0] === 'get' && args.includes('anas:restore')) {
+          mock.calls.push({ command, args })
+          // review2 (7): the single form (`-o value,source -- <ds>`) and the
+          // batched one (`-o name,value,source -- <ds>...`).
+          const datasets = args.slice(args.indexOf('--') + 1)
+          if (datasets.some(d => unreadable.has(d)))
+            return { stdout: '', stderr: 'cannot get property: pool I/O is currently suspended', exitCode: 1 }
+          const named = args.includes('name,value,source')
+          const rows = datasets.map((d) => {
+            const v = marks.get(d)
+            const row = v === undefined ? '-\t-' : `${v}\tlocal`
+            return named ? `${d}\t${row}` : row
+          })
+          return { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 }
+        }
+        return exec(command, args, o)
+      }
+      return { marks, unreadable }
+    }
+
+    const MARK = JSON.stringify({ v: 1, repo: 'pbs-main', ns: 'gtrestore', snapshot: SNAP, archive: 'vol.img', started: '2026-11-14T10:00:00.000Z', state: 'writing' })
+
+    async function enable(headers: Record<string, string> = {}) {
+      return server!.inject({ method: 'POST', url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}/state`, headers: { ...IDENTITY, 'content-type': 'application/json', ...headers }, payload: { action: 'enable' } })
+    }
+
+    async function disableInConfigfs(): Promise<void> {
+      await writeFile(join(dir, 'target', 'iscsi', ANAS_IQN, 'tpgt_1', 'enable'), '0\n')
+    }
+
+    it('R8 (review D5): an in-place restore streaming — the dashboard says a restore is running and does not invite Enable; Enable is REFUSED naming the job; the failed restore keeps the mark and the target dark', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      const m = marksFollow(mock)
+      const g = pauseAtMapAndStream(mock, { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 })
+      const first = await restore(body())
+      const res = await restore(body(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      await g.atStream.reached
+      await disableInConfigfs()
+      assert.ok(m.marks.has('tank/vol1'), 'the mark is on the volume before the first byte')
+
+      const status = await server!.inject({ method: 'GET', url: '/v1/status', headers: IDENTITY })
+      const sj = status.json() as { data?: { warnings?: { message: string }[] }, warnings?: { message: string }[] }
+      const disabledCard = (sj.data?.warnings ?? sj.warnings ?? []).map(w => w.message).find(msg => /is disabled/.test(msg)) ?? ''
+      assert.match(disabledCard, /is writing LUN 0 \('vmdisk1'\) of .* right now \(job .*\)\. Enable is refused until the restore ends\. When the restore ends, a target the restore disabled is enabled again only if the image is complete and its size verified, and put back as it was if the restore fails before writing anything and leaves the volume with no restore mark \(an earlier restore's mark, put back, keeps it disabled\); in every other case it stays disabled and the restore job says why\. A target the restore did not disable is left as it is\./)
+      assert.doesNotMatch(disabledCard, /Enable it from the iSCSI screen when you are ready/)
+
+      const en = await enable()
+      assert.equal(en.statusCode, 409, en.body)
+      assert.equal((en.json() as { error: { reason: string } }).error.reason, 'restore-in-progress')
+      assert.match(en.body, /A whole-image restore is writing LUN 0 \('vmdisk1'\) of .* right now \(job /)
+      assert.equal(en.headers['x-anas-confirm-code'], undefined, 'no confirm while it runs')
+
+      g.atStream.open()
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /Enable on the iSCSI screen asks you to confirm that you accept the partial image, and removes the restore mark on tank\/vol1/)
+      assert.ok(m.marks.has('tank/vol1'), 'the mark stays: the LUN holds a partial image')
+      assert.ok(!mock.calls.some(c => c.command === TARGETCLI && c.args.includes('enable')), 'nothing enabled the target')
+    })
+
+    it('R8 (review D5 c): an Enable accepted with no mark, still queued when a mark appears, refuses IN THE JOB — nothing is enabled', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      const m = marksFollow(mock)
+      await disableInConfigfs()
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      // Something holds the target's key, so the accepted enable waits.
+      let endHolder!: () => void
+      queue.submit('iscsi.lun.delete', { user: 'test', uid: 0 }, () => new Promise<void>((resolve) => {
+        endHolder = resolve
+        latches.push(resolve)
+      }), { locks: [iscsiTargetClaim(ANAS_IQN)] })
+      await new Promise(resolve => setImmediate(resolve))
+      const en = await enable()
+      assert.equal(en.statusCode, 202, en.body)
+      // Meanwhile a restore onto LUN 0 started and died, leaving its mark.
+      m.marks.set('tank/vol1', MARK)
+      endHolder()
+      const job = await waitForJob((en.json() as { job: { id: string } }).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /A restore mark on .* is not the one this enable was accepted for: LUN 0 \('vmdisk1'\): a whole-image restore of vol\.img .* onto tank\/vol1 did not finish, so the LUN holds a partial image\..* Nothing was enabled/)
+      assert.ok(!mock.calls.some(c => c.command === TARGETCLI && c.args.includes('enable')), 'the half-written LUN was not served')
+      assert.ok(m.marks.has('tank/vol1'))
+    })
+
+    it('review D5 b: Enable on an interrupted restore is a 409 confirm naming what and since when; the confirmed enable removes the mark, then enables', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      const m = marksFollow(mock)
+      await disableInConfigfs()
+      m.marks.set('tank/vol1', MARK)
+      const first = await enable()
+      assert.equal(first.statusCode, 409, first.body)
+      const err = (first.json() as { error: { code: string, message: string, warnings: string[] } }).error
+      assert.equal(err.code, 'CONFIRMATION_REQUIRED')
+      assert.match(err.message, /^Enabling .* serves a LUN whose whole-image restore did not finish$/)
+      assert.match(err.warnings.join(' '), /LUN 0 \('vmdisk1'\): a whole-image restore of vol\.img from host\/gtimgboth\/2026-08-25T19:28:38Z \(repository pbs-main, namespace gtrestore\) started 2026-11-14T10:00:00\.000Z onto tank\/vol1 did not finish, so the LUN holds a partial image\. An initiator will be served that partial image\. Confirming removes the restore mark; restoring the image again is the other way out\./)
+      const res = await enable({ 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202, res.body)
+      const job = await waitForJob((res.json() as { job: { id: string } }).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.ok(!m.marks.has('tank/vol1'), 'the confirm removed the mark')
+      const seq = mock.calls.map(c => `${c.command} ${c.args.join(' ')}`)
+      const inherit = seq.indexOf(`${ZFS} inherit anas:restore -- tank/vol1`)
+      const enabled = seq.indexOf(`${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1 enable`)
+      assert.ok(inherit >= 0 && enabled > inherit, 'the mark goes first, then the target is enabled')
+    })
+
+    it('review D5 b: a mark that cannot be READ refuses Enable — never enabled on unknown', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      const m = marksFollow(mock)
+      await disableInConfigfs()
+      m.unreadable.add('tank/vol1')
+      const en = await enable()
+      assert.equal(en.statusCode, 409, en.body)
+      assert.equal((en.json() as { error: { reason: string } }).error.reason, 'restore-mark-unreadable')
+      assert.match(en.body, /could not check whether LUN 0 \('vmdisk1'\) of .* holds a partially restored image/)
+    })
+
+    it('review D5 d: adding an initiator ACL to a target whose LUN is marked is refused (it would reach a new initiator)', async () => {
+      await serveAnas()
+      const m = marksFollow(mockOf())
+      m.marks.set('tank/vol1', MARK)
+      const res = await server!.inject({
+        method: 'PUT',
+        url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}`,
+        headers: { ...IDENTITY, 'content-type': 'application/json' },
+        payload: { acls: [{ initiatorIqn: INITIATOR }, { initiatorIqn: 'iqn.2026-01.org.example:new' }] },
+      })
+      assert.equal(res.statusCode, 409, res.body)
+      assert.equal((res.json() as { error: { reason: string } }).error.reason, 'restore-mark')
+      assert.match(res.body, /Adding an initiator to this target would serve that image to initiators and is refused/)
+    })
+
+    it('review D1: an add-LUN over the zvol a new-LUN restore is writing (an UNMAPPED backstore holds it) is refused with the backstore sentence', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.addFixture({ command: ZFS, args: volsizeArgs('tank/newvol'), result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
+      const g = pauseAtMapAndStream(mock)
+      g.atCreate.open()
+      g.atMap.open()
+      const first = await restore(newLunBody())
+      const res = await restore(newLunBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      await g.atStream.reached
+      const add = await server!.inject({ method: 'POST', url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}/luns`, headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: { name: 'other', kind: 'zvol', backing: 'tank/newvol' } })
+      assert.equal(add.statusCode, 409, add.body)
+      assert.equal((add.json() as { error: { reason: string } }).error.reason, 'backing-held-by-backstore')
+      assert.match(add.body, /held by iSCSI backstore 'newvol' \(block, \/dev\/zvol\/tank\/newvol\), which is not mapped as a LUN/)
+      assert.ok(!mock.calls.some(c => c.args.join(' ').includes('name=other')), 'no second backstore over the device')
+      g.atStream.open()
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    })
+
+    it('review2 defect A (1): a partial restore, then a retry PBS refuses before any byte — the mark of the first is still there, and Enable still asks', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      const m = marksFollow(mock)
+      const results: ExecStreamResult[] = [
+        { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 },
+        // review3 3: the CAPTURED refused stderr (restore-failure-taxonomy.txt F10).
+        { stderr: 'Error: client error (Connect)\n\nCaused by:\n    error connecting to https://pbs.example:8007/ - tcp connect error: Connection refused (os error 111)\n', exitCode: 255, bytesWritten: 0 },
+      ]
+      mock.execToStream = async (command, args) => {
+        mock.calls.push({ command, args })
+        return results.shift()!
+      }
+      let firstMark = ''
+      for (const n of [1, 2]) {
+        if (n === 2)
+          await disableInConfigfs() // the first run left the target disabled (the mock targetcli does not touch configfs)
+        const first = await restore(body())
+        const res = await restore(body(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+        const job = await waitForJob(res.body.job!.id)
+        assert.equal(job.status, 'failed')
+        if (n === 1)
+          firstMark = m.marks.get('tank/vol1') ?? ''
+        else
+          assert.match(job.error!.message, /Nothing was written to \/dev\/zvol\/tank\/vol1\. tank\/vol1 carries the restore mark of .* again, as it did before this restore/)
+      }
+      assert.ok(firstMark.length > 0)
+      assert.equal(m.marks.get('tank/vol1'), firstMark, 'the first restore\'s mark, exactly')
+      const en = await enable()
+      assert.equal(en.statusCode, 409, en.body)
+      assert.equal((en.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
+      assert.ok(!mock.calls.some(c => c.command === TARGETCLI && c.args.includes('enable')), 'nothing enabled the partial image')
+    })
+
+    // --- review2 D: an image FILE carries no mark; the job records close what they can
+
+    async function statusMessages(): Promise<string[]> {
+      const status = await server!.inject({ method: 'GET', url: '/v1/status', headers: IDENTITY })
+      const sj = status.json() as { data?: { warnings?: { message: string }[] }, warnings?: { message: string }[] }
+      return (sj.data?.warnings ?? sj.warnings ?? []).map(w => w.message)
+    }
+    async function healthRows(): Promise<{ lunIndex?: number, state: string, source: string, dataset: string | null, job?: string, detail: string }[]> {
+      const h = await server!.inject({ method: 'GET', url: '/v1/iscsi/health', headers: IDENTITY })
+      return (h.json() as { data: { restoreMarks?: [] } }).data.restoreMarks ?? []
+    }
+    const enabledAfterStream = (mock: MockExecutor) => {
+      const seq = mock.calls.map(c => `${c.command} ${c.args.join(' ')}`)
+      const at = seq.findIndex(a => a.startsWith(`${PBC} restore`))
+      return seq.slice(at + 1).filter(a => a === `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1 enable`).length
+    }
+
+    it('review2 D5-file (4a): while a FILE LUN restore streams Enable is refused and nothing invites it; once it fails part-way Enable asks, naming the job record; the confirm enables it once', async () => {
+      const { imagePath } = await serveImageLun()
+      const mock = mockOf()
+      marksFollow(mock)
+      const g = pauseAtMapAndStream(mock, { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 })
+      const first = await restore(imageBody())
+      const res = await restore(imageBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      await g.atStream.reached
+      await disableInConfigfs()
+      const running = (await healthRows()).find(r => r.lunIndex === 1)
+      assert.deepEqual([running?.state, running?.source, running?.dataset, running?.job], ['in-progress', 'job', null, res.body.job!.id])
+      const card = (await statusMessages()).find(m => /is disabled/.test(m)) ?? ''
+      assert.match(card, new RegExp(`A whole-image restore \\(job ${res.body.job!.id}\\) is writing LUN 1 \\('lun2'\\) of .* right now\\. Enable is refused until the restore ends\\.`))
+      assert.doesNotMatch(card, /Enable it from the iSCSI screen when you are ready/)
+      const en = await enable()
+      assert.equal(en.statusCode, 409, en.body)
+      assert.equal((en.json() as { error: { reason: string } }).error.reason, 'restore-in-progress')
+      assert.equal(en.headers['x-anas-confirm-code'], undefined)
+
+      g.atStream.open()
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error!.code, 'IMAGE_PARTIAL')
+      assert.match(job.error!.message, /while ANAS keeps this job's record; an image file carries no restore mark/)
+
+      const row = (await healthRows()).find(r => r.lunIndex === 1)
+      assert.deepEqual([row?.state, row?.source, row?.job], ['interrupted', 'job', job.id])
+      const ask = await enable()
+      assert.equal(ask.statusCode, 409, ask.body)
+      const err = (ask.json() as { error: { code: string, message: string, warnings: string[] } }).error
+      assert.equal(err.code, 'CONFIRMATION_REQUIRED')
+      assert.match(err.message, /serves a LUN whose whole-image restore did not finish$/)
+      assert.match(err.warnings.join(' '), new RegExp(`LUN 1 \\('lun2'\\): the whole-image restore job ${job.id} onto ${imagePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')} did not finish, so the LUN may hold a partial image\\. An initiator will be served that image\\. ANAS knows this only from that job's record in this run of the ANAS daemon: an image file carries no restore mark, so the record is lost when the ANAS daemon restarts, or when the daemon holds more than 100 such records and more than 1000 jobs \\(the oldest record goes first\\)\\.`))
+      const acl = await server!.inject({ method: 'PUT', url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}`, headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: { acls: [{ initiatorIqn: INITIATOR }, { initiatorIqn: 'iqn.2026-01.org.example:new' }] } })
+      assert.equal(acl.statusCode, 409, acl.body)
+      assert.match(acl.body, /The whole-image restore job .* onto LUN 1 \('lun2'\) of .* did not finish, so it may hold a partial image\. ANAS knows this only from/)
+      assert.equal(enabledAfterStream(mock), 0, 'the partial file was never served')
+
+      const ok = await enable({ 'x-anas-confirm': String(ask.headers['x-anas-confirm-code']) })
+      assert.equal(ok.statusCode, 202, ok.body)
+      const ej = await waitForJob((ok.json() as { job: { id: string } }).job.id)
+      assert.equal(ej.status, 'completed', JSON.stringify(ej.error))
+      assert.equal(enabledAfterStream(mock), 1, 'the confirm accepted it: enabled once')
+      assert.equal((await healthRows()).find(r => r.lunIndex === 1), undefined, 'the completed Enable accepted that record')
+    })
+
+    it('review2 D5-file (4b): an Enable accepted BEFORE a file restore ran enables nothing when the job finds that restore failed part-way', async () => {
+      await serveImageLun()
+      const mock = mockOf()
+      marksFollow(mock)
+      mock.execToStream = async (command, args) => {
+        mock.calls.push({ command, args })
+        return { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 }
+      }
+      await disableInConfigfs()
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      // Something holds the target's key, so the restore and the enable queue behind it.
+      let endHolder!: () => void
+      queue.submit('iscsi.lun.delete', { user: 'test', uid: 0 }, () => new Promise<void>((resolve) => {
+        endHolder = resolve
+        latches.push(resolve)
+      }), { locks: [iscsiTargetClaim(ANAS_IQN)] })
+      await new Promise(resolve => setImmediate(resolve))
+      const first = await restore(imageBody())
+      const res = await restore(imageBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      const en = await enable()
+      assert.equal(en.statusCode, 202, en.body)
+      endHolder()
+      const rjob = await waitForJob(res.body.job!.id)
+      assert.equal(rjob.error?.code, 'IMAGE_PARTIAL')
+      const ejob = await waitForJob((en.json() as { job: { id: string } }).job.id)
+      assert.equal(ejob.status, 'failed')
+      assert.match(ejob.error!.message, new RegExp(`^What ANAS knows about the restored images on .* is not what this enable was accepted for: LUN 1 \\('lun2'\\): the whole-image restore job ${rjob.id} .* did not finish.* Nothing was enabled`))
+      assert.equal(enabledAfterStream(mock), 0, 'the half-written file was not served')
+    })
+
+    it('review3 4: an Enable confirmed over a FILE record that a later complete restore cleared enables nothing, and its STATE_CHANGED names a job record, not a mark', async () => {
+      const { imagePath } = await serveImageLun()
+      const mock = mockOf()
+      marksFollow(mock)
+      mock.execToStream = async (command, args) => {
+        mock.calls.push({ command, args })
+        return { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 }
+      }
+      const first = await restore(imageBody())
+      const res = await restore(imageBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal((await waitForJob(res.body.job!.id)).error?.code, 'IMAGE_PARTIAL')
+      await disableInConfigfs()
+      const ask = await enable()
+      assert.equal(ask.statusCode, 409, ask.body)
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      let endHolder!: () => void
+      queue.submit('iscsi.lun.delete', { user: 'test', uid: 0 }, () => new Promise<void>((resolve) => {
+        endHolder = resolve
+        latches.push(resolve)
+      }), { locks: [iscsiTargetClaim(ANAS_IQN)] })
+      await new Promise(resolve => setImmediate(resolve))
+      const ok = await enable({ 'x-anas-confirm': String(ask.headers['x-anas-confirm-code']) })
+      assert.equal(ok.statusCode, 202, ok.body)
+      // A later restore onto the file completes while the Enable waits: the record no longer applies.
+      const done = queue.submit('backup.restore.image', { user: 'test', uid: 0, params: { backing: imagePath, target: ANAS_IQN, lun: 1 } }, async () => ({}))
+      assert.equal((await waitForJob(done.id)).status, 'completed')
+      endHolder()
+      const ej = await waitForJob((ok.json() as { job: { id: string } }).job.id)
+      assert.equal(ej.status, 'failed')
+      assert.equal(ej.error?.message, `What this enable was confirmed for on ${ANAS_IQN} (the job records of failed restores onto image files) no longer applies; nothing was enabled — enable the target again.`)
+      assert.equal(enabledAfterStream(mock), 0)
+    })
+
+    it('review3 2: a file the failed restore left SHORTER is refused in place (size-mismatch) until the truncate the job names sets it back; then the door asks to confirm', async () => {
+      const { imagePath } = await serveImageLun()
+      const mock = mockOf()
+      marksFollow(mock)
+      mock.execToStream = async (command, args) => {
+        mock.calls.push({ command, args })
+        // The stream's open truncates the file; half the image is written.
+        await truncate(imagePath, 268435456)
+        return { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 }
+      }
+      const first = await restore(imageBody())
+      const res = await restore(imageBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.error?.code, 'IMAGE_PARTIAL')
+      assert.ok(job.error!.message.includes(`To restore the image again in place, first set ${imagePath} to the image's ${IMAGE_SIZE} bytes with 'truncate -s ${IMAGE_SIZE} ${imagePath}'`), job.error!.message)
+      const again = await restore(imageBody())
+      assert.equal(again.statusCode, 409)
+      assert.equal((again.body as unknown as { error: { reason: string } }).error.reason, 'size-mismatch', 'restoring again in place, as the file is now, is refused')
+      await truncate(imagePath, IMAGE_SIZE) // what 'truncate -s <bytes> <path>' does
+      const ask = await restore(imageBody())
+      assert.equal(ask.statusCode, 409)
+      assert.equal((ask.body as unknown as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED', 'at the image\'s length the door asks to confirm')
+    })
+
+    it('review3 1: the daemon\'s queue keeps a FILE LUN\'s failed restore past its 1000-job eviction (the pin is wired in createServer)', async () => {
+      await serveImageLun()
+      const mock = mockOf()
+      marksFollow(mock)
+      mock.execToStream = async (command, args) => {
+        mock.calls.push({ command, args })
+        return { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 }
+      }
+      const first = await restore(imageBody())
+      const res = await restore(imageBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      const rjob = await waitForJob(res.body.job!.id)
+      assert.equal(rjob.error?.code, 'IMAGE_PARTIAL')
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      for (let i = 0; i < 1001; i++)
+        queue.submit('test.noop', { user: 'test', uid: 0 }, async () => {})
+      for (let i = 0; i < 50; i++)
+        await new Promise(resolve => setImmediate(resolve))
+      assert.ok(queue.list().length <= 1000 + 100, 'eviction ran')
+      assert.equal(queue.get(rjob.id)?.error?.code, 'IMAGE_PARTIAL', 'pinned: still held')
+      const row = (await healthRows()).find(r => r.lunIndex === 1)
+      assert.deepEqual([row?.state, row?.source, row?.job], ['interrupted', 'job', rjob.id])
+    })
+
+    // --- review2 E: Repair over a hole whose backing carries a restore mark ---
+
+    async function repairOverMarkedHole(state: 'interrupted' | 'unverified' | 'unreadable') {
+      await serveAnas({ hole: true, backingPresent: `${ZVOL_PATH}:/dev/zvol/tank/gone` })
+      const m = marksFollow(mockOf())
+      if (state === 'interrupted')
+        m.marks.set('tank/gone', MARK)
+      if (state === 'unverified')
+        m.marks.set('tank/gone', JSON.stringify({ ...JSON.parse(MARK), state: 'unverified', reason: 'size could not be re-read' }))
+      if (state === 'unreadable')
+        m.unreadable.add('tank/gone')
+      return server!.inject({ method: 'POST', url: '/v1/iscsi/health/repair', headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: {} })
+    }
+
+    it('review2 E (5): Repair over an interrupted mark answers its own reason, a true sentence, and ways out that exist for a hole', async () => {
+      const r = await repairOverMarkedHole('interrupted')
+      assert.equal(r.statusCode, 409, r.body)
+      const err = (r.json() as { error: { reason: string, message: string } }).error
+      assert.equal(err.reason, 'restore-mark')
+      assert.equal(err.message, 'None of the missing LUNs can be repaired. One hole is held back by a restore mark on the backing: '
+      + `LUN 1 of ${ANAS_IQN} (backstore 'ghost', /dev/zvol/tank/gone): a whole-image restore of vol.img from ${SNAP} (repository pbs-main, `
+      + 'namespace gtrestore) started 2026-11-14T10:00:00.000Z onto tank/gone did not finish, so it holds a partial image. Repair would map '
+      + 'that image into the target again, so it does not. If you accept the image as it is, clear its restore mark '
+      + '(\'zfs inherit anas:restore tank/gone\') and run Repair again. If you do not, saving the iSCSI configuration by hand '
+      + '(\'targetcli saveconfig\') removes the LUN from the saved configuration for good, together with every other missing LUN; '
+      + 'the volume keeps its mark, and the image can then be restored as a new LUN.')
+      assert.doesNotMatch(err.message, /Restore the image again|\.\.|record-incomplete|does not describe/)
+    })
+
+    it('review2 E (5): Repair over an unverified mark says the client reported it complete', async () => {
+      const r = await repairOverMarkedHole('unverified')
+      const err = (r.json() as { error: { reason: string, message: string } }).error
+      assert.equal(err.reason, 'restore-mark')
+      assert.match(err.message, /a whole-image restore of vol\.img .* wrote tank\/gone, and the client reported the image complete, but its size was not verified \(size could not be re-read\)\. Repair would map that image/)
+    })
+
+    it('review2 E (5): Repair over a mark that cannot be read: one stop, and the wait named', async () => {
+      const r = await repairOverMarkedHole('unreadable')
+      const err = (r.json() as { error: { reason: string, message: string } }).error
+      assert.equal(err.reason, 'restore-mark')
+      assert.match(err.message, /: ANAS could not read the restore mark on tank\/gone \(cannot get property: pool I\/O is currently suspended\), so it cannot tell whether it holds a partially restored image\. Repair is refused for a LUN whose restore mark could not be read until it can be read\.$/)
+      assert.doesNotMatch(err.message, /\.\./)
+    })
+
+    // --- review2 F (6): every sentence true on the path that prints it ------
+
+    it('review2 F2 (6): adding an initiator while a restore RUNS says it runs — never "did not finish"', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      const m = marksFollow(mock)
+      const g = pauseAtMapAndStream(mock, { stderr: 'restore complete (512 MiB processed in 0.6s)    \n', exitCode: 0, bytesWritten: IMAGE_SIZE })
+      const first = await restore(body())
+      const res = await restore(body(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      await g.atStream.reached
+      assert.ok(m.marks.has('tank/vol1'))
+      const acl = await server!.inject({ method: 'PUT', url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}`, headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: { acls: [{ initiatorIqn: INITIATOR }, { initiatorIqn: 'iqn.2026-01.org.example:new' }] } })
+      assert.equal(acl.statusCode, 409, acl.body)
+      const err = (acl.json() as { error: { reason: string, message: string } }).error
+      assert.equal(err.reason, 'restore-in-progress')
+      assert.equal(err.message, `A whole-image restore is writing LUN 0 ('vmdisk1') of ${ANAS_IQN} right now (job ${res.body.job!.id}). Adding an initiator to this target is refused until the restore ends.`)
+      g.atStream.open()
+      await waitForJob(res.body.job!.id)
+    })
+
+    it('review2 F (6): a confirm replayed after the mark CHANGED names the two marks in words, never their JSON', async () => {
+      await serveAnas()
+      const m = marksFollow(mockOf())
+      await disableInConfigfs()
+      m.marks.set('tank/vol1', MARK)
+      const first = await enable()
+      m.marks.set('tank/vol1', JSON.stringify({ ...JSON.parse(MARK), state: 'unverified', reason: 'size could not be re-read' }))
+      const replay = await enable({ 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(replay.statusCode, 409, replay.body)
+      const err = (replay.json() as { error: { code: string, message: string } }).error
+      assert.equal(err.code, 'CONFIRM_SCOPE_CHANGED')
+      assert.equal(err.message, 'what ANAS knows about the restored images on its LUNs changed since you confirmed (was: tank/vol1: an unfinished '
+      + `whole-image restore of vol.img from ${SNAP} (repository pbs-main, namespace gtrestore) started 2026-11-14T10:00:00.000Z; now: `
+      + `tank/vol1: an unverified whole-image restore of vol.img from ${SNAP} (repository pbs-main, namespace gtrestore) started `
+      + '2026-11-14T10:00:00.000Z (not verified: size could not be re-read)) — confirm again')
+      assert.doesNotMatch(err.message, /[{}"]/)
+      assert.ok(replay.headers['x-anas-confirm-code'], 'a fresh code for the new state')
+    })
+
+    it('review2 F (6): the confirm removed the mark and the ENABLE then failed — the job error says the mark was removed', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      const m = marksFollow(mock)
+      await disableInConfigfs()
+      m.marks.set('tank/vol1', MARK)
+      mock.prependFixture({ command: TARGETCLI, args: [`/iscsi/${ANAS_IQN}/tpg1`, 'enable'], result: { stdout: '', stderr: 'Cannot enable: no portal', exitCode: 1 } })
+      const first = await enable()
+      const res = await enable({ 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      const job = await waitForJob((res.json() as { job: { id: string } }).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, new RegExp(`^The restore mark was removed from tank/vol1, as the confirm accepted, but enabling ${ANAS_IQN.replace(/[.:]/g, '\\$&')} then failed: .*Cannot enable: no portal`))
+      assert.equal(m.marks.has('tank/vol1'), false)
+    })
+
+    it('review2 F (6): a mark that cannot be removed enables nothing, and says so', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      const m = marksFollow(mock)
+      await disableInConfigfs()
+      m.marks.set('tank/vol1', MARK)
+      const inner = mock.exec.bind(mock)
+      mock.exec = async (command, args, o) => {
+        if (command === ZFS && args[0] === 'inherit')
+          return { stdout: '', stderr: 'cannot inherit anas:restore for \'tank/vol1\': pool I/O is currently suspended', exitCode: 1 }
+        return inner(command, args, o)
+      }
+      const first = await enable()
+      const res = await enable({ 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      const job = await waitForJob((res.json() as { job: { id: string } }).job.id)
+      assert.equal(job.error?.message, 'could not remove the restore mark anas:restore from tank/vol1: cannot inherit anas:restore for \'tank/vol1\': pool I/O is currently suspended. Nothing was enabled.')
+      assert.ok(!mock.calls.some(c => c.command === TARGETCLI && c.args.includes('enable')))
+    })
+
+    it('review2 F1 (6): the in-place confirm promises a re-enable only where the restore would make one, per backing kind', async () => {
+      await serveAnas()
+      const zvolOn = (await restore(body())).body as unknown as { error: { warnings: string[] } }
+      const on = zvolOn.error.warnings.join('\n')
+      assert.match(on, /When the restore ends, the target is enabled again only if the image is complete and its size verified, and put back as it was if the restore fails before writing anything and leaves the volume with no restore mark \(an earlier restore's mark, put back, keeps it disabled\); in every other case it stays disabled and the restore job says why\./)
+      assert.match(on, /the volume keeps the restore mark anas:restore, so Enable asks you to confirm before it serves that image\./)
+      assert.doesNotMatch(on, /re-enabled when the restore finishes|explicitly enable it/)
+      await disableInConfigfs()
+      const off = ((await restore(body())).body as unknown as { error: { warnings: string[] } }).error.warnings.join('\n')
+      assert.match(off, /The target is disabled now; a restore leaves a target it did not disable as it finds it\./)
+      assert.doesNotMatch(off, /enables the target again/)
+    })
+
+    it('review2 F1 (6): the in-place confirm on an image FILE says the job record is the only record', async () => {
+      await serveImageLun()
+      const res = (await restore(imageBody())).body as unknown as { error: { warnings: string[] } }
+      const w = res.error.warnings.join('\n')
+      assert.match(w, /Enable asks you to confirm before it serves that image while ANAS keeps the restore job's record; an image file carries no restore mark, so the record is lost when the ANAS daemon restarts, or when the daemon holds more than 100 such records and more than 1000 jobs \(the oldest record goes first\)\./)
+      assert.doesNotMatch(w, /anas:restore/)
+      // review3 4: the three endings, true for a file: a failed restore that opened it never comes back enabled.
+      assert.match(w, /When the restore ends, the target is enabled again only if the image is complete and its size verified, and put back as it was if the restore fails before it opens the image file and the file is still the image's size \(opening it for the restore empties it\); in every other case it stays disabled and the restore job says why\./)
+    })
+
+    it('review2 F (6): an add-LUN over a backstore a restore is writing names the job, ends with its stop, and does not say delete it', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.addFixture({ command: ZFS, args: volsizeArgs('tank/newvol'), result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
+      const g = pauseAtMapAndStream(mock)
+      g.atCreate.open()
+      g.atMap.open()
+      const first = await restore(newLunBody())
+      const res = await restore(newLunBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      await g.atStream.reached
+      const add = await server!.inject({ method: 'POST', url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}/luns`, headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: { name: 'other', kind: 'zvol', backing: 'tank/newvol' } })
+      const msg = (add.json() as { error: { message: string } }).error.message
+      assert.match(msg, new RegExp(`a whole-image restore as a new LUN is writing the image into it right now \\(job ${res.body.job!.id}\\)\\. .*adding it as a LUN is refused while the restore runs; when it ends, the restore maps it as a LUN itself or says why it did not\\.$`))
+      assert.doesNotMatch(msg, /Delete the backstore|delete newvol/)
+      const name = await server!.inject({ method: 'POST', url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}/luns`, headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: { name: 'newvol', kind: 'zvol', backing: 'tank/other' } })
+      const nmsg = (name.json() as { error: { message: string } }).error.message
+      assert.equal(nmsg, `A backstore named 'newvol' exists on this node and no LUN maps it: a whole-image restore is writing its image right now (job ${res.body.job!.id}). The name is the SCSI model string initiators see, so it has to be unique: pick another name.`)
+      g.atStream.open()
+      await waitForJob(res.body.job!.id)
     })
 
     // --- cr.54 (review H3): the new-LUN restore is on the guard ------------

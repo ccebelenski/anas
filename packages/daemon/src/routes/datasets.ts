@@ -336,6 +336,15 @@ export function assertVolumeMutable(
     }
   }
 
+  // cr3.lunrestore (review D3, ruled): a volume a backstore NO LUN maps holds
+  // is either an image being restored or one whose restore did not finish or
+  // was not verified — and the restore's size check is the proof it is whole.
+  // Any volsize change on it (a grow too) is refused, by the claim (stateless).
+  if (held?.unmapped === true && op === 'grow' && next?.volsize !== undefined && next.volsize !== current.volsize) {
+    const refusal = heldByLunRefusal(`'${name}'`, 'Resizing volume', held)
+    return { reason: refusal.reason, message: refusal.message }
+  }
+
   // A grow is the one mutation a LUN does not veto: it is live and safe, and it
   // is the whole point of `iscsi.3`'s Resize Volume.
   if (!held || op === 'grow')
@@ -2015,7 +2024,10 @@ export async function datasetRoutes(
       // shared sentence (lunGrowGuidance) rides the job result as a warning,
       // exactly as the iSCSI door's own LUN resize carries it: one definition,
       // two doors.
-      const held = await datasetHeldByLun(target, fullName)
+      // cr3.lunrestore: a backstore no LUN maps serves no initiator, so there
+      // is nothing to rescan and no served LUN to verify the device against.
+      const heldAny = await datasetHeldByLun(target, fullName)
+      const held = heldAny !== null && heldAny.unmapped !== true ? heldAny : null
       if (held !== null)
         warnings.push(lunGrowGuidance(props.volsize))
 
@@ -2038,7 +2050,7 @@ export async function datasetRoutes(
             reply.code(409)
             return { error: { code: 'CONFLICT', reason: verdict.refusal.reason, message: verdict.refusal.message } }
           }
-          servedGrow = servedLunIdentity(held.targetIqn, lun, verdict.device)
+          servedGrow = servedLunIdentity(heldTarget!.iqn, lun, verdict.device)
         }
       }
     }

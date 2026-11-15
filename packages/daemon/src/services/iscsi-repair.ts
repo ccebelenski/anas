@@ -48,7 +48,7 @@
  *     after a repair that left NO holes, and a partial repair says so instead.
  */
 
-import type { IscsiHealth, IscsiLunAttributes, IscsiMissingLun, IscsiTargetDetail } from '@anas/shared'
+import type { IscsiHealth, IscsiLunAttributes, IscsiMissingLun, IscsiRestoreMarkState, IscsiTargetDetail } from '@anas/shared'
 import type { SaveconfigStorageObject } from '../parsers/lio-saveconfig.js'
 import type { LioLiveState } from './iscsi-configfs.js'
 import type { IscsiBackstoreAttributes, IscsiMutateOptions, IscsiRefusal } from './iscsi-mutate.js'
@@ -72,6 +72,7 @@ import {
 } from './iscsi-mutate.js'
 import { servedElsewhere } from './iscsi-served.js'
 import { attributesFromPersisted, normalizePlugin, targetTpgs } from './iscsi.js'
+import { clearMarkCommand } from './restore-mark.js'
 
 /** One hole, with everything the replay needs, read off the PERSISTED config. */
 export interface IscsiRepairItem {
@@ -129,6 +130,16 @@ export interface IscsiRepairItem {
    * one rule at the verbs' door and at Repair's.
    */
   handsOff?: boolean
+  /**
+   * cr3.lunrestore (review2 E): the hole's backing carries a restore mark — or
+   * its mark could not be read, or a restore is writing it now. Blocked:
+   * re-creating the LUN would map that image into its target again.
+   * `blockedReason` is then a clause saying what the mark says (no stop), and
+   * `restoreMarkDataset` the volume it is on (null when it could not be read
+   * off the path).
+   */
+  restoreMark?: IscsiRestoreMarkState
+  restoreMarkDataset?: string | null
   /** The persisted write-cache posture, replayed on the fileio create line. */
   writeBack: boolean
   /** The attribute set to replay after create, before the map. */
@@ -318,6 +329,34 @@ function stubClause(stubs: number): string {
     + `serve an empty disk with the right serial (story iscsi.8).`
 }
 
+/**
+ * The sentence for holes a restore mark holds back (cr3.lunrestore, review2
+ * E), with the ways out that exist for a hole: accept the image (clear the
+ * mark, Repair again), or drop the LUN from the saved configuration by hand
+ * and restore the image as a new LUN; for an unreadable mark or a running
+ * restore, wait. '' when there are none.
+ */
+function restoreMarkClause(marked: IscsiRepairItem[]): string {
+  if (marked.length === 0)
+    return ''
+  const named = marked.map(b => `LUN ${b.lunIndex} of ${b.targetIqn} (backstore '${b.backstoreName}', ${b.backingPath}): ${b.blockedReason}`).join('; ')
+  const ways: string[] = []
+  const settled = marked.filter(b => b.restoreMark === 'interrupted' || b.restoreMark === 'unverified')
+  if (settled.length > 0) {
+    const clear = settled.map(b => (b.restoreMarkDataset ? `'${clearMarkCommand(b.restoreMarkDataset)}'` : null)).filter(Boolean)
+    ways.push(`Repair would map ${settled.length === 1 ? 'that image' : 'those images'} into the target again, so it does not. `
+      + `If you accept ${settled.length === 1 ? 'the image' : 'an image'} as it is, clear its restore mark${clear.length ? ` (${clear.join(', ')})` : ''} `
+      + `and run Repair again. If you do not, saving the iSCSI configuration by hand ('targetcli saveconfig') removes `
+      + `the LUN from the saved configuration for good, together with every other missing LUN; the volume keeps its mark, `
+      + `and the image can then be restored as a new LUN.`)
+  }
+  if (marked.some(b => b.restoreMark === 'unreadable'))
+    ways.push('Repair is refused for a LUN whose restore mark could not be read until it can be read.')
+  if (marked.some(b => b.restoreMark === 'in-progress'))
+    ways.push('Repair is refused for a LUN a restore is writing until the restore ends.')
+  return ` ${marked.length === 1 ? 'One hole is' : `${marked.length} holes are`} held back by a restore mark on the backing: ${named}. ${ways.join(' ')}`
+}
+
 /** Nothing to repair — the live tree already matches the saved configuration. */
 export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
   if (plan.repairable.length + plan.blocked.length === 0) {
@@ -340,6 +379,12 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
         + `${[...new Set(handsOff.map(b => b.blockedReason))].join(' ')}`
         : '')
     const own = plan.blocked.filter(b => !b.foreignTarget && !b.handsOff)
+    // cr3.lunrestore (review2 E): holes held back by a restore mark are their
+    // own kind — a modelled state on the item, never a sentence match — with
+    // their own sentence and ways out that exist for a HOLE (an in-place
+    // restore needs a live LUN, so "restore again" is not one of them).
+    const marked = own.filter(b => b.restoreMark !== undefined)
+    const markedClause = restoreMarkClause(marked)
     if (own.length === 0) {
       return {
         reason: handsOff.length > 0 ? 'target-hands-off' : 'foreign-holes-only',
@@ -350,9 +395,16 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
     // that is not on the node yet (bring it back), and a persisted record the
     // replay cannot be built from (C3 — nothing the operator does to the
     // storage will help, so "import the pool" would be a wrong instruction).
-    const absent = own.filter(b => b.blockedReason === undefined)
-    const incomplete = own.filter(b => b.blockedReason !== undefined && !b.deviceServed)
-    const served = own.filter(b => b.deviceServed)
+    const unmarked = own.filter(b => b.restoreMark === undefined)
+    const absent = unmarked.filter(b => b.blockedReason === undefined)
+    const incomplete = unmarked.filter(b => b.blockedReason !== undefined && !b.deviceServed)
+    const served = unmarked.filter(b => b.deviceServed)
+    if (unmarked.length === 0) {
+      return {
+        reason: 'restore-mark',
+        message: `None of the missing LUNs can be repaired.${markedClause}${foreignClause}`,
+      }
+    }
     const incompleteClause = (incomplete.length === 0
       ? ''
       : ` ${incomplete.length === 1 ? 'One hole' : `${incomplete.length} holes`} cannot be repaired from the saved `
@@ -364,14 +416,14 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
     if (absent.length === 0 && incomplete.length === 0) {
       return {
         reason: 'served-device-mismatch',
-        message: `None of the missing LUNs can be repaired.${incompleteClause}${foreignClause}`,
+        message: `None of the missing LUNs can be repaired.${incompleteClause}${markedClause}${foreignClause}`,
       }
     }
     if (absent.length === 0) {
       return {
         reason: 'record-incomplete',
         message: `None of the missing LUNs can be repaired — the saved configuration does not describe `
-          + `${incomplete.length === 1 ? 'it' : 'them'} completely.${incompleteClause}${foreignClause}`,
+          + `${incomplete.length === 1 ? 'it' : 'them'} completely.${incompleteClause}${markedClause}${foreignClause}`,
       }
     }
     const named = absent
@@ -383,7 +435,7 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
       message: `None of the missing LUNs can be repaired yet — their backing objects are still not on `
         + `this node: ${named}. Bring the storage back first (import the pool, restore the image, mount `
         + `the filesystem) and run Repair again. Recreating a backstore over an absent device is what `
-        + `produced the hole.${stubs > 0 ? stubClause(stubs) : ''}${incompleteClause}${foreignClause}`,
+        + `produced the hole.${stubs > 0 ? stubClause(stubs) : ''}${incompleteClause}${markedClause}${foreignClause}`,
     }
   }
   return null
@@ -529,12 +581,15 @@ export async function repairIscsiHoles(
     ? ''
     : ` ${handsOffItems.map(b => `LUN ${b.lunIndex} of ${b.targetIqn}`).join(', ')} ${handsOffItems.length === 1 ? 'is' : 'are'} not repaired: `
       + `${[...new Set(handsOffItems.map(b => b.blockedReason))].join(' ')}`
+  // review3 6: holes a restore mark held back are named, with their way out —
+  // a mixed result used to count them as "still missing" and say no more.
+  const markedClause = restoreMarkClause(plan.blocked.filter(b => !b.foreignTarget && !b.handsOff && b.restoreMark !== undefined))
   const stillDegraded = stillMissing.length === 0
     ? undefined
     : foreign.length === stillMissing.length
       ? `This node stays degraded, and ANAS makes no iSCSI change: ${foreignHolesSentence(foreign)}`
       : `This node stays degraded: ${stillMissing.length} LUN${stillMissing.length === 1 ? ' is' : 's are'} still missing, `
-        + `so nothing was saved.${foreign.length > 0 ? ` ${foreignHolesSentence(foreign)}` : ''}${handsOffClause}`
+        + `so nothing was saved.${foreign.length > 0 ? ` ${foreignHolesSentence(foreign)}` : ''}${handsOffClause}${markedClause}`
   return { repaired, stillMissing, saved, foreignUntouched, ...(stillDegraded ? { stillDegraded } : {}) }
 }
 

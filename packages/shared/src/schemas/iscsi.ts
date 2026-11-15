@@ -850,6 +850,140 @@ export const IscsiDisabledTarget = z.object({
 export type IscsiDisabledTarget = z.infer<typeof IscsiDisabledTarget>
 
 /**
+ * The ZFS user property a whole-image restore sets on the VOLUME it writes
+ * (cr3.lunrestore, operator ruling 2026-11-14: "the failed restore should
+ * leave some kind of breadcrumb"). Set before the first byte is written,
+ * removed (`zfs inherit`) only once the image is complete and its size
+ * verified, by the Enable confirm that accepts a partial image, or replaced by
+ * the next restore onto the object. A fact on the object itself (the
+ * `anas:schedule` stamp's family, ident.1), never shadow state. Ground truth
+ * (ZFS 2.4.2, captured 2026-11-15): it survives a full overwrite of the device
+ * and a rollback, does not travel with a plain `zfs send` or onto a clone, and
+ * `zfs inherit` clears it.
+ */
+export const RESTORE_MARK_PROPERTY = 'anas:restore'
+
+/**
+ * The value of {@link RESTORE_MARK_PROPERTY}: what was being restored and since
+ * when. JSON, bounded, validated on read: a value that does not parse is still
+ * a mark ("a restore was started here; its details could not be read").
+ * `state`: `writing` from before the first byte until the verify; `unverified`
+ * when the client reported the image complete but its size could not be
+ * confirmed (nothing may treat such an image as good).
+ */
+export const RestoreMark = z.object({
+  v: z.literal(1),
+  repo: z.string().min(1).max(128),
+  ns: z.string().max(256).optional(),
+  snapshot: z.string().min(1).max(256),
+  archive: z.string().min(1).max(128),
+  /** ISO 8601 start of the restore. */
+  started: z.string().min(1).max(40),
+  state: z.enum(['writing', 'unverified']),
+  /** Why the size was not verified (state `unverified` only). */
+  reason: z.string().max(512).optional(),
+})
+export type RestoreMark = z.infer<typeof RestoreMark>
+
+/**
+ * The job error code a failed whole-image restore carries when it may have
+ * left the backing holding an image that is not proven whole (cr3.lunrestore,
+ * review2): `IMAGE_PARTIAL` — some of the image, or an unknown amount of it,
+ * reached the backing; `IMAGE_UNVERIFIED` — the client reported the image
+ * complete but ANAS could not confirm it (its size, or the flush to the medium).
+ * A failure that provably wrote nothing carries neither.
+ *
+ * For a zvol the restore mark says the same on the object and outlives the
+ * job. An image FILE carries no mark, so for a file backing this code on the
+ * job ANAS still holds is the ONLY record: it lives in the daemon's job queue
+ * and is gone after a restart of the daemon (or once the job is evicted: the
+ * queue keeps a standing one past its job limit, up to a bound — review3 1).
+ */
+export const ImageRestoreFailureCode = z.enum(['IMAGE_PARTIAL', 'IMAGE_UNVERIFIED'])
+export type ImageRestoreFailureCode = z.infer<typeof ImageRestoreFailureCode>
+
+/**
+ * What a restore mark on a LUN's (or an unmapped backstore's) volume means NOW
+ * (cr3.lunrestore): `in-progress` — a whole-image restore job is running onto
+ * it; `interrupted` — a mark and no running job: the restore did not finish and
+ * the object holds a partial image; `unverified` — the client reported the
+ * image complete but its size could not be confirmed; `unreadable` — the mark
+ * could not be read (never read as "no mark").
+ */
+export const IscsiRestoreMarkState = z.enum(['in-progress', 'interrupted', 'unverified', 'unreadable'])
+export type IscsiRestoreMarkState = z.infer<typeof IscsiRestoreMarkState>
+
+/**
+ * Where a restore-mark row's verdict comes from (cr3.lunrestore, review2 D):
+ * `mark` — the restore mark read off the volume (it outlives jobs, restarts
+ * and reboots); `job` — this daemon's job records only: a restore RUNNING onto
+ * the backing, or the retained failed restore onto an image FILE, which carries
+ * no mark. A `job` verdict about a failed restore is forgotten when the ANAS
+ * daemon restarts (or the job is evicted from the queue past its pin bound).
+ */
+export const IscsiRestoreMarkSource = z.enum(['mark', 'job'])
+export type IscsiRestoreMarkSource = z.infer<typeof IscsiRestoreMarkSource>
+
+/** One marked (or unreadable) backing, as the health read found it. */
+export const IscsiRestoreMarkRow = z.object({
+  backingPath: z.string(),
+  /** The volume the mark is on; null for an image file (it carries no mark). */
+  dataset: z.string().nullable(),
+  backstoreName: z.string(),
+  /** The LUN, when a LUN maps the backstore; absent for an unmapped backstore. */
+  targetIqn: z.string().optional(),
+  tpgTag: z.number().int().nonnegative().optional(),
+  lunIndex: z.number().int().nonnegative().optional(),
+  state: IscsiRestoreMarkState,
+  /** Where the verdict comes from: the mark on the volume, or this daemon's job records. */
+  source: IscsiRestoreMarkSource,
+  /** The mark's details; null when it did not parse, could not be read, or there is no mark. */
+  mark: RestoreMark.nullable(),
+  /** The restore job: the one running (`in-progress`), or the failed one a `job`-sourced verdict comes from. */
+  job: z.string().optional(),
+  /** One sentence: what is known. */
+  detail: z.string(),
+})
+export type IscsiRestoreMarkRow = z.infer<typeof IscsiRestoreMarkRow>
+
+/**
+ * A LIVE backstore that no LUN in any target maps, on storage ANAS manages
+ * (cr3.lunrestore).
+ *
+ * A new-LUN image restore creates its backstore, streams the image into the
+ * backing, and maps the LUN only once the image is complete; so while it runs —
+ * and after a daemon or node stop in that window — the backstore exists and is
+ * mapped nowhere. A LUN deleted by hand with targetcli, its backstore kept,
+ * looks the same. No initiator can see it (only a TPG LUN is a disk to an
+ * initiator), so nothing is being served wrongly and the node is NOT degraded;
+ * but its content may be incomplete, and it holds its backing (dataset and
+ * pool verbs refuse on it), so it is reported with the ways out.
+ *
+ * Derived from configfs on every read — nothing is stored.
+ */
+export const IscsiUnmappedBackstore = z.object({
+  /** The backstore name (the SCSI model string it would carry). */
+  name: z.string(),
+  /** `block` or `fileio`. */
+  plugin: z.string(),
+  /** The backing path (`udev_path`). */
+  backingPath: z.string(),
+  /** The unit serial it was created with; null when it could not be read. */
+  serial: z.string().nullable(),
+  /** Is the backstore in the saved configuration too (it comes back, unmapped, at boot)? Null when that is unknown. */
+  persisted: z.boolean().nullable(),
+  /**
+   * A new-LUN image restore that is writing into it right now, as the caller's
+   * job view says (`job <id>`). Absent when no running restore names it OR the
+   * caller has no job view (the plain health read): never read as "none".
+   */
+  restoreInFlight: z.string().optional(),
+  /** The restore mark on its volume, when there is one (or it could not be read). */
+  restoreMark: IscsiRestoreMarkState.optional(),
+})
+export type IscsiUnmappedBackstore = z.infer<typeof IscsiUnmappedBackstore>
+
+/**
  * A live/persisted divergence that is NOT a missing LUN: something exists in the
  * kernel that the persisted config does not describe (it would vanish at the
  * next boot), or the persisted backing path no longer matches the live one.
@@ -899,6 +1033,17 @@ export const IscsiHealth = IscsiAvailability.extend({
   disabledTargets: z.array(IscsiDisabledTarget),
   portalsWithoutInterface: z.array(IscsiPortalWithoutInterface),
   foreignChanges: z.array(IscsiForeignChange),
+  /**
+   * cr3.lunrestore: live backstores on ANAS storage that no LUN maps. Never
+   * part of `degraded`. Absent from an older daemon; an older panel ignores it.
+   */
+  unmappedBackstores: z.array(IscsiUnmappedBackstore).optional(),
+  /**
+   * cr3.lunrestore: every LUN or unmapped backstore whose volume carries a
+   * restore mark, or whose mark could not be read. Never part of `degraded`.
+   * Absent when the caller did not read marks; an older panel ignores it.
+   */
+  restoreMarks: z.array(IscsiRestoreMarkRow).optional(),
   /**
    * True when the live config is known to be an INCOMPLETE restore (any missing
    * LUN, or a stub found in this pass). While this is true nothing may run
@@ -1492,9 +1637,25 @@ export const IscsiClaim = z.object({
   pool: z.string().optional(),
   /** The ZFS dataset (the zvol itself, or the image's dataset). */
   dataset: z.string().optional(),
-  targetIqn: z.string(),
-  tpgTag: z.number().int().nonnegative(),
-  lunIndex: z.number().int().nonnegative(),
+  /**
+   * The holding LUN's target, TPG and index. Absent ONLY on an `unmapped`
+   * claim (cr3.lunrestore): a backstore no LUN maps has no target and no
+   * index. Every mapped claim carries all three, as before.
+   */
+  targetIqn: z.string().optional(),
+  tpgTag: z.number().int().nonnegative().optional(),
+  lunIndex: z.number().int().nonnegative().optional(),
+  /**
+   * cr3.lunrestore: the holder is a live BACKSTORE that no LUN maps — a
+   * new-LUN image restore writing into it, one an interrupted restore left,
+   * or a LUN removed by hand. LIO holds the backing object because the
+   * backstore exists, not because a LUN or a session does (GT-40), so it
+   * holds exactly as a mapped LUN does. Absent = a mapped LUN. An older
+   * consumer that keys on `targetIqn` does not see this claim at all.
+   */
+  unmapped: z.literal(true).optional(),
+  /** The backstore plugin (`block` / `fileio`), on an `unmapped` claim. */
+  plugin: z.string().optional(),
   backstoreName: z.string(),
   /** Initiator IQNs with a live session mapping this LUN. */
   connectedInitiators: z.array(z.string()),
@@ -1509,7 +1670,11 @@ export const IscsiClaim = z.object({
 })
 export type IscsiClaim = z.infer<typeof IscsiClaim>
 
-/** `iscsiClaims()` — every backing object currently mapped into a LUN. */
+/**
+ * `iscsiClaims()` — every backing object currently mapped into a LUN, and
+ * (cr3.lunrestore) every backing object a live backstore no LUN maps holds
+ * (`unmapped: true`).
+ */
 export const IscsiClaimList = IscsiAvailability.extend({
   claims: z.array(IscsiClaim),
 })
@@ -1527,10 +1692,22 @@ export type IscsiClaimList = z.infer<typeof IscsiClaimList>
  * screen).
  */
 export const IscsiHeldByLun = z.object({
-  /** The holding target's IQN — never truncated. */
-  targetIqn: z.string(),
-  /** LUN number within that target's TPG. */
-  index: z.number().int().nonnegative(),
+  /**
+   * The holding target's IQN — never truncated. Absent ONLY when `unmapped`
+   * (cr3.lunrestore): the holder is a backstore no LUN maps, so there is no
+   * target. An older panel gates on this field and does not grey a button for
+   * such a holder; the daemon still refuses with the `detail` sentence.
+   */
+  targetIqn: z.string().optional(),
+  /** LUN number within that target's TPG. Absent ONLY when `unmapped`. */
+  index: z.number().int().nonnegative().optional(),
+  /**
+   * cr3.lunrestore: the holder is a backstore that no LUN maps (see
+   * {@link IscsiClaim}). `name` and `backingPath` are the backstore's.
+   */
+  unmapped: z.literal(true).optional(),
+  /** The backstore plugin (`block` / `fileio`), when `unmapped`. */
+  plugin: z.string().optional(),
   /**
    * cr3 (ISCSI-H2): the TPG the LUN is in — `index` is an address inside one
    * TPG, so a lookup by index alone can find another TPG's LUN 0. Absent from

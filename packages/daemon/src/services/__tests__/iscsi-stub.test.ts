@@ -701,7 +701,7 @@ describe('quarantine — unmap that LUN, delete the stub backstore, never saveco
       assert.equal(existsSync(image), true, 'the dashboard never unlinks the placeholder')
       const card = summary.warnings.find(w => w.category === 'iscsi' && /placeholder created by/.test(w.message))
       assert.ok(card, JSON.stringify(summary.warnings))
-      assert.match(card.message, /It is still being served\. Use Repair on the iSCSI menu to take it offline now/)
+      assert.match(card.message, /It is still being served\. Use Repair on the iSCSI screen to take it offline now/)
       assert.ok(!/could NOT/.test(card.message), 'nothing was attempted, so nothing "could not" be done')
     })
   })

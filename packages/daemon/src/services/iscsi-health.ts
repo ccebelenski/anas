@@ -41,9 +41,80 @@
  * card.
  */
 
-import type { IscsiDisabledTarget, IscsiForeignChange, IscsiHealth, IscsiMissingLun, IscsiPortalWithoutInterface, IscsiStubLun, IscsiTargetDetail, IscsiTargetServingNothing } from '@anas/shared'
+import type { IscsiDisabledTarget, IscsiForeignChange, IscsiHealth, IscsiMissingLun, IscsiPortalWithoutInterface, IscsiRestoreMarkRow, IscsiRestoreMarkState, IscsiStubLun, IscsiTargetDetail, IscsiTargetServingNothing, IscsiUnmappedBackstore } from '@anas/shared'
+import type { BackingClassification } from './iscsi-ownership.js'
 import type { IscsiReadContext } from './iscsi.js'
+import type { RestoreJobFacts, RestoreMarkRead } from './restore-mark.js'
+import { classifyBacking } from './iscsi-ownership.js'
 import { iscsiAvailability, liveUnreadablePaths, normalizePlugin, targetTpgs } from './iscsi.js'
+import { fileRestoreAgain, restoreMarkDetail, restoreMarkState } from './restore-mark.js'
+
+/** One live backstore that no live LUN maps (cr3.lunrestore). */
+export interface UnmappedBackstoreFacts {
+  name: string
+  /** Normalised plugin (`block`, `fileio`, ...). */
+  plugin: string
+  /** `udev_path` — the backing object it holds. */
+  backingPath: string
+  serial: string | null
+  /** In the saved configuration too; null when that file could not be read. */
+  persisted: boolean | null
+  /** Where the backing resolves — ownership, pool and dataset. */
+  classification: BackingClassification
+}
+
+/**
+ * Every LIVE backstore that no LIVE LUN of any target, in any TPG, maps
+ * (cr3.lunrestore). Pure over the gathered context.
+ *
+ * Why it matters: LIO holds a backing object because the BACKSTORE exists,
+ * not because a LUN or a session does (GT-40: the refusals "are all-or-nothing
+ * and identical whether or not an initiator is connected"), and a new-LUN image
+ * restore keeps exactly such a backstore while the image streams — mapped as a
+ * LUN only once the image is complete. The claims (every dataset, pool and AHR
+ * verb) and the health read both start here.
+ *
+ * A LUN whose plugin could not be read from its symlink is matched by name
+ * alone: the backstore is then counted as mapped, never reported as stray.
+ * Returns `[]` when the live tree could not be listed in full — a mapping that
+ * was not seen is not proof of none (the node is degraded for that already).
+ */
+export function unmappedLiveBackstores(ctx: IscsiReadContext): UnmappedBackstoreFacts[] {
+  if (!ctx.live.present || liveUnreadablePaths(ctx).length > 0)
+    return []
+  const mapped = (name: string, plugin: string): boolean =>
+    ctx.live.targets.some(t => t.tpgs.some(g => g.luns.some(l =>
+      l.backstoreName === name && (l.plugin === null || normalizePlugin(l.plugin) === plugin))))
+  const out: UnmappedBackstoreFacts[] = []
+  for (const b of ctx.live.backstores) {
+    const plugin = normalizePlugin(b.plugin)
+    if (!b.udevPath || mapped(b.name, plugin))
+      continue
+    out.push({
+      name: b.name,
+      plugin,
+      backingPath: b.udevPath,
+      serial: b.serial,
+      persisted: ctx.persistedUnreadable
+        ? null
+        : (ctx.persisted?.storageObjects ?? []).some(o => o.name === b.name && normalizePlugin(o.plugin) === plugin),
+      classification: classifyBacking(b.udevPath, ctx.inputs, ctx.backing.get(b.udevPath)?.exists ?? null),
+    })
+  }
+  return out
+}
+
+/**
+ * Is this unmapped backstore ANAS's to report? Its backing resolves onto
+ * storage ANAS manages (a zvol or an image on an ANAS dataset or AHR pool),
+ * outside PVE's footprint — the same rule that makes a LUN's backing ANAS's
+ * (`deriveOwnership`, rule 2). A backstore on a raw device, on PVE storage or
+ * on storage that could not be judged is hands-off: still a claim, never a card.
+ */
+export function isAnasUnmappedBackstore(b: UnmappedBackstoreFacts): boolean {
+  const c = b.classification
+  return (c.kind === 'zvol' || c.kind === 'file') && !c.pveOwned && c.ownershipUnknown !== true
+}
 
 /** ` (TPG <n>)` for any TPG but the target's first — whose sentences stay as they were. */
 function tpgClause(tag: number, firstTag: number): string {
@@ -68,7 +139,32 @@ export interface IscsiHealthOptions {
    * stub is an ordinary missing LUN and the explanation would be gone.
    */
   quarantined?: Map<string, { quarantined: boolean, fileRemoved: boolean }>
+  /**
+   * cr3.lunrestore (review N5): the id of a whole-image restore job RUNNING
+   * onto this backing path now, as the caller's job view says. A queued job
+   * writes nothing and never counts. Every caller that reads marks passes it
+   * (the health route, the dashboard): a mark with no running job is an
+   * interrupted restore.
+   */
+  restoreRunning?: (backingPath: string) => string | undefined
+  /**
+   * cr3.lunrestore (review2 D): the retained failed restore onto a backing
+   * that carries no mark (an image file), as the caller's job view says —
+   * `restoreJobsOf(queue).restoreFailed`. Forgotten on a daemon restart.
+   */
+  restoreFailed?: RestoreJobFacts['restoreFailed']
+  /**
+   * cr3.lunrestore: the restore mark read for each zvol backing (by backing
+   * path) — `readRestoreMarks`. Absent = marks were not read: no mark row.
+   */
+  marks?: Map<string, RestoreMarkRead>
 }
+
+/** The callbacks and reads a health READ passes through. */
+export type IscsiHealthReadOptions = Pick<IscsiHealthOptions, 'disabledDetail' | 'restoreRunning' | 'restoreFailed'>
+
+// The mark-state rules live with the mark (`restore-mark.ts`); re-exported for the readers.
+export { restoreMarkDetail, restoreMarkState }
 
 /**
  * Compute the health diff from a gathered context and the targets already built
@@ -286,6 +382,68 @@ export function computeIscsiHealth(
     }
   }
 
+  // --- live backstores no LUN maps, on ANAS storage (cr3.lunrestore) -------
+  // NOT degraded: no initiator sees a backstore that is not a TPG LUN, so
+  // nothing is being served wrongly, and a save persists it as what it is —
+  // a storage object with no LUN — which never becomes a restore hole.
+  const restoreMarks: IscsiRestoreMarkRow[] = []
+  const markRow = (backingPath: string, backstoreName: string, what: string, lun?: { targetIqn: string, tpgTag: number, lunIndex: number }): IscsiRestoreMarkState | null => {
+    const read = opts.marks?.get(backingPath)
+    const running = opts.restoreRunning?.(backingPath)
+    // review2 D: a backing that carries no mark (an image file) is judged
+    // from this daemon's job records — a running restore, or the retained
+    // failed one (forgotten on a restart).
+    const record = read?.state === 'unsupported' ? opts.restoreFailed?.(backingPath, lun?.targetIqn) : undefined
+    const state = restoreMarkState(read, running, record)
+    if (state === null || !read)
+      return null
+    const source = read.state === 'present' || read.state === 'unknown' ? 'mark' as const : 'job' as const
+    const mark = read.state === 'present' ? read.mark : null
+    const dataset = read.state === 'unsupported' ? null : read.dataset
+    const job = state === 'in-progress' ? running : record?.job
+    // review3 2: an image file a LUN serves, whose failed restore stands —
+    // restoring it again in place needs the file at the image's length first.
+    const again = record && lun && state !== 'in-progress' ? fileRestoreAgain(backingPath, record.imageBytes) : undefined
+    restoreMarks.push({
+      backingPath,
+      dataset,
+      backstoreName,
+      ...(lun ?? {}),
+      state,
+      source,
+      mark,
+      ...(job ? { job } : {}),
+      detail: restoreMarkDetail({ state, source, mark, ...(job ? { job } : {}), what, dataset, ...(again ? { again } : {}) }),
+    })
+    return state
+  }
+  if (opts.marks) {
+    for (const target of targets) {
+      for (const tpg of targetTpgs(target)) {
+        for (const lun of tpg.luns) {
+          if (lun.present && lun.backingPath)
+            markRow(lun.backingPath, lun.name, `LUN ${lun.index} ('${lun.name}') of ${target.iqn}`, { targetIqn: target.iqn, tpgTag: tpg.tpgTag, lunIndex: lun.index })
+        }
+      }
+    }
+  }
+
+  const unmappedBackstores: IscsiUnmappedBackstore[] = unmappedLiveBackstores(ctx)
+    .filter(isAnasUnmappedBackstore)
+    .map((b) => {
+      const inFlight = opts.restoreRunning?.(b.backingPath)
+      const marked = markRow(b.backingPath, b.name, `backstore '${b.name}'`)
+      return {
+        name: b.name,
+        plugin: b.plugin,
+        backingPath: b.backingPath,
+        serial: b.serial,
+        persisted: b.persisted,
+        ...(inFlight ? { restoreInFlight: `job ${inFlight}` } : {}),
+        ...(marked ? { restoreMark: marked } : {}),
+      }
+    })
+
   return {
     ...iscsiAvailability(ctx),
     missingLuns,
@@ -294,6 +452,8 @@ export function computeIscsiHealth(
     disabledTargets,
     portalsWithoutInterface,
     foreignChanges,
+    unmappedBackstores,
+    ...(opts.marks ? { restoreMarks } : {}),
     // A hole in the live config makes every `saveconfig` destructive (GT-22) —
     // and so does an ANAS-OWNED stub, for the same reason with the sign flipped:
     // the live tree is about to LOSE that LUN to the quarantine, and a save

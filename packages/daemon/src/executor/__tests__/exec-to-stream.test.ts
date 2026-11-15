@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../mock.js'
 import { ProdExecutor } from '../prod.js'
+import { StreamNotStartedError } from '../stream-errors.js'
 
 /**
  * `ProdExecutor.execToStream` — REAL processes, real file descriptors.
@@ -92,7 +93,8 @@ describe('ProdExecutor.execToStream (real processes, real fds)', () => {
     const path = join(dir, 'absent.raw')
     await assert.rejects(
       exec.execToStream(PRINTF, ['x'], { path, flags: constants.O_WRONLY }),
-      (err: NodeJS.ErrnoException) => err.code === 'ENOENT',
+      // cr3.lunrestore (review2 B): and it says the child never started.
+      (err: NodeJS.ErrnoException) => err.code === 'ENOENT' && err instanceof StreamNotStartedError,
     )
   })
 
@@ -147,7 +149,7 @@ describe('ProdExecutor.execToStream (real processes, real fds)', () => {
     const exec = new ProdExecutor()
     await assert.rejects(
       exec.execToStream('/no/such/binary/xyz', [], { path: join(dir, 'out.raw'), flags: 'w' }),
-      (err: NodeJS.ErrnoException) => err.code === 'ENOENT',
+      (err: NodeJS.ErrnoException) => err.code === 'ENOENT' && err instanceof StreamNotStartedError,
     )
   })
 

@@ -943,6 +943,44 @@ export function describeLunHolder(holder: Pick<LunHolder, 'lunIndex' | 'backstor
   return `held by iSCSI LUN ${holder.lunIndex} '${holder.backstoreName}' of target ${holder.targetIqn} (${holder.backingPath})`
 }
 
+/**
+ * cr3.lunrestore (review N7): a LIVE backstore that NO LUN maps and that holds
+ * `devPath` (the exact device or file, or a file under the directory named) —
+ * a restore as a new LUN writing into it, or one left behind. It holds the
+ * object exactly as a mapped LUN does (GT-40), so it explains a bare `busy`
+ * too. Pure; null when none.
+ */
+export function findUnmappedBackstoreHolder(state: LioLiveState, devPath: string): { backstoreName: string, plugin: string, backingPath: string } | null {
+  if (!state.present || devPath.length === 0)
+    return null
+  const wanted = devPath.replace(TRAILING_SLASH_RE, '') || '/'
+  for (const b of state.backstores) {
+    const plugin = normalizePlugin(b.plugin)
+    const path = b.udevPath
+    if (path.length === 0 || !(path === wanted || (wanted !== '/' && path.startsWith(`${wanted}/`))))
+      continue
+    const mapped = state.targets.some(t => t.tpgs.some(g => g.luns.some(l =>
+      l.backstoreName === b.name && (l.plugin === null || normalizePlugin(l.plugin) === plugin))))
+    if (!mapped)
+      return { backstoreName: b.name, plugin, backingPath: path }
+  }
+  return null
+}
+
+/** {@link findUnmappedBackstoreHolder} with the configfs read done for you (fail-open: null). */
+export async function unmappedBackstoreHoldingDevice(devPath: string, opts?: ConfigfsOptions): Promise<{ backstoreName: string, plugin: string, backingPath: string } | null> {
+  return findUnmappedBackstoreHolder(await readConfigfs(opts), devPath)
+}
+
+/**
+ * The one holder sentence for a backstore no LUN maps — the unmapped
+ * counterpart of {@link describeLunHolder}, shared by the claims and the busy
+ * diagnosis.
+ */
+export function describeUnmappedHolder(holder: { backstoreName: string, plugin: string, backingPath: string }): string {
+  return `held by iSCSI backstore '${holder.backstoreName}' (${holder.plugin}, ${holder.backingPath}), which is not mapped as a LUN`
+}
+
 /** The backstore name a configfs path belongs to (the last path component). */
 export function backstoreNameFromPath(path: string): string {
   return basename(path)

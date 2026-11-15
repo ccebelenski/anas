@@ -7,6 +7,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { composeSnapshotId } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
+import { StreamNotStartedError } from '../../executor/stream-errors.js'
 import { parseSnapshotList } from '../backup-reads.js'
 import {
   assertSizeMatch,
@@ -135,10 +136,21 @@ function target(luns: IscsiLun[], over: Partial<IscsiTargetDetail> = {}): IscsiT
   }
 }
 
+const MARK_VALUE_RE = /^anas:restore=\{.*\}$/
+
+/** No restore mark on the volume (`zfs get ... anas:restore` answers `-\t-`): the run starts clean. */
+const NO_MARK = { command: ZFS, argsMatch: (a: string[]) => a[0] === 'get' && a.includes('anas:restore'), result: { stdout: '-\t-\n', stderr: '', exitCode: 0 } }
+
+/** The call log with the restore mark's JSON value elided (it carries the start time). */
+function argvOf(mock: MockExecutor): string[] {
+  return mock.calls.map(c => `${c.command} ${c.args.map(a => (MARK_VALUE_RE.test(a) ? 'anas:restore=<mark>' : a)).join(' ')}`)
+}
+
 /** A mock wired for a SUCCESSFUL restore: targetcli ok, the stream delivers all. */
 function successMock(opts: { stderr?: string, bytesWritten?: number } = {}): MockExecutor {
   const mock = new MockExecutor()
   mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+  mock.addFixture(NO_MARK)
   mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
   mock.addStreamFixture({
     command: PBC,
@@ -568,10 +580,16 @@ describe('runImageRestore — the happy sequence, as an exact call log', () => {
     const result = await runImageRestore(mock, deps(mock, lun, tgt), noop)
 
     // The whole sequence, in order, with nothing between the halves.
-    assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.join(' ')}`), [
+    assert.deepEqual(argvOf(mock), [
+      `${ZFS} get -Hp -o value,source anas:restore -- tank/vol1`,
       `${TARGETCLI} /iscsi/${IQN}/tpg1 disable`,
       `${TARGETCLI} saveconfig`,
+      // cr3.lunrestore: the breadcrumb before the first byte,
+      `${ZFS} set anas:restore=<mark> -- tank/vol1`,
       `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
+      // then the size read back, and the mark removed once it is verified.
+      `${ZFS} get -Hp -o value volsize -- tank/vol1`,
+      `${ZFS} inherit anas:restore -- tank/vol1`,
       `${TARGETCLI} /iscsi/${IQN}/tpg1 enable`,
       `${TARGETCLI} saveconfig`,
     ])
@@ -766,10 +784,16 @@ describe('runImageRestore — the run-time session re-check (R1, issue #52)', ()
     // whether the disable happens at all, so it cannot come after it.
     assert.equal(callsWhenAsked, 0)
     // And with no session, the sequence is the one it always was.
-    assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.join(' ')}`), [
+    assert.deepEqual(argvOf(mock), [
+      `${ZFS} get -Hp -o value,source anas:restore -- tank/vol1`,
       `${TARGETCLI} /iscsi/${IQN}/tpg1 disable`,
       `${TARGETCLI} saveconfig`,
+      // cr3.lunrestore: the breadcrumb before the first byte,
+      `${ZFS} set anas:restore=<mark> -- tank/vol1`,
       `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
+      // then the size read back, and the mark removed once it is verified.
+      `${ZFS} get -Hp -o value volsize -- tank/vol1`,
+      `${ZFS} inherit anas:restore -- tank/vol1`,
       `${TARGETCLI} /iscsi/${IQN}/tpg1 enable`,
       `${TARGETCLI} saveconfig`,
     ])
@@ -889,6 +913,9 @@ describe('runImageRestore — where the iSCSI lock is held, and where it is not'
 describe('runImageRestore — failures', () => {
   it('a MID-STREAM failure leaves the target DISABLED and says the LUN is partial', async () => {
     const mock = new MockExecutor()
+    // cr3.lunrestore: the volume takes the restore mark (zfs set / inherit) and its size is read back.
+    mock.addFixture(NO_MARK)
+    mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addStreamFixture({
       command: PBC,
@@ -906,19 +933,27 @@ describe('runImageRestore — failures', () => {
       (err: Error) => {
         assert.match(err.message, /the image was partially written \(268435456 of 536870912 bytes reached/)
         assert.match(err.message, /disabled until you restore again or accept the state/)
+        // cr3.lunrestore (D5 e): the way to accept is named.
+        assert.match(err.message, /Enable on the iSCSI screen asks you to confirm that you accept the partial image, and removes the restore mark on tank\/vol1/)
         return true
       },
     )
-    // The `finally` did NOT re-enable: a half-written LUN must not be served.
-    assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.join(' ')}`), [
+    // The `finally` did NOT re-enable: a half-written LUN must not be served —
+    // and the mark set before the stream stays on the volume.
+    assert.deepEqual(argvOf(mock), [
+      `${ZFS} get -Hp -o value,source anas:restore -- tank/vol1`,
       `${TARGETCLI} /iscsi/${IQN}/tpg1 disable`,
       `${TARGETCLI} saveconfig`,
+      `${ZFS} set anas:restore=<mark> -- tank/vol1`,
       `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
     ])
   })
 
   it('a failure BEFORE any byte lands re-enables the target in the finally', async () => {
     const mock = new MockExecutor()
+    // cr3.lunrestore: the volume takes the restore mark (zfs set / inherit) and its size is read back.
+    mock.addFixture(NO_MARK)
+    mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addStreamFixture({
       command: PBC,
@@ -938,17 +973,25 @@ describe('runImageRestore — failures', () => {
         return true
       },
     )
-    assert.deepEqual(mock.calls.map(c => c.args.join(' ')), [
-      `/iscsi/${IQN}/tpg1 disable`,
-      'saveconfig',
-      `restore ${SNAP} vol.img - --ns gtrestore`,
-      `/iscsi/${IQN}/tpg1 enable`,
-      'saveconfig',
+    // cr3.lunrestore: nothing was written, so the mark set before the stream is
+    // removed again before the target comes back.
+    assert.deepEqual(argvOf(mock), [
+      `${ZFS} get -Hp -o value,source anas:restore -- tank/vol1`,
+      `${TARGETCLI} /iscsi/${IQN}/tpg1 disable`,
+      `${TARGETCLI} saveconfig`,
+      `${ZFS} set anas:restore=<mark> -- tank/vol1`,
+      `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
+      `${ZFS} inherit anas:restore -- tank/vol1`,
+      `${TARGETCLI} /iscsi/${IQN}/tpg1 enable`,
+      `${TARGETCLI} saveconfig`,
     ])
   })
 
   it('a re-enable that itself fails does not replace the restore error — it is said loudly', async () => {
     const mock = new MockExecutor()
+    // cr3.lunrestore: the volume takes the restore mark (zfs set / inherit) and its size is read back.
+    mock.addFixture(NO_MARK)
+    mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
     // disable + its saveconfig succeed; the enable fails.
     mock.addFixture({
       command: TARGETCLI,
@@ -972,6 +1015,8 @@ describe('runImageRestore — failures', () => {
 
   it('cr3.backup BACKUP-M5: a FAILED restore whose re-enable also fails says the target is still disabled in its error', async () => {
     const mock = new MockExecutor()
+    mock.addFixture(NO_MARK)
+    mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({
       command: TARGETCLI,
       results: [
@@ -984,7 +1029,9 @@ describe('runImageRestore — failures', () => {
     // written" and, before this fix, dropped the re-enable failure entirely.
     mock.addStreamFixture({
       command: PBC,
-      result: { stderr: 'Error: authentication failed - invalid credentials\n', exitCode: 255, bytesWritten: 0 },
+      // cr3.lunrestore (review2 B): a failure pbc reports before it fetches any data (GT-56).
+      // review3 3: the CAPTURED line, with its stop (backup-failure-taxonomy.txt CASE 4).
+      result: { stderr: 'Error: permission check failed.\n', exitCode: 255, bytesWritten: 0 },
     })
     const lun = zvolLun()
     await assert.rejects(
@@ -997,15 +1044,17 @@ describe('runImageRestore — failures', () => {
     )
   })
 
-  it('a byte count that disagrees with the manifest is a warning, not a silent pass', async () => {
+  it('a byte count that disagrees with the manifest is not a silent pass: unverified, the target stays disabled (review3 6: it used to be a warning beside a re-enable)', async () => {
     const mock = successMock({ bytesWritten: IMAGE_SIZE - 4096 })
     const lun = zvolLun()
     const tgt = target([lun])
-    const result = await runImageRestore(mock, deps(mock, lun, tgt), noop)
-    assert.ok(
-      result.warnings?.some(w => /reported a complete restore but 536866816 bytes reached/.test(w)),
-      JSON.stringify(result.warnings),
-    )
+    await assert.rejects(runImageRestore(mock, deps(mock, lun, tgt), noop), (err: Error) => {
+      assert.match(err.message, /^the client reported the image complete, but 536866816 bytes reached \/dev\/zvol\/tank\/vol1, not the image's 536870912: target .* stays disabled/)
+      assert.equal((err as Error & { jobErrorCode?: string }).jobErrorCode, 'IMAGE_UNVERIFIED')
+      assert.doesNotMatch(err.message, /verify the LUN's contents before serving it/)
+      return true
+    })
+    assert.equal(mock.calls.filter(c => c.command === TARGETCLI && c.args.includes('enable')).length, 0, 'never served')
   })
 
   it('cr.48d: a classified failure whose pbc stderr echoes the repo secret is masked in the thrown job error', async () => {
@@ -1016,6 +1065,9 @@ describe('runImageRestore — failures', () => {
     // lands (the target comes back).
     const caseImpl = async (stderr: string, bytesWritten: number, expected: RegExp, noBytes: boolean) => {
       const mock = new MockExecutor()
+      // cr3.lunrestore: the volume takes the restore mark (zfs set / inherit) and its size is read back.
+      mock.addFixture(NO_MARK)
+      mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
       mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
       mock.addStreamFixture({ command: PBC, result: { stderr, exitCode: 255, bytesWritten } })
       const lun = zvolLun()
@@ -1045,7 +1097,8 @@ describe('runImageRestore — failures', () => {
     )
     // A snapshot the client cannot find, before any byte landed.
     await caseImpl(
-      'Error: snapshot host/gtrestore/2020-01-01T00:00:00Z does not exist - super-secret\n',
+      // review3 3: the captured line's shape (F1), the secret inside the name it echoes.
+      'Error: snapshot host/super-secret/2020-01-01T00:00:00Z does not exist.\n',
       0,
       /missing NAMESPACE/,
       true,
@@ -1054,6 +1107,9 @@ describe('runImageRestore — failures', () => {
 
   it('cr.48d: the generic fallback masks the echoed secret in the thrown job error too (b)', async () => {
     const mock = new MockExecutor()
+    // cr3.lunrestore: the volume takes the restore mark (zfs set / inherit) and its size is read back.
+    mock.addFixture(NO_MARK)
+    mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addStreamFixture({
       command: PBC,
@@ -1064,8 +1120,10 @@ describe('runImageRestore — failures', () => {
     await assert.rejects(
       runImageRestore(mock, deps(mock, lun, tgt), noop),
       (err: Error) => {
-        assert.match(err.message, /^Error: /, err.message)
-        assert.match(err.message, /Nothing was written to/)
+        // cr3.lunrestore (review2 B): an unclassified failure with no progress is
+        // not proof that nothing was written — the sentence says it is not known.
+        assert.match(err.message, /how much of the image reached \/dev\/zvol\/tank\/vol1 is not known \(possibly none\)/, err.message)
+        assert.match(err.message, /Error: proxmox-backup-client rejected \[secret\]$/)
         assert.ok(err.message.includes('[secret]'), err.message)
         assert.ok(!err.message.includes('super-secret'), err.message)
         return true
@@ -1075,13 +1133,17 @@ describe('runImageRestore — failures', () => {
 
   it('cr.48d: a pbc that cannot be started carries no secret in the rejection the job would record', async () => {
     const mock = new MockExecutor()
+    // cr3.lunrestore: the volume takes the restore mark (zfs set / inherit) and its size is read back.
+    mock.addFixture(NO_MARK)
+    mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addStreamFixture({
       command: PBC,
       // The `result` is the run-time throw's dead weight — the interface needs
       // it, and a throwing fixture never reaches it.
       result: { stderr: '', exitCode: 0, bytesWritten: 0 },
-      throws: new Error('spawn /usr/bin/proxmox-backup-client ENOENT while using super-secret'),
+      // cr3.lunrestore (review2 B): the executor's own "never started" (only it can say so).
+      throws: new StreamNotStartedError('spawn /usr/bin/proxmox-backup-client ENOENT while using super-secret'),
     })
     const lun = zvolLun()
     const tgt = target([lun])
@@ -1151,6 +1213,9 @@ describe('cr.48e — the in-place door masks the forwarded progress line', () =>
     // `progress N% (…)` can carry an error fragment quoting the credential
     // (cr.48d left this line verbatim — that is the carrier this step closes).
     const mock = new MockExecutor()
+    // cr3.lunrestore: the volume takes the restore mark (zfs set / inherit) and its size is read back.
+    mock.addFixture(NO_MARK)
+    mock.addFixture({ command: ZFS, result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addStreamFixture({
       command: PBC,

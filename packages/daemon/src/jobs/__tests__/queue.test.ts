@@ -362,3 +362,42 @@ describe('an accepted cancel and the job verdict (rclone.5 review)', () => {
     assert.equal(mock.signals.length, 0, 'nothing was ever signalled')
   })
 })
+
+describe('JobQueue.findEndedRuns and pinWhile (cr3.lunrestore review3 1)', () => {
+  const user = { user: 'root@pam', uid: 0 }
+  async function finish(queue: JobQueue, operation: string, name: string, fail = false): Promise<string> {
+    const ref = queue.submit(operation, { ...user, params: { name } }, async () => {
+      if (fail)
+        throw new Error('no')
+    })
+    for (let i = 0; i < 100 && !['completed', 'failed'].includes(queue.get(ref.id)?.status ?? ''); i++)
+      await settle()
+    return ref.id
+  }
+
+  it('findEndedRuns lists every ended run on the target, oldest first, with its submit params; never one still running', async () => {
+    const queue = new JobQueue()
+    const a = await finish(queue, 'x.op', 't')
+    const b = await finish(queue, 'x.op', 't', true)
+    await finish(queue, 'x.op', 'other')
+    queue.submit('x.op', { ...user, params: { name: 't' } }, forever)
+    await settle()
+    const runs = queue.findEndedRuns('x.op', 't')
+    assert.deepEqual(runs.map(r => [r.job.id, r.job.status, r.params.name]), [[a, 'completed', 't'], [b, 'failed', 't']])
+  })
+
+  it('a pinned finished job survives eviction past maxRetained; past maxPinned the OLDEST pinned goes first', async () => {
+    const queue = new JobQueue({ maxRetained: 2, maxPinned: 2 })
+    queue.pinWhile((job, params) => job.status === 'failed' && String(params.name).startsWith('keep'))
+    const k1 = await finish(queue, 'x.op', 'keep1', true)
+    const k2 = await finish(queue, 'x.op', 'keep2', true)
+    const plain = await finish(queue, 'x.op', 'plain', true)
+    for (let i = 0; i < 4; i++)
+      await finish(queue, 'x.op', `n${i}`)
+    assert.deepEqual([k1, k2, plain].map(id => queue.get(id) !== undefined), [true, true, false], 'both pinned kept, the unpinned one evicted')
+    const k3 = await finish(queue, 'x.op', 'keep3', true)
+    await finish(queue, 'x.op', 'n9')
+    assert.deepEqual([k1, k2, k3].map(id => queue.get(id) !== undefined), [false, true, true], 'three pinned over a bound of two: the oldest evicted')
+    assert.ok(queue.list().length <= 2 + 2, 'never more than maxRetained + maxPinned finished jobs')
+  })
+})

@@ -56,8 +56,8 @@ import { anasIqn, IscsiIqn } from '@anas/shared'
 import { zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { readAhrPools } from './ahr-topology.js'
-import { CONFIGFS_TARGET_ROOT, describeLunHolder, readMappedLuns } from './iscsi-configfs.js'
-import { computeIscsiHealth } from './iscsi-health.js'
+import { CONFIGFS_TARGET_ROOT, describeLunHolder, describeUnmappedHolder, readMappedLuns } from './iscsi-configfs.js'
+import { computeIscsiHealth, unmappedLiveBackstores } from './iscsi-health.js'
 import { classifyBacking, ownershipFromInputs } from './iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, liveUnreadablePaths, readIscsiContext, targetTpgs } from './iscsi.js'
 import { assertNoSecretArgs as assertSecretArgShape, SecretOnArgvError } from './secret-argv.js'
@@ -727,6 +727,12 @@ export interface IscsiMutateOptions {
    * only when this job made it, never a namesake that was already there.
    */
   onBackstoreCreated?: () => void
+  /**
+   * Called by {@link mapLunIntoTarget} the moment its `<tpg>/luns create`
+   * SUCCEEDED, with the index (cr3.lunrestore) — an undo of a map whose ACL
+   * grant failed unmaps only a LUN this run mapped.
+   */
+  onLunMapped?: (index: number) => void
 }
 
 function report(opts: IscsiMutateOptions, message: string): void {
@@ -1514,10 +1520,11 @@ export function nextLunIndex(target: IscsiTargetDetail): number {
 }
 
 /**
- * Create a backstore and map it as a LUN — the ONE shared step every path that
- * gives a target a new LUN goes through (the add-LUN door, and a whole-image
- * restore that lands as a NEW LUN, story backup2.10). A second copy of this
- * sequence would be a second place for the create-only `wwn=` rule to drift.
+ * Create a backstore and map it as a LUN — the add-LUN door's step. It is the
+ * two shared halves, {@link createLunBackstore} then {@link mapLunIntoTarget},
+ * run back to back; a whole-image restore that lands as a NEW LUN (story
+ * backup2.10) runs the same two halves with the image stream BETWEEN them
+ * (cr3.lunrestore), so there is still one copy of the create-only `wwn=` rule.
  *
  * The order is the contract, not a preference:
  *
@@ -1533,10 +1540,7 @@ export function nextLunIndex(target: IscsiTargetDetail): number {
  * along in the same window so the recreate path has exactly one list to replay.
  *
  * Deliberately does NOT save the config: the caller persists at the moment the
- * LUN is in the state it wants. Add-LUN saves straight after; a new-LUN restore
- * saves only AFTER the image has fully streamed into the fresh backing — and a
- * failed restore must never persist a half-created LUN, which is why its
- * cleanup removes what it made instead of saving.
+ * LUN is in the state it wants. Add-LUN saves straight after.
  */
 export async function createAndMapLun(
   opts: IscsiMutateOptions,
@@ -1547,16 +1551,55 @@ export async function createAndMapLun(
   serial: string,
   blockSize?: number,
 ): Promise<{ index: number, attributes: IscsiBackstoreAttributes }> {
-  const { executor } = opts
-  const tag = target.tpgTag
-  const index = nextLunIndex(target)
-  const attrs = defaultBackstoreAttributes(backing.plugin, blockSize !== undefined ? { blockSize } : {})
-  const store = backstorePath(backing.plugin, name)
-
   // cr3 review 2: every token and every ACL this sequence will reach is
   // checked before the backstore exists.
-  assertConfigshellArgs([store, `name=${name}`, `wwn=${serial}`, ...attributeTokens(attrs)])
+  const attrs = backstoreAttributesFor(backing.plugin, name, serial, blockSize)
   refuseBeforeFirstAct(aclNamesRefusal(target.iqn, target.acls))
+
+  await createLunBackstore(opts, name, backing, size, serial, blockSize)
+  const index = await mapLunIntoTarget(opts, target, name, backing.plugin)
+  return { index, attributes: attrs }
+}
+
+/**
+ * The attribute set a new backstore gets, with every token the create step
+ * will hand targetcli checked first (cr3 review 2) — shared by
+ * {@link createAndMapLun} and {@link createLunBackstore}, so the check runs
+ * before the first act on both paths.
+ */
+function backstoreAttributesFor(plugin: string, name: string, serial: string, blockSize?: number): IscsiBackstoreAttributes {
+  const attrs = defaultBackstoreAttributes(plugin, blockSize !== undefined ? { blockSize } : {})
+  assertConfigshellArgs([backstorePath(plugin, name), `name=${name}`, `wwn=${serial}`, ...attributeTokens(attrs)])
+  return attrs
+}
+
+/**
+ * The FIRST half of {@link createAndMapLun} (cr3.lunrestore): create the
+ * backstore with its `wwn=` and set every attribute — and map nothing.
+ *
+ * A backstore that no LUN maps is invisible to every initiator: an initiator
+ * sees a target's TPG LUNs, and a backstore becomes one only through
+ * `<tpg>/luns create` (GT-13: `core/<plugin>_<n>/<name>` and
+ * `iscsi/<IQN>/tpgt_<n>/lun/lun_<n>` are separate trees; GT-11: `storage_objects`
+ * and `targets[].tpgs[].luns` are separate arrays of the saved configuration).
+ * The new-LUN image restore calls this, streams the image into the backing,
+ * proves it whole, and only then calls {@link mapLunIntoTarget} — so a
+ * half-written image is never a LUN, live or saved.
+ *
+ * Calls `opts.onBackstoreCreated` the moment the create SUCCEEDED (cr3,
+ * ISCSI-M5): an undo deletes a backstore only when this run made it.
+ */
+export async function createLunBackstore(
+  opts: IscsiMutateOptions,
+  name: string,
+  backing: ResolvedBacking,
+  size: number | null,
+  serial: string,
+  blockSize?: number,
+): Promise<IscsiBackstoreAttributes> {
+  const { executor } = opts
+  const attrs = backstoreAttributesFor(backing.plugin, name, serial, blockSize)
+  const store = backstorePath(backing.plugin, name)
 
   report(opts, `Creating ${backing.plugin} backstore ${name}`)
   if (backing.plugin === 'block') {
@@ -1588,13 +1631,36 @@ export async function createAndMapLun(
     await runTargetcli(executor, [store, 'set', 'attribute', token])
   }
 
+  return attrs
+}
+
+/**
+ * The SECOND half of {@link createAndMapLun} (cr3.lunrestore): map an existing
+ * backstore into the target at the lowest free index of `target` as read by
+ * the caller, then grant that index to every ACL the target has. The ACL names
+ * are checked before the map. Returns the index. Saves nothing.
+ */
+export async function mapLunIntoTarget(
+  opts: IscsiMutateOptions,
+  target: IscsiTargetDetail,
+  name: string,
+  plugin: string,
+): Promise<number> {
+  const { executor } = opts
+  const tag = target.tpgTag
+  const index = nextLunIndex(target)
+  const store = backstorePath(plugin, name)
+  assertConfigshellArgs([store])
+  refuseBeforeFirstAct(aclNamesRefusal(target.iqn, target.acls))
+
   report(opts, `Mapping ${name} as LUN ${index}`)
   await runTargetcli(executor, [`${tpgPath(target.iqn, tag)}/luns`, 'create', `storage_object=${store}`, `lun=${index}`])
+  opts.onLunMapped?.(index)
 
   for (const acl of target.acls)
     await grantLunsToAcl(opts, target.iqn, tag, acl.initiatorIqn, [index], acl.mappedLuns)
 
-  return { index, attributes: attrs }
+  return index
 }
 
 /** zfs's stderr for a named dataset that is not there (captured `fixtures/iscsi/zfs-list-t-volume-absent.stderr.txt`). */
@@ -2084,7 +2150,45 @@ export function claimsFromTargets(targets: IscsiTargetDetail[]): IscsiClaim[] {
   return claims
 }
 
-/** `claimsFromTargets` with the read done for you — the seam's public form. */
+/** The unmapped holder sentence (cr3.lunrestore) — one copy, in iscsi-configfs. */
+export { describeUnmappedHolder }
+
+/**
+ * The claims of every LIVE backstore no LUN maps (cr3.lunrestore). Such a
+ * backstore holds its backing object exactly as a mapped LUN does — LIO holds
+ * the object because the backstore exists (GT-40) — and a new-LUN image restore
+ * keeps one for the whole stream, mapping it only once the image is complete.
+ * Without these claims a dataset destroy, rename, rollback or shrink, a pool
+ * destroy or export, an AHR verb or an unmount would pass ANAS's gate on the
+ * very object the restore is writing. Every backstore counts, whoever made it:
+ * a hold is a fact about the object, not about ownership.
+ */
+export function unmappedBackstoreClaims(ctx: IscsiReadContext): IscsiClaim[] {
+  return unmappedLiveBackstores(ctx).map((b) => {
+    const claim: IscsiClaim = {
+      backingPath: b.backingPath,
+      kind: b.classification.kind,
+      backstoreName: b.name,
+      plugin: b.plugin,
+      unmapped: true,
+      // Nothing maps it, so nothing can be logged in to it.
+      connectedInitiators: [],
+      detail: describeUnmappedHolder({ backstoreName: b.name, plugin: b.plugin, backingPath: b.backingPath }),
+    }
+    if (b.classification.pool !== null)
+      claim.pool = b.classification.pool
+    if (b.classification.dataset !== null)
+      claim.dataset = b.classification.dataset
+    return claim
+  })
+}
+
+/** Every claim a gathered state holds: the mapped LUNs', then the unmapped backstores' (cr3.lunrestore). */
+export function claimsFromState(ctx: IscsiReadContext, targets: IscsiTargetDetail[]): IscsiClaim[] {
+  return [...claimsFromTargets(targets), ...unmappedBackstoreClaims(ctx)]
+}
+
+/** `claimsFromState` with the read done for you — the seam's public form. */
 export async function iscsiClaims(
   executor: CommandExecutor,
   paths: IscsiPaths = {},
@@ -2096,5 +2200,5 @@ export async function iscsiClaims(
   const unreadable = liveUnreadablePaths(ctx)
   if (unreadable.length > 0)
     throw new Error(`the iSCSI configfs tree could not be listed in full (${unreadable.join(', ')})`)
-  return { installed: iscsiAvailability(ctx).installed, claims: claimsFromTargets(targets) }
+  return { installed: iscsiAvailability(ctx).installed, claims: claimsFromState(ctx, targets) }
 }

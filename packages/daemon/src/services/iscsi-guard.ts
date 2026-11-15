@@ -218,8 +218,12 @@ export const targetLunsGate: Gate<TargetObject> = async ({ target }) => {
  * A new LUN's name is free NODE-WIDE: the backstore name is a global namespace
  * in LIO, not per-target, and it is the SCSI model string every initiator sees
  * (GT-15). The add-LUN door and the restore-as-a-new-LUN door both ask it.
+ *
+ * `restoreRunning` (cr3.lunrestore, review2 F): the caller's job view — a
+ * backstore a whole-image restore is writing into right now is named as such,
+ * and the operator is never told to remove it.
  */
-export function lunNameFreeGate(name: string): Gate<TargetObject> {
+export function lunNameFreeGate(name: string, restoreRunning?: (backingPath: string) => string | undefined): Gate<TargetObject> {
   return async ({ state }) => {
     if (state.targets.some(t => targetTpgs(t).some(g => g.luns.some(l => l.name === name)))) {
       return conflict({
@@ -231,13 +235,21 @@ export function lunNameFreeGate(name: string): Gate<TargetObject> {
     // the saved configuration — takes the name too. The create would fail
     // ("exists") or, worse, the add's undo would delete a backstore this job
     // never made; and a persisted one comes back at the next boot.
-    const live = state.ctx.live.backstores.some(b => b.name === name)
+    const live = state.ctx.live.backstores.find(b => b.name === name)
     const persisted = (state.ctx.persisted?.storageObjects ?? []).some(o => o.name === name)
     if (live || persisted) {
+      const job = live?.udevPath ? restoreRunning?.(live.udevPath) : undefined
+      const unique = 'The name is the SCSI model string initiators see, so it has to be unique'
       return conflict({
         reason: 'name-taken',
-        message: `A backstore named '${name}' already exists on this node${live ? '' : ' in the saved configuration'}, mapped as no LUN. `
-          + `The name is the SCSI model string initiators see, so it has to be unique — pick another name, or remove that backstore with targetcli.`,
+        message: live
+          ? job
+            ? `A backstore named '${name}' exists on this node and no LUN maps it: a whole-image restore is writing its image `
+            + `right now (job ${job}). ${unique}: pick another name.`
+            : `A backstore named '${name}' exists on this node and no LUN maps it. ${unique}: pick another name, or remove `
+              + `that backstore with targetcli.`
+          : `A backstore named '${name}' is in the saved configuration of this node (not in the live one), and no LUN maps it. `
+            + `${unique}: pick another name. The next iSCSI change in ANAS saves the configuration without it.`,
       })
     }
     return null

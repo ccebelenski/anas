@@ -32,7 +32,7 @@ import { attributeScrub, pathExists, runningAhrCheck, scrubAhrPool } from '../se
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
 import { AHR_FINDMNT_ARGS } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
-import { heldByLun, lioUnreadableAdvisory } from '../services/iscsi-held.js'
+import { heldByLun, heldHolderPhrase, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
 import { mountTargetGate, mountTargetRefusal, normalizeMountpointPath } from '../services/mounts.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
@@ -77,6 +77,15 @@ function noSessionClause(held: IscsiHeldByLun): string {
 }
 
 /**
+ * The disclosure's lead for a holder that is a backstore no LUN maps
+ * (cr3.lunrestore): no initiator can see it, so it is no guest's live disk.
+ */
+function unmappedOnPoolClause(held: IscsiHeldByLun): string {
+  return `${held.backingPath} on this pool is held by ${heldHolderPhrase(held)}: no initiator can see it, and its content may be `
+    + `incomplete (a restore as a new LUN writes into such a backstore before it maps it).`
+}
+
+/**
  * The parity-rewrite confirm gate's LUN disclosure (seventh pass, F10), or no
  * line at all when nothing is served from the pool.
  *
@@ -87,6 +96,9 @@ function noSessionClause(held: IscsiHeldByLun): string {
 export function rewriteLunWarnings(held: IscsiHeldByLun | null): string[] {
   if (!held)
     return []
+  // cr3.lunrestore: a backstore no LUN maps is no guest's disk — said as what it is.
+  if (held.unmapped === true)
+    return [`${unmappedOnPoolClause(held)} It reads every member of the band twice and rewrites parity, and it writes no file`]
   const sessions = held.connectedInitiators.length
   return [
     `A guest's disk is live on this pool: iSCSI LUN ${held.index} ('${held.name}') of target ${held.targetIqn} is served from ${held.backingPath}${
@@ -109,6 +121,8 @@ export function rewriteLunWarnings(held: IscsiHeldByLun | null): string[] {
 export function reconcileLunWarnings(held: IscsiHeldByLun | null): string[] {
   if (!held)
     return []
+  if (held.unmapped === true)
+    return [`${unmappedOnPoolClause(held)} Every row this run writes already matches the checksum btrfs stored for it, so what the backstore holds does not change`]
   const sessions = held.connectedInitiators.length
   return [
     `A guest's disk is live on this pool: iSCSI LUN ${held.index} ('${held.name}') of target ${held.targetIqn} is served from ${held.backingPath}${

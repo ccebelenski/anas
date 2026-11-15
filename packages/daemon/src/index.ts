@@ -152,7 +152,7 @@ async function main() {
           log: (line: string) => server.log.warn(line),
         }).then((outcomes) => {
           if (outcomes.length > 0)
-            server.log.warn(`iscsi stub quarantine: ${outcomes.length} placeholder LUN(s) taken offline — repair them from the iSCSI menu once the filesystem is mounted`)
+            server.log.warn(`iscsi stub quarantine: ${outcomes.length} placeholder LUN(s) taken offline — repair them from the iSCSI screen once the filesystem is mounted`)
         }).catch((err) => {
         // cr.34: a hung targetcli now REJECTS at its deadline instead of
         // hanging; that is a logged failure, never a dead daemon.

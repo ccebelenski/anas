@@ -26,11 +26,13 @@
  * reading the failure as "no warnings".
  */
 
-import type { DashboardWarning, IscsiHealth, IscsiTargetDetail } from '@anas/shared'
+import type { DashboardWarning, IscsiHealth } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { IscsiHealthReadOptions } from './iscsi-health.js'
 import type { IscsiPaths } from './iscsi.js'
 import { foreignHolesSentence } from './iscsi-mutate.js'
 import { readIscsiHealth } from './iscsi-quarantine.js'
+import { clearMarkCommand, markDataset, restoreEndSentence } from './restore-mark.js'
 
 /**
  * Build the `iscsi` dashboard cards from a health diff. Pure — the caller has
@@ -110,9 +112,9 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     // placeholder before it plans anything. A foreign target's stub is never
     // ANAS's to touch (story `iscsi.5`), so that one stays a hand job.
     const action = stub.quarantined
-      ? `ANAS has taken it offline${stub.fileRemoved ? ' and removed the placeholder' : ''}; mount the filesystem and use Repair on the iSCSI menu to put the LUN back with its own serial.`
+      ? `ANAS has taken it offline${stub.fileRemoved ? ' and removed the placeholder' : ''}; mount the filesystem and use Repair on the iSCSI screen to put the LUN back with its own serial.`
       : stub.ownership === 'anas'
-        ? `It is still being served. Use Repair on the iSCSI menu to take it offline now — Repair unmaps a placeholder before anything else and keeps the saved record — then mount the filesystem and use Repair again to put the LUN back with its own serial.`
+        ? `It is still being served. Use Repair on the iSCSI screen to take it offline now — Repair unmaps a placeholder before anything else and keeps the saved record — then mount the filesystem and use Repair again to put the LUN back with its own serial.`
         : `It is still being served, and the target is not ANAS's, so ANAS will not unmap it. Log initiators out and delete LUN ${stub.lunIndex} by hand, then mount the filesystem.`
     warnings.push({
       level: 'critical',
@@ -141,7 +143,7 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     // visibly a file at it (story `iscsi.8`).
     const placeholderClause = ' That path holds a PLACEHOLDER the restore service created — a file of the right name '
       + 'that is not the image, which is why ANAS took the LUN offline. Mount the filesystem that should hold the '
-      + 'image, then use Repair on the iSCSI menu to put the LUN back with its own serial.'
+      + 'image, then use Repair on the iSCSI screen to put the LUN back with its own serial.'
     // ANAS deleted the file at that path itself, so "bring the storage back
     // (restore the image)" would be an instruction to undo a deletion that
     // destroyed nothing: the file was a 0-byte placeholder on the wrong
@@ -149,7 +151,7 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     // filesystem that did not mount.
     const removedClause = ' That path is empty because ANAS REMOVED the placeholder it found there — it was 0 bytes and '
       + 'on the wrong filesystem, so nothing of yours was deleted. Mount the filesystem that should hold the image, then '
-      + 'use Repair on the iSCSI menu to put the LUN back with its own serial.'
+      + 'use Repair on the iSCSI screen to put the LUN back with its own serial.'
     // cr3 (ISCSI-L7): a hole in a target ANAS does not manage is never
     // Repair's — the card says whose it is and how to restore it by hand.
     const backNow = lun.targetOwnership === 'foreign'
@@ -159,7 +161,7 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
         : placeholderRemoved.has(`${lun.targetIqn}#${lun.lunIndex}`)
           ? removedClause
           : lun.backingExists === true
-            ? ' That path is available again — use Repair on the iSCSI menu to put the LUN back.'
+            ? ' That path is available again — use Repair on the iSCSI screen to put the LUN back.'
             : lun.backingExists === false
               ? ' That path is still missing — bring the storage back (import the pool, restore the image) first.'
               : ''
@@ -222,17 +224,115 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     })
   }
 
-  // A target ANAS owns that is switched off is serving nothing, and the decision
-  // that switched it off lives in a job that is gone (live-proof F12).
+  // cr3.lunrestore: the restore marks (the breadcrumb on the volume), by target.
+  const marks = health.restoreMarks ?? []
+  const marksOf = (iqn: string) => marks.filter(m => m.targetIqn === iqn)
+  const disabledIqns = new Set(health.disabledTargets.map(t => t.targetIqn))
+
+  // A target ANAS owns that is switched off is serving nothing (live-proof F12).
+  // cr3.lunrestore: WHY comes from the restore mark on its LUNs' volumes —
+  // which survives the job — and a retained job only adds what it said.
   for (const t of health.disabledTargets) {
+    const own = marksOf(t.targetIqn)
+    const running = own.find(m => m.state === 'in-progress')
+    const unreadable = own.filter(m => m.state === 'unreadable')
+    const partial = own.filter(m => m.state === 'interrupted' || m.state === 'unverified')
+    const lead = `iSCSI target ${t.targetIqn} is disabled — it is serving nothing, and its `
+      + `${t.lunCount} LUN${t.lunCount === 1 ? '' : 's'} ${t.lunCount === 1 ? 'is' : 'are'} unreachable `
+      + `(LIO's enable flag is per target, not per LUN).`
+    const said = t.detail ? ` ${t.detail}` : ''
+    let tail: string
+    if (running) {
+      // (a) a restore is running onto it: progress, never an invitation to
+      // Enable — and no promise about the end (review2 F1): the restore
+      // enables only what it disabled, only over an image it proved.
+      // review3 4: the three ways it can end, per backing kind (a file's row
+      // has no volume).
+      tail = ` ${running.detail} Enable is refused until the restore ends. `
+        + `${restoreEndSentence(running.dataset === null ? 'file' : 'zvol', 'a target the restore disabled')} `
+        + `A target the restore did not disable is left as it is.`
+    }
+    else if (partial.length > 0) {
+      // review2 D: a row may come from a mark (the confirm removes it) or from
+      // a job record of an image file (nothing to remove) — the sentence says
+      // what Enable does for the rows it has.
+      // review3 2: restoring again in place is the way out for a volume; an
+      // image file's own row says what it needs first (its length).
+      const marked = partial.filter(m => m.source === 'mark').length
+      const again = marked === 0
+        ? ''
+        : marked === partial.length ? ' Restoring the image again is the other way out.' : ' For a LUN on a volume, restoring the image again is the other way out.'
+      tail = ` ${partial.map(m => m.detail).join(' ')} Enabling the target serves ${partial.length === 1 ? 'that image' : 'those images'} `
+        + `to initiators: Enable on the iSCSI screen asks you to confirm${marked > 0 ? ` and removes the restore mark${marked === 1 ? '' : 's'}` : ''}.`
+        + `${again}${said}`
+    }
+    else if (unreadable.length > 0) {
+      tail = ` ${unreadable.map(m => m.detail).join(' ')} Enable is refused until the mark can be read.${said}`
+    }
+    else {
+      tail = `${said} Enable it from the iSCSI screen when you are ready.`
+    }
+    warnings.push({ level: 'warning', category: 'iscsi', message: `${lead}${tail}`, ref: t.targetIqn })
+  }
+
+  // cr3.lunrestore: a LUN whose volume carries an interrupted or unverified
+  // restore mark on a target that is ENABLED (switched on by hand): initiators
+  // are being served that image now — critical.
+  for (const m of marks) {
+    if (!m.targetIqn || disabledIqns.has(m.targetIqn) || (m.state !== 'interrupted' && m.state !== 'unverified'))
+      continue
+    warnings.push({
+      level: 'critical',
+      category: 'iscsi',
+      message: `${m.detail} Target ${m.targetIqn} is enabled, so initiators are being served that image now. `
+        + `Disable the target, then ${m.source === 'job' ? 'accept it with Enable\'s confirm, or restore it again in place as said above' : 'restore the image again or accept it with Enable\'s confirm'}.`,
+      ref: m.targetIqn,
+    })
+  }
+
+  // cr3.lunrestore: a backstore on ANAS storage that no LUN maps. `warning`,
+  // never `critical` and never the degraded card: no initiator can see a
+  // backstore that is not a TPG LUN, so nothing is being served wrongly and
+  // every other iSCSI verb still runs. What it HOLDS is said from the restore
+  // mark on its volume: an interrupted restore (partial image), an unverified
+  // one, or — with no mark — only what is known. A restore that is running
+  // onto it now (the job view) is progress, not a finding: no card.
+  for (const b of health.unmappedBackstores ?? []) {
+    if (b.restoreInFlight)
+      continue
+    const dataset = markDataset(b.backingPath)
+    const row = marks.find(m => !m.targetIqn && m.backingPath === b.backingPath)
+    const saved = b.persisted === true
+      ? ' It is in the saved configuration, so it comes back, still not mapped, at the next boot.'
+      : b.persisted === false
+        ? ' It is not in the saved configuration, so it is gone after the next reboot; its backing stays.'
+        : ''
+    const resave = b.persisted === true ? ' (the next iSCSI change in ANAS saves the configuration without it)' : ''
+    const destroy = dataset ? `'zfs destroy ${dataset}'` : `delete the image file ${b.backingPath}`
+    const held = dataset
+      ? `ANAS refuses to destroy, roll back, rename or resize ${dataset} while the backstore exists.`
+      : `ANAS refuses to destroy or roll back the storage ${b.backingPath} is on, or unmount it, while the backstore exists.`
+    const remove = `To remove it: 'targetcli /backstores/${b.plugin} delete ${b.name}'${resave}, then ${destroy} if you do not need the image.`
+    let what: string
+    if (row?.state === 'interrupted') {
+      what = `${row.detail} No initiator can see it. ${held}${saved} ${remove} To restore the image again: remove both, then restore it as a new LUN.`
+    }
+    else if (row?.state === 'unverified') {
+      what = `${row.detail} No initiator can see it. ${held}${saved} ${remove} If you have checked the image, `
+        + `${row.source === 'mark' && row.dataset ? `clear the mark ('${clearMarkCommand(row.dataset)}') and ` : ''}map the backstore with targetcli.`
+    }
+    else if (row?.state === 'unreadable') {
+      what = `${row.detail} No initiator can see it. ${held}${saved} ${remove}`
+    }
+    else {
+      // N3: no mark — say only what is known.
+      what = `A backstore no LUN maps holds this storage${dataset ? ', and no restore mark is on it' : ' (an image file carries no restore mark)'}: `
+        + `ANAS cannot tell what it holds. No initiator can see it. ${held}${saved} ${remove}`
+    }
     warnings.push({
       level: 'warning',
       category: 'iscsi',
-      message: `iSCSI target ${t.targetIqn} is disabled — it is serving nothing, and its `
-        + `${t.lunCount} LUN${t.lunCount === 1 ? '' : 's'} ${t.lunCount === 1 ? 'is' : 'are'} unreachable `
-        + `(LIO's enable flag is per target, not per LUN). ${t.detail ? `${t.detail} ` : ''}`
-        + `Enable it from the iSCSI menu when you are ready.`,
-      ref: t.targetIqn,
+      message: `iSCSI backstore '${b.name}' (${b.plugin}, ${b.backingPath}) is not mapped as a LUN. ${what}`,
     })
   }
 
@@ -262,7 +362,7 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
 export async function collectIscsiWarnings(
   executor: CommandExecutor,
   paths: IscsiPaths = {},
-  opts: { disabledDetail?: (target: IscsiTargetDetail) => string | undefined } = {},
+  opts: IscsiHealthReadOptions = {},
 ): Promise<DashboardWarning[]> {
   // A pure read (cr.62, review L9): the dashboard REPORTS a placeholder LUN
   // (the card above says it is still served and points at Repair); it never

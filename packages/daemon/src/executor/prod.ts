@@ -23,6 +23,7 @@ import {
   resolveDeadline,
   TERM_GRACE_MS,
 } from './deadline.js'
+import { StreamFlushError, StreamNotStartedError } from './stream-errors.js'
 
 /** Promisified `open(2)` — the caller owns the fd, so the stream cannot close it. */
 function openFd(path: string, flags: string | number): Promise<number> {
@@ -689,11 +690,26 @@ export class ProdExecutor implements CommandExecutor {
   ): Promise<ExecStreamResult> {
     // Resolved before anything is opened: a bad deadline option is a
     // programming error and must not leave a descriptor behind.
-    const deadline = resolveDeadline(command, args, opts, this.budgets)
+    // cr3.lunrestore (review2 B): every rejection BEFORE the child exists is a
+    // StreamNotStartedError — nothing was written — and only those are: a
+    // caller reads any other rejection as "unknown how much was written".
+    let deadline: ResolvedDeadline
+    try {
+      deadline = resolveDeadline(command, args, opts, this.budgets)
+    }
+    catch (err) {
+      throw new StreamNotStartedError(err instanceof Error ? err.message : String(err), err)
+    }
     // The fd is opened HERE and stays ours: an fsync has to happen on a
     // still-open descriptor, and the byte count is read off it after the child
     // exits.
-    const fd = await openFd(target.path, target.flags)
+    let fd: number
+    try {
+      fd = await openFd(target.path, target.flags)
+    }
+    catch (err) {
+      throw new StreamNotStartedError(err instanceof Error ? err.message : String(err), err)
+    }
     return new Promise((resolve, reject) => {
       let child: ChildProcess
       try {
@@ -706,7 +722,7 @@ export class ProdExecutor implements CommandExecutor {
       }
       catch (err) {
         closeFd(fd)
-        reject(err instanceof Error ? err : new Error(String(err)))
+        reject(new StreamNotStartedError(err instanceof Error ? err.message : String(err), err))
         return
       }
 
@@ -742,7 +758,8 @@ export class ProdExecutor implements CommandExecutor {
         fsync(fd, (err) => {
           closeFd(fd)
           if (err && exitCode === 0) {
-            reject(err)
+            // The child said it finished; the medium may not hold what it wrote.
+            reject(new StreamFlushError(err.message, bytesWritten))
             return
           }
           resolve({ stderr, exitCode, bytesWritten, ...(signal ? { signal } : {}) })
@@ -761,7 +778,9 @@ export class ProdExecutor implements CommandExecutor {
         settled = true
         watch.cancel()
         closeFd(fd)
-        reject(err)
+        // No pid: the child never ran (ENOENT, EACCES on the binary). With a
+        // pid it did run, and what it wrote is unknown.
+        reject(child.pid === undefined ? new StreamNotStartedError(err.message, err) : err)
       })
 
       child.on('close', (code, signal) => {

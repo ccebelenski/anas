@@ -952,7 +952,7 @@
             + 'on a ZFS volume. Use Resize Volume to grow it.',
         dsPerms: 'A volume has no mountpoint, so it has no file permissions to edit.',
         dsShare: 'A volume is a block device with no path to share. Block export '
-            + 'is the iSCSI menu, not a file share.',
+            + 'is the iSCSI screen, not a file share.',
     };
 
     // ---- Story iscsi.6: "a LUN is holding this" ---------------------------

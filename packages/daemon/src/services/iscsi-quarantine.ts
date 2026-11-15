@@ -77,12 +77,15 @@
 import type { IscsiHealth, IscsiStubLun, IscsiTargetDetail } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { LioLiveState } from './iscsi-configfs.js'
+import type { IscsiHealthReadOptions } from './iscsi-health.js'
 import type { IscsiPaths, IscsiReadContext } from './iscsi.js'
+import type { RestoreMarkRead } from './restore-mark.js'
 import { stat, unlink } from 'node:fs/promises'
 import { lunsMappingBackstore } from './iscsi-configfs.js'
-import { computeIscsiHealth } from './iscsi-health.js'
+import { computeIscsiHealth, unmappedLiveBackstores } from './iscsi-health.js'
 import { assertConfigshellArgs, runTargetcli, tpgPath, withIscsiLock } from './iscsi-mutate.js'
-import { buildIscsiTargets, readIscsiContext } from './iscsi.js'
+import { buildIscsiTargets, readIscsiContext, targetTpgs } from './iscsi.js'
+import { readRestoreMarksBatch } from './restore-mark.js'
 
 /** What one quarantine pass did, per stub. */
 export interface IscsiQuarantineOutcome {
@@ -209,7 +212,7 @@ async function quarantineOne(
 export async function readIscsiHealthWithQuarantine(
   executor: CommandExecutor,
   paths: IscsiQuarantineOptions = {},
-  opts: { disabledDetail?: (target: IscsiTargetDetail) => string | undefined } = {},
+  opts: IscsiHealthReadOptions = {},
 ): Promise<{ ctx: IscsiReadContext, targets: IscsiTargetDetail[], health: IscsiHealth, outcomes: IscsiQuarantineOutcome[] }> {
   const { log: logSeam, ...readPaths } = paths
   const log = logSeam ?? ((line: string) => process.stdout.write(`${line}\n`))
@@ -324,7 +327,7 @@ export async function readIscsiHealthWithQuarantine(
 export async function readIscsiHealth(
   executor: CommandExecutor,
   paths: IscsiPaths = {},
-  opts: { disabledDetail?: (target: IscsiTargetDetail) => string | undefined } = {},
+  opts: IscsiHealthReadOptions = {},
 ): Promise<{ ctx: IscsiReadContext, targets: IscsiTargetDetail[], health: IscsiHealth }> {
   return read(executor, paths, opts)
 }
@@ -333,16 +336,46 @@ export async function readIscsiHealth(
 async function read(
   executor: CommandExecutor,
   paths: IscsiPaths,
-  opts: { disabledDetail?: (target: IscsiTargetDetail) => string | undefined },
+  opts: IscsiHealthReadOptions,
   quarantined?: Map<string, { quarantined: boolean, fileRemoved: boolean }>,
 ): Promise<{ ctx: IscsiReadContext, targets: IscsiTargetDetail[], health: IscsiHealth }> {
   const ctx = await readIscsiContext(executor, paths)
   const targets = await buildIscsiTargets(ctx)
+  // cr3.lunrestore: a caller with a job view reads the restore marks too.
+  const marks = opts.restoreRunning ? await readRestoreMarks(executor, ctx, targets) : undefined
   const health = computeIscsiHealth(ctx, targets, {
     ...(opts.disabledDetail ? { disabledDetail: opts.disabledDetail } : {}),
+    ...(opts.restoreRunning ? { restoreRunning: opts.restoreRunning } : {}),
+    ...(opts.restoreFailed ? { restoreFailed: opts.restoreFailed } : {}),
+    ...(marks ? { marks } : {}),
     ...(quarantined ? { quarantined } : {}),
   })
   return { ctx, targets, health }
+}
+
+/**
+ * The restore mark of every zvol backing the health read reports on — each
+ * present LUN's and each live backstore no LUN maps — in one `zfs get`
+ * (cr3.lunrestore, review2 (7)). A file backing carries none (`unsupported`).
+ */
+export async function readRestoreMarks(
+  executor: CommandExecutor,
+  ctx: IscsiReadContext,
+  targets: IscsiTargetDetail[],
+): Promise<Map<string, RestoreMarkRead>> {
+  const paths = new Set<string>()
+  for (const t of targets) {
+    for (const g of targetTpgs(t)) {
+      for (const l of g.luns) {
+        if (l.present && l.backingPath)
+          paths.add(l.backingPath)
+      }
+    }
+  }
+  for (const b of unmappedLiveBackstores(ctx))
+    paths.add(b.backingPath)
+  // review2 (7): ONE `zfs get` for every volume, not one per backing.
+  return readRestoreMarksBatch(executor, [...paths])
 }
 
 /**

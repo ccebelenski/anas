@@ -247,7 +247,7 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
       degraded: true,
     }))
     const card = w.find(c => /placeholder created by/.test(c.message))!
-    assert.match(card.message, /It is still being served\. Use Repair on the iSCSI menu to take it offline now/)
+    assert.match(card.message, /It is still being served\. Use Repair on the iSCSI screen to take it offline now/)
     assert.ok(!/could NOT/.test(card.message), card.message)
     // Only the signal that actually fired is quoted.
     assert.ok(!/instead of/.test(card.message), card.message)
@@ -336,7 +336,7 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
     assert.match(card.message, /ANAS REMOVED the placeholder/)
     assert.match(card.message, /nothing of yours was deleted/)
     assert.match(card.message, /Mount the filesystem that should hold the image/)
-    assert.match(card.message, /use Repair on the iSCSI menu/)
+    assert.match(card.message, /use Repair on the iSCSI screen/)
     assert.ok(!/still missing/.test(card.message), card.message)
     assert.ok(!/restore the image\) first/.test(card.message), card.message)
   })
@@ -388,7 +388,7 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
     assert.equal(plain[0].ref, IQN)
     assert.match(plain[0].message, /is disabled/)
     assert.match(plain[0].message, /4 LUNs are unreachable/)
-    assert.match(plain[0].message, /Enable it from the iSCSI menu/)
+    assert.match(plain[0].message, /Enable it from the iSCSI screen/)
 
     const withReason = buildIscsiWarnings(health({
       disabledTargets: [{ targetIqn: IQN, tpgTag: 1, lunCount: 1, detail: 'A whole-image restore onto it failed and left it disabled: the image was partially written' }],

@@ -1,12 +1,14 @@
 import type { IscsiHealth, IscsiSessionList, IscsiTargetDetail, IscsiTargetList } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
+import type { JobQueue } from '../jobs/queue.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { IscsiIqn } from '@anas/shared'
 import { readNodeInitiatorName } from '../parsers/iscsi-initiator.js'
 import { readIscsiHealth } from '../services/iscsi-quarantine.js'
 import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, readIscsiContext, targetTpgs, toTargetSummary } from '../services/iscsi.js'
 import { readPveFirewallAdvisory } from '../services/pve-firewall.js'
+import { restoreJobsOf } from '../services/restore-mark.js'
 
 /**
  * iSCSI — the READ layer (story `iscsi.2`).
@@ -32,12 +34,18 @@ import { readPveFirewallAdvisory } from '../services/pve-firewall.js'
  */
 export interface IscsiRouteOptions extends IscsiPaths {
   executor: CommandExecutor
+  /**
+   * cr3.lunrestore: the job view the health read needs to tell a restore mark
+   * on a running restore from an interrupted one. Absent (a test): no marks
+   * are read.
+   */
+  jobQueue?: Pick<JobQueue, 'findRunning' | 'findEndedRuns' | 'findLastCompleted'>
   /** `/etc/pve/firewall` override (story iscsi.6) — read-only, tests only. */
   firewallDir?: string
 }
 
 export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptions) {
-  const { executor, firewallDir, ...paths } = opts
+  const { executor, firewallDir, jobQueue, ...paths } = opts
 
   // --- GET /iscsi/targets --------------------------------------------------
   server.get('/iscsi/targets', async () => {
@@ -79,7 +87,8 @@ export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptio
   // degraded while it is ANAS's) and the act belongs to Repair (POST, Sys.Modify,
   // CSRF), which quarantines before it plans; the daemon-start pass still runs.
   server.get('/iscsi/health', async () => {
-    const { health } = await readIscsiHealth(executor, paths)
+    // cr3.lunrestore: with a job view, the restore marks are read and named.
+    const { health } = await readIscsiHealth(executor, paths, jobQueue ? restoreJobsOf(jobQueue) : {})
     const result: IscsiHealth = health
     return { data: result }
   })

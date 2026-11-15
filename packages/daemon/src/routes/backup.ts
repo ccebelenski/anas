@@ -156,6 +156,7 @@ import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
 import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
+import { JOB_RECORD_LIFETIME, restoreEndSentence, restoreJobsOf } from '../services/restore-mark.js'
 import { datasetSourceClaims, pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
 import { notThereClause, readSourceGuardFacts, unmountedMountFor, unreadableFactsRefusal } from '../services/source-guard.js'
 import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
@@ -2549,9 +2550,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         `The WHOLE TARGET goes offline for the duration, not just this LUN: LIO's enable flag lives on the `
         + `target portal group${otherLuns > 0 ? `, so its other ${otherLuns} LUN${otherLuns === 1 ? '' : 's'} are unreachable too` : ''}.`,
         'Disabling refuses new logins and hides the target from discovery, so an initiator that auto-reconnects '
-        + '(open-iscsi, Windows) cannot come back mid-restore. It is re-enabled when the restore finishes.',
-        'If the restore fails part-way, the LUN holds a HALF-WRITTEN image and the target stays disabled until '
-        + 'you restore again or explicitly enable it.',
+        + '(open-iscsi, Windows) cannot come back mid-restore.',
+        // cr3.lunrestore (review2 F1, review3 4): true on every path — the
+        // three ways a restore can end, per backing kind.
+        target.enabled
+          ? restoreEndSentence(lun.kind === 'zvol' ? 'zvol' : 'file', 'the target')
+          : 'The target is disabled now; a restore leaves a target it did not disable as it finds it.',
+        lun.kind === 'zvol'
+          ? 'If the restore fails part-way, the LUN holds a HALF-WRITTEN image: the target stays disabled and the volume '
+          + 'keeps the restore mark anas:restore, so Enable asks you to confirm before it serves that image.'
+          : 'If the restore fails part-way, the LUN holds a HALF-WRITTEN image and the target stays disabled. Enable asks you '
+            + `to confirm before it serves that image while ANAS keeps the restore job's record; ${JOB_RECORD_LIFETIME}.`,
       ],
     })) {
       return reply
@@ -2801,7 +2810,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }),
       // (2) target there and ANAS's, (3) the name free node-wide, (4) the
       // backing resolves onto ANAS storage — at the path that was confirmed.
-      gates: [saveableGate, foreignGate, lunNameFreeGate(newLun.name), backstoreNameFreeGate, backingGate, backingUnmovedGate],
+      gates: [saveableGate, foreignGate, lunNameFreeGate(newLun.name, restoreJobsOf(jobQueue).restoreRunning), backstoreNameFreeGate, backingGate, backingUnmovedGate],
       // §4.2: the target's key (the LUN set and the grants change) and the
       // keys the sibling verb that creates this backing takes — a zvol is a
       // dataset CREATE (its own key exclusive, every ancestor and the pool
@@ -2837,6 +2846,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           ? `the new LUN's backing ${b.ok.backing.path} now lives on a different filesystem`
           : `the new LUN's backing was ${routeBacking.backing.path}; now ${b.ok.backing.path}`
       },
+    }
+
+    // cr3.lunrestore: the re-proof once THIS run's backstore exists — before
+    // the map, and before a failed run saves away a copy of its backstore
+    // another verb persisted. Every gate that still applies runs; the two name
+    // gates do not, because this run's own backstore (or that saved copy) is
+    // what now holds the name — the service proves the backstore is still its
+    // own (`ownBackstoreRefusal`: name, plugin, serial, path, mapped by nothing).
+    const afterCreateSpec: GuardSpec<TargetObject> = {
+      ...spec,
+      gates: [saveableGate, foreignGate, backingGate, backingUnmovedGate],
     }
 
     const pre = await guardCheck(spec)
@@ -2918,17 +2938,16 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         + 'the original by its serial will see a different disk.',
         'The source LUN — the LUN this image was backed up from — is not touched: it stays online, keeps its '
         + 'serial, and no initiator has to log out.',
-        // cr3.backup R1: the old sentence ("the half-written state is never
-        // persisted") was false — the stream runs with the iSCSI lock released
-        // and any other iSCSI change saves the live LUN with it.
-        'If the restore fails part-way, ANAS removes the new LUN, its backstore and its backing. While the image '
-        + 'is being written the new LUN is live and its contents are incomplete: if the daemon or the node stops '
-        + 'before the restore ends and another iSCSI change saved the configuration meanwhile, the LUN comes back '
-        + 'looking complete - delete it and restore again.',
-        // cr3 review2 (5): the one failure that undoes nothing.
-        'If only saving the iSCSI configuration fails once the image is written, the LUN, its backstore and its '
-        + 'backing are kept and the job says so: the LUN is live but not saved, so retry the save with any iSCSI '
-        + 'change before the target service restarts.',
+        // cr3.lunrestore: the window the cr3.backup R1 sentence warned about is
+        // closed — the LUN is mapped only once the image is complete.
+        `No initiator sees the new LUN until the whole image is written and its size is verified: until then it `
+        + `is a backstore '${newLun.name}' that is not mapped as a LUN. If the restore fails part-way, ANAS removes `
+        + 'the backstore and its backing. If the daemon or the node stops before the restore ends, the backstore '
+        + 'can remain, still not mapped: the iSCSI dashboard card names it and says how to remove it.',
+        // cr3 review2 (5): the failures that undo nothing — the image is whole.
+        'If mapping the LUN or saving the iSCSI configuration fails once the image is written and verified, the '
+        + 'image, its backstore and its backing are kept and the job says what to do: a LUN that is live but not '
+        + 'saved needs any iSCSI change before the target service restarts.',
       ],
     })) {
       return reply
@@ -2957,8 +2976,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       'backup.restore.image',
       { ...identity, params: auditParams },
       // NO `withIscsiLock` here: `runNewLunImageRestore` OWNS the lock for this
-      // operation and takes it only for its short targetcli sections (create+map
-      // the LUN, the final saveconfig, and any cleanup undo), leaving it released
+      // operation and takes it only for its short targetcli sections (create
+      // the backstore; map + grant + saveconfig once the image is complete; any
+      // cleanup undo), leaving it released
       // across the image stream, which can run for hours. Wrapping the call would
       // both hold the node's only iSCSI mutex for that whole time and deadlock
       // against the service's own acquisitions (the mutex is a plain chain, not
@@ -3000,6 +3020,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
               }
               return (await reverify(spec, pre.bound)).object.target
             },
+            // cr3.lunrestore: once the backstore exists — the map's re-read.
+            refreshAfterCreate: async () => (await reverify(afterCreateSpec, pre.bound)).object,
+            // cr3.lunrestore (D2/D4/N1): the live tree with no gate — the
+            // cleanup proves a backstore is this run's before it deletes it.
+            readLive: async () => readIscsiState(executor, iscsiPaths),
             name: newLun.name,
             backing: fresh.ok.backing,
             ...(fresh.ok.ahr ? { ahr: { fstabPath, pool: fresh.ok.ahr } } : {}),
@@ -3010,13 +3035,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
               configfsRoot: iscsiPaths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
               progress: ctx.updateProgress,
             },
-            // cr.38: the keys go back the moment the LUN is mapped, and are
-            // taken again before a failed run's undo unmaps it.
-            mapped: ctx.release,
-            beforeUndo: ctx.reacquire,
+            // cr.38 / cr3.lunrestore: the keys go back the moment the
+            // backstore exists (its claim holds the backing from there), and
+            // are taken again before the map and before a failed run's undo.
+            release: ctx.release,
+            reacquire: ctx.reacquire,
             // cr3.backup (iSCSI review): what saveconfig.json holds, for the
             // failed run's cleanup to learn whether another verb's save
-            // persisted this half-written LUN while the lock was released.
+            // persisted this run's backstore while the lock was released.
             // An ABSENT file has saved nothing (empty list); one that cannot
             // be read or parsed is unknown (null), never "not there".
             persistedBackstores: async () => {
@@ -3037,14 +3063,16 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         })
       }),
       // cr.33 (§4.3): a restore is a data mover — the long lane. cr.38 session
-      // B (cr.40's intent): it holds the target's key (`iscsi-target:<iqn>`)
-      // from its re-read of the target until the LUN is MAPPED — the index and
-      // the ACL grants it maps with are read under it — and gives it back for
-      // the image stream (`mapped`), so a verb on a target that stays online
-      // (adding an ACL, deleting another LUN) waits only until the map, never
-      // for the hours the image takes. A failed run takes the key again before
-      // its undo unmaps the LUN (`beforeUndo`). cr.54: plus the new backing's
-      // own keys (the spec's `locks`), on the same release/reacquire.
+      // B (cr.40's intent), reordered by cr3.lunrestore: it holds the target's
+      // key (`iscsi-target:<iqn>`) from its re-read of the target until the
+      // BACKSTORE exists, gives it back for the image stream (`release`), so a
+      // verb on a target that stays online (adding an ACL, deleting another
+      // LUN) never waits for the hours the image takes, and takes it again
+      // (`reacquire`) before the map — the index and the ACL grants it maps
+      // with are read under it — or before a failed run's undo. cr.54: plus the
+      // new backing's own keys (the spec's `locks`), on the same
+      // release/reacquire; while they are released the unmapped backstore's
+      // claim is what refuses a dataset or pool verb on the backing.
       { lane: 'long', locks: pre.locks },
     )
 

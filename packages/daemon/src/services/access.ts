@@ -24,7 +24,7 @@ import { parseDatasetGet, parseZfsList, zfsListArgs } from '../parsers/zfs-list.
 import { ahrPoolClaims, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
 import { mountedSubvolume, mountRowOf, nestedSubvolumes, notChangedList, subvolumeRelPath, walkScopeFrom } from './access-walk.js'
-import { heldByLunOnce } from './iscsi-held.js'
+import { heldByLunOnce, heldHolderPhrase } from './iscsi-held.js'
 import { probeMount } from './mounts.js'
 import { isProbeableKind, kindOfMount, mountIndex, normalizePath } from './nested-filesystems.js'
 import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from './pve-footprint.js'
@@ -1192,7 +1192,7 @@ export function createAccessService(opts: AccessServiceOptions) {
       warnings.push('On a Hybrid RAID pool it sweeps every subvolume under the pool\'s data as one tree; the pool\'s snapshots are not touched.')
     const held = await heldByLunOnce(executor, { path: dir }, iscsiPaths)
     if (held)
-      warnings.push(`The walk includes the image of iSCSI LUN ${held.index} '${held.name}' of target ${held.targetIqn} (${held.backingPath}): its owner, mode and ACL change, its contents do not.`)
+      warnings.push(`The walk includes the image of ${held.unmapped === true ? heldHolderPhrase(held) : `iSCSI LUN ${held.index} '${held.name}' of target ${held.targetIqn}`} (${held.backingPath}): its owner, mode and ACL change, its contents do not.`)
     warnings.push('The current permissions are not recorded anywhere, so this cannot be undone.')
     const params: Record<string, unknown> = t.kind === 'zfs'
       ? { dataset: t.dataset }

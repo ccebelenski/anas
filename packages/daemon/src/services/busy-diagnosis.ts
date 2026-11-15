@@ -3,7 +3,7 @@ import type { ConfigfsOptions, LunHolder } from './iscsi-configfs.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { zvolDevicePath } from '@anas/shared'
-import { describeLunHolder, lunHoldingDevice } from './iscsi-configfs.js'
+import { describeLunHolder, describeUnmappedHolder, lunHoldingDevice, unmappedBackstoreHoldingDevice } from './iscsi-configfs.js'
 
 /**
  * Busy-unmount root-cause diagnosis (story 3.29, docs/EPICS-HISTORY.md Epic 3;
@@ -279,6 +279,31 @@ export async function diagnoseLunHolder(
 }
 
 /**
+ * cr3.lunrestore (review N7): the same candidates as {@link diagnoseLunHolder},
+ * asked of the backstores no LUN maps. Fail-open: null.
+ */
+export async function diagnoseUnmappedHolder(
+  errorText: string,
+  path?: string,
+  opts?: BusyDiagnosisOptions,
+): Promise<{ backstoreName: string, plugin: string, backingPath: string } | null> {
+  const dataset = opts?.dataset ?? extractBusyDataset(errorText)
+  for (const candidate of [path, extractBusyPath(errorText), dataset ? zvolDevicePath(dataset) : null]) {
+    if (!candidate)
+      continue
+    try {
+      const holder = await unmappedBackstoreHoldingDevice(candidate, opts)
+      if (holder)
+        return holder
+    }
+    catch {
+      // Unreadable configfs — fall through, as the LUN branch does.
+    }
+  }
+  return null
+}
+
+/**
  * The wire-up entry point. Given a surfaced error and (optionally) the known
  * target path, append the holder clause IFF the error is a busy failure AND a
  * holder is found. In every other case the original error text is returned
@@ -307,6 +332,10 @@ export async function enrichBusyError(
   const lun = await diagnoseLunHolder(errorText, path, opts)
   if (lun)
     return `${errorText} — ${describeLunHolder(lun)}`
+  // cr3.lunrestore (review N7): a backstore no LUN maps holds the object too.
+  const unmapped = await diagnoseUnmappedHolder(errorText, path, opts)
+  if (unmapped)
+    return `${errorText} — ${describeUnmappedHolder(unmapped)}`
   const target = path ?? extractBusyPath(errorText)
   if (!target)
     return errorText

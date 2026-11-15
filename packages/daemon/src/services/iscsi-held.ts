@@ -17,7 +17,10 @@
  *
  *  1. **One source.** Everything is derived from `iscsiClaims()` — the same
  *     configfs-derived read `GET /v1/iscsi/claims` serves. No second reader, no
- *     second phrasing (the holder sentence comes from `describeLunHolder`).
+ *     second phrasing (the holder sentence comes from `describeLunHolder`, or
+ *     `describeUnmappedHolder` for a backstore no LUN maps — cr3.lunrestore:
+ *     LIO holds the object because the backstore exists, GT-40, and a new-LUN
+ *     restore keeps such a backstore for its whole stream).
  *  2. **Cached per request, never across requests.** A list endpoint asks once
  *     and answers for every row; the next request reads again. There is no
  *     shadow state and no TTL cache to go stale (Principle 11) — a LUN added a
@@ -169,6 +172,17 @@ export function claimHoldsSubject(claim: IscsiClaim, subject: HeldByLunSubject):
 
 /** The wire shape, reduced from the claim. One sentence, one source. */
 export function toHeldByLun(claim: IscsiClaim): IscsiHeldByLun {
+  if (claim.unmapped === true) {
+    // cr3.lunrestore: a backstore no LUN maps — no target, no index.
+    return {
+      unmapped: true,
+      ...(claim.plugin !== undefined ? { plugin: claim.plugin } : {}),
+      name: claim.backstoreName,
+      backingPath: claim.backingPath,
+      connectedInitiators: [],
+      detail: claim.detail,
+    }
+  }
   return {
     targetIqn: claim.targetIqn,
     index: claim.lunIndex,
@@ -179,6 +193,19 @@ export function toHeldByLun(claim: IscsiClaim): IscsiHeldByLun {
     ...(claim.connectedInitiatorsUnknown === true ? { connectedInitiatorsUnknown: true } : {}),
     detail: claim.detail,
   }
+}
+
+/**
+ * The holder named in a sentence that is not the refusal itself (a confirm's
+ * disclosure, a repair's advice, a permission walk's warning) — cr3.lunrestore:
+ * "iSCSI LUN 2 ('vmdisk') of target <iqn>" for a mapped LUN, and "iSCSI
+ * backstore 'newvol', which is not mapped as a LUN" for an unmapped one, so no
+ * caller ever prints a LUN number or a target that does not exist.
+ */
+export function heldHolderPhrase(held: Pick<IscsiHeldByLun, 'unmapped' | 'index' | 'name' | 'targetIqn'>): string {
+  return held.unmapped === true
+    ? `iSCSI backstore '${held.name}', which is not mapped as a LUN`
+    : `iSCSI LUN ${held.index} ('${held.name}') of target ${held.targetIqn}`
 }
 
 /**
@@ -377,6 +404,25 @@ export function heldByLunRefusal(
   action: string,
   held: IscsiHeldByLun,
 ): HeldByLunRefusal {
+  if (held.unmapped === true) {
+    // cr3.lunrestore: a backstore no LUN maps. No initiator can see it, but
+    // LIO holds the object all the same (GT-40), and its content may be half
+    // an image. ANAS has no verb for a backstore no LUN maps, so the way out
+    // is targetcli's own delete (the parent form GT-42 proves).
+    const command = held.plugin !== undefined
+      ? `'targetcli /backstores/${held.plugin} delete ${held.name}'`
+      : `targetcli (backstore '${held.name}')`
+    return {
+      reason: 'held-by-lun',
+      message: `${action} ${what} is refused: it is ${held.detail}. `
+        + `Nothing underneath stops this on its own — the operation would either fail with a bare 'busy' error or succeed silently under a backstore that still has the object open. `
+        + `A backstore no LUN maps is what a restore as a new LUN holds while it writes the image (it is mapped once the image is complete), `
+        + `or what an interrupted restore or a LUN removed by hand left behind; its content may be incomplete. `
+        + `If no restore is running, delete it with ${command}, then retry. `
+        + `This refusal has no confirm bypass.`,
+      heldByLun: held,
+    }
+  }
   const sessions = held.connectedInitiators.length
   // The unknown-session clause rides `held.detail` (the claim's one
   // sentence) — said once there, never again here (cr3 review 2, L2).

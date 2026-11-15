@@ -1,4 +1,4 @@
-import type { IscsiAclRequest, IscsiClaimList, IscsiLun, IscsiTargetDetail } from '@anas/shared'
+import type { IscsiAclRequest, IscsiClaimList, IscsiLun, IscsiRestoreMarkState, IscsiTargetDetail } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
@@ -6,7 +6,9 @@ import type { ConfirmStore } from '../safety/confirm.js'
 import type { Gate, GuardReads } from '../safety/guard.js'
 import type { IscsiState, TargetObject } from '../services/iscsi-guard.js'
 import type { IscsiBackstoreAttributes, IscsiMutateOptions, IscsiRefusal, ResolvedAhrPool } from '../services/iscsi-mutate.js'
+import type { IscsiRepairItem, IscsiRepairPlan } from '../services/iscsi-repair.js'
 import type { IscsiPaths } from '../services/iscsi.js'
+import type { RestoreMarkRead } from '../services/restore-mark.js'
 import {
   aclAuthRequirement,
   aclSatisfiesAuth,
@@ -55,7 +57,7 @@ import {
   assertPersistedReadable,
   assertSaveable,
   backingPathRefusal,
-  claimsFromTargets,
+  claimsFromState,
   createIscsiTarget,
   createSparseImage,
   deleteIscsiLun,
@@ -85,6 +87,7 @@ import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
 import { assertRepairable, guardRepairPlan, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { iscsiAvailability, targetTpgs } from '../services/iscsi.js'
+import { clearMarkCommand, clearRestoreMark, describeMarkSet, describeRestoreMark, enableMarkVerdict, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkRefusal, restoreMarkState } from '../services/restore-mark.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -242,6 +245,28 @@ async function removeOrphanedBackstore(executor: CommandExecutor, plugin: string
 }
 
 /**
+ * What a restore mark says about a hole's backing, as a clause for the Repair
+ * refusal (cr3.lunrestore, review2 E): no leading capital, no stop.
+ */
+function repairMarkClause(read: RestoreMarkRead, state: IscsiRestoreMarkState, running: string | undefined): string {
+  if (read.state === 'unknown')
+    return `ANAS could not read the restore mark on ${read.dataset} (${read.reason}), so it cannot tell whether it holds a partially restored image`
+  if (state === 'in-progress')
+    return `a whole-image restore is writing it right now (job ${running})`
+  if (read.state !== 'present')
+    return 'it carries a restore mark'
+  const what = describeRestoreMark(read)
+  return state === 'unverified'
+    ? `${what} wrote ${read.dataset}, and the client reported the image complete, but its size was not verified${read.mark?.reason ? ` (${read.mark.reason})` : ''}`
+    : `${what} onto ${read.dataset} did not finish, so it holds a partial image`
+}
+
+/** An error's message, or the thing thrown. */
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+/**
  * Send an `IscsiRefusal` as a 409 with no confirm code (Principle 14, Level 1).
  * Always called as `return sendRefusal(...)` from a handler (cr3: no helper
  * sends one on a caller's behalf any more), so the request is answered once.
@@ -255,6 +280,61 @@ function sendRefusal(reply: FastifyReply, refusal: IscsiRefusal): FastifyReply {
 export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMutateRouteOptions) {
   const { executor, jobQueue, confirmStore, fstabPath = '/etc/fstab', ...paths } = opts
   const configfsRoot = paths.configfsRoot ?? CONFIGFS_TARGET_ROOT
+  /** cr3.lunrestore (review2 D): what the job records say about a backing. */
+  const restoreJobs = restoreJobsOf(jobQueue)
+
+  /**
+   * cr3.lunrestore (review D5 d): Repair re-creates a saved LUN over its
+   * backing; a backing whose volume carries a restore mark (or whose mark
+   * cannot be read) would be served with a partial image, so that hole moves
+   * to `blocked` with the mark's sentence.
+   */
+  async function markRepairPlan(plan: IscsiRepairPlan): Promise<IscsiRepairPlan> {
+    const repairable: IscsiRepairItem[] = []
+    const blocked = [...plan.blocked]
+    // review2 (7): every hole's mark in one command.
+    const reads = await readRestoreMarksBatch(executor, plan.repairable.map(i => i.backingPath))
+    for (const item of plan.repairable) {
+      // review2 E: the mark's state rides the item (`restoreMark`), and the
+      // refusal's sentence is built from it in `assertRepairable`.
+      const read = reads.get(item.backingPath)!
+      const running = restoreJobs.restoreRunning(item.backingPath)
+      const state = restoreMarkState(read, running)
+      if (state === null) {
+        repairable.push(item)
+        continue
+      }
+      blocked.push({ ...item, restoreMark: state, restoreMarkDataset: read.state === 'present' || read.state === 'unknown' ? read.dataset : null, blockedReason: repairMarkClause(read, state, running) })
+    }
+    return { repairable, blocked }
+  }
+
+  /**
+   * cr3.lunrestore (review D5 d): an edit that ADDS an initiator ACL grants
+   * every LUN of the target to it — a LUN whose volume carries a restore mark
+   * (a partial or unverified image) would reach a new initiator. Refused while
+   * any LUN is marked, or its mark cannot be read; at the route and again in
+   * the job (it is a gate).
+   */
+  function restoreMarkAclGate(acls: { initiatorIqn: string }[] | undefined): Gate<TargetObject> {
+    return async ({ target }) => {
+      const have = new Set(target.acls.map(a => a.initiatorIqn))
+      if (!acls || !acls.some(a => !have.has(a.initiatorIqn)))
+        return null
+      // review2 F2/D: a restore RUNNING onto a LUN refuses until it ends (no
+      // "did not finish" while it is still writing), and an image file's
+      // retained failed restore refuses like a mark.
+      for (const f of await readLunMarks(executor, targetTpgs(target).flatMap(g => g.luns), { ...restoreJobs, targetIqn: target.iqn })) {
+        const refused = restoreMarkRefusal(f.read, `LUN ${f.index} ('${f.name}') of ${target.iqn}`, 'Adding an initiator to this target', {
+          mark: 'Enable on the target asks you to confirm and accept that image (which removes the mark), or restore the image again; then add the initiator.',
+          job: 'Enable on the target asks you to confirm and accept that image; add the initiator after that, or after the image is restored again.',
+        }, f)
+        if (refused)
+          return conflict(refused)
+      }
+      return null
+    }
+  }
 
   /** The mutation context every sequence gets: executor, configfs root, progress. */
   function mutateOptions(progress?: (m: string) => void): IscsiMutateOptions {
@@ -434,7 +514,7 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         scope: updateSessionScope(req),
         scopeLabels: UPDATE_SESSION_SCOPE_LABELS,
       }),
-      gates: [saveableGate, foreignGate, updateSessionsReadableGate(req)],
+      gates: [saveableGate, foreignGate, updateSessionsReadableGate(req), restoreMarkAclGate(req.acls)],
       locks: async () => [iscsiTargetClaim(iqn)],
     }
     const pre = await guardCheck(spec)
@@ -618,7 +698,7 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     // STATE_CHANGED), and the "already in that state" gate runs at both doors.
     const spec = {
       operation: `iscsi.target.${action}`,
-      object: targetView(guardDeps, iqn, { seed: state }),
+      object: targetView(guardDeps, iqn, { seed: state, scopeLabels: { marks: 'what ANAS knows about the restored images on its LUNs' } }),
       gates: [saveableGate, foreignGate, notAlreadyGate(action)],
       locks: async () => [iscsiTargetClaim(iqn)],
     }
@@ -626,6 +706,42 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if ('refusal' in pre)
       return sendGuardRefusal(reply, pre.refusal)
     const target = pre.object.target
+
+    // cr3.lunrestore (review D5 b): Enable serves every LUN of the target, so a
+    // LUN whose volume carries a restore mark is asked about first — refused
+    // while the restore runs or when the mark cannot be read, and behind a
+    // confirm when the restore did not finish. The confirm binds the marks it
+    // showed (`<dataset>=<value>`); the job re-reads them under the lock.
+    //
+    // review2 D: an image FILE carries no mark, so its LUN is judged from this
+    // daemon's job records — a restore running onto it refuses, and a retained
+    // failed restore is behind the same confirm (bound by the job id). That
+    // knowledge is gone after a restart of the ANAS daemon; the confirm says so.
+    const factsOf = (t: IscsiTargetDetail) => readLunMarks(executor, targetTpgs(t).flatMap(g => g.luns), { ...restoreJobs, targetIqn: iqn })
+    let acceptedMarks: string[] = []
+    /** review3 4: what the accepted confirm was about — restore marks, job records of image files, or both. */
+    let accepted = { marks: false, jobs: false }
+    if (action === 'enable') {
+      const verdict = enableMarkVerdict(iqn, await factsOf(target))
+      if (verdict.kind === 'refuse')
+        return sendRefusal(reply, { reason: verdict.reason, message: verdict.message })
+      if (verdict.kind === 'confirm') {
+        acceptedMarks = markSignature(verdict.marks)
+        accepted = { marks: verdict.marks.some(f => f.read.state === 'present'), jobs: verdict.marks.some(f => f.read.state !== 'present' && f.record !== undefined) }
+        if (!guardConfirm(confirmStore, request, reply, spec, pre, {
+          validated: { target: iqn, action },
+          address: ['target'],
+          // review2 F: the marks are bound as a scope the confirm alone holds
+          // (the job compares them its own way, below), described in words —
+          // a CONFIRM_SCOPE_CHANGED names the two sets, never their JSON.
+          confirmScope: { marks: describeMarkSet(verdict.marks) },
+          message: verdict.message,
+          warnings: verdict.warnings,
+        })) {
+          return reply
+        }
+      }
+    }
 
     // `disable` refuses NEW logins; the portal socket stays open and an
     // established session keeps running (GT-37). Saying so is the difference
@@ -641,8 +757,58 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       `iscsi.target.${action}`,
       { ...identity, params: { target: iqn } },
       iscsiGuarded(spec, pre, async ({ target: now }, ctx) => {
-        const result = await setIscsiTargetState(mutateOptions(ctx.updateProgress), now, action)
-        return { ...result, warnings }
+        const removed: string[] = []
+        if (action === 'enable') {
+          // cr3.lunrestore (review D5 c, R8): the marks again, under the lock,
+          // when the job runs — an enable queued before a restore started (or
+          // before it failed) must not serve the half-written LUN.
+          const verdict = enableMarkVerdict(iqn, await factsOf(now))
+          if (verdict.kind === 'refuse')
+            throw new GuardRefusalError(conflict({ reason: verdict.reason, message: `${verdict.message} Nothing was enabled.` }))
+          const seen = verdict.kind === 'confirm' ? markSignature(verdict.marks) : []
+          if (seen.join('\n') !== acceptedMarks.join('\n')) {
+            // review2 D5-file: an Enable accepted before a file restore failed
+            // part-way finds the job's record here and enables nothing.
+            const onlyMarks = verdict.kind === 'confirm' && verdict.marks.every(f => f.read.state === 'present')
+            throw new GuardRefusalError({
+              status: 409,
+              code: 'STATE_CHANGED',
+              message: verdict.kind === 'confirm'
+                ? `${onlyMarks ? `A restore mark on ${iqn} is not the one this enable was accepted for` : `What ANAS knows about the restored images on ${iqn} is not what this enable was accepted for`}: `
+                + `${verdict.warnings.join(' ')} Nothing was enabled; enable the target again to see what it says.`
+                : accepted.jobs
+                  // review3 4: an image file carries no mark — its record no longer applies.
+                  ? `What this enable was confirmed for on ${iqn} (${accepted.marks ? 'the restore marks and ' : ''}the job records of `
+                  + `failed restores onto image files) no longer applies; nothing was enabled — enable the target again.`
+                  : `The restore marks this enable was confirmed for are gone; nothing was enabled — enable the target again.`,
+            })
+          }
+          // The confirm accepted these images as they are: the marks go, then
+          // the target is enabled. A mark that cannot be removed enables nothing.
+          for (const f of verdict.kind === 'confirm' ? verdict.marks : []) {
+            if (f.read.state === 'present') {
+              ctx.updateProgress(`removing the restore mark from ${f.read.dataset} (accepted by the confirm)`)
+              try {
+                await clearRestoreMark(executor, f.read.dataset)
+              }
+              catch (err) {
+                throw new Error(`${errorText(err)}. Nothing was enabled${removed.length ? `; the restore mark was removed from ${removed.join(', ')}` : ''}.`)
+              }
+              removed.push(f.read.dataset)
+            }
+          }
+        }
+        try {
+          const result = await setIscsiTargetState(mutateOptions(ctx.updateProgress), now, action)
+          return { ...result, warnings }
+        }
+        catch (err) {
+          // review2 F: the marks the confirm accepted are already gone; say so.
+          if (removed.length === 0)
+            throw err
+          throw new Error(`The restore mark was removed from ${removed.join(', ')}, as the confirm accepted, but enabling `
+            + `${iqn} then failed: ${errorText(err)}`)
+        }
       }),
       { locks: pre.locks },
     )
@@ -752,14 +918,45 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
             return { refusal: unsafeZvol }
           // Every TPG of every target (cr3, ISCSI-H2 review): a zvol exported
           // only by a foreign target's second TPG is exported all the same.
-          if (o.state.targets.some(t => targetTpgs(t).some(g => g.luns.some(l => l.backingPath === path)))) {
+          // cr3.lunrestore (review D1): and a backstore NO LUN maps holds the
+          // device too — a restore as a new LUN writing into it, or one left
+          // behind — so the question is the claims', not the LUN list's.
+          const holder = claimsFromState(o.state.ctx, o.state.targets).find(c => c.backingPath === path)
+          if (holder) {
+            // review2 F: a restore writing into it now is named, and the
+            // operator is not told to delete what it is writing; either
+            // sentence ends with its stop.
+            const writing = holder.unmapped === true ? restoreJobs.restoreRunning(path) : undefined
             return {
-              refusal: {
-                reason: 'backing-already-mapped',
-                message: `${path} is already exported as a LUN on this node — exporting one block device through two LUNs invites two initiators to write to it at once`,
-              },
+              refusal: holder.unmapped === true
+                ? {
+                    reason: 'backing-held-by-backstore',
+                    message: writing
+                      ? `${path} is ${holder.detail}: a whole-image restore as a new LUN is writing the image into it right now `
+                      + `(job ${writing}). A second backstore over the same device would serve that image to initiators, so adding it `
+                      + `as a LUN is refused while the restore runs; when it ends, the restore maps it as a LUN itself or says why it did not.`
+                      : `${path} is ${holder.detail}: a restore as a new LUN may have left it behind, or it was made by hand. A second `
+                        + `backstore over the same device would serve the same image to initiators. Delete the backstore with `
+                        + `'targetcli /backstores/${holder.plugin ?? 'block'} delete ${holder.backstoreName}', then retry.`,
+                  }
+                : {
+                    reason: 'backing-already-mapped',
+                    message: `${path} is already exported as a LUN on this node — exporting one block device through two LUNs invites two initiators to write to it at once`,
+                  },
             }
           }
+          // cr3.lunrestore: a volume carrying a restore mark holds a partial
+          // (or unverified) image; a mark that cannot be read is not "none".
+          // review2 (9): the volume is named from the path, as the writer names it.
+          const markOn = markDataset(path) ?? path
+          const marked = restoreMarkRefusal(
+            await readRestoreMark(executor, { path }),
+            `volume ${markOn}`,
+            'Adding it as a LUN',
+            `If you accept its content, clear the mark with '${clearMarkCommand(markOn)}' and add the LUN again; otherwise destroy the volume and restore the image as a new LUN.`,
+          )
+          if (marked)
+            return { refusal: marked }
           return { ok: { path, plugin: 'block' as const, ...(resolved.ok.dataset ? { dataset: resolved.ok.dataset } : {}), size: null } }
         }
         const dir = await resolveFileBackingDir(executor, req.backing, o.state.ctx)
@@ -799,7 +996,7 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     const spec = {
       operation: 'iscsi.lun.add',
       object: targetView(guardDeps, iqn, { seed: state, revision: false }),
-      gates: [saveableGate, foreignGate, lunNameFreeGate(req.name), backingGate],
+      gates: [saveableGate, foreignGate, lunNameFreeGate(req.name, restoreJobs.restoreRunning), backingGate],
       // §4.2 + cr.63 (review L17): the target's key, and the BACKING's keys
       // shared — the zvol's dataset keys, or the keys of the filesystem the
       // image lands on — so a dataset destroy, a pool export or destroy, an
@@ -1347,11 +1544,11 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (unreadable)
       return sendRefusal(reply, unreadable)
 
-    const plan = await guardRepairPlan(
+    const plan = await markRepairPlan(await guardRepairPlan(
       planIscsiRepair(state.ctx, state.health, state.targets),
       state.ctx.live,
       statDeviceFrom(paths),
-    )
+    ))
     const refusal = assertRepairable(plan)
     if (refusal) {
       // cr.64b2-iii (I): when THIS request's read just quarantined a
@@ -1388,11 +1585,11 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         const freshUnreadable = assertPersistedReadable(fresh.ctx)
         if (freshUnreadable)
           throw new GuardRefusalError(conflict(freshUnreadable))
-        const freshPlan = await guardRepairPlan(
+        const freshPlan = await markRepairPlan(await guardRepairPlan(
           planIscsiRepair(fresh.ctx, computeIscsiHealth(fresh.ctx, fresh.targets), fresh.targets),
           fresh.ctx.live,
           statDeviceFrom(paths),
-        )
+        ))
         return repairIscsiHoles(mutateOptions(updateProgress), freshPlan)
       }),
       // cr.40 (§4.2): the keys of every target and LUN the request's plan
@@ -1415,7 +1612,8 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     const state = await readIscsiState(executor, paths)
     const result: IscsiClaimList = {
       ...iscsiAvailability(state.ctx),
-      claims: claimsFromTargets(state.targets),
+      // cr3.lunrestore: and every backstore no LUN maps, which holds its backing just the same.
+      claims: claimsFromState(state.ctx, state.targets),
     }
     return { data: result }
   })

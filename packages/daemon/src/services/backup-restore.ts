@@ -3,18 +3,26 @@ import type {
   BackupRepo,
   BackupSnapshot,
   CreateDatasetRequest,
+  ImageRestoreFailureCode,
   IscsiLun,
   IscsiSession,
   IscsiTargetDetail,
 } from '@anas/shared'
 import type { CommandExecutor, ExecStreamResult, ExecStreamTarget } from '../executor/types.js'
+import type { TargetObject } from './iscsi-guard.js'
 import type { IscsiMutateOptions, ResolvedBacking } from './iscsi-mutate.js'
+import type { IscsiReadContext } from './iscsi.js'
+import type { RestoreMarkRead } from './restore-mark.js'
 import { constants } from 'node:fs'
 import { stat, unlink } from 'node:fs/promises'
+import { RESTORE_MARK_PROPERTY } from '@anas/shared'
+import { StreamFlushError, StreamNotStartedError } from '../executor/stream-errors.js'
 import { buildCreateArgs } from '../routes/datasets.js'
 import { ensureAhrTargetOrdering } from './ahr-create.js'
 import { classifyPermissionFailure, PBC, pbcPositional, withStateLeftBehind } from './backup-runner.js'
-import { createAndMapLun, createSparseImage, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
+import { aclNamesRefusal, createLunBackstore, createSparseImage, mapLunIntoTarget, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
+import { normalizePlugin } from './iscsi.js'
+import { capitalize, clearMarkCommand, clearRestoreMark, describeRestoreMark, fileRestoreAgain, JOB_RECORD_LIFETIME, markDataset, putBackRestoreMark, readRestoreMark, setRestoreMark, unverifiedMark, writingMark } from './restore-mark.js'
 import { maskSecretValues } from './secret-argv.js'
 
 /**
@@ -181,6 +189,9 @@ const PROGRESS_RE = /^progress\s+(\d+)%\s*\((.*)\)\s*$/
 const COMPLETE_RE = /^restore complete\s*\((.*)\)\s*$/
 /** Trailing padding spaces pbc puts on every line. */
 const TRAILING_WS_RE = /\s+$/
+/** The amount processed, at the start of a progress line's parenthesis: `43.939 MiB of 250.001 MiB in 16.1s` (GT-59). */
+const PROCESSED_RE = /^(\d+)(?:\.(\d+))?\s*(B|KiB|MiB|GiB|TiB|PiB)\s+of\s/
+const UNIT_BYTES: Record<string, number> = { B: 1, KiB: 2 ** 10, MiB: 2 ** 20, GiB: 2 ** 30, TiB: 2 ** 40, PiB: 2 ** 50 }
 
 export interface RestoreProgress {
   /** The last percentage pbc reported, or null when it printed none. */
@@ -189,6 +200,29 @@ export interface RestoreProgress {
   lastLine: string | null
   /** pbc's own `restore complete (…)` line, when it printed one. */
   complete: string | null
+  /**
+   * A LOWER BOUND on the bytes the last progress line says were processed
+   * (`1 MiB of 512 GiB` — review3 3: a `progress 0%` line on a large image
+   * still names an amount), its display rounding taken off. Absent when that
+   * line names none.
+   */
+  processedBytes?: number
+}
+
+/**
+ * The lower bound of an amount pbc printed: it shows at most three decimals
+ * and drops trailing zeros (`250.001 MiB`, `3.1 MiB/s`, `512 MiB` for exactly
+ * 536870912 bytes — the captures in `fixtures/backup/`), so half of 0.001 of
+ * the unit comes off; a plain `B` count is exact.
+ */
+function processedLowerBound(inner: string): number | undefined {
+  const m = inner.match(PROCESSED_RE)
+  if (!m)
+    return undefined
+  const shown = Number(`${m[1]}.${m[2] ?? '0'}`)
+  if (m[3] === 'B')
+    return Math.floor(shown)
+  return Math.max(0, Math.floor((shown - 0.0005) * UNIT_BYTES[m[3]]))
 }
 
 /** How many image bytes reached the target, and whether that number is exact. */
@@ -221,8 +255,14 @@ export function imageBytesWritten(
     return { bytes: descriptorBytes, estimated: false }
   if (exitCode === 0 && progress.complete)
     return { bytes: imageSize, estimated: false }
-  if (progress.percent !== null && progress.percent > 0)
-    return { bytes: Math.floor((progress.percent / 100) * imageSize), estimated: true }
+  if (progress.percent !== null) {
+    // review3 3: the amount on the line counts too — `progress 0% (1 MiB of
+    // 512 GiB in 6.0s)` is 1 MiB written, never 0.
+    const byPercent = Math.floor((progress.percent / 100) * imageSize)
+    const bytes = Math.min(imageSize, Math.max(byPercent, progress.processedBytes ?? 0))
+    if (bytes > 0)
+      return { bytes, estimated: true }
+  }
   return { bytes: 0, estimated: false }
 }
 
@@ -243,6 +283,11 @@ export function parseRestoreProgress(stderr: string): RestoreProgress {
     if (p) {
       progress.percent = Number(p[1])
       progress.lastLine = line
+      const processed = processedLowerBound(p[2])
+      if (processed === undefined)
+        delete progress.processedBytes
+      else
+        progress.processedBytes = processed
       continue
     }
     const c = line.match(COMPLETE_RE)
@@ -266,6 +311,35 @@ const NO_ARCHIVE_RE = /archive not found in manifest/i
 const BAD_SUFFIX_RE = /failed to parse archive type/i
 const NO_PERM_RE = /no permissions on/i
 const BROKEN_PIPE_RE = /broken pipe|connection closed/i
+
+/**
+ * The lines pbc prints when it fails BEFORE it fetches any data (review3 3),
+ * each anchored to one whole line of stderr (trimmed, its padding off). The
+ * captures they come from: `fixtures/backup/restore-failure-taxonomy.txt`
+ * (F1-F5, F10, F11 are `restore` runs; 21-connect A and D are `snapshot list`)
+ * and `fixtures/backup/backup-failure-taxonomy.txt` (CASE 4 and 7, `snapshot
+ * list`).
+ */
+const PREWRITE_LINE_RES: readonly RegExp[] = [
+  /^Error: snapshot \S+ does not exist\.$/, // F1, F2, F3 (restore)
+  /^Error: archive not found in manifest$/, // F4 (restore)
+  /^Error: failed to parse archive type for '[^']*'$/, // F5 (restore)
+  /^Error: no permissions on \S+$/, // F11 (restore)
+  /^Error: permission check failed\.$/, // CASE 4 (snapshot list)
+  /^Error: permission check failed - missing \S+ on \S+$/, // CASE 7 (snapshot list)
+  /^Error: client error \(Connect\)$/, // F10 (restore); 21-connect A, C, D
+  /^error connecting to \S+ - tcp connect error: Connection refused \(os error 111\)$/, // F10 (restore)
+  /^error connecting to \S+ - dns error: .+$/, // 21-connect A (snapshot list)
+  /^WARNING: certificate fingerprint does not match expected fingerprint!$/, // 21-connect D (snapshot list)
+  /^certificate validation failed - Certificate fingerprint was not confirmed\.$/, // 21-connect D
+  /^\d+: error:[0-9A-F]+:SSL routines:[^:]*:certificate verify failed:/, // 21-connect D
+]
+
+/** Lines that say nothing either way, from the same captures (`Caused by:`, the pinned fingerprint). */
+const NEUTRAL_LINE_RES: readonly RegExp[] = [
+  /^Caused by:$/,
+  /^expected:\s+[0-9a-f]{2}(?::[0-9a-f]{2})+$/,
+]
 
 /**
  * The `Error:` line to quote in a failure detail — RAW, on purpose.
@@ -328,6 +402,83 @@ export function explainRestoreFailure(stderr: string, signal?: string, secretVal
   // classification above reads the RAW text and is untouched. A masked value
   // under four characters, or no values at all, is a no-op.
   return maskSecretValues(rawExplainRestoreFailure(stderr, signal), secretValues)
+}
+
+/**
+ * Did the client fail BEFORE it could write a byte of the image (cr3.lunrestore,
+ * review2 B, review3 3)? Only the failures pbc reports before it fetches any
+ * data count: the server not reached (refused, a name that did not resolve, a
+ * failed connect), a certificate that does not match, a rejected credential or
+ * missing privileges, a snapshot or archive that does not exist, a wrong
+ * archive name — each as the WHOLE line pbc prints ({@link PREWRITE_LINE_RES}).
+ *
+ * Anything that may have written wins over a pre-write line: a signal, any
+ * progress or `restore complete` line (the stream started), a dropped
+ * connection or a timeout anywhere in the text, and any line that is neither a
+ * pre-write line nor a known neutral one (unclassified). "Nothing written"
+ * needs at least one pre-write line and nothing else.
+ */
+export function failedBeforeWriting(stderr: string, signal?: string): boolean {
+  if (signal)
+    return false
+  if (DEADLINE_RE.test(stderr) || BROKEN_PIPE_RE.test(stderr))
+    return false
+  let preWrite = false
+  for (const raw of stderr.split(LINE_SPLIT_RE)) {
+    const line = raw.replace(TRAILING_WS_RE, '').trim()
+    if (!line)
+      continue
+    if (PROGRESS_RE.test(line) || COMPLETE_RE.test(line))
+      return false
+    if (PREWRITE_LINE_RES.some(re => re.test(line))) {
+      preWrite = true
+      continue
+    }
+    if (!NEUTRAL_LINE_RES.some(re => re.test(line)))
+      return false
+  }
+  return preWrite
+}
+
+/**
+ * Why an exit-0 stream is not proof of the whole image (review3 6), or null:
+ * the descriptor count when it moved and is not the image's size; otherwise
+ * the client did not print its `restore complete` line, and ANAS cannot count
+ * what the client wrote through its own descriptor (live-proof wave 2).
+ */
+function exitZeroCountGap(descriptorBytes: number, counted: number, imageSize: number, path: string): string | null {
+  if (counted === imageSize)
+    return null
+  if (descriptorBytes > 0)
+    return `${descriptorBytes} bytes reached ${path}, not the image's ${imageSize}`
+  return 'it did not report the restore complete and ANAS cannot count what it wrote'
+}
+
+/**
+ * The clause for a failed stream that counted no bytes and is not proof that
+ * nothing was written (review3 3), true for what the client printed: no
+ * progress line at all, or the last line it printed (masked, cr.48e), which
+ * named no amount above zero.
+ */
+function unknownAmount(progress: RestoreProgress, where: string, secret: string): string {
+  const said = progress.lastLine ?? progress.complete
+  if (said === null)
+    return `the restore failed before the client reported any progress, so how much of the image reached ${where} is not known (possibly none)`
+  // Review 4: the client's completion line followed by a failure is not
+  // "no amount above zero"; it is a complete report that the exit contradicts.
+  if (progress.lastLine === null)
+    return `the client printed '${maskSecretValues(said, [secret])}' and then failed, so whether the whole image reached ${where} is not proven`
+  return `the client printed '${maskSecretValues(said, [secret])}' and then failed without naming an amount above zero, so how much `
+    + `of the image reached ${where} is not known (possibly none)`
+}
+
+/**
+ * A failed whole-image restore that may have left an image that is not proven
+ * whole: the job fails with this code (`ImageRestoreFailureCode`), which is the
+ * only record a FILE backing has of it (cr3.lunrestore, review2 D).
+ */
+export function imageRestoreFailure(message: string, code: ImageRestoreFailureCode): Error {
+  return Object.assign(new Error(message), { jobErrorCode: code })
 }
 
 /** The classification itself — over the raw stderr, unmasked ({@link explainRestoreFailure}). */
@@ -655,6 +806,14 @@ export async function runImageRestore(
   let failure: unknown
   const stillDisabled: string[] = []
 
+  // cr3.lunrestore: the breadcrumb on the volume (a file image carries none).
+  const markOn = markDataset(lun.backingPath)
+  // cr3.lunrestore (review2 A): the mark ALREADY on the volume when this run
+  // starts — an earlier restore that did not finish, or one whose size was not
+  // verified. A run removes only the mark it created on a volume that carried
+  // none; a run that writes nothing puts this one back exactly.
+  let prior: Extract<RestoreMarkRead, { state: 'present' }> | null = null
+
   // ---- 1. Re-check + disable: ONE locked section --------------------------
   // Under the lock so nothing else can mutate the LIO tree between the answer
   // and the act on it. The refusal is thrown from INSIDE the lock, before the
@@ -677,6 +836,22 @@ export async function runImageRestore(
     if (sessions.length > 0)
       throw new Error(liveSessionsAtRunRefusal(target.iqn, sessions))
 
+    // cr3.lunrestore (review2 A): the mark already on the volume, read before
+    // anything is touched. A mark that cannot be read refuses the restore here,
+    // with nothing done: a run that later wrote nothing could not tell whether
+    // it was erasing an earlier restore's record of a partial image. (A mark
+    // that IS read never refuses: restoring again is a way out of it.)
+    if (markOn !== null) {
+      const read = await readRestoreMark(executor, { path: lun.backingPath })
+      if (read.state === 'unknown') {
+        throw new Error(`ANAS could not read the restore mark ${RESTORE_MARK_PROPERTY} on ${markOn} (${read.reason}), so it cannot `
+          + `keep the record an earlier restore may have left there. The restore is refused until the mark can be read. `
+          + 'Nothing was disabled and nothing was written.')
+      }
+      if (read.state === 'present')
+        prior = read
+    }
+
     // cr.40 (WAVE3-DESIGN §2.4 "image restore in place"): whether the target
     // is enabled is read NOW, under the lock — not taken from the request's
     // read. A target the operator disabled while the job waited is left
@@ -695,7 +870,100 @@ export async function runImageRestore(
     }
   })
 
+  const mark = writingMark({ repo: deps.repo.name, ...(deps.namespace ? { namespace: deps.namespace } : {}), snapshot: deps.snapshot, archive: deps.archive })
+  // Set when the target must stay disabled although nothing partial was
+  // written by the stream: an image not proven good, or a mark that could not
+  // be cleared (the LUN still reads as a partial image everywhere).
+  let keepDisabled: string | null = null
+  // An image file the stream's open emptied although nothing was written.
+  let fileEmptied = false
+  const nothingWritten = (message: string): Error => fileEmptied ? imageRestoreFailure(message, 'IMAGE_PARTIAL') : new Error(message)
+
+  /**
+   * Nothing reached the volume: leave its mark as this run found it (review2
+   * A). No mark before: remove the one this run set. A mark before: put that
+   * value back exactly, and keep the target disabled — the volume still holds
+   * the earlier restore's image, and Enable's confirm is the way to accept it.
+   * A mark that cannot be put back or removed keeps the target disabled too.
+   * Returns the sentence the job error carries ('' when there is none).
+   */
+  const restorePriorMark = async (): Promise<string> => {
+    if (markOn === null) {
+      // An image FILE is opened 'w' for the stream, which TRUNCATES it: once
+      // the open happened, "nothing was written" still means the old image is
+      // gone. Its size says which (an open that failed left it whole).
+      if (kind !== 'file')
+        return ''
+      const size = await readTargetSize(executor, lun)
+      if (!('error' in size) && size.size === deps.imageSize)
+        return ''
+      fileEmptied = true
+      keepDisabled = `${lun.backingPath} ${'error' in size ? `could not be re-read (${size.error})` : `is ${size.size} bytes now, not ${deps.imageSize}`}: `
+        + `the image file is emptied when it is opened for the restore, so it no longer holds the image it held, and target `
+        + `${target.iqn} stays disabled. ${capitalize(fileRestoreAgain(lun.backingPath, deps.imageSize))}`
+      return ` ${keepDisabled}.`
+    }
+    if (prior === null) {
+      try {
+        await clearRestoreMark(executor, markOn)
+        return ''
+      }
+      catch (err) {
+        keepDisabled = `${errorText(err)}; nothing was written, but the volume still reads as a partial image, so target `
+          + `${target.iqn} stays disabled: clear the mark with '${clearMarkCommand(markOn)}', then enable the target`
+        return ` ${keepDisabled}.`
+      }
+    }
+    const earlier = describeRestoreMark(prior)
+    try {
+      await putBackRestoreMark(executor, markOn, prior.raw)
+      keepDisabled = `${markOn} carries the restore mark of ${earlier} again, as it did before this restore: the LUN holds `
+        + `that restore's image, so target ${target.iqn} stays disabled. Enable on the iSCSI screen asks you to confirm `
+        + `that you accept that image; restoring again is the other way out`
+    }
+    catch (err) {
+      keepDisabled = `${errorText(err)} (the mark of ${earlier}): ${markOn} carries this restore's mark instead, so it still `
+        + `reads as holding a partial image and target ${target.iqn} stays disabled`
+    }
+    return ` ${keepDisabled}.`
+  }
+
+  /** How the operator accepts what is on the LUN — true per backing kind. */
+  const wayOut = (what: string): string => markOn !== null
+    ? `Enable on the iSCSI screen asks you to confirm that you accept ${what}, and removes the restore mark on ${markOn}`
+    : `Enable on the iSCSI screen asks you to confirm that you accept ${what} while ANAS keeps this job's record; `
+      + `${JOB_RECORD_LIFETIME}. ${capitalize(fileRestoreAgain(lun.backingPath, deps.imageSize))}`
+
+  /** Turn this run's mark `unverified` with the reason; the clause the job error carries. */
+  const markUnverified = async (reason: string): Promise<string> => {
+    try {
+      await setRestoreMark(executor, markOn!, unverifiedMark(mark, reason))
+      return ` and the restore mark on ${markOn} now says the image was not verified`
+    }
+    catch (markErr) {
+      return ` and the restore mark on ${markOn} stays as it was set at the start (${errorText(markErr)})`
+    }
+  }
+
   try {
+    if (markOn !== null) {
+      // No mark, no write: a mark that cannot be set refuses the restore here.
+      // Nothing was written; the `finally` re-enables what was disabled unless
+      // an earlier mark is still on the volume (then it stays disabled).
+      updateProgress(`marking ${markOn} as being restored (${RESTORE_MARK_PROPERTY}) before the first byte is written`)
+      try {
+        await setRestoreMark(executor, markOn, mark)
+      }
+      catch (err) {
+        // A failed set changed nothing: an earlier mark is still there, and
+        // the target is not enabled over it (review2 A).
+        if (prior !== null) {
+          keepDisabled = `${markOn} still carries the restore mark of ${describeRestoreMark(prior)}, so target ${target.iqn} stays disabled`
+        }
+        throw new Error(`${errorText(err)}; a restore that cannot leave its mark is refused. Nothing was written to ${lun.backingPath}.`
+          + `${keepDisabled ? ` ${keepDisabled}.` : ''}`)
+      }
+    }
     const args = imageRestoreArgs(deps.snapshot, deps.archive, deps.namespace, deps.rate)
     updateProgress(
       `restoring ${deps.archive} from ${deps.snapshot} into ${lun.backingPath} `
@@ -731,8 +999,26 @@ export async function runImageRestore(
       // way the reads mask theirs — the secret rides the child env and can be
       // echoed by anyone, and this message lands in job.error. No
       // classification ever runs on this text; it only ever leaves.
-      throw new Error(`proxmox-backup-client could not be started: ${
-        maskSecretValues(err instanceof Error ? err.message : String(err), [deps.secret])}`)
+      const said = maskSecretValues(errorText(err), [deps.secret])
+      // cr3.lunrestore (review2 B): only the executor can prove the client
+      // never started (nothing was written): then the previous state comes
+      // back. Every other rejection — a flush that failed after exit 0, a
+      // child that died in a way the executor could not report — leaves an
+      // unknown amount on the device: the target stays disabled, the mark stays.
+      if (err instanceof StreamNotStartedError) {
+        const kept = await restorePriorMark()
+        throw nothingWritten(`proxmox-backup-client could not be started: ${said}. Nothing was written to ${lun.backingPath}.${kept}`)
+      }
+      if (err instanceof StreamFlushError) {
+        const reason = `the client exited 0, but flushing ${lun.backingPath} to the medium failed (${said})`
+        const marked = markOn !== null ? await markUnverified(reason) : ''
+        partial = `${reason}: how much of the image is on the medium is not known. Target ${target.iqn} stays disabled${marked}. ${wayOut('the image')}`
+        throw imageRestoreFailure(`${partial}.`, 'IMAGE_UNVERIFIED')
+      }
+      partial = `the image restore into ${lun.backingPath} ended without a result from the client (${said}): how much of `
+        + `the image reached it is not known. Target ${target.iqn} stays disabled${markOn !== null ? ` and the restore mark on ${markOn} stays` : ''}. `
+        + `${wayOut('the partial image')}`
+      throw imageRestoreFailure(`${partial}.`, 'IMAGE_PARTIAL')
     }
     const progress = parseRestoreProgress(r.stderr)
     const written = imageBytesWritten(r.bytesWritten, progress, deps.imageSize, r.exitCode)
@@ -748,22 +1034,32 @@ export async function runImageRestore(
       if (bytesWritten > 0) {
         // The half-written state, stated in the words the story asks for. The
         // device has no marker of its own; this sentence IS the record.
+        // cr3.lunrestore (D5 e): the way to accept the state is named.
         partial = `the image was partially written (${written.estimated ? 'at least ' : ''}${bytesWritten} `
           + `of ${deps.imageSize} bytes reached ${lun.backingPath}); the LUN is disabled until you restore `
-          + `again or accept the state. ${detail}`
-        throw new Error(partial)
+          + `again or accept the state: ${wayOut('the partial image')}. ${detail}`
+        throw imageRestoreFailure(partial, 'IMAGE_PARTIAL')
       }
-      throw new Error(`${detail} Nothing was written to ${lun.backingPath}.`)
+      if (!failedBeforeWriting(r.stderr, r.signal)) {
+        // cr3.lunrestore (review2 B): no byte count and no progress line is not
+        // proof that nothing was written — the client opens the device itself
+        // (our descriptor never moves) and prints its first progress line only
+        // seconds in. Only a failure it reports before fetching any data is.
+        // review3 3: and a progress line that names no amount is not "no
+        // progress": the sentence says which it was.
+        partial = `${unknownAmount(progress, lun.backingPath, deps.secret)}; the LUN is disabled until you restore again or accept the `
+          + `state: ${wayOut('the image')}. ${detail}`
+        throw imageRestoreFailure(partial, 'IMAGE_PARTIAL')
+      }
+      // Nothing was written: the volume is as it was, and so is its mark.
+      const kept = await restorePriorMark()
+      throw nothingWritten(`${detail} Nothing was written to ${lun.backingPath}.${kept}`)
     }
 
-    if (bytesWritten !== deps.imageSize) {
-      // pbc said complete and the byte count disagrees: report it rather than
-      // trusting either number on its own.
-      warnings.push(
-        `the client reported a complete restore but ${bytesWritten} bytes reached ${lun.backingPath}, `
-        + `not the manifest's ${deps.imageSize} - verify the LUN's contents before serving it.`,
-      )
-    }
+    // review3 6: an exit 0 whose byte count is not the image's (no `restore
+    // complete` line, or a descriptor count that disagrees) is not proof of a
+    // complete image: unverified below, never a warning beside a re-enable.
+    const countGap = exitZeroCountGap(r.bytesWritten, bytesWritten, deps.imageSize, lun.backingPath)
 
     // ---- Read-back: the disk must still be the same disk -------------------
     updateProgress('verifying the backstore path, unit serial and attributes are unchanged')
@@ -771,22 +1067,40 @@ export async function runImageRestore(
       const after = await deps.readBack()
       const afterTarget = after.find(t => t.iqn === target.iqn)
       warnings.push(...readBackWarnings(lun, afterTarget?.luns.find(l => l.index === lun.index)))
-      if (kind === 'file') {
-        // The file was rewritten in place, so its length must be the image's.
-        // A file that grew or shrank would mean the fileio backstore is now
-        // serving a different size than it was created with, which LIO does
-        // not notice and an initiator would discover the hard way.
-        const size = await readTargetSize(executor, lun)
-        if ('error' in size)
-          warnings.push(`could not re-read the size of ${lun.backingPath}: ${size.error}`)
-        else if (size.size !== deps.imageSize)
-          warnings.push(`${lun.backingPath} is ${size.size} bytes after the restore, not the image's ${deps.imageSize}`)
-      }
     }
     catch (err) {
       warnings.push(
         `the image was written, but the LIO read-back failed: ${err instanceof Error ? err.message : String(err)}`,
       )
+    }
+
+    // cr3.lunrestore: the size must be the image's before anything treats the
+    // LUN as good — a zvol AND an image file (review2 C: a file that grew or
+    // shrank used to be a warning and was re-enabled; a fileio backstore then
+    // serves a size LIO does not notice). Unverified: the target stays
+    // disabled, the job fails with both numbers or the read error, and a
+    // zvol's mark says so.
+    const size = await readTargetSize(executor, lun)
+    const unverified = 'error' in size
+      ? `the size of ${lun.backingPath} could not be re-read (${size.error})`
+      : size.size !== deps.imageSize
+        ? `${lun.backingPath} is ${size.size} bytes, not the image's ${deps.imageSize}`
+        : countGap
+    if (unverified !== null) {
+      const marked = markOn !== null ? await markUnverified(unverified) : ''
+      keepDisabled = `${progress.complete ? 'the client reported the image complete' : 'the client exited 0'}, but ${unverified}: target ${target.iqn} stays disabled${marked}. `
+        + `${wayOut('it')}${markOn !== null ? '. Restoring again is the other way out' : ''}`
+      throw imageRestoreFailure(`${keepDisabled}.`, 'IMAGE_UNVERIFIED')
+    }
+    if (markOn !== null) {
+      try {
+        await clearRestoreMark(executor, markOn)
+      }
+      catch (markErr) {
+        keepDisabled = `the image was restored in full and its size verified, but ${errorText(markErr)}: the volume still `
+          + `reads as a partial image, so the target stays disabled. Clear the mark with '${clearMarkCommand(markOn)}', then enable the target`
+        throw new Error(`${keepDisabled}.`)
+      }
     }
   }
   catch (err) {
@@ -801,7 +1115,7 @@ export async function runImageRestore(
     // is worse than serving nothing, and the operator's explicit re-enable is
     // the acknowledgement. Everything else — including a failure that wrote no
     // bytes — gets the target back.
-    if (disabledByUs && !partial) {
+    if (disabledByUs && !partial && !keepDisabled) {
       try {
         updateProgress(`re-enabling iSCSI target ${target.iqn}`)
         // The lock again, for the same reason it was taken to disable: this is
@@ -861,19 +1175,29 @@ export interface NewLunRestoreDeps {
   /**
    * The destination target as the REQUEST read it — ANAS-owned, the route's
    * pre-flight proved it. It names the target (IQN, TPG tag) and nothing else:
-   * the index and the ACL grants come from {@link refresh}.
+   * the index and the ACL grants come from {@link refreshAfterCreate}.
    */
   target: IscsiTargetDetail
   /**
-   * Re-read the destination target NOW and re-run the route's gates on it (LIO
-   * installed and not degraded, the target there and ANAS's, the name still
-   * free node-wide); throws the gate's refusal (story cr.40, audit #34). Called
-   * once before anything is created, and again UNDER the iSCSI lock right
-   * before the LUN is mapped — whose index and ACL grants are the answer's, so
-   * a LUN or an ACL added while the job waited is seen. Required, never
-   * optional: without it the LUN lands at the request-time index.
+   * Re-read the destination target NOW and re-run EVERY gate of the route on
+   * it (LIO installed and not degraded, the target there and ANAS's, the name
+   * still free node-wide, the backing on ANAS storage at the confirmed path);
+   * throws the gate's refusal (story cr.40, audit #34). Called once before
+   * anything is created, and again UNDER the iSCSI lock right before the
+   * backstore is created — while the name is still free. Required.
    */
   refresh: () => Promise<IscsiTargetDetail>
+  /**
+   * Re-read once THIS run's backstore exists (cr3.lunrestore): the target and
+   * the whole iSCSI state as they are now, with every gate that still applies
+   * — LIO saveable, the target there and ANAS's, the backing at the confirmed
+   * path — but NOT the name gates, which this run's own backstore (or the copy
+   * of it a save persisted) now answers. Called under the iSCSI lock right
+   * before the map (the index and the ACL grants are this answer's), and before
+   * a failed run saves away a copy of its backstore another verb persisted.
+   * Throws the gate's refusal. Required.
+   */
+  refreshAfterCreate: () => Promise<TargetObject>
   /** The new LUN's name — the backstore name and the SCSI model string. */
   name: string
   /**
@@ -893,28 +1217,37 @@ export interface NewLunRestoreDeps {
   /** The mutate context the targetcli steps run in. */
   mutate: IscsiMutateOptions
   /**
-   * The job's lock release (story cr.38 session B: `ctx.release()`), called
-   * the moment the LUN is mapped. The job holds the target's key
-   * (`iscsi-target:<iqn>`) while it re-reads the target, creates the backing
-   * and maps the LUN — the steps whose index and ACL grants another verb on
-   * the target must not race — and gives it back for the stream, which writes
-   * only the new backing object and can run for hours. Absent = no lock.
+   * The job's lock release (story cr.38: `ctx.release()`), called the moment
+   * the BACKSTORE exists (cr3.lunrestore; it used to be the map). The job holds
+   * the target's key and the backing's keys while it creates the backing and
+   * the backstore, and gives them back for the stream, which writes only the
+   * new backing object and can run for hours. From then on the unmapped
+   * backstore is what holds the backing against a dataset or pool verb (its
+   * claim, `unmappedBackstoreClaims`). Absent = no lock.
    */
-  mapped?: () => void
+  release?: () => void
   /**
-   * Re-acquire the target's key before the failure path's undo unmaps the
-   * LUN (cr.38: `ctx.reacquire()`): the undo changes the target again, so it
-   * waits its turn behind whatever took the key during the stream.
+   * Take the keys back after {@link release} (cr.38: `ctx.reacquire()`):
+   * before the map, which changes the target, and before a failed run's undo,
+   * which deletes the backstore and destroys the backing — each waits its turn
+   * behind whatever took a key during the stream.
    */
-  beforeUndo?: () => Promise<void>
+  reacquire?: () => Promise<void>
   /**
    * cr3.backup (iSCSI review): the storage objects the SAVED LIO configuration
    * holds right now (`saveconfig.json`), or null when it cannot be read — what
    * a failed run's cleanup asks to learn whether another verb's `saveconfig`
-   * persisted this run's half-written LUN during the stream. Absent = not
-   * checked (the pre-cr3 behaviour).
+   * persisted this run's backstore during the stream. Absent = not checked.
    */
   persistedBackstores?: () => Promise<{ name: string, wwn: string | null }[] | null>
+  /**
+   * cr3.lunrestore (review D2/D4/N1): the live LIO state NOW, with no gate —
+   * what the cleanup reads, under the iSCSI lock, to prove a backstore of this
+   * name is THIS run's before it deletes anything, and what a failed map reads
+   * to learn whether the map landed anyway. Throws when it cannot be read.
+   * Required.
+   */
+  readLive: () => Promise<{ ctx: IscsiReadContext }>
 }
 
 /**
@@ -932,69 +1265,84 @@ export function newLunZvolCreateArgs(dataset: string, size: number): string[] {
 }
 
 /**
- * Run one whole-image restore that lands as a NEW LUN (story backup2.10).
+ * Why this run's backstore may not be mapped now, or null when it may
+ * (cr3.lunrestore, point 4). Between the backstore create and the map the
+ * iSCSI lock was released for the stream; the name is node-global (GT-15) and
+ * the map reads the state again, so anything that changed the backstore in
+ * between — deleted by hand, recreated under the same name, mapped by hand —
+ * is refused here, never mapped over and never failed obscurely by targetcli.
+ * The index is not planned ahead: it is the lowest free one of the target as
+ * read under the lock now.
+ */
+export function ownBackstoreRefusal(
+  state: Pick<TargetObject['state'], 'ctx'>,
+  backstore: { name: string, plugin: string, backingPath: string, serial: string },
+): string | null {
+  const { name, plugin, backingPath, serial } = backstore
+  const live = state.ctx.live.backstores.find(b => b.name === name && normalizePlugin(b.plugin) === plugin)
+  if (!live)
+    return `backstore '${name}' is no longer in the live configuration (it was deleted while the image was written)`
+  if ((live.serial ?? '').toLowerCase() !== serial.toLowerCase()) {
+    return `backstore '${name}' now carries the unit serial ${live.serial ?? '(unreadable)'}, not the ${serial} this restore `
+      + `created it with: it is no longer this restore's backstore`
+  }
+  if (live.udevPath !== backingPath)
+    return `backstore '${name}' now points at ${live.udevPath}, not at ${backingPath}`
+  const mappedBy = state.ctx.live.targets.flatMap(t => t.tpgs.flatMap(g => g.luns
+    .filter(l => l.backstoreName === name)
+    .map(l => `LUN ${l.index} of ${t.iqn}${g.tag === 1 ? '' : ` (TPG ${g.tag})`}`)))
+  if (mappedBy.length > 0)
+    return `backstore '${name}' was mapped as ${mappedBy.join(', ')} by something else while the image was written`
+  return null
+}
+
+/**
+ * Run one whole-image restore that lands as a NEW LUN (story backup2.10;
+ * reordered by cr3.lunrestore).
+ *
+ * THE RULE: a new-LUN restore never exposes an image that is not completely
+ * written. The LUN is mapped, its ACLs granted and the configuration saved
+ * only AFTER the stream ended with exit 0 and the size read back confirmed it.
+ * And the object carries a BREADCRUMB while it is not proven whole (operator
+ * ruling 2026-11-14): the restore mark (`anas:restore`, `restore-mark.ts`) on
+ * the volume, set before the first byte and removed only once the size is
+ * verified.
  *
  * THE SEQUENCE, and why it is this order:
  *
  *   1. **Create the backing at exactly the manifest size** — `zfs create -s -V`
- *      for a zvol, a sparse image for fileio. This is the GT-42 guard in its
- *      other direction: instead of proving the target already matches the
- *      image, the target is MADE to match the image, so a mismatch is
- *      impossible by construction.
- *   2. **Backstore, attributes, map, grants** — the ONE shared
- *      {@link createAndMapLun} step the add-LUN door uses, with a FRESH serial:
- *      a copy is a new disk, and the source keeps its own identity (GT-14/15/16).
- *   3. **Stream the image in** — the same `restore <snap> <archive> -` argv as
- *      the in-place restore; the fsync is inside the executor.
- *   4. **Read the size back** — the new object must hold exactly the image.
- *   5. **Save the LIO configuration ONLY NOW** — when the LUN is fully
- *      populated. A failed run must never persist a half-created LUN.
+ *      for a zvol, a sparse image for fileio (GT-42 by construction) — and, on
+ *      a zvol, **set the restore mark** before anything can write to it. A mark
+ *      that cannot be set refuses the restore: no mark, no write.
+ *   2. **Create the backstore and set its attributes — and map nothing**
+ *      ({@link createLunBackstore}) with a FRESH serial: a copy is a new disk
+ *      (GT-14/15/16). A backstore no TPG LUN points at is no disk to any
+ *      initiator (GT-13; GT-11: a separate array of the saved configuration),
+ *      so a `saveconfig` another verb runs during the stream persists a storage
+ *      object with no LUN. It holds the backing while it exists (GT-40), and
+ *      its claim makes every dataset, pool and AHR verb refuse on the backing.
+ *   3. **Stream the image in.** A stream that does not exit 0 is provably
+ *      partial: the run is undone (the backstore — re-read and proved this
+ *      run's own first — then the backing).
+ *   4. **Read the size back.** From here on NOTHING is destroyed (review D3,
+ *      ruling): a read that fails or disagrees is not mapped; the backstore and
+ *      the backing are kept, and the mark turns `unverified` with the reason,
+ *      so nothing treats the image as good.
+ *   5. **Remove the mark** (the image is complete and verified), then **map at
+ *      the lowest free index, grant to every ACL, save** — under the lock,
+ *      after a re-read that refuses if the backstore is no longer this run's
+ *      ({@link ownBackstoreRefusal}). A failure keeps the image and says how to
+ *      map it or remove it.
  *
- * The source LUN is never touched: no TPG disable, no session gate, no
- * read-back of it. And because everything this run creates is seconds old and
- * ANAS's, a mid-stream failure UNDOES IT — unmap, delete the backstore, destroy
- * the backing — and says so, instead of saving a half-done state or leaving a
- * half-filled LUN that looks healthy in the grid.
+ * The source LUN is never touched. WHERE THE LOCK IS (the #52 shape): the
+ * daemon-wide mutex is taken for the backstore create, for the map + grants +
+ * save, and for each targetcli step of an undo — never across the stream. The
+ * job's keys go back once the backstore exists and are taken again right after
+ * the stream, before anything else acts.
  *
- * WHERE THE LOCK IS, AND WHY IT IS NOT AROUND THE WHOLE THING (the #52 shape,
- * applied to this door too): the daemon-wide `withIscsiLock` mutex exists so two
- * `targetcli` runs never touch the LIO tree at once, and this function OWNS it
- * for a new-LUN restore — it takes it for the two SHORT targetcli sections
- * (create+map the LUN, and the final `saveconfig`) and for the cleanup's undo,
- * and holds it for NEITHER the image stream nor the size read-back. A new-LUN
- * restore streams for HOURS; a lock held across it would block every iSCSI
- * mutation on the node for the whole restore. The stream needs no mutual
- * exclusion — it writes the new backing OBJECT (the zvol/image), not the tree.
- * The mutex is NOT reentrant (a plain promise chain), so the route must NOT wrap
- * this call in another `withIscsiLock` — that would both reintroduce the
- * hours-long block and deadlock against these acquisitions.
- *
- * THE CRASH WINDOW, AND WHY THERE IS NO MARKER (ruling, 0.3.1): `saveconfig` is
- * the LAST step, so a daemon CRASH mid-stream (not a job failure — that path
- * unwinds cleanly above) leaves the new LUN LIVE in configfs but ABSENT from
- * `saveconfig.json`. On a host REBOOT — the LIO persistence boundary — boot
- * restores from `saveconfig.json`, which never held the LUN, so it is simply
- * gone; only an inert orphaned backing object remains on disk, served to no one,
- * and it is NOT a stub (a stub is a PERSISTED LUN whose backing went missing,
- * the opposite case). On a daemon-only restart (host up) the LUN lingers live at
- * exactly the manifest size — the size-based stub detector cannot see it because
- * the size is correct, only the CONTENTS are half — BUT the existing
- * persisted⟷live health diff already names it: `lun-not-persisted`, "live but
- * not in the saved configuration — it will not come back after a reboot". A
- * completed restore saves the config (persisted); a crashed one does not, so
- * that flag distinguishes them with no shadow state. This is the general LIO
- * live-then-save model (the add-LUN door has the same window, only milliseconds
- * wide), and the stateless principle wins: adding a persistent "restore in
- * flight" marker would be shadow state the health diff already makes unnecessary.
- *
- * cr3.backup R1 — CORRECTION, the paragraph above is true only when nothing else
- * saves meanwhile. The stream runs with the iSCSI mutex released and EVERY other
- * iSCSI verb ends in `saveconfig`, which persists the live tree with this
- * half-written LUN in it. A failed run then re-saves after its undo (see
- * removeNewLun); a CRASH in that window leaves the LUN persisted at the right
- * size, `lun-not-persisted` silent, and the half image served after restart.
- * Open: the options are in the cr3.backup report (the narrow fix needs the
- * iSCSI area's create/map split and an unmapped-backstore hold and health row).
+ * A CRASH at any point leaves either no LUN at all — at most a marked volume
+ * and an unmapped backstore, which the health read and the dashboard name as
+ * an interrupted restore — or, after the map, a LUN whose image is complete.
  */
 export async function runNewLunImageRestore(
   executor: CommandExecutor,
@@ -1004,27 +1352,31 @@ export async function runNewLunImageRestore(
   const { target, backing } = deps
   const kind: 'zvol' | 'file' = backing.plugin === 'block' ? 'zvol' : 'file'
   const streamTarget = restoreStreamTarget(backing.path, kind)
-  const warnings: string[] = []
+  // The volume the restore mark lives on; null for an image file (no mark).
+  const markOn = markDataset(backing.path)
+  const mark = writingMark({ repo: deps.repo.name, ...(deps.namespace ? { namespace: deps.namespace } : {}), snapshot: deps.snapshot, archive: deps.archive })
 
   let bytesWritten = 0
   let duration: string | undefined
-  let index = 0
   let serial = ''
-  // What this run has created so far — the cleanup's work list.
-  const state = { backingCreated: false, backstoreTouched: false, mapped: false }
-  // cr3 review (8): set once the restore is complete and only the final save
-  // failed — then nothing is undone.
-  let keepWhatWasMade = false
+  // review3 6: what an exit 0 said about the byte count.
+  let reportedComplete = false
+  let countGap: string | null = null
+  // What this run has created so far — the cleanup's work list. `released`:
+  // the job's keys were given back for the stream.
+  const state = { backingCreated: false, backstoreAttempted: false, released: false }
+  // cr3.lunrestore (review2 B): a stream that REJECTED after the client may
+  // have run (a flush that failed after exit 0, a child the executor lost):
+  // how much of the image is there is unknown, and it may be all of it — so
+  // nothing is destroyed. Handled after the undo block, never by it.
+  let rejected: unknown = null
 
   try {
     // ---- 0. The destination as it is NOW (cr.40) ---------------------------
-    // The job may have waited behind other work: the target, its ownership and
-    // the name are re-proved before anything is created, so a refusal here
-    // leaves nothing to clean up.
     updateProgress(`re-reading iSCSI target ${target.iqn} - the request-time read is not the run-time one`)
     await deps.refresh()
 
-    // ---- 1. The backing at exactly the manifest's size ---------------------
+    // ---- 1. The backing at exactly the manifest's size, then the mark -------
     if (kind === 'zvol') {
       const dataset = backing.dataset ?? zvolDataset(backing.path)
       updateProgress(`creating volume ${dataset} at exactly the image's size (${deps.imageSize} bytes)`)
@@ -1041,50 +1393,41 @@ export async function runNewLunImageRestore(
       await createSparseImage(backing.path, deps.imageSize)
     }
     state.backingCreated = true
+    if (markOn !== null) {
+      // The breadcrumb, before anything can write: no mark, no write.
+      updateProgress(`marking ${markOn} as being restored (${RESTORE_MARK_PROPERTY}) before the first byte is written`)
+      await setRestoreMark(executor, markOn, mark)
+    }
 
     // The moment the image lands on an AHR pool, that pool's boot ordering
-    // starts to matter — the same fstab line the add-LUN door adds, for the
-    // same reason: without it LIO can create a 0-byte placeholder at the
-    // image's path (live-proof F2).
+    // starts to matter (live-proof F2).
     if (deps.ahr) {
       const added = await ensureAhrTargetOrdering(executor, deps.ahr.fstabPath, deps.ahr.pool)
       if (added)
         updateProgress(`Ordered the mount of AHR pool '${deps.ahr.pool.name}' before the iSCSI restore service`)
     }
 
-    // ---- 2. The backstore: a FRESH serial — a copy is a new disk ----------
+    // ---- 2. The backstore, NOT mapped: a FRESH serial — a copy is a new disk
     serial = newSerial()
     updateProgress(
-      `creating backstore ${deps.name} with a fresh unit serial `
-      + '(a copy is a NEW disk — the source LUN keeps its own)',
+      `creating backstore ${deps.name} with a fresh unit serial (a copy is a NEW disk; the source LUN keeps its own). `
+      + 'It is not mapped as a LUN until the whole image is written and verified',
     )
-    // Under the lock: createAndMapLun is a run of targetcli commands against the
-    // LIO tree (backstore create, attributes, map, ACL grants), so it must not
-    // interleave with another node mutation. The lock is taken HERE and released
-    // the moment the LUN is mapped — NOT held across the hours-long stream below.
-    //
-    // cr.40 (audit #34): the index and the ACL grants come from the target as
-    // read HERE, under the lock — not from the request's read, which a LUN or
-    // an ACL added while the job waited has made stale.
-    const mapped = await withIscsiLock(async () => {
+    await withIscsiLock(async () => {
+      // cr.40: the target and every gate again, under the lock, while the name
+      // is still free; the ACL names the map will grant to are checked now.
       const fresh = await deps.refresh()
-      // From the first targetcli on, a failure may have left a backstore —
-      // the cleanup's delete tolerates one that was never created.
-      state.backstoreTouched = true
-      return createAndMapLun(
-        deps.mutate,
-        fresh,
-        deps.name,
-        backing,
-        kind === 'file' ? deps.imageSize : null,
-        serial,
-      )
+      const acls = aclNamesRefusal(fresh.iqn, fresh.acls)
+      if (acls)
+        throw new Error(acls.message)
+      // D4: from here on the cleanup re-reads for a backstore of this name and
+      // THIS serial — a create that failed (or timed out) after taking effect
+      // is found and removed by that read, not by a flag.
+      state.backstoreAttempted = true
+      await createLunBackstore(deps.mutate, deps.name, backing, kind === 'file' ? deps.imageSize : null, serial)
     })
-    index = mapped.index
-    state.mapped = true
-    // cr.38: the target is changed; from here to the save only the new backing
-    // object is written — another verb on the target may go ahead.
-    deps.mapped?.()
+    deps.release?.()
+    state.released = deps.release !== undefined
 
     // ---- 3. The image -------------------------------------------------------
     const args = imageRestoreArgs(deps.snapshot, deps.archive, deps.namespace, deps.rate)
@@ -1101,10 +1444,7 @@ export async function runNewLunImageRestore(
         timeoutMs: null,
         longRunning: 'proxmox-backup-client image restore to a new backing: a data mover, hours for a large image',
         onStderr: (chunk) => {
-          // GT-59: forward every progress line, as the in-place run does —
-          // masked (cr.48e), same as there: a line matching the progress shape
-          // can carry an error fragment quoting the repo secret, and the
-          // percentage parse reads the raw chunk either way.
+          // GT-59, masked (cr.48e).
           const p = parseRestoreProgress(chunk)
           if (p.percent !== null && p.percent !== lastPercent) {
             lastPercent = p.percent
@@ -1114,80 +1454,201 @@ export async function runNewLunImageRestore(
       })
     }
     catch (err) {
-      // cr.48d: the same mask the in-place door applies — a rejection's message
-      // can echo the repo secret and this lands in job.error via the cleanup
-      // sentence below.
-      throw new Error(`proxmox-backup-client could not be started: ${
-        maskSecretValues(err instanceof Error ? err.message : String(err), [deps.secret])}`)
-    }
-    const progress = parseRestoreProgress(r.stderr)
-    const written = imageBytesWritten(r.bytesWritten, progress, deps.imageSize, r.exitCode)
-    bytesWritten = written.bytes
-    if (progress.complete)
-      duration = progress.complete
-
-    if (r.exitCode !== 0) {
-      // cr.48d: the detail is masked against the repo secret this restore
-      // handed pbc, as the in-place door's is.
-      const detail = explainRestoreFailure(r.stderr, r.signal, [deps.secret])
-      if (bytesWritten > 0) {
-        throw new Error(
-          `the image was partially written (${written.estimated ? 'at least ' : ''}${bytesWritten} `
-          + `of ${deps.imageSize} bytes reached the new backing ${backing.path}). ${detail}`,
-        )
+      // cr.48d: masked. cr3.lunrestore (review2 B): only a client that never
+      // started is "nothing written" — that run is undone like any provably
+      // incomplete one. Any other rejection is kept (below).
+      if (err instanceof StreamNotStartedError) {
+        throw new Error(`proxmox-backup-client could not be started: ${maskSecretValues(errorText(err), [deps.secret])}. `
+          + `Nothing was written to the new backing ${backing.path}.`)
       }
-      throw new Error(`${detail} Nothing was written to the new backing ${backing.path}.`)
+      rejected = err
     }
+    if (rejected === null) {
+      const progress = parseRestoreProgress(r!.stderr)
+      const written = imageBytesWritten(r!.bytesWritten, progress, deps.imageSize, r!.exitCode)
+      bytesWritten = written.bytes
+      if (progress.complete)
+        duration = progress.complete
+      // review3 6: an exit 0 the byte count does not prove is unverified (below).
+      reportedComplete = progress.complete !== null
+      countGap = exitZeroCountGap(r!.bytesWritten, bytesWritten, deps.imageSize, backing.path)
 
-    // ---- 4. Read-back: the new object must hold exactly the image ----------
-    updateProgress('verifying the new backing holds exactly the image')
-    const size = await readTargetSize(executor, { kind, backingPath: backing.path, dataset: backing.dataset })
-    if ('error' in size)
-      warnings.push(`could not re-read the size of ${backing.path}: ${size.error}`)
-    else if (size.size !== deps.imageSize)
-      warnings.push(`${backing.path} is ${size.size} bytes after the restore, not the image's ${deps.imageSize}`)
-    // cr3 review2 (4): "in full" is said only when the size read back and agreed.
-    const sizeVerified = !('error' in size) && size.size === deps.imageSize
-
-    // ---- 5. Only NOW is the LUN persisted -----------------------------------
-    updateProgress('Saving the LIO configuration')
-    try {
-      // The lock again, a SECOND short acquisition — saveconfig walks the whole
-      // tree and must not run alongside another targetcli. The stream between
-      // the map and this save ran with the lock released.
-      await withIscsiLock(async () => saveIscsiConfig(executor))
-    }
-    catch (err) {
-      // cr3 review (8): the restore is COMPLETE and verified; only the save
-      // failed, and a save can be retried. The LUN, its backstore and its
-      // volume are KEPT — the cleanup below must not throw a whole restored
-      // disk away over it.
-      keepWhatWasMade = true
-      // cr3 review2 (4): no "or run Repair" — Repair re-creates SAVED LUNs that
-      // are not live; a live, unsaved LUN is nothing it repairs. And the
-      // step-4 warnings ride this error, which would otherwise drop them.
-      const written = sizeVerified
-        ? 'the image was restored in full'
-        : `the image was written but its size could not be confirmed (${warnings.join('; ')})`
-      const others = sizeVerified && warnings.length ? ` Also: ${warnings.join('; ')}.` : ''
-      throw new Error(
-        `${written} and LUN ${index} ('${deps.name}') on ${target.iqn} is live, but saving the iSCSI configuration `
-        + `failed: ${err instanceof Error ? err.message : String(err)}; it will not survive a restart of the target `
-        + `service until the configuration is saved: retry with any iSCSI change.${others}`,
-      )
+      if (r!.exitCode !== 0) {
+        const detail = explainRestoreFailure(r!.stderr, r!.signal, [deps.secret])
+        if (bytesWritten > 0) {
+          throw new Error(
+            `the image was partially written (${written.estimated ? 'at least ' : ''}${bytesWritten} `
+            + `of ${deps.imageSize} bytes reached the new backing ${backing.path}); it was never mapped as a LUN. ${detail}`,
+          )
+        }
+        if (!failedBeforeWriting(r!.stderr, r!.signal)) {
+          throw new Error(`${unknownAmount(progress, `the new backing ${backing.path}`, deps.secret)}; it was never mapped as a LUN. ${detail}`)
+        }
+        throw new Error(`${detail} Nothing was written to the new backing ${backing.path}.`)
+      }
     }
   }
   catch (err) {
-    if (keepWhatWasMade)
-      throw err
+    // Provably partial (or nothing written): undo what this run made, under
+    // the job's keys again.
     const base = err instanceof Error ? err.message : String(err)
-    // The undo unmaps the LUN from the target: under the target's key again.
-    if (state.mapped)
-      await deps.beforeUndo?.()
-    const cleanup = await removeNewLun(executor, deps, index, serial, state)
+    if (state.released)
+      await deps.reacquire?.()
+    const cleanup = await removeNewLun(executor, deps, serial, state)
     if (cleanup)
       throw new Error(`${base} ${cleanup}`)
     throw err
+  }
+
+  // ---- The stream exited 0 (or may have): from here on NOTHING is destroyed (D3)
+  if (state.released)
+    await deps.reacquire?.()
+  const plugin = backing.plugin
+  const keptHow = (targetUsable: boolean, image: KeptImage = 'complete'): string => keptSentence(deps, target, plugin, serial, targetUsable, image)
+
+  if (rejected !== null) {
+    const said = maskSecretValues(errorText(rejected), [deps.secret])
+    if (rejected instanceof StreamFlushError) {
+      const reason = `the client exited 0, but flushing ${backing.path} to the medium failed (${said})`
+      let marked = ''
+      if (markOn !== null) {
+        try {
+          await setRestoreMark(executor, markOn, unverifiedMark(mark, reason))
+          marked = ` ${markOn} keeps its restore mark, now saying the image was not verified, so nothing treats it as good.`
+        }
+        catch (markErr) {
+          marked = ` ${markOn} keeps its restore mark from the start of the restore (${errorText(markErr)}).`
+        }
+      }
+      throw imageRestoreFailure(`${reason}, so it was not mapped as a LUN: how much of the image is on the medium is not known.`
+        + `${marked}${keptHow(true, 'unverified')}`, 'IMAGE_UNVERIFIED')
+    }
+    throw imageRestoreFailure(`the image restore into the new backing ${backing.path} ended without a result from the client (${said}), `
+      + `so it was not mapped as a LUN: how much of the image reached it is not known.`
+      + `${markOn !== null ? ` ${markOn} keeps its restore mark, so nothing treats the image as good.` : ''}${keptHow(true, 'unknown')}`, 'IMAGE_PARTIAL')
+  }
+
+  // ---- 4. Read-back: the new object must hold exactly the image ------------
+  updateProgress('verifying the new backing holds exactly the image')
+  const size = await readTargetSize(executor, { kind, backingPath: backing.path, dataset: backing.dataset })
+  const unverified = 'error' in size
+    ? `the size of ${backing.path} could not be re-read (${size.error})`
+    : size.size !== deps.imageSize
+      ? `${backing.path} is ${size.size} bytes, not the image's ${deps.imageSize}`
+      : countGap
+  if (unverified !== null) {
+    let marked = ''
+    if (markOn !== null) {
+      try {
+        await setRestoreMark(executor, markOn, unverifiedMark(mark, unverified))
+        marked = ` ${markOn} keeps its restore mark, now saying the size was not verified, so nothing treats the image as good.`
+      }
+      catch (markErr) {
+        marked = ` ${markOn} keeps its restore mark from the start of the restore (${markErr instanceof Error ? markErr.message : String(markErr)}).`
+      }
+    }
+    throw imageRestoreFailure(
+      `${reportedComplete ? 'the client reported the image complete' : 'the client exited 0'}, but ${unverified}, so it was not mapped as a LUN.${marked}${keptHow(true, 'unverified')}`,
+      'IMAGE_UNVERIFIED',
+    )
+  }
+
+  // ---- 5. Verified: remove the mark, then map, grant, save ------------------
+  if (markOn !== null) {
+    try {
+      await clearRestoreMark(executor, markOn)
+    }
+    catch (markErr) {
+      throw new Error(
+        `the image was restored in full and its size verified, but ${markErr instanceof Error ? markErr.message : String(markErr)}, `
+        + `so it was not mapped as a LUN: a marked volume reads as a partial image everywhere. Clear it with `
+        + `'${clearMarkCommand(markOn)}'.${keptHow(true)}`,
+      )
+    }
+  }
+
+  let mappedAt: { iqn: string, tag: number, index: number } | null = null
+  let index = 0
+  let mapTarget: { iqn: string, tag: number } = { iqn: target.iqn, tag: target.tpgTag }
+  updateProgress(`the image is complete and verified: mapping ${deps.name} as a LUN on ${target.iqn}`)
+  try {
+    await withIscsiLock(async () => {
+      let now: TargetObject
+      try {
+        now = await deps.refreshAfterCreate()
+      }
+      catch (err) {
+        // The target refused (gone, hands-off, LIO not saveable): the image is
+        // kept, and the operator is not told to map into that target (N2).
+        throw new NotMappedError(`it could not be mapped as a LUN: ${errorText(err)}`, false, true)
+      }
+      mapTarget = { iqn: now.target.iqn, tag: now.target.tpgTag }
+      const refused = ownBackstoreRefusal(now.state, { name: deps.name, plugin, backingPath: backing.path, serial })
+      if (refused)
+        throw new NotMappedError(refused, true, false)
+      try {
+        index = await mapLunIntoTarget(
+          { ...deps.mutate, onLunMapped: (n) => { mappedAt = { iqn: now.target.iqn, tag: now.target.tpgTag, index: n } } },
+          now.target,
+          deps.name,
+          plugin,
+        )
+      }
+      catch (err) {
+        throw new NotMappedError(`mapping it as a LUN on ${now.target.iqn} failed: ${errorText(err)}`, true, true)
+      }
+      updateProgress('Saving the LIO configuration')
+      try {
+        await saveIscsiConfig(executor)
+      }
+      catch (err) {
+        throw new SaveFailedError(errorText(err))
+      }
+    })
+  }
+  catch (err) {
+    if (err instanceof SaveFailedError) {
+      // cr3 review (8): complete and mapped; only the save failed.
+      throw new Error(
+        `the image was restored in full and LUN ${index} ('${deps.name}') on ${target.iqn} is live, but saving the iSCSI `
+        + `configuration failed: ${err.message}; it will not survive a restart of the target service until the `
+        + `configuration is saved: retry with any iSCSI change.`,
+      )
+    }
+    const notMapped = err instanceof NotMappedError ? err : new NotMappedError(errorText(err), true, true)
+    // N1: a map that reported a failure may still have landed (a timeout after
+    // the act). The live tree is read again before the outcome is worded, and
+    // any LUN mapping this run's backstore — partial grants and all — is
+    // removed; what could not be removed is said.
+    let unmapped = ''
+    const partial = mappedAt as { iqn: string, tag: number, index: number } | null
+    let landed: { iqn: string, tag: number, index: number }[] = partial ? [partial] : []
+    if (notMapped.backstoreIsOurs) {
+      try {
+        const live = await withIscsiLock(async () => deps.readLive())
+        landed = live.ctx.live.targets.flatMap(t => t.tpgs.flatMap(g => g.luns
+          .filter(l => l.backstoreName === deps.name)
+          .map(l => ({ iqn: t.iqn, tag: g.tag, index: l.index }))))
+      }
+      catch (readErr) {
+        if (partial === null)
+          unmapped = ` ANAS could not read the live configuration back to check whether the map landed anyway (${errorText(readErr)}).`
+      }
+    }
+    for (const l of landed) {
+      try {
+        await withIscsiLock(async () => runTargetcli(executor, [`${tpgPath(l.iqn, l.tag)}/luns`, 'delete', `lun${l.index}`]))
+        unmapped += ` ANAS removed the partial mapping (LUN ${l.index}).`
+      }
+      catch (unmapErr) {
+        unmapped += ` The partial mapping could not be removed (${errorText(unmapErr)}): LUN ${l.index} on ${l.iqn} serves the `
+          + `complete image but may not be granted to every initiator, and it is not saved.`
+      }
+    }
+    const kept = notMapped.backstoreIsOurs
+      ? keptSentence(deps, { iqn: mapTarget.iqn, tpgTag: mapTarget.tag }, plugin, serial, notMapped.targetUsable)
+      : ` ${backing.path} is kept; ANAS did not touch the backstore named '${deps.name}'.`
+    throw new Error(`the image was restored in full into ${backing.path}, but ${sentenceBody(notMapped.message)}.${unmapped}${kept}`)
   }
 
   const result: BackupImageRestoreResult = {
@@ -1205,128 +1666,225 @@ export async function runNewLunImageRestore(
   }
   if (duration)
     result.duration = duration
-  if (warnings.length)
-    result.warnings = warnings
   return result
 }
 
+const TRAILING_STOPS_RE = /[\s.]+$/
+/** zfs's stderr for a named dataset that is not there (N8). */
+const ZFS_DATASET_ABSENT_RE = /dataset does not exist/
+const NO_BYPASS_RE = /\s*This refusal has no confirm bypass\.?/g
+
+/** A refusal's message as the middle of a job sentence: no route-only phrase, no trailing stop (N2). */
+function sentenceBody(message: string): string {
+  return message.replace(NO_BYPASS_RE, '').replace(TRAILING_STOPS_RE, '')
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
 /**
- * Remove what a failed new-LUN restore created, in the REVERSE of the order it
- * created them, WITHOUT saving the configuration: a half-created LUN must not
- * survive as if it were healthy, and a save would persist exactly that.
+ * What a kept, complete-or-unverified image is and what to do with it (N2):
+ * map it into the target only when that target can take it; otherwise say so.
+ */
+/**
+ * What a kept image is known to be (cr3.lunrestore, review2 F4): `complete` —
+ * written and verified; `unverified` — the client reported it complete and
+ * ANAS could not confirm it; `unknown` — the client's end was not seen, so it
+ * may be partial.
+ */
+type KeptImage = 'complete' | 'unverified' | 'unknown'
+
+function keptSentence(
+  deps: NewLunRestoreDeps,
+  target: { iqn: string, tpgTag: number },
+  plugin: string,
+  serial: string,
+  targetUsable: boolean,
+  image: KeptImage = 'complete',
+): string {
+  const dataset = markDataset(deps.backing.path)
+  const remove = `delete it with 'targetcli /backstores/${plugin} delete ${deps.name}', then ${dataset ? `'zfs destroy ${dataset}'` : `delete ${deps.backing.path}`}`
+  const mapCmd = `map it with 'targetcli ${tpgPath(target.iqn, target.tpgTag)}/luns create /backstores/${plugin}/${deps.name}' and `
+    + `grant it to the initiators (the next iSCSI change in ANAS saves the configuration)`
+  const map = image === 'unknown'
+    ? `It may hold a partial image: ${remove}, and restore the image again.`
+    : image === 'unverified'
+      ? `If you have checked the image and want to serve it, ${dataset ? `clear the restore mark with '${clearMarkCommand(dataset)}', then ` : ''}${mapCmd}; otherwise ${remove}.`
+      : targetUsable
+        ? `To serve it, ${mapCmd}; or ${remove}.`
+        : `Target ${target.iqn} cannot take it as it is (above): map it into a target ANAS manages with targetcli, or ${remove}.`
+  return ` The backstore '${deps.name}' (unit serial ${serial}) and ${deps.backing.path} are kept, not mapped as a LUN. ${map}`
+}
+
+/** The map step refused or failed after a complete image (cr3.lunrestore) — nothing of the image is undone. */
+class NotMappedError extends Error {
+  /**
+   * `backstoreIsOurs`: false when the refusal is that the backstore is no
+   * longer this run's. `targetUsable`: false when the target itself refused
+   * (gone, hands-off, LIO not saveable) — the kept sentence then does not tell
+   * the operator to map into it (N2).
+   */
+  constructor(message: string, readonly targetUsable: boolean, readonly backstoreIsOurs: boolean) {
+    super(message)
+    this.name = 'NotMappedError'
+  }
+}
+
+/** The final save failed after a complete map (cr3 review (8)) — the LUN is kept, live and unsaved. */
+class SaveFailedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SaveFailedError'
+  }
+}
+
+/**
+ * Remove what a failed new-LUN restore created — only ever after a stream that
+ * did not exit 0, or a failure before the stream: an image that may be
+ * complete is never destroyed (D3).
  *
- * Each step is best-effort — the point is to leave NOTHING behind, and a step
- * that cannot be undone says so in the result rather than hiding it. Returns
- * the sentence the failed job carries, or '' when nothing was created yet.
+ * The backstore is deleted only when a re-read UNDER THE LOCK proves it is this
+ * run's (review D2/D4): the name and plugin, this run's fresh serial, exactly
+ * this backing path, and mapped by nothing — the map step's own identity check
+ * ({@link ownBackstoreRefusal}). That read also finds a backstore whose create
+ * timed out after taking effect. A backstore of the name that is not this
+ * run's is left and named. The backing is destroyed only when no live
+ * backstore holds it any more. Nothing is said to "remain" that the re-read did
+ * not prove gone.
  */
 async function removeNewLun(
   executor: CommandExecutor,
   deps: NewLunRestoreDeps,
-  index: number,
   serial: string,
-  state: { backingCreated: boolean, backstoreTouched: boolean, mapped: boolean },
+  state: { backingCreated: boolean, backstoreAttempted: boolean },
 ): Promise<string> {
-  if (!state.backingCreated && !state.backstoreTouched)
+  if (!state.backingCreated && !state.backstoreAttempted)
     return ''
 
-  const { target, backing } = deps
+  const { backing } = deps
   const removed: string[] = []
   const left: string[] = []
+  let ourBackstoreGone = !state.backstoreAttempted
+  let backingHeldBy: string | null = null
+  let liveUnread = false
 
-  if (state.mapped) {
+  if (state.backstoreAttempted || state.backingCreated) {
     try {
-      // The cleanup runs after the stream, so the lock is free — each targetcli
-      // undo re-takes it, the same short-section discipline as the create path.
-      await withIscsiLock(async () => runTargetcli(executor, [`${tpgPath(target.iqn, target.tpgTag)}/luns`, 'delete', `lun${index}`]))
-      removed.push(`LUN ${index}`)
+      await withIscsiLock(async () => {
+        const live = await deps.readLive()
+        const own = ownBackstoreRefusal(live, { name: deps.name, plugin: backing.plugin, backingPath: backing.path, serial })
+        const named = live.ctx.live.backstores.find(b => b.name === deps.name && normalizePlugin(b.plugin) === backing.plugin)
+        if (state.backstoreAttempted && own === null) {
+          try {
+            // The parent form GT-42 proves.
+            await runTargetcli(executor, [`/backstores/${backing.plugin}`, 'delete', deps.name])
+            removed.push(`backstore '${deps.name}'`)
+            ourBackstoreGone = true
+          }
+          catch (err) {
+            const msg = errorText(err)
+            if (NO_SUCH_OBJECT_RE.test(msg))
+              ourBackstoreGone = true
+            else
+              left.push(`backstore '${deps.name}' could not be deleted (${msg})`)
+          }
+        }
+        else if (state.backstoreAttempted && !named) {
+          // Never created, or gone by hand: nothing of this run's is there.
+          ourBackstoreGone = true
+        }
+        else if (named) {
+          left.push(`a backstore named '${deps.name}' that is not this restore's is in the live configuration (${own}); ANAS left it as it is`)
+          ourBackstoreGone = !state.backstoreAttempted || (named.serial ?? '').toLowerCase() !== serial.toLowerCase()
+        }
+        // Whatever still holds the backing after the delete keeps it alive.
+        const holder = live.ctx.live.backstores.find(b => b.udevPath === backing.path
+          && !(ourBackstoreGone && b.name === deps.name && normalizePlugin(b.plugin) === backing.plugin && (b.serial ?? '').toLowerCase() === serial.toLowerCase()))
+        backingHeldBy = holder ? holder.name : null
+      })
     }
     catch (err) {
-      left.push(`LUN ${index} on ${target.iqn} could not be unmapped (${err instanceof Error ? err.message : String(err)})`)
-    }
-  }
-
-  if (state.backstoreTouched) {
-    try {
-      // cr3.backup (iSCSI review): the PARENT form GT-42 proves
-      // (`backstores/fileio delete <name>`, exit 0 with a live session), the
-      // form every other delete in iscsi-mutate uses — not the object-level
-      // `/backstores/<plugin>/<name> delete`, which no capture proves.
-      await withIscsiLock(async () => runTargetcli(executor, [`/backstores/${backing.plugin}`, 'delete', deps.name]))
-      removed.push(`backstore '${deps.name}'`)
-    }
-    catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      // createAndMapLun may have died before the backstore existed — a delete
-      // that finds nothing has left nothing behind.
-      if (!NO_SUCH_OBJECT_RE.test(msg))
-        left.push(`backstore '${deps.name}' could not be deleted (${msg})`)
+      liveUnread = true
+      left.push(`the live iSCSI configuration could not be read to prove which backstore is this restore's (${errorText(err)}), `
+        + `so ANAS deleted nothing: check for backstore '${deps.name}' with 'targetcli ls /backstores'`)
     }
   }
 
   if (state.backingCreated) {
-    try {
-      if (backing.plugin === 'block') {
-        const dataset = backing.dataset ?? zvolDataset(backing.path)
-        const r = await executor.exec(ZFS, ['destroy', '--', dataset])
-        if (r.exitCode !== 0) {
-          throw new Error(r.stderr.trim() || `zfs destroy ${dataset} exited with code ${r.exitCode}`)
-        }
-        removed.push(`volume ${dataset}`)
-      }
-      else {
-        await unlink(backing.path)
-        removed.push(`image ${backing.path}`)
-      }
+    if (liveUnread) {
+      left.push(`${backingWhat(backing)} is kept`)
     }
-    catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      const what = backing.plugin === 'block'
-        ? `volume ${backing.dataset ?? zvolDataset(backing.path)}`
-        : `image ${backing.path}`
-      left.push(`${what} could not be destroyed (${msg})`)
+    else if (backingHeldBy !== null) {
+      left.push(`${backingWhat(backing)} is kept, because backstore '${backingHeldBy}' still holds it`)
+    }
+    else {
+      try {
+        if (backing.plugin === 'block') {
+          const dataset = backing.dataset ?? zvolDataset(backing.path)
+          const r = await executor.exec(ZFS, ['destroy', '--', dataset])
+          if (r.exitCode !== 0) {
+            const line = r.stderr.trim() || `zfs destroy ${dataset} exited with code ${r.exitCode}`
+            // N8: renamed (or destroyed) by hand while the image was written.
+            throw new Error(ZFS_DATASET_ABSENT_RE.test(line)
+              ? `it is no longer at that name (${line}): it was renamed or destroyed by hand while the image was written; if it was renamed, the volume under its new name holds a partial image and carries the restore mark ${RESTORE_MARK_PROPERTY}`
+              : line)
+          }
+          removed.push(`volume ${dataset}`)
+        }
+        else {
+          await unlink(backing.path)
+          removed.push(`image ${backing.path}`)
+        }
+      }
+      catch (err) {
+        left.push(`${backingWhat(backing)} could not be destroyed (${errorText(err)})`)
+      }
     }
   }
 
-  // cr3.backup (iSCSI review): the stream ran with the iSCSI mutex released
-  // (by design — it lasts hours), and every other iSCSI verb ends in
-  // `saveconfig`, which persists the LIVE tree — this half-written LUN
-  // included. The undo above changes only the live tree, so a LUN another verb
-  // persisted mid-stream would come back at boot over a backing this cleanup
-  // just destroyed. The saved configuration is READ (the system's own record,
-  // not a marker): when it holds THIS run's backstore — its name AND the fresh
-  // serial this run minted — and the undo removed everything, the live tree is
-  // saved once more, under the lock, after the target's gates (LIO saveable)
-  // are re-proved. Otherwise nothing is saved, exactly as before: a save
-  // after a partial undo would persist that half state.
-  if (state.mapped && left.length === 0 && deps.persistedBackstores) {
+  // The save-away (cr3.backup, carried over; N4: whenever THIS run's backstore
+  // is gone from the live tree, whatever happened to the backing): a copy of
+  // it another verb's `saveconfig` persisted during the stream would come back
+  // at boot. Read the saved configuration (the system's own record); when it
+  // holds THIS run's backstore (name AND fresh serial), save the live tree once
+  // more under the lock, after the gates that still apply are re-proved.
+  if (state.backstoreAttempted && ourBackstoreGone && !liveUnread && deps.persistedBackstores) {
     const persisted = await deps.persistedBackstores().catch(() => null)
     if (persisted === null) {
       left.push(`the saved LIO configuration could not be read to check whether another iSCSI change persisted `
-        + `LUN '${deps.name}' during the restore - if it did, the LUN comes back at the next boot; check the `
-        + `iSCSI screen and save the configuration from there`)
+        + `backstore '${deps.name}' during the restore - if it did, it comes back, not mapped as a LUN, at the next boot; `
+        + `the iSCSI dashboard card names it`)
     }
     else if (persisted.some(o => o.name === deps.name && o.wwn !== null && o.wwn === serial)) {
       try {
         await withIscsiLock(async () => {
-          await deps.refresh()
+          await deps.refreshAfterCreate()
           await saveIscsiConfig(executor)
         })
         removed.push(`the copy of it another iSCSI change had saved during the restore`)
       }
       catch (err) {
-        left.push(`another iSCSI change saved LUN '${deps.name}' during the restore and the configuration could not `
-          + `be saved again without it (${err instanceof Error ? err.message : String(err)}) - it comes back at the `
-          + `next boot until the configuration is saved from the iSCSI screen`)
+        left.push(`another iSCSI change saved backstore '${deps.name}' during the restore and the configuration could `
+          + `not be saved again without it (${errorText(err)}) - it comes back, not mapped as a LUN, at the next boot `
+          + `until the configuration is saved by any iSCSI change`)
       }
     }
   }
 
   // cr3 review2 (6): one true sentence per outcome.
   if (!left.length) {
-    return `The LUN and its backing were created for this restore seconds ago and are ANAS's to clean up: `
-      + `ANAS has removed ${removed.join(', ')}, so nothing of the failed restore remains.`
+    return `The backstore and its backing were created by this restore and are ANAS's to clean up: `
+      + `ANAS has removed ${removed.length ? removed.join(', ') : 'nothing, because nothing of it was left'}, so nothing of the failed restore remains.`
   }
-  return `The LUN and its backing were created for this restore seconds ago: `
+  return `The backstore and its backing were created by this restore: `
     + `${removed.length ? `ANAS removed ${removed.join(', ')}. ` : 'ANAS could not remove any of it. '}`
     + `This was left behind and needs your hand: ${left.join('; ')}.`
+}
+
+/** "volume <dataset>" or "image <path>" — the backing, as the cleanup names it. */
+function backingWhat(backing: ResolvedBacking): string {
+  return backing.plugin === 'block'
+    ? `volume ${backing.dataset ?? zvolDataset(backing.path)}`
+    : `image ${backing.path}`
 }
