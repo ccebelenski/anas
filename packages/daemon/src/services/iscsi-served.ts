@@ -278,7 +278,7 @@ export async function reverifyServedLun(
   const { ctx, targets } = await readIscsiState(executor, paths)
   const target = targets.find(t => t.iqn === expected.target)
   const head = `LUN ${expected.index} of ${expected.target} is no longer the LUN this request was accepted for`
-  const tail = 'Nothing was changed. Refresh the iSCSI view and retry against what is there now.'
+  const tail = 'Nothing was changed. Refresh the iSCSI screen and retry against what is there now.'
   if (!target)
     throw new Error(`${head}: the target is gone. ${tail}`)
   const lun = target.luns.find(l => l.index === expected.index)

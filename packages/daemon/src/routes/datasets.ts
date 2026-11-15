@@ -86,8 +86,8 @@ export function replicaTargetConfirm(dataset: string, mark: { snapshot: string, 
     warnings: [
       `Once it is not read-only, any write to it changes it, and so does any read of a file on it while access-time updates (atime) are on.`,
       `Replication into it then stops until the target is rolled back to the last replicated snapshot, which discards what was written. Turning read-only back on does not undo a change already made.`,
-      `The next replication run that sends into it sets it read-only again.`,
-      `To keep this copy as the live dataset, remove the replication task that sends into it, on the sending node; until then its runs into this dataset fail.`,
+      `The next replication run sets it read-only again if nothing was written to it by then: its receive does when there is something to send, and the run itself when there is not.`,
+      `To keep this copy as the live dataset, remove the replication task that sends into it, on the sending node; until then each run sets this dataset read-only again, or fails once it was written to.`,
       `It carries the replication hold ${mark.tag} on '${mark.snapshot}'.`,
     ],
   }

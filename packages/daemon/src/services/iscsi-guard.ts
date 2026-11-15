@@ -177,7 +177,7 @@ export function sessionsUnreadableRefusal(what: string, action: string): IscsiRe
     reason: 'sessions-unknown',
     message: `The session state of ${what} could not be read (an initiator ACL's configfs 'info' was unreadable), so ANAS `
       + `cannot tell whether an initiator is logged in. ${action} is refused until it reads back — a live initiator is never `
-      + `yanked on a guess. Refresh the iSCSI view and retry.`,
+      + `yanked on a guess. Refresh the iSCSI screen and retry.`,
   }
 }
 

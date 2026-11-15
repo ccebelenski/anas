@@ -391,9 +391,20 @@ export function createServer(opts?: ServerOptions) {
     // that wants a mark registers an exact-args fixture, which wins.
     mock.addFixture({
       command: '/usr/sbin/zfs',
-      argsMatch: a => a[0] === 'get' && a.includes(RESTORE_MARK_PROPERTY),
+      argsMatch: a => a[0] === 'get' && a.includes(RESTORE_MARK_PROPERTY) && !a.includes('name,value,source'),
       result: { stdout: '-\t-\n', stderr: '', exitCode: 0 },
     })
+    // The batched form (`-o name,value,source -- <volumes>`): one row per
+    // volume asked, named (seam review 2: the single-volume answer above read
+    // as "names no volume" for two or more).
+    const mockMarkExec = mock.exec.bind(mock)
+    mock.exec = async (command, args, execOpts) => {
+      if (command === '/usr/sbin/zfs' && args[0] === 'get' && args.includes(RESTORE_MARK_PROPERTY) && args.includes('name,value,source')) {
+        mock.calls.push({ command, args })
+        return { stdout: args.slice(args.indexOf('--') + 1).map(v => `${v}\t-\t-\n`).join(''), stderr: '', exitCode: 0 }
+      }
+      return mockMarkExec(command, args, execOpts)
+    }
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', 'all', '-j'], result: mockFixtures.zpoolGetAll('testpool') })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['scrub', '--', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })

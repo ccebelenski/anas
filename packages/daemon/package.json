@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "build": "tsc",
+    "build": "tsc && cp src/services/anas-acl-walk.pl dist/services/anas-acl-walk.pl",
     "test": "tsx --test \"src/**/__tests__/*.test.ts\""
   },
   "dependencies": {

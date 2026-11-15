@@ -348,6 +348,20 @@ describe('nf.3 D11 — readLocalHoldsChecked and describeHolds (the forced-rollb
     assert.equal(await readLocalHoldsChecked(thrown, [`${SRC}@s1`]), null)
 
     assert.deepEqual(await readLocalHoldsChecked(new MockExecutor(), []), new Map(), 'nothing to read, nothing run')
+
+    // Seam review 2: an exit 0 whose lines are not `<asked snapshot>\t<tag>\t<time>`
+    // did not answer: the gates that read this never take it as "no hold".
+    for (const stdout of [
+      `${SRC}@s1 ${TAG_A} Thu Nov 14 10:00 2026\n`, // space-separated
+      `${SRC}@s1\t${TAG_A}\n`, // no timestamp
+      `${SRC}@other\t${TAG_A}\tThu Nov 14 10:00 2026\n`, // a snapshot that was not asked
+      `NAME\tTAG\tTIMESTAMP\n${SRC}@s1\t${TAG_A}\tThu Nov 14 10:00 2026\n`, // a header
+      `${SRC}@s1\t${TAG_A}\tThu Nov 14 10:00 2026\r\n`,
+    ]) {
+      const odd = new MockExecutor()
+      odd.addFixture({ command: ZFS, args: ['holds', '-H', '--', `${SRC}@s1`], result: { stdout, stderr: '', exitCode: 0 } })
+      assert.equal(await readLocalHoldsChecked(odd, [`${SRC}@s1`]), null, JSON.stringify(stdout))
+    }
   })
 
   it('describeHolds names a task\'s chain by the task, an unclaimed chain, the legacy tag and anyone else\'s tag', async () => {

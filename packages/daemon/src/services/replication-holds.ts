@@ -110,7 +110,21 @@ export async function readLocalHoldsChecked(executor: CommandExecutor, snapFulls
     return new Map()
   try {
     const r = await executor.exec('/usr/sbin/zfs', ['holds', '-H', '--', ...snapFulls])
-    return r.exitCode === 0 ? parseHolds(r.stdout) : null
+    if (r.exitCode !== 0)
+      return null
+    // One rule with the drift reader (`snapshotHoldTags`, seam review 2): an
+    // answer with a line that is not `<asked snapshot>\t<tag>\t<timestamp>`
+    // did not answer. A gate that reads it as "no hold" would let a held
+    // snapshot be renamed or destroyed.
+    const asked = new Set(snapFulls)
+    for (const line of r.stdout.split('\n')) {
+      if (line.length === 0)
+        continue
+      const f = line.split('\t')
+      if (f.length !== 3 || !asked.has(f[0]) || f[1].length === 0 || f[2].length === 0 || line.includes('\r'))
+        return null
+    }
+    return parseHolds(r.stdout)
   }
   catch {
     return null

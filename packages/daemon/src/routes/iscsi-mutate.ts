@@ -1152,7 +1152,7 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
             reason: 'size-unknown',
             message: `LUN ${index}'s current size could not be read, so ANAS cannot prove a change to ${req.size} bytes `
               + `is a GROW rather than a SHRINK — and the resize is applied unchecked. Re-read the target's size `
-              + `(refresh the iSCSI view) and retry once it reads back. This refusal has no confirm bypass.`,
+              + `(refresh the iSCSI screen) and retry once it reads back. This refusal has no confirm bypass.`,
           },
         }
       }

@@ -480,8 +480,11 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     // The gate refuses holds the rollback would destroy MID-SWEEP; the target
     // survives a rollback (it is the state rolled back TO), so its own hold
     // is no reason to refuse, and it never reaches `zfs holds` as an operand.
+    // The target is held, and `zfs holds` is asked about the swept snapshot
+    // only: it answers nothing for it. (A row for a snapshot that was not
+    // asked is not an answer ZFS gives; the reader takes one as unreadable.)
     await serve()
-    holds = ok(`testpool/media@snap1\t${CAPTURED_TAG}\tThu Oct 15 16:59 2026\n`)
+    holds = ok('')
     const res = await inject(ROLLBACK_FORCE)
     assert.equal(res.statusCode, 409, res.body)
     assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED', 'a hold on the target is no reason to refuse — the challenge is asked')
@@ -507,30 +510,22 @@ describe('cr.37 — dataset and snapshot verbs re-gate in the job (ruling (j))',
     assert.deepEqual(holdsCalls().map(c => c.args), [['holds', '-H', '--', 'testpool/media@snap2']], 'only the swept snapshot, never the bookmark')
   })
 
-  it('nf.3 review 6: zfs holds exit 0 with a garbled (tab-less) row reads as NO hold (the documented fail-open row) — a clean row beside it still refuses, garbled alone lets the rollback proceed', async () => {
-    // parseHolds is total: a line without a tab is skipped, and skipping it
-    // cannot invent or hide a hold on a well-formed row. (The exit-1 half —
-    // unreadable refuses — is pinned by the builder's unreadable test and not
-    // duplicated here.)
-    await serve()
-    holds = ok(`garbage line with no tabs at all\n${HOLDS_ON_SNAP2}`)
-    const refused = await inject(ROLLBACK_FORCE)
-    assert.equal(refused.statusCode, 409, refused.body)
-    assert.equal(refused.json().error.reason, 'snapshot-held', 'the clean row still refuses despite the garbage')
-    assert.deepEqual(calls.filter(isMutation), [])
-    await server!.close()
-    server = undefined
-
-    await serve()
-    holds = ok('garbage line with no tabs at all\nalso-not-a-hold-line\n')
-    const res = await inject(ROLLBACK_FORCE)
-    assert.equal(res.statusCode, 409, res.body)
-    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED', 'exit 0 + only-unparseable rows reads as no holds: the gate passes')
-    const res2 = await inject(ROLLBACK_FORCE, res.headers['x-anas-confirm-code'] as string)
-    assert.equal(res2.statusCode, 202, res2.body)
-    const job = await finished((res2.json() as JobAccepted).job.id)
-    assert.equal(job.status, 'completed', JSON.stringify(job.error))
-    assert.ok(calls.some(c => c.command === ZFS && c.args[0] === 'rollback'))
+  it('nf.3 review 6, re-pinned by the cr3 seam review: zfs holds exit 0 with a line that is not a holds row is UNREADABLE, never "no hold": the rollback is refused, beside a clean row or alone', async () => {
+    // One rule with the replication drift reader: an answer with a line that
+    // is not `<asked snapshot>\t<tag>\t<timestamp>` did not answer. The gate
+    // exists because ZFS stops at a held snapshot only after destroying the
+    // unheld ones, so "could not tell" refuses.
+    for (const answer of [`garbage line with no tabs at all\n${HOLDS_ON_SNAP2}`, 'garbage line with no tabs at all\nalso-not-a-hold-line\n']) {
+      await serve()
+      holds = ok(answer)
+      const refused = await inject(ROLLBACK_FORCE)
+      assert.equal(refused.statusCode, 409, refused.body)
+      assert.notEqual(refused.json().error.code, 'CONFIRMATION_REQUIRED', 'no confirm is offered over an unreadable answer')
+      assert.ok(typeof refused.headers['x-anas-confirm-code'] !== 'string')
+      assert.deepEqual(calls.filter(isMutation), [])
+      await server!.close()
+      server = undefined
+    }
   })
 
   it('a bookmark OLDER than the target is not destroyed by force and is not bound', async () => {

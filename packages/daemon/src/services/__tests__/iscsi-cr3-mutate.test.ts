@@ -319,7 +319,7 @@ describe('cr3 ISCSI-L7 (ruled) — Repair never writes to a foreign target; its 
     assert.deepEqual(health.missingLuns.map(m => [m.targetIqn, m.targetOwnership]), [[FOREIGN, 'foreign'], [OWN, 'anas']])
     // A change refused now names BOTH: Repair for ANAS's, the hand restore for theirs.
     const refused = assertSaveable(c, targets)!
-    assert.match(refused.message, /use Repair on the iSCSI view/)
+    assert.match(refused.message, /use Repair on the iSCSI screen/)
     assert.match(refused.message, new RegExp(`LUN 0 of ${FOREIGN.replaceAll('.', '\\.')} .* missing from a target ANAS does not manage`))
 
     const plan = planIscsiRepair(c, health, targets)

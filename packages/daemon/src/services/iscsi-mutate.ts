@@ -657,7 +657,7 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
       // the whole live tree and drops every session on the node first
       // (services/iscsi-repair.ts, and ANAS never issues it).
       + `/etc/rtslib-fb-target/saveconfig.json permanently. Bring the backing storage back (import the pool, `
-      + `restore the image), then use Repair on the iSCSI view, and retry.${foreignClause}${handsOffClause}`,
+      + `restore the image), then use Repair on the iSCSI screen, and retry.${foreignClause}${handsOffClause}`,
   }
 }
 
