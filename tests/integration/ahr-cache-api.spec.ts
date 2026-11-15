@@ -485,6 +485,9 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
     // pool's mount must never outlive the test.
     const WRITE_LOG = '/tmp/anas-cache-write.log'
     const WRITE_STOP = '/tmp/anas-cache-write.stop'
+    // The reader loop's log too: left behind, it sat in the node's /tmp after
+    // every run (cr3 node pass 2 housekeeping).
+    const READER_LOG = '/tmp/anas-cache-reader.log'
     const cacheId = BY_ID(CACHE_SERIAL)
     await execFileAsync(FIXTURE_SH, ['up'])
     for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
@@ -521,7 +524,6 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       // The first two runs of this spec logged `rc=0` through an EIO window the
       // kernel had recorded (`BTRFS warning (device dm-0): direct IO failed …
       // err no 10`), and this is why.
-      const READER_LOG = '/tmp/anas-cache-reader.log'
       await sshExec(
         `rm -f ${READER_LOG}; setsid bash -c 'for p in $(seq 1 600); do for f in ${MOUNT}/f*.bin; do `
         + `dd if=$f of=/dev/null bs=4k count=16 iflag=direct status=none 2>/dev/null; rc=$?; `
@@ -689,7 +691,7 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       // — which is what happened on the first run of this spec: the loop
       // outlived the test, held `/mnt/anas-ahr/gtcache`, and made the
       // afterAll's `umount` (and with it the whole fixture teardown) fail.
-      await sshExec(`pkill -f 'se[q] 1 600' || true; pkill -f 'anas-cache-write[.]stop' || true; rm -f ${WRITE_STOP} ${WRITE_LOG}`)
+      await sshExec(`pkill -f 'se[q] 1 600' || true; pkill -f 'anas-cache-write[.]stop' || true; rm -f ${WRITE_STOP} ${WRITE_LOG} ${READER_LOG}`)
         .catch(() => {})
       await ctx.dispose()
     }

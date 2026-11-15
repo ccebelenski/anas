@@ -27,6 +27,15 @@ done
 
 [ -z "$DISK_NUM" ] && usage
 
+# The same per-VM hot-plug lock remove-disk.sh holds until a detach has really
+# finished: an attach never starts while a detach of this VM is in flight.
+HOTPLUG_LOCK="${STORAGE_PATH}/.${VM_NAME}-hotplug.lock"
+exec 9>"$HOTPLUG_LOCK"
+if ! flock -w 300 9; then
+  echo "ERROR: another hot-plug of ${VM_NAME} held ${HOTPLUG_LOCK} for 300 s" >&2
+  exit 1
+fi
+
 DISK_PATH="${STORAGE_PATH}/${VM_NAME}-hot${DISK_NUM}.qcow2"
 SERIAL="ANAS_HOT${DISK_NUM}"
 

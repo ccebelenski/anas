@@ -1,0 +1,49 @@
+# ==============================================================================
+# REAL CAPTURE from the disposable stunt node anas-pve (cr3 node pass 2, 2026-11-15).
+# kernel 7.0.14-28-pve, btrfs-progs 6.14. An AHR pool made through the API
+# (POST /v1/ahr, 2 disks, ahr1) and mounted the way ANAS mounts every AHR pool:
+# subvol=/@data at /mnt/anas-ahr/n2ahr. Three nested subvolumes made by root:
+# sv (under @data), plain/sv2 (under a plain directory of @data), sv/deep
+# (nested in sv). Nothing was edited: these are the exact bytes the commands produced.
+#
+# WHAT IT SHOWS: on a mount of a subvolume, plain `btrfs subvolume list <mnt>`
+# prints a subvolume BELOW the mounted one relative to the MOUNTED subvolume
+# (`sv`, `plain/sv2`, `sv/deep`), not relative to the top level (`@data/sv`);
+# only the siblings of the mounted subvolume (`@data`, `@snapshots`) are printed
+# from the top level. `-a` prints top-level paths but mixes in `<FS_TREE>/`
+# prefixes; `-o` lists only the direct children of the mounted subvolume.
+# Compare backup/btrfs-nested-subvol.txt, captured on a TOP-LEVEL mount
+# (subvol=/), where the nested one does print as `@data/photos`.
+# ==============================================================================
+### $ btrfs --version
+btrfs-progs v6.14
+-EXPERIMENTAL -INJECT -STATIC +LZO +ZSTD +UDEV +FSVERITY +ZONED CRYPTO=builtin
+### exit=0
+### $ findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS /mnt/anas-ahr/n2ahr
+/mnt/anas-ahr/n2ahr /dev/n2ahr/n2ahr-vol[/@data] btrfs rw,relatime,discard=async,space_cache=v2,subvolid=256,subvol=/@data
+### exit=0
+### $ btrfs subvolume list /mnt/anas-ahr/n2ahr
+ID 256 gen 9904 top level 5 path @data
+ID 257 gen 9 top level 5 path @snapshots
+ID 262 gen 9904 top level 256 path sv
+ID 263 gen 9905 top level 256 path plain/sv2
+ID 264 gen 9905 top level 262 path sv/deep
+### exit=0
+### $ btrfs subvolume list -a /mnt/anas-ahr/n2ahr
+ID 256 gen 9904 top level 5 path <FS_TREE>/@data
+ID 257 gen 9 top level 5 path <FS_TREE>/@snapshots
+ID 262 gen 9904 top level 256 path @data/sv
+ID 263 gen 9905 top level 256 path @data/plain/sv2
+ID 264 gen 9905 top level 262 path <FS_TREE>/@data/sv/deep
+### exit=0
+### $ btrfs subvolume list -o /mnt/anas-ahr/n2ahr
+ID 262 gen 9904 top level 256 path @data/sv
+ID 263 gen 9905 top level 256 path @data/plain/sv2
+### exit=0
+### $ stat -c %d:%i:%n /mnt/anas-ahr/n2ahr /mnt/anas-ahr/n2ahr/sv /mnt/anas-ahr/n2ahr/sv/deep /mnt/anas-ahr/n2ahr/plain/sv2
+96:256:/mnt/anas-ahr/n2ahr
+99:256:/mnt/anas-ahr/n2ahr/sv
+101:256:/mnt/anas-ahr/n2ahr/sv/deep
+100:256:/mnt/anas-ahr/n2ahr/plain/sv2
+### exit=0
+7.0.14-28-pve

@@ -1,0 +1,62 @@
+# ==============================================================================
+# REAL CAPTURE from the disposable stunt nodes (cr3 node pass 2, 2026-11-15).
+# Local: anas-pve, zfs-2.4.4-pve1, kernel 7.0.14-28-pve.
+# Over ssh: from anas-pve to anas-zfs (zfs-2.4.2-pve1, kernel 7.0.2-6-pve) as
+# root with the replication key and pinned known_hosts, the way the transport
+# reaches a remote. `cat -A` marks tabs (^I) and line ends ($).
+# Nothing was edited: these are the exact bytes the commands produced.
+#
+# WHAT IT SHOWS: a second `zfs hold` of a tag already on the snapshot exits 1
+# with `cannot hold snapshot '<snapshot>': tag already exists on this dataset`
+# on stderr, the same text locally and over ssh (the form
+# services/replication-holds.ts:42 TAG_EXISTS_RE matches). `zfs holds -H` prints
+# one `<snapshot>\t<tag>\t<timestamp>` row per tag, no header, in no fixed tag
+# order (B before A on 2.4.4, A before B on 2.4.2); the timestamp has spaces.
+# ==============================================================================
+### local (anas-pve)
+### $ zfs hold n2tagA n2zfs/src@s1
+### exit=0
+### $ zfs hold n2tagA n2zfs/src@s1
+cannot hold snapshot 'n2zfs/src@s1': tag already exists on this dataset
+### exit=1
+### $ zfs hold n2tagB n2zfs/src@s1
+### exit=0
+### $ zfs holds -H n2zfs/src@s1 | cat -A
+n2zfs/src@s1^In2tagB^ISun Nov 15 03:25 2026$
+n2zfs/src@s1^In2tagA^ISun Nov 15 03:25 2026$
+### $ zfs holds -H n2zfs/src@s1 n2zfs/src@snapshot-2026-11-15T03-25-06-788Z | cat -A
+n2zfs/src@s1^In2tagB^ISun Nov 15 03:25 2026$
+n2zfs/src@s1^In2tagA^ISun Nov 15 03:25 2026$
+n2zfs/src@snapshot-2026-11-15T03-25-06-788Z^Ianas-repl-141618843810^ISun Nov 15 03:25 2026$
+
+### over ssh: anas-pve -> anas-zfs (ssh -i <replication_key> -o UserKnownHostsFile=<known_hosts> -o StrictHostKeyChecking=yes -o BatchMode=yes root@<host> ...)
+### $ zfs hold n2tagA rpool/n2repl@h1
+### exit=0
+### $ zfs hold n2tagA rpool/n2repl@h1 2>err; cat -A err
+cannot hold snapshot 'rpool/n2repl@h1': tag already exists on this dataset$
+### exit=1
+### $ zfs hold n2tagB rpool/n2repl@h1
+### exit=0
+### $ zfs holds -H rpool/n2repl@h1 | cat -A
+rpool/n2repl@h1^In2tagA^ISun Nov 15 03:25 2026$
+rpool/n2repl@h1^In2tagB^ISun Nov 15 03:25 2026$
+### $ "zfs hold n2tagA \"rpool/n2repl@h1 x\""   (one remote shell string, a space in the name)
+cannot hold snapshot 'rpool/n2repl@h1 x': dataset does not exist
+### exit=1
+
+### written@<base> on a target during an incremental receive in flight (anas-pve, local,
+### `zfs send -i @base n2zfs/src3@next | <1 MiB per 50 ms throttle> | zfs recv -o readonly=on n2zfs/dst/inflight`, 200 MiB)
+### polled every 0.5 s: `zfs get -Hp -o value written@base,readonly n2zfs/dst/inflight`, snapshot count, receive_resume_token
+03:25:45.005 0 on  snaps=1 recvtoken=-
+03:25:49.931 0 on  snaps=1 recvtoken=-
+03:25:54.854 0 on  snaps=1 recvtoken=-
+recv rc=0
+03:25:55.971 209863680 on  snaps=2 recvtoken=-
+### => 0 for the whole receive; the new snapshot and the full written@base arrive together.
+
+### readonly source on a child of a recursive receive (`zfs send -R n2zfs/srcr@r1 | zfs recv -o readonly=on n2zfs/dst/rec`)
+### $ zfs get -Hp -o name,property,value,source readonly,written@r1 n2zfs/dst/rec n2zfs/dst/rec/kid | cat -A
+n2zfs/dst/rec^Ireadonly^Ion^Ilocal$
+n2zfs/dst/rec^Iwritten@r1^I0^Ilocal$
+n2zfs/dst/rec/kid^Ireadonly^Ion^Iinherited from n2zfs/dst/rec$
+n2zfs/dst/rec/kid^Iwritten@r1^I0^Ilocal$

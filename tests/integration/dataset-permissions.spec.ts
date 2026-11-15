@@ -251,9 +251,12 @@ test.describe.serial('ANAS layered permissions editor (throwaway dataset)', () =
     await win2.locator('.anas-btn-dataset-access-submit').click()
     await expect(win2).toBeHidden({ timeout: 30_000 })
 
-    // Source of truth: the named entry is gone and the mode bits are clean (755,
-    // no lingering setgid).
+    // Source of truth: the named entry is gone and the permission bits are back
+    // to 755. The setgid bit the grant added STAYS (cr3.shares third review N3,
+    // services/access.ts "a clear never removes setgid": ANAS cannot tell the
+    // bit it set from one an administrator set) — so the full mode is 2755.
+    // Stale expectation found by cr3 node pass 2 (the spec still said 755).
     await expect.poll(() => aclHasNamedUser(mount, PU), { timeout: 60_000 }).toBe(false)
-    await expect.poll(() => getMode(mount), { timeout: 60_000 }).toBe('755')
+    await expect.poll(() => getMode(mount), { timeout: 60_000 }).toBe('2755')
   })
 })

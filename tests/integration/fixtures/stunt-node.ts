@@ -508,6 +508,11 @@ export async function destroyPool(name: string): Promise<void> {
     // Now capture member device paths (may be partitions), then destroy.
     `devs=$(zpool status -PL "$pool" 2>/dev/null | grep -oE '/dev/[^ ]+' || true)`,
     `zpool destroy -f "$pool" 2>/dev/null || true`,
+    // A pool ANAS created or imported got its zfs-import@<pool>.service
+    // enabled (issue #22); a raw destroy leaves that unit behind and it fails
+    // at the next boot ("no such pool available"; cr3 node pass 2 found
+    // zfs-import@anasactimport.service failed after pools-act-api's import test).
+    `systemctl disable "zfs-import@$(systemd-escape "$pool").service" >/dev/null 2>&1 || true`,
     // Wipe each member's WHOLE disk (parent of the partition, else itself).
     `for d in $devs; do`,
     `  p=$(lsblk -no pkname "$d" 2>/dev/null | head -1)`,

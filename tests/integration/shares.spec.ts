@@ -83,9 +83,13 @@ test.describe('ANAS Shares view (stunt node)', () => {
     // EXACTLY (a substring 'share1' would also hit the NFS /testpool/share1 row,
     // and 'printers' the /var/lib/samba/printers path) then assert the SMB badge
     // in the same row.
-    for (const name of ['printers', 'print$', 'share1']) {
+    // `print$` carries the "not managed by ANAS" marker in the same cell
+    // (cr3.shares f838c60ac: a name ANAS's ShareName refuses is listed, marked,
+    // and left to smb.conf), so its cell reads `print$ not managed by ANAS`
+    // (cr3 node pass 2: the exact `^print\$$` match was a stale expectation).
+    for (const cellText of ['printers', 'print$ not managed by ANAS', 'share1']) {
       const nameCell = grid
-        .locator('.x-grid-cell-inner', { hasText: new RegExp(`^${name.replace(/\$/g, '\\$')}$`) })
+        .locator('.x-grid-cell-inner', { hasText: new RegExp(`^${cellText.replace(/\$/g, '\\$')}$`) })
         .first()
       await expect(nameCell).toBeVisible({ timeout: 45_000 })
       const row = nameCell.locator('xpath=ancestor::*[contains(@class,"x-grid-row")][1]')
