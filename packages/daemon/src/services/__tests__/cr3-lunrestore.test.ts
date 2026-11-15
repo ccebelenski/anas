@@ -1953,6 +1953,31 @@ describe('cr3.lunrestore review3 (6) — an exit 0 the byte count does not prove
     assert.equal(JSON.parse(node.marks.get('tank/vol1')!).state, 'unverified')
   })
 
+  it('node capture 2026-11-15, in place: the image completion line of client 4.2.0 with the image\'s byte count completes the restore and the target is enabled again', async () => {
+    const node = withMarks(inPlaceMock({ stderr: '', exitCode: 0, bytesWritten: 0 }))
+    const size = inPlaceDeps(node.executor, { enabled: true }).imageSize
+    const done = withMarks(inPlaceMock({ stderr: `restore image complete (bytes=${size}, duration=5.43s, speed=94.28MB/s)    \r`, exitCode: 0, bytesWritten: 0 }))
+    const rec = recording(done.executor)
+    await runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true }), () => {})
+    assert.ok(enabledBy(rec.calls), 're-enabled')
+    assert.ok(!done.marks.has('tank/vol1'), 'the mark is removed')
+  })
+
+  it('node capture 2026-11-15, in place: a completion line whose own count is short stays disabled and says the count, never "did not report"', async () => {
+    const probe = withMarks(inPlaceMock({ stderr: '', exitCode: 0, bytesWritten: 0 }))
+    const size = inPlaceDeps(probe.executor, { enabled: true }).imageSize
+    const node = withMarks(inPlaceMock({ stderr: `restore image complete (bytes=${size - 4096}, duration=5.43s, speed=94.28MB/s)    \r`, exitCode: 0, bytesWritten: 0 }))
+    const rec = recording(node.executor)
+    await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true }), () => {}), (err: Error) => {
+      assert.ok(err.message.startsWith(`the client reported the image complete, but its own count is ${size - 4096} bytes, not the image's ${size}: target `), err.message)
+      assert.doesNotMatch(err.message, /did not report the restore complete/)
+      assert.equal((err as Error & { jobErrorCode?: string }).jobErrorCode, 'IMAGE_UNVERIFIED')
+      return true
+    })
+    assert.ok(!enabledBy(rec.calls), 'never re-enabled')
+    assert.equal(JSON.parse(node.marks.get('tank/vol1')!).state, 'unverified')
+  })
+
   it('new LUN: exit 0 with no "restore complete" line — not mapped, kept unverified', async () => {
     await withRoot(async (root) => {
       const rec = recording(mockWith(undefined, { stderr: '', exitCode: 0, bytesWritten: 0 }))

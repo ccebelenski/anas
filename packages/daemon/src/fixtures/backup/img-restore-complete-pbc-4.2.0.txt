@@ -1,0 +1,13 @@
+# CAPTURE 2026-11-15, the ZFS-root test node, proxmox-backup-client 4.2.0-1.
+# A whole-image restore of a 512 MiB image archive to stdout, the argv the
+# daemon issues, by hand:
+#   proxmox-backup-client restore host/<id>/<time> src.img - > /dev/null
+# exit 0. The ENTIRE stderr is the one line below (padded with spaces, as the
+# client pads every line): no `progress N%` line is printed for an image
+# archive on this client, and the completion line is not the
+# `restore complete (<amount> processed in <t>, average <rate>)` shape of
+# restore-progress.txt and img-restore-and-map.txt.
+# Through ANAS the same restore wrote the whole image (sha256 of the LUN's
+# backing equal to the source, on a zvol and on an image file) and the job
+# ended IMAGE_UNVERIFIED, because only the older shape was matched.
+restore image complete (bytes=536870912, duration=5.43s, speed=94.28MB/s)    

@@ -185,8 +185,19 @@ export function imageArchiveSize(snapshot: BackupSnapshot, archive: string): num
 
 /** `progress 17% (43.939 MiB of 250.001 MiB in 16.1s, 3.1 MiB/s)` — GT-59. */
 const PROGRESS_RE = /^progress\s+(\d+)%\s*\((.*)\)\s*$/
-/** `restore complete (250.001 MiB processed in 1m 27.5s, average 2.857 MiB/s)`. */
-const COMPLETE_RE = /^restore complete\s*\((.*)\)\s*$/
+/**
+ * The client's completion line, in both captured shapes:
+ * `restore complete (250.001 MiB processed in 1m 27.5s, average 2.857 MiB/s)`
+ * (GT-59, and the image restores of fixtures/backup/img-restore-and-map.txt),
+ * and `restore image complete (bytes=536870912, duration=5.43s, speed=94.28MB/s)`,
+ * which proxmox-backup-client 4.2.0 prints for an image archive, as its ONLY
+ * line: no progress lines at all (node capture 2026-11-15,
+ * fixtures/backup/img-restore-complete-pbc-4.2.0.txt). Matching only the
+ * first made every whole-image restore on that client end unverified.
+ */
+const COMPLETE_RE = /^restore (?:image )?complete\s*\((.*)\)\s*$/
+/** The exact byte count the second shape carries: `bytes=536870912`. */
+const COMPLETE_BYTES_RE = /(?:^|,\s*)bytes=(\d+)(?:,|$)/
 /** Trailing padding spaces pbc puts on every line. */
 const TRAILING_WS_RE = /\s+$/
 /** The amount processed, at the start of a progress line's parenthesis: `43.939 MiB of 250.001 MiB in 16.1s` (GT-59). */
@@ -200,6 +211,8 @@ export interface RestoreProgress {
   lastLine: string | null
   /** pbc's own `restore complete (…)` line, when it printed one. */
   complete: string | null
+  /** The exact bytes that line states (`bytes=N`, the image shape), when it states them. */
+  completeBytes?: number
   /**
    * A LOWER BOUND on the bytes the last progress line says were processed
    * (`1 MiB of 512 GiB` — review3 3: a `progress 0%` line on a large image
@@ -253,8 +266,10 @@ export function imageBytesWritten(
 ): ImageBytesWritten {
   if (descriptorBytes > 0)
     return { bytes: descriptorBytes, estimated: false }
+  // The line's own count when it states one (the image shape): a count that
+  // is not the image's size then fails the size check like a descriptor's.
   if (exitCode === 0 && progress.complete)
-    return { bytes: imageSize, estimated: false }
+    return { bytes: progress.completeBytes ?? imageSize, estimated: false }
   if (progress.percent !== null) {
     // review3 3: the amount on the line counts too — `progress 0% (1 MiB of
     // 512 GiB in 6.0s)` is 1 MiB written, never 0.
@@ -291,8 +306,14 @@ export function parseRestoreProgress(stderr: string): RestoreProgress {
       continue
     }
     const c = line.match(COMPLETE_RE)
-    if (c)
+    if (c) {
       progress.complete = line
+      const b = c[1].match(COMPLETE_BYTES_RE)
+      if (b && Number.isSafeInteger(Number(b[1])))
+        progress.completeBytes = Number(b[1])
+      else
+        delete progress.completeBytes
+    }
   }
   return progress
 }
@@ -446,11 +467,15 @@ export function failedBeforeWriting(stderr: string, signal?: string): boolean {
  * the client did not print its `restore complete` line, and ANAS cannot count
  * what the client wrote through its own descriptor (live-proof wave 2).
  */
-function exitZeroCountGap(descriptorBytes: number, counted: number, imageSize: number, path: string): string | null {
+function exitZeroCountGap(descriptorBytes: number, counted: number, imageSize: number, path: string, statedBytes?: number): string | null {
   if (counted === imageSize)
     return null
   if (descriptorBytes > 0)
     return `${descriptorBytes} bytes reached ${path}, not the image's ${imageSize}`
+  // The completion line's own count (the image shape) that is not the image's
+  // size: the client DID report, so the sentence below would be false.
+  if (statedBytes !== undefined)
+    return `its own count is ${statedBytes} bytes, not the image's ${imageSize}`
   return 'it did not report the restore complete and ANAS cannot count what it wrote'
 }
 
@@ -484,8 +509,13 @@ export function imageRestoreFailure(message: string, code: ImageRestoreFailureCo
 /** The classification itself — over the raw stderr, unmasked ({@link explainRestoreFailure}). */
 function rawExplainRestoreFailure(stderr: string, signal?: string): string {
   if (signal && !hasImageRestoreErrorText(stderr)) {
-    return `The image restore was interrupted - the client was killed by ${signal} `
-      + 'and reported no error of its own; what reached the target is whatever its last progress line claimed.'
+    // Node capture 2026-11-15: this client prints no progress line for an
+    // image archive, so "whatever its last progress line claimed" named a
+    // line that never comes; say which of the two it is.
+    const reached = parseRestoreProgress(stderr).lastLine !== null
+      ? 'and reported no error of its own; what reached the target is at least what its last progress line claimed.'
+      : 'and reported no error of its own and no progress, so how much reached the target is not known.'
+    return `The image restore was interrupted - the client was killed by ${signal} ${reached}`
   }
   const line = firstRestoreError(stderr)
   if (NO_SNAPSHOT_RE.test(stderr)) {
@@ -1095,7 +1125,7 @@ export async function runImageRestore(
     // review3 6: an exit 0 whose byte count is not the image's (no `restore
     // complete` line, or a descriptor count that disagrees) is not proof of a
     // complete image: unverified below, never a warning beside a re-enable.
-    const countGap = exitZeroCountGap(r.bytesWritten, bytesWritten, deps.imageSize, lun.backingPath)
+    const countGap = exitZeroCountGap(r.bytesWritten, bytesWritten, deps.imageSize, lun.backingPath, progress.completeBytes)
 
     // ---- Read-back: the disk must still be the same disk -------------------
     updateProgress('verifying the backstore path, unit serial and attributes are unchanged')
@@ -1520,7 +1550,7 @@ export async function runNewLunImageRestore(
         duration = progress.complete
       // review3 6: an exit 0 the byte count does not prove is unverified (below).
       reportedComplete = progress.complete !== null
-      countGap = exitZeroCountGap(r!.bytesWritten, bytesWritten, deps.imageSize, backing.path)
+      countGap = exitZeroCountGap(r!.bytesWritten, bytesWritten, deps.imageSize, backing.path, progress.completeBytes)
 
       if (r!.exitCode !== 0) {
         const detail = explainRestoreFailure(r!.stderr, r!.signal, [deps.secret])
