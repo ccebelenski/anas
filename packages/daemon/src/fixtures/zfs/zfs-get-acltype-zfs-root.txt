@@ -1,0 +1,5 @@
+rpool	off
+rpool/ROOT	off
+rpool/ROOT/pve-1	posix
+rpool/data	off
+rpool/var-lib-vz	off

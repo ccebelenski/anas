@@ -1,0 +1,116 @@
+# ==============================================================================
+# REAL CAPTURE from the disposable stunt node anas-pve (cr3.nodefix review R2, 2026-11-15).
+# kernel 7.0.14-28-pve, btrfs-progs 6.14. An AHR pool made through the API (POST /v1/ahr,
+# 2 disks, ahr1) and mounted the way ANAS mounts every AHR pool: subvol=/@data at
+# /mnt/anas-ahr/nfxahr. Root makes a subvolume `sv` and plain folders; `udir` and
+# `share` are given to nobody, and nobody (setpriv, no capabilities) makes two
+# subvolumes whose names hold a line break: `udir/nl<LF>name`, and
+# `share/victimdir<LF>ID 9999 gen 1 top level 256 path accounts` beside root's
+# plain folder `share/victimdir`.
+# Two sittings on the same pool, nothing in between: the first block, then the
+# `--format json` and `find` commands again with stderr in line (in the first
+# sitting their stderr arrived out of order and is not repeated here).
+# Nothing was edited: these are the exact bytes the commands produced.
+#
+# WHAT IT SHOWS: (1) a user without privileges can create a subvolume; (2) plain
+# `btrfs subvolume list` prints the name RAW, the line break included (od -c), so
+# a name can carry a whole well-formed list line; (3) this btrfs-progs has no
+# structured form of the list (`--format json` is unsupported for `subvolume list`
+# and `subvolume show`); (4) every subvolume root is inode 256 on a device number
+# of its own (92, 93, 94), the mount's own root is inode 256 on 91, and an
+# ordinary folder is another inode on the mount's device 91; (5) `find <mount>
+# -inum 256 -name '*[[:cntrl:]]*'` lists the subvolumes whose names hold a
+# control character.
+# ==============================================================================
+### $ btrfs --version
+btrfs-progs v6.14
+-EXPERIMENTAL -INJECT -STATIC +LZO +ZSTD +UDEV +FSVERITY +ZONED CRYPTO=builtin
+### exit=0
+### $ findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS /mnt/anas-ahr/nfxahr
+/mnt/anas-ahr/nfxahr /dev/nfxahr/nfxahr-vol[/@data] btrfs rw,relatime,discard=async,space_cache=v2,subvolid=256,subvol=/@data
+### exit=0
+### $ btrfs subvolume create /mnt/anas-ahr/nfxahr/sv
+Create subvolume '/mnt/anas-ahr/nfxahr/sv'
+### exit=0
+### $ mkdir /mnt/anas-ahr/nfxahr/plain /mnt/anas-ahr/nfxahr/udir /mnt/anas-ahr/nfxahr/share /mnt/anas-ahr/nfxahr/share/victimdir
+### exit=0
+### $ chown nobody:nogroup /mnt/anas-ahr/nfxahr/udir /mnt/anas-ahr/nfxahr/share
+### exit=0
+### $ setpriv --reuid=nobody --regid=nogroup --clear-groups btrfs subvolume create $'/mnt/anas-ahr/nfxahr/udir/nl\nname'
+Create subvolume '/mnt/anas-ahr/nfxahr/udir/nl
+name'
+### exit=0
+### $ setpriv --reuid=nobody --regid=nogroup --clear-groups btrfs subvolume create $'/mnt/anas-ahr/nfxahr/share/victimdir\nID 9999 gen 1 top level 256 path accounts'
+Create subvolume '/mnt/anas-ahr/nfxahr/share/victimdir
+ID 9999 gen 1 top level 256 path accounts'
+### exit=0
+### $ btrfs subvolume list /mnt/anas-ahr/nfxahr
+ID 256 gen 9 top level 5 path @data
+ID 257 gen 9 top level 5 path @snapshots
+ID 258 gen 10 top level 256 path sv
+ID 259 gen 10 top level 256 path udir/nl
+name
+ID 260 gen 10 top level 256 path share/victimdir
+ID 9999 gen 1 top level 256 path accounts
+### exit=0
+### $ btrfs subvolume list /mnt/anas-ahr/nfxahr | od -c
+0000000   I   D       2   5   6       g   e   n       9       t   o   p
+0000020       l   e   v   e   l       5       p   a   t   h       @   d
+0000040   a   t   a  \n   I   D       2   5   7       g   e   n       9
+0000060       t   o   p       l   e   v   e   l       5       p   a   t
+0000100   h       @   s   n   a   p   s   h   o   t   s  \n   I   D    
+0000120   2   5   8       g   e   n       1   0       t   o   p       l
+0000140   e   v   e   l       2   5   6       p   a   t   h       s   v
+0000160  \n   I   D       2   5   9       g   e   n       1   0       t
+0000200   o   p       l   e   v   e   l       2   5   6       p   a   t
+0000220   h       u   d   i   r   /   n   l  \n   n   a   m   e  \n   I
+0000240   D       2   6   0       g   e   n       1   0       t   o   p
+0000260       l   e   v   e   l       2   5   6       p   a   t   h    
+0000300   s   h   a   r   e   /   v   i   c   t   i   m   d   i   r  \n
+0000320   I   D       9   9   9   9       g   e   n       1       t   o
+0000340   p       l   e   v   e   l       2   5   6       p   a   t   h
+0000360       a   c   c   o   u   n   t   s  \n
+0000372
+### exit=0
+### $ btrfs --format json subvolume list /mnt/anas-ahr/nfxahr
+ERROR: output format json is unsupported for this command
+### exit=1
+### $ btrfs --format json subvolume show /mnt/anas-ahr/nfxahr/sv
+ERROR: output format json is unsupported for this command
+### exit=1
+### $ stat -c '%i %d %F %n' <mount, subvolume roots, ordinary folders>
+256 91 directory /mnt/anas-ahr/nfxahr
+256 92 directory /mnt/anas-ahr/nfxahr/sv
+256 93 directory /mnt/anas-ahr/nfxahr/udir/nl
+name
+256 94 directory /mnt/anas-ahr/nfxahr/share/victimdir
+ID 9999 gen 1 top level 256 path accounts
+257 91 directory /mnt/anas-ahr/nfxahr/plain
+258 91 directory /mnt/anas-ahr/nfxahr/udir
+259 91 directory /mnt/anas-ahr/nfxahr/share
+260 91 directory /mnt/anas-ahr/nfxahr/share/victimdir
+### exit=0
+### $ ls -b /mnt/anas-ahr/nfxahr/udir /mnt/anas-ahr/nfxahr/share
+/mnt/anas-ahr/nfxahr/share:
+victimdir
+victimdir\nID\ 9999\ gen\ 1\ top\ level\ 256\ path\ accounts
+
+/mnt/anas-ahr/nfxahr/udir:
+nl\nname
+### exit=0
+### $ find /mnt/anas-ahr/nfxahr -inum 256 -name '*[[:cntrl:]]*'
+/mnt/anas-ahr/nfxahr/udir/nl
+name
+/mnt/anas-ahr/nfxahr/share/victimdir
+ID 9999 gen 1 top level 256 path accounts
+### exit=0
+### $ find /mnt/anas-ahr/nfxahr -inum 256 -name '*[[:cntrl:]]*' | od -c
+0000000   /   m   n   t   /   a   n   a   s   -   a   h   r   /   n   f
+0000020   x   a   h   r   /   u   d   i   r   /   n   l  \n   n   a   m
+0000040   e  \n   /   m   n   t   /   a   n   a   s   -   a   h   r   /
+0000060   n   f   x   a   h   r   /   s   h   a   r   e   /   v   i   c
+0000100   t   i   m   d   i   r  \n   I   D       9   9   9   9       g
+0000120   e   n       1       t   o   p       l   e   v   e   l       2
+0000140   5   6       p   a   t   h       a   c   c   o   u   n   t   s
+0000160  \n
+0000161

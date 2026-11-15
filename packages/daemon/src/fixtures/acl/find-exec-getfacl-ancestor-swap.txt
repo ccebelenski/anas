@@ -1,0 +1,20 @@
+# ==============================================================================
+# REAL CAPTURE from the disposable stunt node anas-pve (cr3.nodefix review R1, 2026-11-15).
+# GNU findutils 4.10.0, acl (getfacl) 2.3.2. A scratch tree under /var/tmp/nfxd1c:
+# share/a/b/c carries `setfacl -m d:u:4242:rwx,u:4242:rwx`; share/.decoy/b/c is a
+# lookalike without it. The -exec action is a wrapper that, in the getfacl batch that
+# holds .../c, first changes the tree (SWAP=ancestor: `mv share/a share/.moved && ln -s
+# .decoy share/a`; SWAP=rename: `mv share/a share/.moved`), then execs /usr/bin/getfacl
+# with the same operands: the window between find's listing and the batch.
+# It repeats the cr3.nodefix review's probe (run there with GNU find 4.11 on the dev host).
+# Nothing below the header was edited.
+# ==============================================================================
+### $ SWAP=ancestor find -P /var/tmp/nfxd1c/share -xdev -type d -exec <getfacl after the swap> -n -p -c -E -s {} + | LC_ALL=C sort -u
+### stderr:
+### find exit=0
+### $ SWAP=rename find -P /var/tmp/nfxd1c/share -xdev -type d -exec <getfacl after the swap> -n -p -c -E -s {} + | LC_ALL=C sort -u
+### stderr:
+getfacl: /var/tmp/nfxd1c/share/a: No such file or directory
+getfacl: /var/tmp/nfxd1c/share/a/b: No such file or directory
+getfacl: /var/tmp/nfxd1c/share/a/b/c: No such file or directory
+### find exit=1

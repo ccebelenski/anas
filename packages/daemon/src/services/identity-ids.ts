@@ -2,15 +2,17 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import type { GuardReads } from '../safety/guard.js'
 import type { WalkRoot } from './access-walk.js'
+import type { PveFootprint } from './pve-footprint.js'
 import { isPathWithin, SHARE_ID_MAX, SHARE_ID_MIN } from '@anas/shared'
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { parseExports } from '../parsers/exports.js'
 import { isFindmntTable } from '../parsers/findmnt.js'
 import { isMutableShareId, parseGroups, parsePasswd } from '../parsers/getent.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
-import { findPathPattern, walkArgs, walkScopeFrom } from './access-walk.js'
+import { findPathPattern, walkScopeFrom } from './access-walk.js'
 import { readAhrPools } from './ahr-topology.js'
 import { isUnwalkableKind, kindOfMount, mountIndex, normalizePath } from './nested-filesystems.js'
+import { loadPveFootprint } from './pve-footprint.js'
 import { probeSharePath } from './share-path.js'
 
 // ============================================================================
@@ -66,9 +68,9 @@ import { probeSharePath } from './share-path.js'
 //     default, owns that grant — given to a new account it would be
 //     inherited (EPICS §2 "Shares & identities"). Read once per guard run
 //     under every share/export path, every mounted ZFS filesystem whose
-//     `acltype` is posix and every mounted AHR pool (the access editor's
-//     targets), bounded by root exactly as (2) is, with
-//     `find … -type d -execdir getfacl -n -p -c -E -s {} + | sort -u` —
+//     `acltype` is posix and that PVE does not own, and every mounted AHR
+//     pool (the access editor's targets), bounded by root exactly as (2) is,
+//     with `find … -type d -exec getfacl -n -p -c -E -s {} + | sort -u` —
 //     {@link aclFindArgs}. DIRECTORIES ONLY (cr.59n, operator ruling
 //     2026-10-16): a directory's getfacl prints its access AND default
 //     entries, so an inheritable grant — the one a new account would receive
@@ -127,6 +129,14 @@ export interface OwnershipReadOpts {
    * `readAhrPools` over the executor when absent — a test serves its own.
    */
   ahrPools?: () => Promise<{ mountpoint: string, mounted: boolean }[]>
+  /**
+   * cr3.nodefix D1: does PVE own this ZFS filesystem (the boot tree, a
+   * storage root, a guest volume, a dir storage's dataset)? `null` when that
+   * cannot be judged, with the reads that could not answer (`unjudged`).
+   * {@link pveOwnedFrom} over `loadPveFootprint` when absent — a test serves
+   * its own.
+   */
+  pveOwned?: () => Promise<((dataset: string) => boolean) | { unjudged: string }>
   /** Clock and budget, injectable for the deadline test. */
   now?: () => number
   budgetMs?: number
@@ -163,11 +173,12 @@ export function spaceArgs(kind: IdKind, dataset: string): string[] {
 }
 
 /**
- * The `find` argv that asks "does `id` own anything under this root?": the
- * same start, `-xdev` and prune as nf.1's {@link walkArgs}, then
- * `-uid N -print -quit` (or `-gid`) — the first match ends the walk.
+ * nf.1's bounded start of every identity-scan `find`: `-P` (never follow a
+ * link), the root, `-xdev` when the root has it (a global option, so ahead
+ * of every test), every pruned path as itself. What follows it is one of the
+ * two READS below — never an action that writes (cr3.nodefix review R4).
  */
-export function ownerFindArgs(kind: IdKind, id: number, root: WalkRoot): string[] {
+function boundedFind(root: WalkRoot): string[] {
   const args = ['-P', root.path]
   if (root.xdev)
     args.push('-xdev')
@@ -175,8 +186,16 @@ export function ownerFindArgs(kind: IdKind, id: number, root: WalkRoot): string[
     const terms = root.prune.flatMap((p, i) => [...(i > 0 ? ['-o'] : []), '-path', findPathPattern(p)])
     args.push('(', ...terms, ')', '-prune', '-o')
   }
-  args.push(NOUN[kind].findTest, String(id), '-print', '-quit')
   return args
+}
+
+/**
+ * The `find` argv that asks "does `id` own anything under this root?": the
+ * bounded start ({@link boundedFind}), then `-uid N -print -quit` (or
+ * `-gid`) — the first match ends the walk.
+ */
+export function ownerFindArgs(kind: IdKind, id: number, root: WalkRoot): string[] {
+  return [...boundedFind(root), NOUN[kind].findTest, String(id), '-print', '-quit']
 }
 
 /** The findmnt row of the filesystem `path` sits on (the longest mount target containing it). */
@@ -446,15 +465,120 @@ export function parsePosixAclFilesystems(stdout: string): Set<string> | null {
  * filesystems and automounts never entered). A ZFS filesystem with ACLs off
  * is not walked: the kernel applies no POSIX ACL there, so nothing on it can
  * be inherited (an access-editor grant switches `acltype` on first).
+ *
+ * cr3.nodefix D1: a ZFS filesystem `pveOwned` says PVE owns is not a root of
+ * its own. It is no access-editor target (the editor refuses it 409
+ * PVE_MANAGED) and ANAS makes no share on it, so it is not storage ANAS
+ * manages. The PVE installer leaves `acltype=posix` on the boot filesystem
+ * mounted at `/`, and PVE makes every container root filesystem with it:
+ * as roots, `/` dragged in every local mount below it (/proc, /sys, /dev,
+ * /run, /etc/pve and more) and the walk did not finish in the check's 10 s on a
+ * stock ZFS-root node. A share or export path is still a start wherever it
+ * is (a hand-written one on PVE's filesystem is walked from its own path).
+ * Without `pveOwned` (PVE's claim could not be judged) every ACL-enabled
+ * filesystem is a root, as before: a missing fact only widens the walk.
  */
-export function aclWalkRoots(starts: string[], mounts: Map<string, FindmntNode>, posixAcl: Set<string>): WalkRoot[] {
-  const zfsRoots = [...mounts.values()].filter(n => n.fstype === 'zfs' && posixAcl.has(n.source)).map(n => n.target)
+export function aclWalkRoots(
+  starts: string[],
+  mounts: Map<string, FindmntNode>,
+  posixAcl: Set<string>,
+  pveOwned?: (dataset: string) => boolean,
+): WalkRoot[] {
+  const zfsRoots = [...mounts.values()]
+    .filter(n => n.fstype === 'zfs' && posixAcl.has(n.source) && !(pveOwned?.(n.source) ?? false))
+    .map(n => n.target)
   return walkRootsWhere([...starts, ...zfsRoots], mounts, node => node.fstype !== 'zfs' || posixAcl.has(node.source))
 }
 
 /**
+ * cr3.nodefix D1: the footprint's ownership answer as the ACL walk's
+ * predicate, or null when it cannot be judged — storage.cfg (or the pools its
+ * dir storages sit on) or the boot facts unreadable. The footprint answers
+ * "PVE's" for everything it cannot see, which tightens a gate but would
+ * NARROW this walk, so an unreadable footprint is no predicate at all.
+ */
+export function pveOwnedFrom(
+  fp: Pick<PveFootprint, 'storagesUnavailable' | 'systemFactsUnavailable' | 'ownershipOf' | 'unreadableReads'>,
+): ((dataset: string) => boolean) | { unjudged: string } {
+  if (fp.storagesUnavailable || fp.systemFactsUnavailable) {
+    // cr3.nodefix review R3: the reads that failed, in their own words.
+    const reads = fp.unreadableReads ?? []
+    return { unjudged: reads.length > 0 ? reads.join('; ') : 'PVE\'s storage configuration or the boot facts could not be read' }
+  }
+  return dataset => fp.ownershipOf(dataset) !== null
+}
+
+/**
+ * cr3.nodefix review R3: the executor the footprint read runs on inside the
+ * check — every command's deadline is at most what is left of the check's
+ * one budget (the footprint passes no deadline of its own, so each command
+ * would otherwise get the request lane's full 10 s).
+ */
+function executorWithin(executor: CommandExecutor, deadline: number, now: () => number): CommandExecutor {
+  return new Proxy(executor, {
+    get(target, prop, receiver) {
+      if (prop === 'exec') {
+        return (command: string, args: string[], opts?: Parameters<CommandExecutor['exec']>[2]) => {
+          const left = Math.max(1, deadline - now())
+          const asked = opts?.timeoutMs
+          return target.exec(command, args, { ...opts, timeoutMs: typeof asked === 'number' ? Math.min(asked, left) : left, longRunning: undefined })
+        }
+      }
+      const value = Reflect.get(target, prop, receiver) as unknown
+      return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
+    },
+  })
+}
+
+/** PVE's claim from the live footprint, inside the check's remaining budget (`timeoutMs`). */
+async function footprintWithin(o: OwnershipReadOpts, timeoutMs: number): Promise<((dataset: string) => boolean) | { unjudged: string }> {
+  const now = o.now ?? Date.now
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<never>((_, reject) => {
+    // The footprint also reads storage.cfg in this process: the race keeps
+    // even that inside the budget.
+    timer = setTimeout(() => reject(new CommandTimeoutError('loadPveFootprint', [], 'request', timeoutMs, false)), timeoutMs)
+  })
+  try {
+    return pveOwnedFrom(await Promise.race([loadPveFootprint(executorWithin(o.executor, now() + timeoutMs, now)), late]))
+  }
+  finally {
+    clearTimeout(timer)
+  }
+}
+
+/*
+ * The ACL read runs getfacl as `-exec ... {} +`. (cr3.nodefix D1: it was
+ * `-execdir`, cr.53's guard for the WRITES the shared builder then also
+ * served — review H2, a listed directory swapped for a symlink redirected chown/setfacl/chmod; the
+ * identity scan kept it when cr.59 re-pinned to that builder, and kept it
+ * after the writer moved to anas-acl-walk.pl. `-execdir` runs one batch per
+ * directory: one getfacl per directory that has subdirectories, 14.8 s over
+ * the 8640 directories of a stock PVE root on the ZFS-root test node where
+ * `-exec` took 0.34 s.)
+ *
+ * What `-exec` gives up (cr3.nodefix review R1; captured on the node:
+ * fixtures/acl/find-exec-getfacl-ancestor-swap.txt; coordinator decision:
+ * keep `-exec`, the per-directory getfacl was the outage): getfacl resolves each
+ * absolute operand again when the batch runs. Someone with write access to a
+ * folder inside a walk root that is not sticky can, between find's listing
+ * and that batch, rename an ANCESTOR of a folder carrying an ACL grant and
+ * put a symlink to a lookalike tree in its place: getfacl then reads the
+ * lookalike, the grant is not seen, and find exits 0 — a clean "not in use"
+ * (under `-execdir` the same swap was harmless: find stays in the real
+ * directory). What that yields: the automatic id pick may hand out an id
+ * that an ACL entry on the hidden folder still names. Nothing is written by
+ * this scan, and the other two sources of the check, the `-uid`/`-gid`
+ * ownership find and ZFS's per-user accounting, are not affected. Swapping
+ * the folder ITSELF for a link hides it under `-execdir` too. A rename of
+ * an ancestor without a symlink in its place makes getfacl fail on the
+ * vanished path, find exits 1 and the check refuses (fail closed); so does an
+ * operand longer than PATH_MAX in a very deep tree.
+ */
+
+/**
  * The producer of one root's ACL read: nf.1's bounded `find` (`-P`, `-xdev`,
- * the mounts below pruned) restricted to `-type d` — directories only
+ * the mounts below pruned; {@link boundedFind}) restricted to `-type d` — directories only
  * (cr.59n, operator ruling 2026-10-16, the cost narrowing of cr.59). A
  * directory's getfacl prints its access AND its default entries, so a deleted
  * account's inheritable grant is still seen; a grant written by hand on a
@@ -473,7 +597,7 @@ export function aclWalkRoots(starts: string[], mounts: Map<string, FindmntNode>,
  * going over the executor's 10 MiB buffer.
  */
 export function aclFindArgs(root: WalkRoot): string[] {
-  return walkArgs(root, ['-type', 'd'], [GETFACL, '-n', '-p', '-c', '-E', '-s'])
+  return [...boundedFind(root), '-type', 'd', '-exec', GETFACL, '-n', '-p', '-c', '-E', '-s', '{}', '+']
 }
 
 /** `[default:]user|group|mask|other:<qualifier>:<perms>` — one getfacl entry line (`-E`: no comment). */
@@ -505,7 +629,7 @@ export function parseAclIds(stdout: string): { uid: Set<number>, gid: Set<number
 }
 
 /** The ACL walk's roots, read once per guard run. */
-function readAclRoots(o: OwnershipReadOpts): Promise<WalkRoot[] | { unreadable: string }> {
+function readAclRoots(o: OwnershipReadOpts): Promise<{ roots: WalkRoot[], widened?: string } | { unreadable: string }> {
   return o.reads.once('idcheck:acl-roots', async () => {
     const paths = await readSharePaths(o)
     if ('unreadable' in paths)
@@ -528,7 +652,20 @@ function readAclRoots(o: OwnershipReadOpts): Promise<WalkRoot[] | { unreadable: 
     const mounts = await readMounts(o)
     if ('unreadable' in mounts)
       return mounts
-    return aclWalkRoots([...paths, ...ahr], mounts, posix)
+    // cr3.nodefix D1: PVE's claim is asked only when a ZFS filesystem with
+    // ACLs on is mounted (it is the only thing it decides).
+    const anyPosix = [...mounts.values()].some(n => n.fstype === 'zfs' && posix.has(n.source))
+    if (!anyPosix)
+      return { roots: aclWalkRoots([...paths, ...ahr], mounts, posix) }
+    const owned = await withinDeadline(o, 'which ZFS filesystems PVE owns', async timeoutMs =>
+      o.pveOwned ? o.pveOwned() : footprintWithin(o, timeoutMs))
+    if (typeof owned === 'function')
+      return { roots: aclWalkRoots([...paths, ...ahr], mounts, posix, owned) }
+    if ('unreadable' in owned)
+      return owned
+    // Cannot judge: every ACL-enabled filesystem is walked (a missing fact
+    // only widens), and a walk that then fails says why it was that wide.
+    return { roots: aclWalkRoots([...paths, ...ahr], mounts, posix), widened: owned.unjudged }
   })
 }
 
@@ -539,9 +676,10 @@ function readAclRoots(o: OwnershipReadOpts): Promise<WalkRoot[] | { unreadable: 
  */
 function aclNamedIds(o: OwnershipReadOpts): Promise<Record<IdKind, Map<number, string>> | { unreadable: string }> {
   return o.reads.once('idcheck:acl', async () => {
-    const roots = await readAclRoots(o)
-    if ('unreadable' in roots)
-      return roots
+    const read = await readAclRoots(o)
+    if ('unreadable' in read)
+      return read
+    const { roots, widened } = read
     const named: Record<IdKind, Map<number, string>> = { uid: new Map(), gid: new Map() }
     for (const root of roots) {
       const what = `the ACLs under '${root.path}'`
@@ -560,8 +698,13 @@ function aclNamedIds(o: OwnershipReadOpts): Promise<Record<IdKind, Map<number, s
           return failed(what, 'sort', { stderr: r.rightStderr, exitCode: r.rightExitCode })
         return r.stdout
       })
-      if (typeof text !== 'string')
-        return text
+      if (typeof text !== 'string') {
+        // cr3.nodefix review R3: the walk included PVE's own filesystems
+        // because their owner could not be read — that read is the one to fix.
+        return widened === undefined
+          ? text
+          : { unreadable: `${text.unreadable}; the check read PVE's own filesystems too because it could not tell which are PVE's: ${widened}` }
+      }
       const ids = parseAclIds(text)
       if (!ids)
         return { unreadable: `${what} (getfacl answered in an unknown shape)` }

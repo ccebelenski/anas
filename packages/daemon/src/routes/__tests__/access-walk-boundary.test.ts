@@ -8,7 +8,9 @@ import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { createServer as createDevServer } from '../../server.js'
-import { findPathPattern, walkArgs, walkScopeFrom } from '../../services/access-walk.js'
+import * as accessWalk from '../../services/access-walk.js'
+import { findPathPattern, walkScopeFrom } from '../../services/access-walk.js'
+import { aclFindArgs } from '../../services/identity-ids.js'
 import { mountIndex } from '../../services/nested-filesystems.js'
 import { echoRealPaths, pinnedPaths, walkRuns } from './real-path-echo.js'
 
@@ -280,7 +282,16 @@ describe('nf.1 — the walk scope (access-walk.ts)', () => {
 
   it('a mountpoint with glob characters is pruned as itself', () => {
     assert.equal(findPathPattern('/tank/we[ir]d*?\\x'), '/tank/we\\[ir\\]d\\*\\?\\\\x')
-    const args = walkArgs({ path: '/tank', xdev: true, prune: ['/tank/a*'] }, ['-type', 'd'], ['/usr/bin/chmod', 'g+s', '--'])
-    assert.deepEqual(args, ['-P', '/tank', '-xdev', '(', '-path', '/tank/a\\*', ')', '-prune', '-o', '-type', 'd', '-execdir', '/usr/bin/chmod', 'g+s', '--', '{}', '+'])
+    // cr3.nodefix review R4: pinned through the one find argv that is built,
+    // the identity scan's getfacl READ (was: a chmod g+s WRITE through the
+    // generic walkArgs, which no longer exists).
+    const args = aclFindArgs({ path: '/tank', xdev: true, prune: ['/tank/a*'] })
+    assert.deepEqual(args, ['-P', '/tank', '-xdev', '(', '-path', '/tank/a\\*', ')', '-prune', '-o', '-type', 'd', '-exec', '/usr/bin/getfacl', '-n', '-p', '-c', '-E', '-s', '{}', '+'])
+  })
+
+  it('RED (cr3.nodefix review R4): no find builder that takes an action is exported — the only one is the getfacl read', () => {
+    // `-exec` re-resolves every absolute operand when the batch runs: safe
+    // only for a read (review H2 is what it does to a write).
+    assert.equal(typeof (accessWalk as Record<string, unknown>).walkArgs, 'undefined')
   })
 })

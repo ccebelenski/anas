@@ -680,5 +680,67 @@ sub ordered_readdir {
     is($out->{swapped}, 1, 'it is counted as swapped');
 }
 
+# --- cr3.nodefix D3: a bind mount of a SIBLING folder (same filesystem) ---------
+# `mount --bind <dir>/d2 <dir>/<name>`: the bind's lstat answers d2's device
+# and inode, only its mount id differs. On the ZFS-root node (second cr3 node
+# pass, again in cr3.nodefix): bind met SECOND — never met, the job INCOMPLETE
+# with a false sentence; bind met FIRST — the boundary recorded, then d2
+# skipped as "already seen": d2/f* stayed 700 and the job said complete.
+# Simulated through the io seam: `bind` is a real empty folder whose lstat,
+# fstat and mount id answer what a bind of d2 answers (d2's device and inode,
+# another mount).
+sub sibling_bind_tree {
+    my ($name) = @_;
+    my $r = "$tmp/$name";
+    make_path("$r/d2", "$r/bind");
+    for my $f ('f1', 'd2/f5', 'd2/f6') { open(my $h, '>', "$r/$f") or die; close $h }
+    my @d2 = lstat("$r/d2");
+    my $bind_ino = (stat("$r/bind"))[1];
+    my $is_bind = sub { my @s = stat("/proc/self/fd/$_[0]"); return @s && $s[1] == $bind_ino };
+    my %seam = (
+        lstat => do { my $o = $AnasAclWalk::io{lstat}; sub { return $_[0] eq 'bind' ? [@d2] : $o->(@_) } },
+        fstat => do { my $o = $AnasAclWalk::io{fstat}; sub { my $s = $o->(@_); return $s && $s->[1] == $bind_ino ? [@d2] : $s } },
+        mnt => do { my $o = $AnasAclWalk::io{mnt}; sub { my $m = $o->(@_); return defined $m && $is_bind->($_[0]) ? $m + 1000 : $m } },
+    );
+    return ($r, \%seam, $d2[1]);
+}
+for my $order (['bind', 'd2'], ['d2', 'bind']) {
+    my $first = $order->[0];
+    my ($r, $seam, $d2_ino) = sibling_bind_tree("sibling-$first-first");
+    local $AnasAclWalk::io{readdir} = ordered_readdir(@$order);
+    local $AnasAclWalk::io{lstat} = $seam->{lstat};
+    local $AnasAclWalk::io{fstat} = $seam->{fstat};
+    local $AnasAclWalk::io{mnt} = $seam->{mnt};
+    my ($h, $root) = root_of($r);
+    my ($code, $out, $log) = walk(job(roots => [$root]), "$tmp/sibling-$first.log");
+    is($code, 0, "($first met first) the walk completes");
+    is_deeply([grep { m{/d2} } @$log], ["setfacl -b $r/d2", "setfacl -b $r/d2/f5", "setfacl -b $r/d2/f6"],
+        "RED ($first met first): the real folder and everything in it are walked");
+    ok(!grep({ m{/bind$} } @$log), "($first met first) the bind is never touched");
+    is($out->{boundary}, 1, "RED ($first met first): the bind is the one boundary, reported once over both reads");
+    my ($b) = @{ $out->{boundaries} };
+    is_deeply($b && [$b->{name}, $b->{ino}], ['bind', $d2_ino], "($first met first) named with the identity a bind shows (its source's inode)");
+    ok($b && $b->{mnt} >= 1000, "($first met first) and its own mount");
+    is_deeply([$out->{changing}, $out->{vanished}, $out->{swapped}, $out->{errors}], [0, 0, 0, 0], "($first met first) nothing changing, vanished, swapped or failed");
+    ok($out->{accounted}, "($first met first) the counts add up");
+}
+{
+    # The inode again under another name on the SAME mount is the entry
+    # already met (a hard link here; a rename while the folder is read is the
+    # same case): opened to read its mount, then skipped as before — acted on
+    # once, no boundary, nothing changing.
+    my $r = "$tmp/hardlink";
+    make_path($r);
+    open(my $f, '>', "$r/h1") or die;
+    close $f;
+    link("$r/h1", "$r/h2") or die;
+    my ($h, $root) = root_of($r);
+    my ($code, $out, $log) = walk(job(roots => [$root]), "$tmp/hardlink.log");
+    is(scalar(grep { m{/h[12]$} } @$log), 1, 'two hard links in one folder: acted on once');
+    is_deeply([$out->{boundary}, $out->{changing}, $out->{errors}], [0, 0, 0], 'no boundary, nothing changing, no error');
+    is_deeply($out->{visited}, { files => 1, dirs => 1 }, 'met once');
+    ok($out->{accounted});
+}
+
 chdir '/';    # the helper leaves its cwd in the last walked directory
 done_testing();

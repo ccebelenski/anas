@@ -157,6 +157,11 @@ describe('loadPveFootprint — unreadable boot facts fall back to the whole-pool
     })
     const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
     assert.equal(fp.systemFactsUnavailable, true)
+    // cr3.nodefix review R3: the failed read, named with its error.
+    assert.deepEqual(fp.unreadableReads, ['the boot facts could not be read (zpool get bootfs exited 1: zpool get: cannot open pool: no such pool)'])
+    // ...and an unreadable storage.cfg by its path (a directory where the file should be).
+    const noCfg = await loadPveFootprint(mock, { pveStorageCfg: dir })
+    assert.deepEqual(noCfg.unreadableReads, [`the PVE storage configuration ${dir} could not be read`, 'the boot facts could not be read (zpool get bootfs exited 1: zpool get: cannot open pool: no such pool)'])
 
     // The normal answer still wins first — the fallback only tightens what
     // the per-dataset rules would call manageable.
@@ -191,6 +196,7 @@ describe('loadPveFootprint — unreadable boot facts fall back to the whole-pool
     })
     const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
     assert.equal(fp.systemFactsUnavailable, false)
+    assert.deepEqual(fp.unreadableReads, [])
     assert.equal(fp.ownershipOf('tank/ROOT/pve-1')?.kind, 'system')
     // The sibling outside the boot tree stays manageable — the relaxation.
     assert.equal(fp.ownershipOf('tank/media'), null)

@@ -1,5 +1,8 @@
 import type { FindmntNode } from '../parsers/findmnt.js'
+import { lstat as fsLstat } from 'node:fs/promises'
+import { posix } from 'node:path'
 import { isPathWithin } from '@anas/shared'
+import { lineBreakRemedy, subvolumesBelowMount } from '../parsers/btrfs-subvol-list.js'
 import { normalizePath } from './nested-filesystems.js'
 
 // ============================================================================
@@ -27,11 +30,10 @@ import { normalizePath } from './nested-filesystems.js'
 // alone (named in the confirm and the result) and the child datasets
 // crossed.
 //
-// {@link walkArgs} below is the find(1) argv of the identity scan
-// (identity-ids.ts), a READ of uids, gids and ACL entries — `-P`, `-xdev`,
-// every mount below a root `-prune`d by path, each action `-execdir ... {} +`
-// (find(1): runs "in the subdirectory that contains the files", every member
-// as `./name`). Nothing it runs writes.
+// The identity scan's find(1) argv (a READ of uids, gids and ACL entries)
+// is built in identity-ids.ts from this module's scope; this module exports
+// no find builder that takes an action (cr3.nodefix review R4: `-exec`
+// re-resolves every operand, safe only for a read).
 // ============================================================================
 
 /** One directory a walk starts from, and how it is bounded. */
@@ -60,9 +62,6 @@ export interface WalkScope {
   /** The named child datasets the walk crosses (not hidden under an excluded mount). */
   crossed: { name: string, mountpoint: string }[]
 }
-
-/** Leading slashes of a subvolume path. */
-const LEADING_SLASHES_RE = /^\/+/
 
 /** `find -path` takes a glob: a mountpoint's `*`, `?`, `[`, `]` and `\` must match themselves. */
 const GLOB_META_RE = /[*?[\]\\]/g
@@ -136,60 +135,100 @@ export function walkScopeFrom(
   }
 }
 
+/** What the subvolume confirmation needs of an lstat (node's `fs.promises.lstat`; a test serves its own). */
+export type SubvolumeLstat = (path: string) => Promise<{ dev: number, ino: number, isDirectory: () => boolean, isSymbolicLink: () => boolean }>
+
 /**
- * The identity scan's `find` argv for one walk root (identity-ids.ts — a
- * READ): `-P` (never follow a link), the start, `-xdev` when the root has it
- * (a global option, so ahead of every test), the pruned paths, then the
- * selection and the action, run as `-execdir ... {} +`.
+ * btrfs gives every subvolume's root directory this inode number
+ * (BTRFS_FIRST_FREE_OBJECTID); captured, cr3.nodefix review R2
+ * (fixtures/ahr/btrfs-subvol-list-newline-names.txt): subvolume roots are
+ * inode 256 each on a device number of its own, ordinary folders are not.
  */
-export function walkArgs(root: WalkRoot, select: string[], action: string[]): string[] {
-  const args = ['-P', root.path]
-  if (root.xdev)
-    args.push('-xdev')
-  if (root.prune.length > 0) {
-    const terms = root.prune.flatMap((p, i) => [...(i > 0 ? ['-o'] : []), '-path', findPathPattern(p)])
-    args.push('(', ...terms, ')', '-prune', '-o')
+const SUBVOLUME_ROOT_INO = 256
+
+/**
+ * Why `path` (under the mount `target`) is not a subvolume root, or null
+ * when it is. Every component from the mount down is lstat'ed in turn, so no
+ * symbolic link is ever followed: each must be a folder, and the last must
+ * be inode 256 on another device than the folder holding it.
+ */
+async function notASubvolume(path: string, target: string, lstat: SubvolumeLstat): Promise<string | null> {
+  const rel = posix.relative(target, path)
+  if (rel === '' || rel === '..' || rel.startsWith('../') || posix.isAbsolute(rel))
+    return `${path} is not under the mount`
+  let cur = target
+  let parent: Awaited<ReturnType<SubvolumeLstat>>
+  try {
+    parent = await lstat(target)
   }
-  args.push(...select, '-execdir', ...action, '{}', '+')
-  return args
+  catch (err) {
+    return `the mount ${target} could not be read (${(err as NodeJS.ErrnoException).code ?? String(err)})`
+  }
+  for (const part of rel.split('/')) {
+    cur = posix.join(cur, part)
+    let st: Awaited<ReturnType<SubvolumeLstat>>
+    try {
+      st = await lstat(cur)
+    }
+    catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      return code === 'ENOENT' || code === 'ENOTDIR' ? `${cur} does not exist` : `${cur} could not be read (${code ?? String(err)})`
+    }
+    if (st.isSymbolicLink())
+      return `${cur} is a symbolic link`
+    if (!st.isDirectory())
+      return `${cur} is not a folder`
+    if (cur === path && (st.ino !== SUBVOLUME_ROOT_INO || st.dev === parent.dev))
+      return `${cur} is a plain folder, not a subvolume`
+    parent = st
+  }
+  return null
+}
+
+/**
+ * cr3.nodefix review R2: {@link subvolumesBelowMount}, every placement
+ * confirmed against the filesystem before anything acts on it. The list is
+ * text a user can shape (a subvolume name may hold a line break and so forge
+ * a whole line), so each placed path must BE a subvolume root under the
+ * mount ({@link notASubvolume}); one that is not refuses the whole reading,
+ * naming it and what to do. The ONE reading both consumers use: the
+ * permission walk's plan ({@link nestedSubvolumes}) and the cloud snapshot's
+ * exclusions (cloud-runner.ts).
+ */
+export async function confirmedSubvolumesBelowMount(
+  stdout: string,
+  mount: { target: string, options: string },
+  lstat: SubvolumeLstat = fsLstat,
+): Promise<{ below: { path: string, subvol: string }[] } | { problem: string }> {
+  const read = subvolumesBelowMount(stdout, mount)
+  if ('problem' in read)
+    return read
+  for (const b of read.below) {
+    const why = await notASubvolume(b.path, mount.target, lstat)
+    if (why !== null)
+      return { problem: `named ${b.path} as a subvolume, and ${why}; a subvolume deleted or moved while the list was read does this, and so does one whose name ANAS cannot read: ${lineBreakRemedy(mount.target)}` }
+  }
+  return read
 }
 
 /**
  * The nested btrfs subvolumes under `dir`, as absolute paths (third review
- * D2 — each is a root of the permission walk): `btrfs subvolume list <mountpoint>` names every subvolume of the
- * filesystem relative to its top level; the mount's own `subvol=` option says
- * which of them is mounted at `own.target`, so a subvolume below it maps onto
- * the mounted tree. Subvolumes outside the mounted one (`@snapshots`) are not
- * under `dir` and drop out.
+ * D2 — each is a root of the permission walk), from the plain `btrfs
+ * subvolume list <mountpoint>` of the filesystem `dir` is on. Where each
+ * one lies on the mount is {@link subvolumesBelowMount}'s answer (cr3.nodefix
+ * D2: on an AHR mount, `subvol=/@data`, a nested `@data/sv` prints as `sv`;
+ * this used to keep only paths starting `@data/`, which a subvolume mount
+ * never prints, so no nested subvolume was ever a root). Subvolumes outside
+ * the mounted one (`@snapshots`) and outside `dir` drop out. A list it cannot
+ * place, or a placement the filesystem does not confirm (review R2), is the
+ * `problem` the plan refuses on.
  */
-export function nestedSubvolumes(paths: string[], own: FindmntNode, dir: string): string[] {
-  const mounted = mountedSubvolume(own)
+export async function nestedSubvolumes(stdout: string, own: FindmntNode, dir: string, lstat?: SubvolumeLstat): Promise<string[] | { problem: string }> {
+  const read = await confirmedSubvolumesBelowMount(stdout, own, lstat)
+  if ('problem' in read)
+    return read
   const base = normalizePath(dir)
-  const out: string[] = []
-  for (const p of paths) {
-    const rel = p.replace(LEADING_SLASHES_RE, '')
-    if (mounted !== '' && !rel.startsWith(`${mounted}/`))
-      continue
-    const abs = normalizePath(`${own.target}/${mounted === '' ? rel : rel.slice(mounted.length + 1)}`)
-    if (abs !== base && isPathWithin(base, abs))
-      out.push(abs)
-  }
-  return out
-}
-
-/**
- * The subvolume a btrfs mount shows, relative to the top level, without a
- * leading slash (`@data`; `''` for the top level itself) — from the mount's
- * `subvol=` option.
- */
-export function mountedSubvolume(own: FindmntNode): string {
-  const opt = own.options.split(',').find(o => o.startsWith('subvol='))
-  return (opt ? opt.slice('subvol='.length) : '/').replace(LEADING_SLASHES_RE, '')
-}
-
-/** A subvolume path as `btrfs subvolume list` prints it, without a leading slash. */
-export function subvolumeRelPath(path: string): string {
-  return path.replace(LEADING_SLASHES_RE, '')
+  return read.below.map(b => normalizePath(b.path)).filter(abs => abs !== base && isPathWithin(base, abs))
 }
 
 /** The mount row of the filesystem `path` sits on (exported for the plan's subvolume read). */

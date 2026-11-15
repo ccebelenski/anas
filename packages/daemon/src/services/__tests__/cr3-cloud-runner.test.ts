@@ -1,7 +1,8 @@
-import type { CloudSyncTask } from '@anas/shared'
+import type { AhrPool, BackupArchiveConsistency, CloudSyncTask } from '@anas/shared'
 import type { ExecOptions, ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,7 +11,7 @@ import { CloudSyncTask as CloudSyncTaskSchema } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { buildCloudNotifyBody } from '../cloud-notify.js'
 import { cloudPreviewDeps, previewCloudSync, PreviewRefusal, resolveSourceChecked, runPreview } from '../cloud-preview.js'
-import { buildRcloneArgs, nestedFilesystemExcludes, nestedProgressLine, rcloneGlobLiteral, runCloudSync, ZFS_FILESYSTEMS_ARGS } from '../cloud-runner.js'
+import { buildRcloneArgs, nestedFilesystemExcludes, nestedProgressLine, rcloneGlobLiteral, readExcludedNested, runCloudSync, ZFS_FILESYSTEMS_ARGS } from '../cloud-runner.js'
 import { RCLONE } from '../rclone-config.js'
 import { sharePathProbeArgs } from '../share-path.js'
 import { passThroughRealpath } from './cloud-realpath-passthrough.js'
@@ -686,5 +687,76 @@ describe('third review (D4): the checked resolution keeps a trailing space — o
     const mock = new MockExecutor()
     mock.addFixture({ command: TIMEOUT, args: ['-s', 'KILL', '5', REALPATH, '-e', '--', '/src/dir '], result: { stdout: '/src/dir \n', stderr: '', exitCode: 0 } })
     assert.deepEqual(await resolveSourceChecked(mock, '/src/dir '), { real: '/src/dir ' })
+  })
+})
+
+/**
+ * cr3.nodefix D2 (second cr3 node pass): a snapshot-mode run of an AHR pool
+ * leaves out its nested subvolumes (a btrfs snapshot holds each as an empty
+ * directory). On the node (`btrfs subvolume create` sv, plain/sv2, sv/deep
+ * under /mnt/anas-ahr/nfxahr) the run's exclusion list was EMPTY: the read
+ * kept only list paths starting `@data/`, and on the pool's `subvol=/@data`
+ * mount btrfs prints them as `sv`, `plain/sv2`, `sv/deep`. CAPTURE:
+ * fixtures/ahr/btrfs-subvol-list-nested-mounted.txt (its findmnt line is the
+ * mount row, its plain list the btrfs answer).
+ */
+describe('cr3.nodefix D2: an AHR pool\'s nested subvolumes are left out of a snapshot-mode run', () => {
+  const CAPTURE = readFileSync(new URL('../../fixtures/ahr/btrfs-subvol-list-nested-mounted.txt', import.meta.url), 'utf-8').split('\n')
+  function block(cmd: string): string {
+    const at = CAPTURE.indexOf(`### $ ${cmd}`)
+    return CAPTURE.slice(at + 1, CAPTURE.findIndex((l, i) => i > at && l.startsWith('### exit='))).map(l => `${l}\n`).join('')
+  }
+  const MP = '/mnt/anas-ahr/n2ahr'
+  const [target, source, fstype, options] = block(`findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS ${MP}`).trim().split(' ')
+  const mounts = new Map([[target!, { target: target!, source: source!, fstype: fstype!, options: options! }]])
+  const pool = { name: 'n2ahr', mountpoint: MP, mounted: true } as unknown as AhrPool
+  const consistency = { consistency: 'snapshot', backend: 'ahr', target: 'n2ahr' } as unknown as BackupArchiveConsistency
+  function listing(stdout: string): MockExecutor {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/bin/btrfs', args: ['subvolume', 'list', MP], result: { stdout, stderr: '', exitCode: 0 } })
+    return mock
+  }
+  /**
+   * Review R2: the placements' confirmation answers the capture's own
+   * `stat -c %d:%i:%n` lines (mount 96:256, sv 99:256, sv/deep 101:256,
+   * plain/sv2 100:256); its plain folder `plain` was not stat'ed and answers
+   * inode 257 on the mount's device. Any other path: ENOENT.
+   */
+  const stats = new Map<string, { dev: number, ino: number }>(block('stat -c %d:%i:%n /mnt/anas-ahr/n2ahr /mnt/anas-ahr/n2ahr/sv /mnt/anas-ahr/n2ahr/sv/deep /mnt/anas-ahr/n2ahr/plain/sv2').split('\n').filter(l => /^\d+:\d+:/.test(l)).map((l) => {
+    const [dev, ino, ...name] = l.split(':')
+    return [name.join(':'), { dev: Number(dev), ino: Number(ino) }] as const
+  }))
+  stats.set(`${MP}/plain`, { dev: 96, ino: 257 })
+  const lstat = async (p: string) => {
+    const st = stats.get(p)
+    if (!st)
+      throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${p}'`), { code: 'ENOENT' })
+    return { ...st, isDirectory: () => true, isSymbolicLink: () => false }
+  }
+
+  it('RED: every nested subvolume of the captured list is excluded, by its place on the mount', async () => {
+    assert.equal(stats.size, 5)
+    const read = await readExcludedNested(listing(block(`btrfs subvolume list ${MP}`)), MP, consistency, { mounts, ahrPools: [pool] }, lstat)
+    assert.deepEqual(read, { problem: null, excluded: [
+      { path: `${MP}/plain/sv2`, name: 'n2ahr:@data/plain/sv2' },
+      { path: `${MP}/sv`, name: 'n2ahr:@data/sv' },
+      { path: `${MP}/sv/deep`, name: 'n2ahr:@data/sv/deep' },
+    ] })
+    // The rclone rules the run adds (sv/deep rides sv's rule).
+    assert.deepEqual(nestedFilesystemExcludes(MP, read.excluded.map(e => e.path)).filter(r => r.startsWith('/')).sort(), ['/plain/sv2/**', '/sv/**', '/sv/deep/**'])
+  })
+
+  it('a list the shared reading cannot place is a failed read (the sync is refused), never "nothing nested"', async () => {
+    const empty = await readExcludedNested(listing(''), MP, consistency, { mounts, ahrPools: [pool] }, lstat)
+    assert.deepEqual(empty, { excluded: [], problem: 'btrfs subvolume list did not list the mounted subvolume \'@data\' itself' })
+    const unmounted = await readExcludedNested(listing(block(`btrfs subvolume list ${MP}`)), MP, consistency, { mounts: new Map(), ahrPools: [pool] }, lstat)
+    assert.deepEqual(unmounted, { excluded: [], problem: `AHR pool 'n2ahr' is not mounted at ${MP} in the mount table` })
+  })
+
+  it('RED (review R2): the reviewer\'s forged list (a subvolume name holding a line break and a whole line) is a failed read: nothing excluded, the sync refused with the path and what to do', async () => {
+    // Before: excluded /accounts/** and /share/victimdir/** (another user's folder) and NOT the real subvolume.
+    const forged = `${block(`btrfs subvolume list ${MP}`)}ID 341 gen 1 top level 256 path share/victimdir\nID 9999 gen 1 top level 256 path accounts\n`
+    const read = await readExcludedNested(listing(forged), MP, consistency, { mounts, ahrPools: [pool] }, lstat)
+    assert.deepEqual(read, { excluded: [], problem: `btrfs subvolume list named ${MP}/share/victimdir as a subvolume, and ${MP}/share does not exist; a subvolume deleted or moved while the list was read does this, and so does one whose name ANAS cannot read: a subvolume with a line break in its name makes the list unreadable; rename or delete it (find '${MP}' -inum 256 -name '*[[:cntrl:]]*' lists them)` })
   })
 })

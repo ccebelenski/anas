@@ -9,8 +9,8 @@ const LEADING_SLASHES_RE = /^\/+/
  * home): the real tool needs CAP_SYS_ADMIN and refuses ("Operation not
  * permitted"), which the plan rightly reads as a FAILED read. This answers
  * what root would see for a scratch tree with no nested subvolume: the one
- * subvolume the mount shows (its `subvol=` option), in the tool's own line
- * shape. Null for any other command, or when the mount is not btrfs.
+ * subvolume the mount shows (its `subvol=` and `subvolid=` options), in the
+ * tool's own line shape. Null for any other command, or when the mount is not btrfs.
  */
 export function btrfsListStandIn(command: string, args: string[]): { stdout: string, stderr: string, exitCode: number } | null {
   if (command !== '/usr/bin/btrfs' || args[0] !== 'subvolume' || args[1] !== 'list' || process.getuid?.() === 0)
@@ -20,5 +20,8 @@ export function btrfsListStandIn(command: string, args: string[]): { stdout: str
   if (fstype !== 'btrfs')
     return null
   const subvol = (options.split(',').find(o => o.startsWith('subvol=')) ?? 'subvol=/').slice('subvol='.length).replace(LEADING_SLASHES_RE, '')
-  return { stdout: subvol === '' ? '' : `ID 256 gen 1 top level 5 path ${subvol}\n`, stderr: '', exitCode: 0 }
+  // cr3.nodefix D2: the line carries the mount's own `subvolid=` as its ID,
+  // as root's list would (the plan now places subvolumes by id).
+  const id = (options.split(',').find(o => o.startsWith('subvolid=')) ?? 'subvolid=256').slice('subvolid='.length)
+  return { stdout: subvol === '' ? '' : `ID ${id} gen 1 top level 5 path ${subvol}\n`, stderr: '', exitCode: 0 }
 }

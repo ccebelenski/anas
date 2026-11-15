@@ -2,7 +2,7 @@ import type { SpawnedChild } from '../../executor/types.js'
 import type { JobCancellation, JobContext } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
@@ -227,10 +227,15 @@ describe('a cancelled share grant stays a cancel (fifth review D1)', () => {
 })
 
 describe('the plan\'s btrfs subvolume read (cr3.shares, fourth review)', () => {
-  /** A scratch "pool": `dir` as a btrfs mount of subvolume @data, with a nested subvolume `sub`. */
+  /**
+   * A scratch "pool": `dir` as a btrfs mount of subvolume @data, with the
+   * directories of the captured nested subvolumes (`sv`, `plain/sv2`,
+   * `sv/deep` — fixtures/ahr/btrfs-subvol-list-nested-mounted.txt).
+   */
   function pool(name: string) {
     const dir = join(scratch, name)
-    mkdirSync(join(dir, 'sub', 'deeper'), { recursive: true })
+    mkdirSync(join(dir, 'sv', 'deep'), { recursive: true })
+    mkdirSync(join(dir, 'plain', 'sv2'), { recursive: true })
     const table = JSON.stringify({ filesystems: [
       { target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw', children: [
         { target: dir, source: '/dev/mapper/ahr0', fstype: 'btrfs', options: 'rw,relatime,subvol=/@data' },
@@ -239,8 +244,8 @@ describe('the plan\'s btrfs subvolume read (cr3.shares, fourth review)', () => {
     return { dir, table }
   }
 
-  async function plan(name: string, list: { stdout: string, stderr: string, exitCode: number } | Error) {
-    Object.assign(accessDirIo, REAL_IO)
+  async function plan(name: string, list: { stdout: string, stderr: string, exitCode: number } | Error, io: Partial<typeof accessDirIo> = {}) {
+    Object.assign(accessDirIo, REAL_IO, io)
     const { dir, table } = pool(name)
     const runs: { stdin: string, fds: number }[] = []
     const ex = executor(async (stdin, fds) => {
@@ -258,16 +263,35 @@ describe('the plan\'s btrfs subvolume read (cr3.shares, fourth review)', () => {
     return { dir, planned, acc, runs, calls: ex.calls }
   }
   const out = (stdout: string) => ({ stdout, stderr: '', exitCode: 0 })
+  /** The `btrfs subvolume list` block of fixtures/ahr/btrfs-subvol-list-nested-mounted.txt, verbatim. */
+  const NESTED_LIST = (() => {
+    const lines = readFileSync(fileURLToPath(new URL('../../fixtures/ahr/btrfs-subvol-list-nested-mounted.txt', import.meta.url)), 'utf-8').split('\n')
+    const at = lines.indexOf('### $ btrfs subvolume list /mnt/anas-ahr/n2ahr')
+    return lines.slice(at + 1, lines.findIndex((l, i) => i > at && l.startsWith('### exit='))).map(l => `${l}\n`).join('')
+  })()
 
-  it('the list names a nested subvolume: it is a root of its own, pinned, handed to the helper at fd 4', async () => {
-    const { dir, planned, acc, runs } = await plan('nested', out('ID 256 gen 9 top level 5 path @data\nID 257 gen 9 top level 5 path @snapshots\nID 258 gen 9 top level 256 path @data/sub\n'))
+  it('RED (cr3.nodefix D2): the CAPTURED list of an AHR mount names three nested subvolumes: each is a root of its own, pinned, handed to the helper', async () => {
+    // The capture's own `btrfs subvolume list /mnt/anas-ahr/n2ahr` lines: on a
+    // `subvol=/@data` mount the nested ones print relative to @data (`sv`,
+    // `plain/sv2`, `sv/deep`). This test used to type `path @data/sub`, the
+    // top-level-mount shape, which a subvolume mount never prints.
+    // Review R2: the plan confirms each placement is a subvolume root (inode
+    // 256 on a device of its own, as captured); these scratch folders are
+    // plain, so the confirmation's own lstat says what a subvolume says.
+    const real = REAL_IO.subvolumeLstat
+    const scratchSub = (p: string) => ['/sv', '/plain/sv2', '/sv/deep'].some(s => p.endsWith(`/nested${s}`))
+    const subvolumeLstat = async (p: string) => {
+      const st = await real(p)
+      return scratchSub(p) ? Object.assign(Object.create(st) as typeof st, { ino: 256, dev: st.dev + 1000 + p.length }) : st
+    }
+    const { dir, planned, acc, runs } = await plan('nested', out(NESTED_LIST), { subvolumeLstat })
     assert.ok(planned.ok, JSON.stringify(planned))
     await acc.runSetAccess(planned.value, () => {})
     const job = JSON.parse(runs[0].stdin) as { roots: { fd: number, path: string, dev: number, ino: number }[] }
-    const sub = lstatSync(join(dir, 'sub'))
-    assert.deepEqual(job.roots.map(r => [r.fd, r.path]), [[3, dir], [4, join(dir, 'sub')]])
-    assert.deepEqual([job.roots[1].dev, job.roots[1].ino], [sub.dev, sub.ino])
-    assert.equal(runs[0].fds, 2)
+    const sv = lstatSync(join(dir, 'sv'))
+    assert.deepEqual(job.roots.map(r => [r.fd, r.path]), [[3, dir], [4, join(dir, 'plain', 'sv2')], [5, join(dir, 'sv')], [6, join(dir, 'sv', 'deep')]])
+    assert.deepEqual([job.roots[2].dev, job.roots[2].ino], [sv.dev, sv.ino])
+    assert.equal(runs[0].fds, 4)
   })
 
   it('an EMPTY list on a mount of a subvolume is a failed read: the plan refuses (never "no nested subvolumes")', async () => {
@@ -275,6 +299,14 @@ describe('the plan\'s btrfs subvolume read (cr3.shares, fourth review)', () => {
     assert.equal(planned.ok, false)
     if (!planned.ok)
       assert.match(planned.failure.body.error.message, /btrfs subvolumes under .* could not be listed \(btrfs subvolume list did not list the mounted subvolume '@data' itself\)/)
+  })
+
+  it('cr3.nodefix review R2: the same CAPTURED list where the folders are plain (not subvolume roots): the plan refuses, naming the first', async () => {
+    const { dir, planned, runs } = await plan('notsub', out(NESTED_LIST))
+    assert.equal(planned.ok, false)
+    if (!planned.ok)
+      assert.ok(planned.failure.body.error.message.includes(`(btrfs subvolume list named ${dir}/sv as a subvolume, and ${dir}/sv is a plain folder, not a subvolume; `), planned.failure.body.error.message)
+    assert.equal(runs.length, 0)
   })
 
   it('a line the parser cannot read is a failed read', async () => {

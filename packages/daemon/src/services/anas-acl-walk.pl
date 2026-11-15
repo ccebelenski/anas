@@ -429,6 +429,29 @@ sub gone_entry {
     }
 }
 
+# cr3.nodefix D3: an entry whose inode this directory already showed under
+# another name — a hard link, an entry renamed while the directory was read,
+# or a bind mount of a sibling (the mountpoint's lstat answers the bind's
+# source). It is opened and proven like any entry (O_PATH|O_NOFOLLOW, fstat,
+# mount id) and met only when it sits on another mount or device than the
+# root: then it is a boundary like any other (once per name). On the root's
+# own mount it is the entry already met, and stays skipped as before; so does
+# one that could not be opened or proven (nothing is ever acted on here).
+sub sibling_bind {
+    my ($st, $root, $root_ids, $top, $stack, $name, $l, $key) = @_;
+    return unless S_ISDIR($l->[2]) || S_ISREG($l->[2]);
+    my $fh;
+    sysopen($fh, $name, O_PATH | O_NOFOLLOW) or return;
+    my $f = $io{fstat}->($fh);
+    my $mnt = same_object($l, $f) ? $io{mnt}->(fileno($fh)) : undef;
+    close $fh;
+    return if !defined $mnt || ($f->[0] == $root->{dev} && $mnt == $root->{mnt});
+    $st->{seen}++;
+    $top->{new2}++ if $top->{pass} == 2;
+    $top->{bounds}{$name} = $key;
+    other_side($st, $f, $mnt, $root_ids, $stack, $name);
+}
+
 # Walk one root (already proven by check_roots). Dies only on a failure that
 # leaves the walk unable to continue (it cannot get back to a directory).
 sub walk_root {
@@ -438,7 +461,7 @@ sub walk_root {
     $st->{seen}++;
     add($st, { fh => undef, fd => $root->{fd}, dir => 1, ino => $root->{ino}, rel => '.', name => '.' });
     chdir($dh) or die "could not enter the root '$root->{path}': $!\n";
-    my @stack = ({ dh => $dh, ino => $root->{ino}, name => undef, depth => 0, own => 0, pass => 1, ids => {}, lost => {}, reads => 0, new2 => 0, rel_for_note => '.' });
+    my @stack = ({ dh => $dh, ino => $root->{ino}, name => undef, depth => 0, own => 0, pass => 1, ids => {}, bounds => {}, lost => {}, reads => 0, new2 => 0, rel_for_note => '.' });
     while (@stack) {
         my $top = $stack[-1];
         my $name = $io{readdir}->($top->{dh});
@@ -492,8 +515,19 @@ sub walk_root {
         # One entry, once: an inode this directory already showed (under this
         # name or another one) is not met again — unless its open found it
         # gone (gone_entry): then this meeting is the first that can act.
+        # cr3.nodefix D3: only an entry the walk did NOT find on another
+        # mount claims its inode here (a boundary is remembered by its name
+        # instead), and the inode met again under ANOTHER name is looked at
+        # once more: a bind mount of a sibling shows the sibling's inode, and
+        # only its mount tells it apart (sibling_bind). So whichever comes
+        # first, the folder is walked and the bind is the named boundary.
         my $key = "$l->[0]:$l->[1]";
-        next if $top->{ids}{$key}++;
+        next if defined $top->{bounds}{$name} && $top->{bounds}{$name} eq $key;
+        if (exists $top->{ids}{$key}) {
+            sibling_bind($st, $root, $root_ids, $top, \@stack, $name, $l, $key) if $top->{ids}{$key} ne $name;
+            next;
+        }
+        $top->{ids}{$key} = $name;
         $st->{seen}++;
         $top->{new2}++ if $top->{pass} == 2;
         if (exists $top->{lost}{$key}) {
@@ -539,6 +573,10 @@ sub walk_root {
         }
         if ($f->[0] != $root->{dev} || $mnt != $root->{mnt}) {
             close $fh;
+            # cr3.nodefix D3: a boundary does not claim the inode — a sibling
+            # it is a bind mount of is still walked when it comes later.
+            delete $top->{ids}{$key};
+            $top->{bounds}{$name} = $key;
             other_side($st, $f, $mnt, $root_ids, \@stack, $name);
             next;
         }
@@ -578,7 +616,7 @@ sub walk_root {
             note($st, kind => 'notEntered', ino => $f->[1], name => $rel, message => $why);
             next;
         }
-        push @stack, { dh => $cdh, ino => $f->[1], name => $name, depth => $top->{depth} + 1, own => 1, pass => 1, ids => {}, lost => {}, reads => 0, new2 => 0, rel_for_note => $rel };
+        push @stack, { dh => $cdh, ino => $f->[1], name => $name, depth => $top->{depth} + 1, own => 1, pass => 1, ids => {}, bounds => {}, lost => {}, reads => 0, new2 => 0, rel_for_note => $rel };
     }
 }
 

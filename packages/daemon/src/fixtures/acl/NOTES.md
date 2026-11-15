@@ -16,3 +16,14 @@ What they settle for cr.37: an ACL entry added to a directory changes the `getfa
 text the set-access plan is computed from (a named line plus the `mask::` line), so the
 plan's revision moves and the job refuses STATE_CHANGED instead of running a plan that
 would delete the new entry. Both end with a blank line (getfacl's record separator).
+
+## Real capture — the identity scan's `-exec` window (cr3.nodefix review R1, 2026-11-15)
+
+`find-exec-getfacl-ancestor-swap.txt`: on the stunt node (GNU findutils 4.10.0, acl
+2.3.2), the identity scan's `find -P <root> -xdev -type d -exec getfacl -n -p -c -E -s {} +
+| sort -u`, with the tree changed between find's listing and the getfacl batch (the
+header says how). What it settles: an ANCESTOR of a folder carrying an ACL grant swapped
+for a symlink to a lookalike tree hides the grant with find exit 0 and nothing on stderr
+(the accepted limit, services/access-walk.ts); the same ancestor renamed away with nothing
+in its place makes getfacl fail on each vanished path and find exit 1, which the check
+reads as a refusal. Paths are the node's scratch tree; nothing was edited below the header.

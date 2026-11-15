@@ -15,7 +15,6 @@ import { fileURLToPath } from 'node:url'
 import { AccessWalkReport as AccessWalkReportSchema, DatasetPath, isPathWithin } from '@anas/shared'
 import { ChildCancel } from '../jobs/child-cancel.js'
 import { JobCancelledError } from '../jobs/queue.js'
-import { parseBtrfsSubvolList } from '../parsers/btrfs-subvol-list.js'
 import { isFindmntTable } from '../parsers/findmnt.js'
 import { parseGroups, parsePasswd } from '../parsers/getent.js'
 import { effectivePerms, levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
@@ -23,7 +22,7 @@ import { parsePveMountPaths, PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseDatasetGet, parseZfsList, zfsListArgs } from '../parsers/zfs-list.js'
 import { ahrPoolClaims, zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
-import { mountedSubvolume, mountRowOf, nestedSubvolumes, notChangedList, subvolumeRelPath, walkScopeFrom } from './access-walk.js'
+import { mountRowOf, nestedSubvolumes, notChangedList, walkScopeFrom } from './access-walk.js'
 import { heldByLunOnce, heldHolderPhrase } from './iscsi-held.js'
 import { probeMount } from './mounts.js'
 import { isProbeableKind, kindOfMount, mountIndex, normalizePath } from './nested-filesystems.js'
@@ -135,6 +134,8 @@ export const accessDirIo = {
   readlink: (path: string) => readlink(path),
   /** lstat a path component (the share-path symlink rule). */
   lstat: (path: string) => lstat(path),
+  /** lstat a component of a listed btrfs subvolume's path (cr3.nodefix review R2: the placement's confirmation). */
+  subvolumeLstat: (path: string) => lstat(path),
   /** The opened descriptor's own identity (N1). */
   fstat: (handle: FileHandle) => handle.stat(),
   /** Resolves when the walk helper's script can be read (fifth review D1). */
@@ -1077,13 +1078,14 @@ export function createAccessService(opts: AccessServiceOptions) {
         return cannot(`did not answer: ${list.message}`)
       if (list.exitCode !== 0)
         return cannot(`exited ${list.exitCode}`)
-      const parsed = parseBtrfsSubvolList(list.stdout)
-      if (parsed.length !== list.stdout.split('\n').filter(l => l.trim() !== '').length)
-        return cannot('answered lines it could not read')
-      const mounted = mountedSubvolume(own)
-      if (mounted !== '' && !parsed.some(v => subvolumeRelPath(v.path) === mounted))
-        return cannot(`did not list the mounted subvolume '${mounted}' itself`)
-      subvolumes = nestedSubvolumes(parsed.map(v => v.path), own, dir)
+      // cr3.nodefix D2: every line read, the mounted subvolume listed, and
+      // every subvolume placed on the mount by its parent chain — the one
+      // reading the cloud snapshot's exclusions shares; review R2: and every
+      // placement confirmed to be a subvolume root.
+      const nested = await nestedSubvolumes(list.stdout, own, dir, accessDirIo.subvolumeLstat)
+      if (!Array.isArray(nested))
+        return cannot(nested.problem)
+      subvolumes = nested
     }
     const scope = walkScopeFrom(dir, mounts, children, subvolumes)
     const crossed = new Set(scope.crossed.map(c => c.name))

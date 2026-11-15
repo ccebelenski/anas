@@ -276,6 +276,25 @@ What it settles:
 - `canmount=noauto` prints `noauto` (only `off` is the value the gate skips; a
   `noauto` dataset's stored mountpoint is still gated).
 
+## Real captures — the ZFS-root node's ACL switch and boot dataset (cr3.nodefix D1, 2026-11-14)
+
+Verbatim stdout, exit code 0, from the ZFS-root test node (`anas-zfs`, installed from the
+PVE 9 ISO onto ZFS; `zfs-2.4.2-pve1`) — the same node as
+`../mounts/findmnt-zfs-root.json` and `../system/*-zfs-root.*`:
+
+| File | Command |
+|------|---------|
+| `zfs-get-acltype-zfs-root.txt` | `zfs get -H -p -o name,value -t filesystem acltype` (the identity check's `ACLTYPE_ARGS`) |
+| `zpool-get-bootfs-zfs-root.txt` | `zpool get -H -o name,value bootfs` (the footprint's boot probe) |
+
+What they settle: the PVE installer leaves `acltype` `posix` (source `local`) on the boot
+filesystem `rpool/ROOT/pve-1`, mounted at `/`, and `off` on every other dataset it makes;
+`bootfs` names that same dataset. So on a stock ZFS-root node `/` is a ZFS filesystem with
+POSIX ACLs on, and it is PVE's (the footprint's `system` claim). Also seen on the node, not
+captured as a file: `pvesm alloc local-zfs <vmid> subvol-<vmid>-disk-0 64M --format subvol`
+creates its dataset with `acltype posix` and `xattr sa` (both `local`), so every container
+root filesystem PVE makes is a POSIX-ACL ZFS filesystem too.
+
 ## Pre-existing fixtures — synthetic
 
 Everything here that is NOT in the zoo table above and not one of the two iscsi.3

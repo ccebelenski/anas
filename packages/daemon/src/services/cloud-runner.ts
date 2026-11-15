@@ -2,12 +2,14 @@ import type { AhrPool, BackupArchiveConsistency, CloudRunDetail, CloudRunRecentE
 import type { DeadlineOptions } from '../executor/deadline.js'
 import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
+import type { SubvolumeLstat } from './access-walk.js'
 import type { BackupSnapshotOptions, TakenSnapshot } from './backup-snapshots.js'
 import type { RcloneConfigPaths } from './rclone-config.js'
 import { readdir, stat } from 'node:fs/promises'
 import { posix } from 'node:path'
 import { CLOUD_STATS_INTERVAL_SECS, isPathWithin } from '@anas/shared'
-import { btrfsSubvolListArgs, parseBtrfsSubvolList } from '../parsers/btrfs-subvol-list.js'
+import { btrfsSubvolListArgs } from '../parsers/btrfs-subvol-list.js'
+import { confirmedSubvolumesBelowMount } from './access-walk.js'
 import { readAhrPools } from './ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from './backup-consistency.js'
 import { snapshotRoot } from './backup-expansion.js'
@@ -268,7 +270,6 @@ const CONTROL_CHAR_RE = /[\x00-\x1F\x7F]/
 
 const BTRFS = '/usr/bin/btrfs'
 const ZFS_CANMOUNT_VALUES: ReadonlySet<string> = new Set(['on', 'off', 'noauto'])
-const SUBVOL_DATA_PREFIX = '@data/'
 
 const ZFS = '/usr/sbin/zfs'
 /** The ZFS filesystem list the exclusion reads: name, mountpoint, canmount — tab separated (-H). */
@@ -302,12 +303,14 @@ export async function readZfsFilesystemsChecked(executor: CommandExecutor): Prom
   return { rows }
 }
 
-/** The nested filesystems a snapshot of `real` leaves out, from the complete reads. */
-async function readExcludedNested(
+/** The nested filesystems a snapshot of `real` leaves out, from the complete reads (exported for its test). */
+export async function readExcludedNested(
   executor: CommandExecutor,
   real: string,
   consistency: BackupArchiveConsistency,
   facts: { mounts: Map<string, FindmntNode>, ahrPools: AhrPool[] },
+  /** The subvolume confirmation's lstat (review R2); a test serves its own. */
+  lstat?: SubvolumeLstat,
 ): Promise<{ excluded: { path: string, name: string }[], problem: string | null }> {
   const out = new Map<string, string>()
   const under = (path: string): boolean => path !== real && isPathWithin(real, path) && !ZFS_SNAPDIR_RE.test(path)
@@ -354,12 +357,22 @@ async function readExcludedNested(
     }
     if (listed.exitCode !== 0)
       return { excluded: [], problem: `btrfs subvolume list exited ${listed.exitCode}: ${listed.stderr.trim().split('\n')[0] ?? ''}` }
-    for (const sub of parseBtrfsSubvolList(listed.stdout)) {
-      if (!sub.path.startsWith(SUBVOL_DATA_PREFIX))
-        continue
-      const path = posix.join(pool.mountpoint, sub.path.slice(SUBVOL_DATA_PREFIX.length))
-      if (under(path))
-        out.set(path, `${pool.name}:${sub.path}`)
+    // cr3.nodefix D2: placed on the pool's mount by the one shared reading
+    // (the permission walk's): on the `subvol=/@data` mount a nested
+    // subvolume prints as `sv`, never `@data/sv`, and the `@data/` prefix
+    // this used to keep matched none of them — every nested subvolume was
+    // left in the run, as an empty directory a sync deleted at the destination.
+    const mount = facts.mounts.get(pool.mountpoint)
+    if (!mount || mount.fstype !== 'btrfs')
+      return { excluded: [], problem: `AHR pool '${pool.name}' is not mounted at ${pool.mountpoint} in the mount table` }
+    // Review R2: each placement confirmed to be a subvolume root (a name
+    // with a line break can forge a list line).
+    const placed = await confirmedSubvolumesBelowMount(listed.stdout, mount, lstat)
+    if ('problem' in placed)
+      return { excluded: [], problem: `btrfs subvolume list ${placed.problem}` }
+    for (const sub of placed.below) {
+      if (under(sub.path))
+        out.set(sub.path, `${pool.name}:${sub.subvol}`)
     }
   }
   const excluded = Array.from(out, ([path, name]) => ({ path, name }))

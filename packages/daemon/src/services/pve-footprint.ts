@@ -126,6 +126,15 @@ export function buildSystemPoolFacts(
 let systemFactsWarned = false
 
 export async function readSystemPoolFacts(exec: CommandExecutor): Promise<SystemPoolFacts[] | null> {
+  const read = await readSystemPoolFactsWithCause(exec)
+  return 'facts' in read ? read.facts : null
+}
+
+/**
+ * {@link readSystemPoolFacts} with the failure's own words kept (cr3.nodefix
+ * review R3: a diagnostic that widened because of it names it).
+ */
+async function readSystemPoolFactsWithCause(exec: CommandExecutor): Promise<{ facts: SystemPoolFacts[] } | { cause: string }> {
   try {
     const [bootfsResult, findmntResult] = await Promise.all([
       exec.exec(ZPOOL, ['get', '-H', '-o', 'name,value', 'bootfs']),
@@ -136,7 +145,7 @@ export async function readSystemPoolFacts(exec: CommandExecutor): Promise<System
     // findmnt exits non-zero when / is not a mountpoint entry it can find —
     // that is "no root dataset", not a failure of the probe.
     const rootMount = findmntResult.exitCode === 0 ? parseRootMount(findmntResult.stdout) : null
-    return buildSystemPoolFacts(parseBootfsGet(bootfsResult.stdout), rootMount)
+    return { facts: buildSystemPoolFacts(parseBootfsGet(bootfsResult.stdout), rootMount) }
   }
   catch (err: unknown) {
     if (!systemFactsWarned) {
@@ -144,7 +153,7 @@ export async function readSystemPoolFacts(exec: CommandExecutor): Promise<System
       console.warn('anasd: could not read system-pool boot facts (zpool get bootfs / findmnt /); '
         + 'pools hosting a zfspool storage are treated as PVE whole pools this process lifetime:', err)
     }
-    return null
+    return { cause: err instanceof Error ? err.message : String(err) }
   }
 }
 
@@ -363,6 +372,12 @@ export interface PveFootprint {
    */
   storagesUnavailableCause?: string
   /**
+   * cr3.nodefix review R3: each read that could not answer, in words that
+   * name it and its error (storage.cfg, the boot facts); empty or absent
+   * when everything was read.
+   */
+  unreadableReads?: string[]
+  /**
    * PVE's ownership claim on one full dataset name, or null when it is
    * outside PVE's footprint and ANAS may manage it. A non-null answer carries
    * `childrenManageable` — whether ANAS may still manage DIRECT children of
@@ -477,11 +492,12 @@ export async function loadPveFootprint(
   const findmntNodes = mountRead
     ? mountRead.findmntNodes
     : await readFindmntTable(executor).then(text => (text === null ? null : parseFindmntTable(text)))
-  const [readStorages, readFacts, readMountFacts] = await Promise.all([
+  const storageCfg = opts.pveStorageCfg ?? process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG
+  const [readStorages, factsRead, readMountFacts] = await Promise.all([
     // Explicit override, then the daemon-wide env override, then the real path
     // — the same resolution server.ts hands the route-level consumers.
-    readPveStorages(opts.pveStorageCfg ?? process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG, zfsMountpoints, findmntNodes),
-    readSystemPoolFacts(executor),
+    readPveStorages(storageCfg, zfsMountpoints, findmntNodes),
+    readSystemPoolFactsWithCause(executor),
     // cr.23: the system-path mount facts ride the findmnt table this request
     // already read (zero extra I/O); when that table did not make it through
     // (its read failed, or the zfs list ahead of it did) the fact still
@@ -511,8 +527,14 @@ export async function loadPveFootprint(
   // only tighten, never loosen).
   const unresolvedDirPaths = (readStorages?.unresolvedDirs ?? [])
     .filter(d => pathOnZfsFilesystem(d.path, findmntNodes) !== false)
+  const readFacts = 'facts' in factsRead ? factsRead.facts : null
   const systemFactsUnavailable = readFacts === null
   const systemFacts = readFacts ?? []
+  const unreadableReads = [
+    ...(readStorages === null ? [`the PVE storage configuration ${storageCfg} could not be read`] : []),
+    ...(storagesUnavailableCause !== undefined ? [storagesUnavailableCause] : []),
+    ...('cause' in factsRead ? [`the boot facts could not be read (${factsRead.cause})`] : []),
+  ]
   // cr.23: null = the mount table could NOT be read (UNREADABLE, tightens);
   // a { zfs: {}, ahr: {} } result is a READ answer of "no pool at a system
   // path".
@@ -600,6 +622,7 @@ export async function loadPveFootprint(
     systemFactsUnavailable,
     storagesUnavailable,
     ...(storagesUnavailableCause !== undefined && { storagesUnavailableCause }),
+    unreadableReads,
     ownershipOf,
     ownedDescendant: (candidates, dataset) => ownedDescendantIn(candidates, dataset, ownershipOf),
     // The ONE path → dataset resolver (pvepool.1 review fixes) — the closure

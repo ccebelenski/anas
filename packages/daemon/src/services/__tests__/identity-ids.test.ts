@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { pveOwnership } from '@anas/shared'
 import { CommandTimeoutError } from '../../executor/deadline.js'
 import { MockExecutor } from '../../executor/mock.js'
 import { mockFixtures } from '../../fixtures/loader.js'
@@ -22,10 +23,12 @@ import {
   parsePosixAclFilesystems,
   parseSpaceIds,
   pickId,
+  pveOwnedFrom,
   shareWalkRoots,
   spaceArgs,
 } from '../identity-ids.js'
 import { mountIndex } from '../nested-filesystems.js'
+import { buildSystemPoolFacts, parseBootfsGet } from '../pve-footprint.js'
 
 /**
  * Story cr.29 — the uid / gid a create uses (services/identity-ids.ts).
@@ -61,6 +64,10 @@ import { mountIndex } from '../nested-filesystems.js'
  *    `setfacl -m g:1007:rw-`, a plain file, and a dangling symlink. Verbatim
  *    stdout of `find -P <dir> -xdev -type d -execdir getfacl -n -p -c -E -s
  *    {} + | LC_ALL=C sort -u`; the blank line is getfacl’s record separator.
+ *    cr3.nodefix D1 runs it as `-exec getfacl {} +`: `-c` prints no file name, so
+ *    the sorted lines do not depend on how the operands are spelled — on the
+ *    ZFS-root node the `-execdir` and `-exec` walks of `/` printed
+ *    byte-identical output (`cmp`, 2026-11-14).
  *    cr.59n narrowed the walk from `! -type l` to `-type d`; these are that
  *    same tree re-captured, so the file-only records the old capture held
  *    are gone: the two files’ base entries the directories do not share
@@ -206,7 +213,7 @@ function fakeNode(node: Node): { executor: MockExecutor, calls: { command: strin
     }
     return { stdout: '', stderr: `unexpected ${command}`, exitCode: 127 }
   }
-  // cr.59/cr.59n: the ACL walk, `find … -type d -execdir getfacl … {} + | sort -u`.
+  // cr.59/cr.59n: the ACL walk, `find … -type d -exec getfacl … {} + | sort -u`.
   executor.pipeline = async (cmd1: string, args1: string[], cmd2: string, args2: string[], opts?: PipelineOptions): Promise<PipelineResult> => {
     calls.push({ command: `${cmd1} | ${cmd2}`, args: [...args1, '|', ...args2], timeoutMs: opts?.timeoutMs ?? undefined })
     const root = args1[1]
@@ -226,6 +233,9 @@ function opts(executor: MockExecutor, extra: Partial<OwnershipReadOpts> = {}): O
     reads: new GuardReads(),
     smbConf: async () => SMB_CONF,
     exports: async () => '',
+    // cr3.nodefix D1: these nodes' filesystems are nobody's but the
+    // operator's (the D1 block serves PVE's claim from the ZFS-root captures).
+    pveOwned: async () => () => false,
     ...extra,
   }
 }
@@ -523,7 +533,7 @@ describe('cr.59 — ids a POSIX ACL entry names are skipped too', () => {
     assert.deepEqual(ACLTYPE_ARGS, ['get', '-H', '-p', '-o', 'name,value', '-t', 'filesystem', 'acltype'])
     assert.deepEqual(
       aclFindArgs({ path: '/srv/share', xdev: true, prune: ['/srv/share/nfs'] }),
-      ['-P', '/srv/share', '-xdev', '(', '-path', '/srv/share/nfs', ')', '-prune', '-o', '-type', 'd', '-execdir', '/usr/bin/getfacl', '-n', '-p', '-c', '-E', '-s', '{}', '+'],
+      ['-P', '/srv/share', '-xdev', '(', '-path', '/srv/share/nfs', ')', '-prune', '-o', '-type', 'd', '-exec', '/usr/bin/getfacl', '-n', '-p', '-c', '-E', '-s', '{}', '+'],
     )
     // btrfs (AHR): no -xdev, as nf.1.
     assert.deepEqual(aclFindArgs({ path: '/mnt/anas-ahr/ahr0', xdev: false, prune: [] }).slice(0, 3), ['-P', '/mnt/anas-ahr/ahr0', '-type'])
@@ -684,5 +694,200 @@ describe('cr.59 — ids a POSIX ACL entry names are skipped too', () => {
     const r = await idOwnership('uid', 1005, opts(slow.executor, { now: () => clock, budgetMs: 10_000 }))
     assert.ok('unreadable' in r && /^the ACLs under '.*' \(the check did not finish within 10 s\)$/.test(r.unreadable), JSON.stringify(r))
     assert.ok(slow.calls.filter(c => c.command === `${FIND} | ${SORT}`).every(c => (c.timeoutMs ?? 0) > 0 && (c.timeoutMs ?? 0) < 10_000))
+  })
+})
+
+/**
+ * cr3.nodefix D1 (second cr3 node pass): on a PVE node installed onto ZFS
+ * every create without an explicit id was refused after 10 s — "could not
+ * read the ACLs under '/' (the check did not finish within 10 s)".
+ *
+ * CAPTURES (one node, anas-zfs, PVE 9 ISO install, zfs-2.4.2-pve1):
+ *  - `findmnt --json`: `fixtures/mounts/findmnt-zfs-root.json`;
+ *  - `zfs get -H -p -o name,value -t filesystem acltype`:
+ *    `fixtures/zfs/zfs-get-acltype-zfs-root.txt` — `rpool/ROOT/pve-1<TAB>posix`,
+ *    the installer's own setting on the filesystem mounted at `/`;
+ *  - `zpool get -H -o name,value bootfs`:
+ *    `fixtures/zfs/zpool-get-bootfs-zfs-root.txt` — `rpool<TAB>rpool/ROOT/pve-1`.
+ * On the node `/` was a walk root, and every local mount below it (/proc,
+ * /sys, /dev, /run, /etc/pve, /var/lib/lxcfs and more) a root of its own: 30
+ * roots; `/` alone took 14.8 s with `-execdir` (one getfacl per directory
+ * batch, 8640 directories), /proc 23.8 s.
+ */
+describe('cr3.nodefix D1 — the ZFS-root node: PVE\'s own filesystems are no ACL walk root, and getfacl runs in batches across directories', () => {
+  const ZFS_ROOT_FINDMNT = readFileSync(join(FIXTURES, 'mounts/findmnt-zfs-root.json'), 'utf-8')
+  const ZFS_ROOT_ACLTYPE = readFileSync(join(FIXTURES, 'zfs/zfs-get-acltype-zfs-root.txt'), 'utf-8')
+  const ZFS_ROOT_BOOTFS = readFileSync(join(FIXTURES, 'zfs/zpool-get-bootfs-zfs-root.txt'), 'utf-8')
+  const mounts = mountIndex(ZFS_ROOT_FINDMNT)
+  const posix = parsePosixAclFilesystems(ZFS_ROOT_ACLTYPE)!
+  /** PVE's claim from the captured boot facts (no storages needed: the boot tree is `system`). */
+  const facts = buildSystemPoolFacts(parseBootfsGet(ZFS_ROOT_BOOTFS), null)
+  const owned = (dataset: string): boolean => pveOwnership([], dataset, facts.find(f => f.pool === dataset.split('/')[0])) !== null
+  /** The captured `/` row re-targeted as a data filesystem the operator made: `tank/share` at /tank/share. */
+  const SHARE_ROW: FindmntNode = { ...mounts.get('/')!, target: '/tank/share', source: 'tank/share' }
+
+  it('the captures say what the node said: `/` is rpool/ROOT/pve-1, its ACLs are on, and it is PVE\'s boot filesystem', () => {
+    assert.equal(mounts.get('/')?.source, 'rpool/ROOT/pve-1')
+    assert.equal(mounts.get('/')?.fstype, 'zfs')
+    assert.deepEqual(posix, new Set(['rpool/ROOT/pve-1']))
+    assert.equal(owned('rpool/ROOT/pve-1'), true)
+    assert.equal(owned('tank/share'), false)
+  })
+
+  it('RED: no walk root at all on the stock node — not `/`, and not /proc, /sys, /dev, /run, /etc/pve or anything else mounted below it', () => {
+    // Before the fix (the predicate absent): `/` and 20-odd roots below it.
+    const before = aclWalkRoots([], mounts, posix)
+    assert.equal(before[0]?.path, '/')
+    assert.ok(before.some(r => r.path === '/proc') && before.some(r => r.path === '/etc/pve'))
+    assert.deepEqual(aclWalkRoots([], mounts, posix, owned), [])
+  })
+
+  it('a share or an export is still walked from its own path wherever it is, and a non-PVE ZFS filesystem with ACLs on is still a root', () => {
+    // /mnt/extra is the capture's whole-disk ext4 data mount.
+    assert.deepEqual(aclWalkRoots(['/mnt/extra'], mounts, posix, owned), [{ path: '/mnt/extra', xdev: true, prune: [] }])
+    // A hand-written share on the boot filesystem (ANAS refuses to make one there) is walked from its path, never from `/`.
+    assert.deepEqual(aclWalkRoots(['/srv/share'], mounts, posix, owned).map(r => r.path), ['/srv/share'])
+    const withShare = new Map([...mounts, ['/tank/share', SHARE_ROW]])
+    assert.deepEqual(aclWalkRoots([], withShare, new Set([...posix, 'tank/share']), owned), [
+      { path: '/tank/share', xdev: true, prune: ['/tank/share/.zfs'] },
+    ])
+  })
+
+  it('RED: the oracle — an id an ACL entry names on a managed ZFS filesystem is still refused, and `/` is never read', async () => {
+    const findmnt = JSON.stringify({ filesystems: [...JSON.parse(ZFS_ROOT_FINDMNT).filesystems, { target: '/tank/share', source: 'tank/share', fstype: 'zfs', options: 'rw,xattr,posixacl,casesensitive' }] })
+    const node: Node = {
+      datasets: ['rpool', 'rpool/ROOT', 'rpool/ROOT/pve-1', 'rpool/data', 'rpool/var-lib-vz', 'tank/share'],
+      userspace: {},
+      owned: {},
+      holders: {},
+      findmnt,
+      acltype: { 'rpool/ROOT/pve-1': 'posix', 'tank/share': 'posix' },
+      acls: { '/tank/share': 'user:1005:r-x\n', '/': 'user:1007:r-x\n' },
+    }
+    const { executor, calls } = fakeNode(node)
+    const o = opts(executor, { smbConf: async () => '', pveOwned: async () => owned })
+    assert.deepEqual(await idOwnership('uid', 1005, o), { owns: true, where: `an ACL entry under '/tank/share'` })
+    assert.deepEqual(calls.filter(c => c.command === `${FIND} | ${SORT}`).map(c => c.args[1]), ['/tank/share'])
+  })
+
+  it('PVE\'s claim that cannot be judged walks every ACL-enabled filesystem as before (missing facts only tighten)', async () => {
+    const node: Node = { datasets: ['rpool/ROOT/pve-1'], userspace: {}, owned: {}, holders: {}, findmnt: ZFS_ROOT_FINDMNT, acltype: { 'rpool/ROOT/pve-1': 'posix' }, acls: { '/': 'user:1007:r-x\n' } }
+    const { executor, calls } = fakeNode(node)
+    const o = opts(executor, { smbConf: async () => '', pveOwned: async () => ({ unjudged: 'the boot facts could not be read (zpool get bootfs exited 1: internal error)' }) })
+    assert.deepEqual(await idOwnership('uid', 1007, o), { owns: true, where: `an ACL entry under '/'` })
+    assert.equal(calls.filter(c => c.command === `${FIND} | ${SORT}`)[0]?.args[1], '/')
+    // The footprint's own flags: unreadable storages or boot facts → cannot judge, naming the reads that
+    // failed (review R3); readable → its ownership answer.
+    const fp = (s: boolean, b: boolean, unreadableReads?: string[]) => ({ storagesUnavailable: s, systemFactsUnavailable: b, unreadableReads, ownershipOf: (d: string) => (d === 'rpool/ROOT/pve-1' ? { kind: 'system' as const, reason: 'boot' } : null) })
+    assert.deepEqual(pveOwnedFrom(fp(true, false, ['the PVE storage configuration /etc/pve/storage.cfg could not be read'])), { unjudged: 'the PVE storage configuration /etc/pve/storage.cfg could not be read' })
+    assert.deepEqual(pveOwnedFrom(fp(false, true, ['the boot facts could not be read (x)', 'y'])), { unjudged: 'the boot facts could not be read (x); y' })
+    assert.deepEqual(pveOwnedFrom(fp(false, true)), { unjudged: 'PVE\'s storage configuration or the boot facts could not be read' })
+    const judged = pveOwnedFrom(fp(false, false)) as (d: string) => boolean
+    assert.equal(judged('rpool/ROOT/pve-1'), true)
+    assert.equal(judged('tank/share'), false)
+  })
+
+  it('RED: getfacl is handed absolute paths in batches (`-exec getfacl {} +`), not one batch per directory (`-execdir`)', () => {
+    const args = aclFindArgs({ path: '/tank/share', xdev: true, prune: ['/tank/share/.zfs'] })
+    assert.deepEqual(args, ['-P', '/tank/share', '-xdev', '(', '-path', '/tank/share/.zfs', ')', '-prune', '-o', '-type', 'd', '-exec', '/usr/bin/getfacl', '-n', '-p', '-c', '-E', '-s', '{}', '+'])
+    assert.ok(!args.includes('-execdir'))
+  })
+})
+
+/**
+ * cr3.nodefix review R1: what the `-exec` getfacl batch does when the tree
+ * changes between find's listing and the batch, from the node capture
+ * fixtures/acl/find-exec-getfacl-ancestor-swap.txt (GNU find 4.10.0, getfacl
+ * 2.3.2): an ancestor renamed away makes getfacl fail on every vanished path
+ * and find exit 1 — the check refuses (fail closed); an ancestor swapped for
+ * a symlink to a lookalike tree hides the grant with exit 0 (the accepted
+ * limit, services/access-walk.ts).
+ */
+describe('cr3.nodefix review R1 — the identity scan when the tree changes under its getfacl batch', () => {
+  const CAPTURE = readFileSync(join(FIXTURES, 'acl/find-exec-getfacl-ancestor-swap.txt'), 'utf-8').split('\n')
+  /** The stderr lines and find's exit code of one captured case. */
+  function captured(swap: string): { stderr: string, exit: number, stdout: string } {
+    const at = CAPTURE.findIndex(l => l.startsWith(`### $ SWAP=${swap} `))
+    const err = CAPTURE.indexOf('### stderr:', at)
+    const exit = CAPTURE.findIndex((l, i) => i > err && l.startsWith('### find exit='))
+    return {
+      stdout: CAPTURE.slice(at + 1, err).map(l => `${l}\n`).join(''),
+      stderr: CAPTURE.slice(err + 1, exit).map(l => `${l}\n`).join(''),
+      exit: Number(CAPTURE[exit]!.slice('### find exit='.length)),
+    }
+  }
+  const ROOT = '/var/tmp/nfxd1c/share'
+  const node: Node = { ...BASE, acltype: {} }
+  const shared = { smbConf: async () => `[s]\npath = ${ROOT}\n` }
+
+  it('a folder renamed away under the batch: find exits 1 and the check refuses, naming the vanished path (fail closed)', async () => {
+    const rename = captured('rename')
+    assert.equal(rename.exit, 1)
+    assert.match(rename.stderr, /^getfacl: \/var\/tmp\/nfxd1c\/share\/a: No such file or directory$/m)
+    const { executor } = fakeNode({ ...node, aclFail: root => root === ROOT ? { leftExitCode: rename.exit, rightExitCode: 0, leftStderr: rename.stderr, rightStderr: '', stdout: rename.stdout } : undefined })
+    const r = await pickId('uid', [1004], reservations(), opts(executor, shared))
+    assert.ok('refusal' in r && r.refusal === 'unreadable', JSON.stringify(r))
+    assert.ok('unreadable' in r && r.unreadable.startsWith(`the ACLs under '${ROOT}' (find … getfacl: getfacl: ${ROOT}/a: No such file or directory`), JSON.stringify(r))
+  })
+
+  it('the accepted limit: an ancestor swapped for a symlink answers exit 0 and no grant, and the check reads "not in use"', async () => {
+    const swap = captured('ancestor')
+    assert.deepEqual([swap.exit, swap.stderr, swap.stdout], [0, '', ''])
+    const { executor } = fakeNode({ ...node, aclFail: root => root === ROOT ? { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: swap.stdout } : undefined })
+    assert.deepEqual(await pickId('uid', [1004], reservations(), opts(executor, shared)), { id: 1005, skipped: [] })
+  })
+})
+
+/**
+ * cr3.nodefix review R3: on a ZFS-root node whose PVE footprint could not be
+ * read, the walk widens back to `/` (missing facts only widen) and, before
+ * this, the user got the 10 s refusal with a sentence that did not say why;
+ * and the footprint read itself ran its commands on the request lane's full
+ * 10 s each, outside the check's one budget.
+ */
+describe('cr3.nodefix review R3 — a walk that widened says why, and PVE\'s claim is read inside the check\'s budget', () => {
+  const ZFS_ROOT_FINDMNT = readFileSync(join(FIXTURES, 'mounts/findmnt-zfs-root.json'), 'utf-8')
+  const zfsRoot: Node = { datasets: ['rpool/ROOT/pve-1'], userspace: {}, owned: {}, holders: {}, findmnt: ZFS_ROOT_FINDMNT, acltype: { 'rpool/ROOT/pve-1': 'posix' } }
+
+  it('RED: a widened walk that runs out names the read that made it wide', async () => {
+    const cause = 'the PVE storage configuration /etc/pve/storage.cfg could not be read'
+    const { executor } = fakeNode({ ...zfsRoot, aclFail: (root) => {
+      if (root === '/')
+        throw new CommandTimeoutError(FIND, [], 'request', 10_000, false)
+      return undefined
+    } })
+    const r = await idOwnership('uid', 1005, opts(executor, { smbConf: async () => '', pveOwned: async () => ({ unjudged: cause }) }))
+    assert.deepEqual(r, { unreadable: `the ACLs under '/' (the check did not finish within 10 s); the check read PVE's own filesystems too because it could not tell which are PVE's: ${cause}` })
+  })
+
+  it('RED: the footprint read gets at most what is left of the budget, and a read that hangs ends the check inside it', async () => {
+    const saved = process.env.ANAS_STORAGE_CFG
+    process.env.ANAS_STORAGE_CFG = join(FIXTURES, 'no-such-storage.cfg')
+    try {
+      const { executor, calls } = fakeNode(zfsRoot)
+      const inner = executor.exec.bind(executor)
+      // `zpool get bootfs` does not answer (a suspended pool): it would
+      // return, far too late, after 3 s — the old read waited for it.
+      executor.exec = async (command, args, o) => {
+        if (command === '/usr/sbin/zpool') {
+          calls.push({ command, args, timeoutMs: o?.timeoutMs ?? undefined })
+          await new Promise(resolve => setTimeout(resolve, 3_000))
+          return { stdout: '', stderr: 'unexpected', exitCode: 127 }
+        }
+        return inner(command, args, o)
+      }
+      const started = Date.now()
+      const r = await idOwnership('uid', 1005, opts(executor, { smbConf: async () => '', pveOwned: undefined, budgetMs: 1_000 }))
+      assert.deepEqual(r, { unreadable: 'which ZFS filesystems PVE owns (the check did not finish within 1 s)' })
+      assert.ok(Date.now() - started < 2_500, `answered in ${Date.now() - started} ms`)
+      const zpool = calls.find(c => c.command === '/usr/sbin/zpool')
+      assert.ok(zpool && (zpool.timeoutMs ?? Infinity) <= 1_000, JSON.stringify(zpool))
+    }
+    finally {
+      if (saved === undefined)
+        delete process.env.ANAS_STORAGE_CFG
+      else
+        process.env.ANAS_STORAGE_CFG = saved
+    }
   })
 })

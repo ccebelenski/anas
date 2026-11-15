@@ -170,3 +170,12 @@ is built on are kept here — the same bytes the GT document quotes.
 |------|--------|------------|
 | `scrub-dmesg-gt3.txt` | GT-3, `out/03-dmesg.txt` | Rot written BELOW md: the `scrub: checksum error at logical … root 256 inode 257 offset … (path: f1.bin)` warning, plus the `bdev … errs:` counter line that follows it (which is NOT an error event and must not be counted as one) |
 | `scrub-dmesg-gt6.txt` | GT-6, `out/04-gt6-dmesg.txt` | Rot written THROUGH md (parity agrees with the bad data): the same warning shape for a second inode, plus the `csum_errors: 2` line the capture script appends from the scrub summary |
+
+## Genuine captures — nested subvolumes on an AHR mount (cr3 node pass 2, cr3.nodefix review R2)
+
+Both files carry their commands, exit codes and what they settle in their own header.
+
+| File | What it settles |
+|------|-----------------|
+| `btrfs-subvol-list-nested-mounted.txt` | On a `subvol=/@data` mount, `btrfs subvolume list` prints a subvolume below the mounted one relative to it (`sv`, `plain/sv2`, `sv/deep`) |
+| `btrfs-subvol-list-newline-names.txt` | A user without privileges can create a subvolume; the list prints a name's line break raw, so a name can forge a whole list line; btrfs-progs 6.14 has no `--format json` for `subvolume list`; a subvolume root is inode 256 on a device number of its own, an ordinary folder is not; `find <mount> -inum 256 -name '*[[:cntrl:]]*'` lists the subvolumes with a control character in their names |
