@@ -24,7 +24,7 @@ Every state-changing operation returns `202 Accepted` with a job reference. The 
 
 anasd does not accept arbitrary commands. It accepts structured operations with validated parameters and maps them to specific system commands internally. The API surface defines what the system can do. If it's not in the API, it can't be done through ANAS.
 
-## 6. Shared schemas, validated at every boundary
+## 6. Shared schemas, validated at anasd
 
 Request and response types are defined once (Zod) and shared between anas and anasd. ~~Validation happens at both boundaries — the anas gateway validates incoming user input, anasd validates before execution. This is defense in depth, not redundancy.~~ **Corrected (operator ruling, 2026-11-14):** anasd is the schema boundary: it validates every request against the shared schemas before execution. The anas gateway authenticates the caller, checks the PVE privilege and forwards the request body unparsed.
 

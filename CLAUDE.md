@@ -27,7 +27,7 @@
 - Check the API resource model in DESIGN.md for the correct endpoints
 - Use shared Zod schemas — do not define types inline
 - Use execFile, never exec — arguments as arrays
-- Validate at both boundaries (the anas gateway and anasd)
+- Validate in anasd against the shared schemas (it is the schema boundary); the anas gateway authenticates, checks the PVE privilege and forwards the body unparsed (ruling 2026-11-14)
 - Service reloads are side effects of mutations, not separate API calls
 
 ## Do not
