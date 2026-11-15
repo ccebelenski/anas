@@ -22,7 +22,7 @@ import { ensureAhrTargetOrdering } from './ahr-create.js'
 import { classifyPermissionFailure, PBC, pbcPositional, withStateLeftBehind } from './backup-runner.js'
 import { aclNamesRefusal, createLunBackstore, createSparseImage, mapLunIntoTarget, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
 import { normalizePlugin } from './iscsi.js'
-import { capitalize, clearMarkCommand, clearRestoreMark, describeRestoreMark, fileRestoreAgain, JOB_RECORD_LIFETIME, markDataset, putBackRestoreMark, readRestoreMark, setRestoreMark, unverifiedMark, writingMark } from './restore-mark.js'
+import { capitalize, clearMarkCommand, clearRestoreMark, describeRestoreMark, fileRestoreAgain, isFileMark, jobRecordLifetime, markDataset, markName, markOn as markOnOf, NOT_A_VOLUME, putBackRestoreMark, readRestoreMark, RestoreMarkUnsupportedError, setRestoreMark, unreadableFileWay, unverifiedMark, writingMark } from './restore-mark.js'
 import { maskSecretValues } from './secret-argv.js'
 
 /**
@@ -806,8 +806,17 @@ export async function runImageRestore(
   let failure: unknown
   const stillDisabled: string[] = []
 
-  // cr3.lunrestore: the breadcrumb on the volume (a file image carries none).
-  const markOn = markDataset(lun.backingPath)
+  // cr3.lunrestore: the breadcrumb on the volume — and, since
+  // cr3.lunrestore.filemark, on the image file itself (an extended attribute).
+  // Null once the read or the set says the object cannot carry one: then this
+  // daemon's job record stands in, as it did before file marks, and `noMark`
+  // says why.
+  let markOn: string | null = markOnOf(lun.backingPath)
+  let noMark: Extract<RestoreMarkRead, { state: 'unsupported' }> | null = markOn === null
+    ? { state: 'unsupported', reason: NOT_A_VOLUME }
+    : null
+  /** The object the mark is on, in words ("the volume", "the image file"). */
+  const markObject = (): string => (markOn !== null && isFileMark(markOn) ? 'the image file' : 'the volume')
   // cr3.lunrestore (review2 A): the mark ALREADY on the volume when this run
   // starts — an earlier restore that did not finish, or one whose size was not
   // verified. A run removes only the mark it created on a volume that carried
@@ -844,12 +853,19 @@ export async function runImageRestore(
     if (markOn !== null) {
       const read = await readRestoreMark(executor, { path: lun.backingPath })
       if (read.state === 'unknown') {
-        throw new Error(`ANAS could not read the restore mark ${RESTORE_MARK_PROPERTY} on ${markOn} (${read.reason}), so it cannot `
+        throw new Error(`ANAS could not read the restore mark ${markName(markOn)} on ${markOn} (${read.reason}), so it cannot `
           + `keep the record an earlier restore may have left there. The restore is refused until the mark can be read. `
-          + 'Nothing was disabled and nothing was written.')
+          + `Nothing was disabled and nothing was written.${unreadableFileWay(markOn, 'the restore')}`)
       }
       if (read.state === 'present')
         prior = read
+      // cr3.lunrestore.filemark: an image file that cannot carry a mark (no
+      // attr tools, a filesystem that refuses extended attributes) restores
+      // as before file marks: the job record stands in.
+      if (read.state === 'unsupported') {
+        noMark = read
+        markOn = null
+      }
     }
 
     // cr.40 (WAVE3-DESIGN §2.4 "image restore in place"): whether the target
@@ -888,35 +904,38 @@ export async function runImageRestore(
    * Returns the sentence the job error carries ('' when there is none).
    */
   const restorePriorMark = async (): Promise<string> => {
-    if (markOn === null) {
+    if (kind === 'file') {
       // An image FILE is opened 'w' for the stream, which TRUNCATES it: once
       // the open happened, "nothing was written" still means the old image is
       // gone. Its size says which (an open that failed left it whole).
-      if (kind !== 'file')
-        return ''
+      // cr3.lunrestore.filemark: an emptied file keeps THIS run's mark — it
+      // no longer holds the image an earlier mark described either.
       const size = await readTargetSize(executor, lun)
-      if (!('error' in size) && size.size === deps.imageSize)
-        return ''
-      fileEmptied = true
-      keepDisabled = `${lun.backingPath} ${'error' in size ? `could not be re-read (${size.error})` : `is ${size.size} bytes now, not ${deps.imageSize}`}: `
-        + `the image file is emptied when it is opened for the restore, so it no longer holds the image it held, and target `
-        + `${target.iqn} stays disabled. ${capitalize(fileRestoreAgain(lun.backingPath, deps.imageSize))}`
-      return ` ${keepDisabled}.`
+      if ('error' in size || size.size !== deps.imageSize) {
+        fileEmptied = true
+        keepDisabled = `${lun.backingPath} ${'error' in size ? `could not be re-read (${size.error})` : `is ${size.size} bytes now, not ${deps.imageSize}`}: `
+          + `the image file is emptied when it is opened for the restore, so it no longer holds the image it held, and target `
+          + `${target.iqn} stays disabled${markOn !== null ? `; it keeps this restore's mark ${markName(markOn)}` : ''}. `
+          + `${capitalize(fileRestoreAgain(lun.backingPath, deps.imageSize))}`
+        return ` ${keepDisabled}.`
+      }
     }
+    if (markOn === null)
+      return ''
     if (prior === null) {
       try {
         await clearRestoreMark(executor, markOn)
         return ''
       }
       catch (err) {
-        keepDisabled = `${errorText(err)}; nothing was written, but the volume still reads as a partial image, so target `
+        keepDisabled = `${errorText(err)}; nothing was written, but ${markObject()} still reads as a partial image, so target `
           + `${target.iqn} stays disabled: clear the mark with '${clearMarkCommand(markOn)}', then enable the target`
         return ` ${keepDisabled}.`
       }
     }
     const earlier = describeRestoreMark(prior)
     try {
-      await putBackRestoreMark(executor, markOn, prior.raw)
+      await putBackRestoreMark(executor, markOn, prior.raw, prior.hex)
       keepDisabled = `${markOn} carries the restore mark of ${earlier} again, as it did before this restore: the LUN holds `
         + `that restore's image, so target ${target.iqn} stays disabled. Enable on the iSCSI screen asks you to confirm `
         + `that you accept that image; restoring again is the other way out`
@@ -928,11 +947,16 @@ export async function runImageRestore(
     return ` ${keepDisabled}.`
   }
 
-  /** How the operator accepts what is on the LUN — true per backing kind. */
+  /**
+   * How the operator accepts what is on the LUN — true per backing kind, and
+   * for an image file per whether it carries the mark (cr3.lunrestore.filemark):
+   * a file restored again in place needs its length first.
+   */
   const wayOut = (what: string): string => markOn !== null
     ? `Enable on the iSCSI screen asks you to confirm that you accept ${what}, and removes the restore mark on ${markOn}`
+    + `${isFileMark(markOn) ? `. ${capitalize(fileRestoreAgain(lun.backingPath, deps.imageSize))}` : ''}`
     : `Enable on the iSCSI screen asks you to confirm that you accept ${what} while ANAS keeps this job's record; `
-      + `${JOB_RECORD_LIFETIME}. ${capitalize(fileRestoreAgain(lun.backingPath, deps.imageSize))}`
+      + `${jobRecordLifetime(noMark ?? undefined)}. ${capitalize(fileRestoreAgain(lun.backingPath, deps.imageSize))}`
 
   /** Turn this run's mark `unverified` with the reason; the clause the job error carries. */
   const markUnverified = async (reason: string): Promise<string> => {
@@ -950,18 +974,29 @@ export async function runImageRestore(
       // No mark, no write: a mark that cannot be set refuses the restore here.
       // Nothing was written; the `finally` re-enables what was disabled unless
       // an earlier mark is still on the volume (then it stays disabled).
-      updateProgress(`marking ${markOn} as being restored (${RESTORE_MARK_PROPERTY}) before the first byte is written`)
+      updateProgress(`marking ${markOn} as being restored (${markName(markOn)}) before the first byte is written`)
       try {
         await setRestoreMark(executor, markOn, mark)
       }
       catch (err) {
-        // A failed set changed nothing: an earlier mark is still there, and
-        // the target is not enabled over it (review2 A).
-        if (prior !== null) {
-          keepDisabled = `${markOn} still carries the restore mark of ${describeRestoreMark(prior)}, so target ${target.iqn} stays disabled`
+        // cr3.lunrestore.filemark: an image file that turns out unable to
+        // carry a mark, with none on it before, restores as before file marks
+        // (the job record stands in, and its sentences say why). With an
+        // earlier mark on it, a failed set is a refusal like any other.
+        if (err instanceof RestoreMarkUnsupportedError && prior === null) {
+          noMark = { state: 'unsupported', reason: err.reason }
+          updateProgress(`${lun.backingPath} cannot carry a restore mark (${err.reason}): this restore's job record stands in for it`)
+          markOn = null
         }
-        throw new Error(`${errorText(err)}; a restore that cannot leave its mark is refused. Nothing was written to ${lun.backingPath}.`
-          + `${keepDisabled ? ` ${keepDisabled}.` : ''}`)
+        else {
+          // A failed set changed nothing: an earlier mark is still there, and
+          // the target is not enabled over it (review2 A).
+          if (prior !== null) {
+            keepDisabled = `${markOn} still carries the restore mark of ${describeRestoreMark(prior)}, so target ${target.iqn} stays disabled`
+          }
+          throw new Error(`${errorText(err)}; a restore that cannot leave its mark is refused. Nothing was written to ${lun.backingPath}.`
+            + `${keepDisabled ? ` ${keepDisabled}.` : ''}`)
+        }
       }
     }
     const args = imageRestoreArgs(deps.snapshot, deps.archive, deps.namespace, deps.rate)
@@ -1032,8 +1067,9 @@ export async function runImageRestore(
       // restore handed pbc — a pbc error line that echoes it meets `[secret]`.
       const detail = explainRestoreFailure(r.stderr, r.signal, [deps.secret])
       if (bytesWritten > 0) {
-        // The half-written state, stated in the words the story asks for. The
-        // device has no marker of its own; this sentence IS the record.
+        // The half-written state, stated in the words the story asks for.
+        // The restore mark stays on the object (where it can carry one); this
+        // sentence is the job's record of it.
         // cr3.lunrestore (D5 e): the way to accept the state is named.
         partial = `the image was partially written (${written.estimated ? 'at least ' : ''}${bytesWritten} `
           + `of ${deps.imageSize} bytes reached ${lun.backingPath}); the LUN is disabled until you restore `
@@ -1089,7 +1125,7 @@ export async function runImageRestore(
     if (unverified !== null) {
       const marked = markOn !== null ? await markUnverified(unverified) : ''
       keepDisabled = `${progress.complete ? 'the client reported the image complete' : 'the client exited 0'}, but ${unverified}: target ${target.iqn} stays disabled${marked}. `
-        + `${wayOut('it')}${markOn !== null ? '. Restoring again is the other way out' : ''}`
+        + `${wayOut('it')}${markOn !== null && !isFileMark(markOn) ? '. Restoring again is the other way out' : ''}`
       throw imageRestoreFailure(`${keepDisabled}.`, 'IMAGE_UNVERIFIED')
     }
     if (markOn !== null) {
@@ -1097,7 +1133,7 @@ export async function runImageRestore(
         await clearRestoreMark(executor, markOn)
       }
       catch (markErr) {
-        keepDisabled = `the image was restored in full and its size verified, but ${errorText(markErr)}: the volume still `
+        keepDisabled = `the image was restored in full and its size verified, but ${errorText(markErr)}: ${markObject()} still `
           + `reads as a partial image, so the target stays disabled. Clear the mark with '${clearMarkCommand(markOn)}', then enable the target`
         throw new Error(`${keepDisabled}.`)
       }
@@ -1352,8 +1388,10 @@ export async function runNewLunImageRestore(
   const { target, backing } = deps
   const kind: 'zvol' | 'file' = backing.plugin === 'block' ? 'zvol' : 'file'
   const streamTarget = restoreStreamTarget(backing.path, kind)
-  // The volume the restore mark lives on; null for an image file (no mark).
-  const markOn = markDataset(backing.path)
+  // Where the restore mark lives: the volume, or (cr3.lunrestore.filemark)
+  // the new image file itself. Null once the set says the file cannot carry
+  // one: then the job record stands in, as before file marks.
+  let markOn: string | null = markOnOf(backing.path)
   const mark = writingMark({ repo: deps.repo.name, ...(deps.namespace ? { namespace: deps.namespace } : {}), snapshot: deps.snapshot, archive: deps.archive })
 
   let bytesWritten = 0
@@ -1395,8 +1433,19 @@ export async function runNewLunImageRestore(
     state.backingCreated = true
     if (markOn !== null) {
       // The breadcrumb, before anything can write: no mark, no write.
-      updateProgress(`marking ${markOn} as being restored (${RESTORE_MARK_PROPERTY}) before the first byte is written`)
-      await setRestoreMark(executor, markOn, mark)
+      updateProgress(`marking ${markOn} as being restored (${markName(markOn)}) before the first byte is written`)
+      try {
+        await setRestoreMark(executor, markOn, mark)
+      }
+      catch (err) {
+        // cr3.lunrestore.filemark: a new image file on a filesystem (or a
+        // node) that cannot carry a mark restores as before file marks; the
+        // LUN is mapped only once the image is verified either way.
+        if (!(err instanceof RestoreMarkUnsupportedError))
+          throw err
+        updateProgress(`${backing.path} cannot carry a restore mark (${err.reason}): this restore's job record stands in for it`)
+        markOn = null
+      }
     }
 
     // The moment the image lands on an AHR pool, that pool's boot ordering
@@ -1504,7 +1553,7 @@ export async function runNewLunImageRestore(
   if (state.released)
     await deps.reacquire?.()
   const plugin = backing.plugin
-  const keptHow = (targetUsable: boolean, image: KeptImage = 'complete'): string => keptSentence(deps, target, plugin, serial, targetUsable, image)
+  const keptHow = (targetUsable: boolean, image: KeptImage = 'complete'): string => keptSentence(deps, target, plugin, serial, targetUsable, image, markOn)
 
   if (rejected !== null) {
     const said = maskSecretValues(errorText(rejected), [deps.secret])
@@ -1561,7 +1610,7 @@ export async function runNewLunImageRestore(
     catch (markErr) {
       throw new Error(
         `the image was restored in full and its size verified, but ${markErr instanceof Error ? markErr.message : String(markErr)}, `
-        + `so it was not mapped as a LUN: a marked volume reads as a partial image everywhere. Clear it with `
+        + `so it was not mapped as a LUN: a marked ${isFileMark(markOn) ? 'image file' : 'volume'} reads as a partial image everywhere. Clear it with `
         + `'${clearMarkCommand(markOn)}'.${keptHow(true)}`,
       )
     }
@@ -1646,7 +1695,7 @@ export async function runNewLunImageRestore(
       }
     }
     const kept = notMapped.backstoreIsOurs
-      ? keptSentence(deps, { iqn: mapTarget.iqn, tpgTag: mapTarget.tag }, plugin, serial, notMapped.targetUsable)
+      ? keptSentence(deps, { iqn: mapTarget.iqn, tpgTag: mapTarget.tag }, plugin, serial, notMapped.targetUsable, 'complete', markOn)
       : ` ${backing.path} is kept; ANAS did not touch the backstore named '${deps.name}'.`
     throw new Error(`the image was restored in full into ${backing.path}, but ${sentenceBody(notMapped.message)}.${unmapped}${kept}`)
   }
@@ -1702,6 +1751,8 @@ function keptSentence(
   serial: string,
   targetUsable: boolean,
   image: KeptImage = 'complete',
+  /** Where this run's mark is (cr3.lunrestore.filemark): the volume, the image file, or null when it carries none. */
+  markOn: string | null = markOnOf(deps.backing.path),
 ): string {
   const dataset = markDataset(deps.backing.path)
   const remove = `delete it with 'targetcli /backstores/${plugin} delete ${deps.name}', then ${dataset ? `'zfs destroy ${dataset}'` : `delete ${deps.backing.path}`}`
@@ -1710,7 +1761,7 @@ function keptSentence(
   const map = image === 'unknown'
     ? `It may hold a partial image: ${remove}, and restore the image again.`
     : image === 'unverified'
-      ? `If you have checked the image and want to serve it, ${dataset ? `clear the restore mark with '${clearMarkCommand(dataset)}', then ` : ''}${mapCmd}; otherwise ${remove}.`
+      ? `If you have checked the image and want to serve it, ${markOn ? `clear the restore mark with '${clearMarkCommand(markOn)}', then ` : ''}${mapCmd}; otherwise ${remove}.`
       : targetUsable
         ? `To serve it, ${mapCmd}; or ${remove}.`
         : `Target ${target.iqn} cannot take it as it is (above): map it into a target ANAS manages with targetcli, or ${remove}.`

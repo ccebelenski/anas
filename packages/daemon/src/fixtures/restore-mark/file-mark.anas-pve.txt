@@ -1,0 +1,335 @@
+### anas-pve ext4 read-absent
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 78
+/mnt/filemarkgt/root-ext4/a/lun0.img: trusted.anas.restore: No such attribute
+
+EXIT=1
+### anas-pve ext4 set-writing
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 read-writing
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 368
+# file: /mnt/filemarkgt/root-ext4/a/lun0.img
+trusted.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 set-unverified
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a22756e7665726966696564222c22726561736f6e223a222f782f6c756e302e696d6720697320302062797465732c206e6f742074686520696d61676527732031303438353736227d -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 read-unverified
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 492
+# file: /mnt/filemarkgt/root-ext4/a/lun0.img
+trusted.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a22756e7665726966696564222c22726561736f6e223a222f782f6c756e302e696d6720697320302062797465732c206e6f742074686520696d61676527732031303438353736227d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 remove
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 remove-absent
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 66
+setfattr: /mnt/filemarkgt/root-ext4/a/lun0.img: No such attribute
+
+EXIT=1
+### anas-pve ext4 read-missing-file
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/a/gone.img
+--- stdout 0
+
+--- stderr 74
+getfattr: /mnt/filemarkgt/root-ext4/a/gone.img: No such file or directory
+
+EXIT=1
+### anas-pve ext4 set-missing-file
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/root-ext4/a/gone.img
+--- stdout 0
+
+--- stderr 74
+setfattr: /mnt/filemarkgt/root-ext4/a/gone.img: No such file or directory
+
+EXIT=1
+### anas-pve ext4 set-empty
+$ setfattr -n trusted.anas.restore -v 0x -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 read-empty
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 70
+# file: /mnt/filemarkgt/root-ext4/a/lun0.img
+trusted.anas.restore=0x
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 set-odd
+$ setfattr -n trusted.anas.restore -v 0xfffe0a7b -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 read-odd
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 78
+# file: /mnt/filemarkgt/root-ext4/a/lun0.img
+trusted.anas.restore=0xfffe0a7b
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 set-newline
+$ setfattr -n trusted.anas.restore -v 0x7b0a7d -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 read-newline
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 76
+# file: /mnt/filemarkgt/root-ext4/a/lun0.img
+trusted.anas.restore=0x7b0a7d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 toobig-set-4096
+$ setfattr -n trusted.anas.restore -v aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 72
+setfattr: /mnt/filemarkgt/root-ext4/a/lun0.img: No space left on device
+
+EXIT=1
+### anas-pve ext4 toobig-set-4032
+$ setfattr -n trusted.anas.restore -v aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -- /mnt/filemarkgt/root-ext4/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 readonly-read
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/ext4ro/lun0.img
+--- stdout 69
+# file: /mnt/filemarkgt/ext4ro/lun0.img
+trusted.anas.restore=0x7b7d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 readonly-set
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/ext4ro/lun0.img
+--- stdout 0
+
+--- stderr 65
+setfattr: /mnt/filemarkgt/ext4ro/lun0.img: Read-only file system
+
+EXIT=1
+### anas-pve ext4 readonly-remove
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/ext4ro/lun0.img
+--- stdout 0
+
+--- stderr 65
+setfattr: /mnt/filemarkgt/ext4ro/lun0.img: Read-only file system
+
+EXIT=1
+### anas-pve ext4 full-read
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/ext4small/full/lun0.img
+--- stdout 0
+
+--- stderr 81
+/mnt/filemarkgt/ext4small/full/lun0.img: trusted.anas.restore: No such attribute
+
+EXIT=1
+### anas-pve ext4 full-set
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/ext4small/full/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve ext4 full-remove
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/ext4small/full/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs read-absent
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 0
+
+--- stderr 74
+/mnt/filemarkgt/btrfs/a/lun0.img: trusted.anas.restore: No such attribute
+
+EXIT=1
+### anas-pve btrfs set-writing
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs read-writing
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 364
+# file: /mnt/filemarkgt/btrfs/a/lun0.img
+trusted.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs set-unverified
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a22756e7665726966696564222c22726561736f6e223a222f782f6c756e302e696d6720697320302062797465732c206e6f742074686520696d61676527732031303438353736227d -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs read-unverified
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 488
+# file: /mnt/filemarkgt/btrfs/a/lun0.img
+trusted.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a22756e7665726966696564222c22726561736f6e223a222f782f6c756e302e696d6720697320302062797465732c206e6f742074686520696d61676527732031303438353736227d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs remove
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs remove-absent
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 0
+
+--- stderr 62
+setfattr: /mnt/filemarkgt/btrfs/a/lun0.img: No such attribute
+
+EXIT=1
+### anas-pve btrfs read-missing-file
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/a/gone.img
+--- stdout 0
+
+--- stderr 70
+getfattr: /mnt/filemarkgt/btrfs/a/gone.img: No such file or directory
+
+EXIT=1
+### anas-pve btrfs set-missing-file
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/btrfs/a/gone.img
+--- stdout 0
+
+--- stderr 70
+setfattr: /mnt/filemarkgt/btrfs/a/gone.img: No such file or directory
+
+EXIT=1
+### anas-pve btrfs set-empty
+$ setfattr -n trusted.anas.restore -v 0x -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs read-empty
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 66
+# file: /mnt/filemarkgt/btrfs/a/lun0.img
+trusted.anas.restore=0x
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs set-odd
+$ setfattr -n trusted.anas.restore -v 0xfffe0a7b -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs read-odd
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 74
+# file: /mnt/filemarkgt/btrfs/a/lun0.img
+trusted.anas.restore=0xfffe0a7b
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs set-newline
+$ setfattr -n trusted.anas.restore -v 0x7b0a7d -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-pve btrfs read-newline
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/a/lun0.img
+--- stdout 72
+# file: /mnt/filemarkgt/btrfs/a/lun0.img
+trusted.anas.restore=0x7b0a7d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-pve vfat unsupported-read
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /mnt/filemarkgt/vfat/lun0.img
+--- stdout 0
+
+--- stderr 77
+/mnt/filemarkgt/vfat/lun0.img: trusted.anas.restore: Operation not supported
+
+EXIT=1
+### anas-pve vfat unsupported-set
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/vfat/lun0.img
+--- stdout 0
+
+--- stderr 65
+setfattr: /mnt/filemarkgt/vfat/lun0.img: Operation not supported
+
+EXIT=1
+### anas-pve vfat unsupported-remove
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/vfat/lun0.img
+--- stdout 0
+
+--- stderr 65
+setfattr: /mnt/filemarkgt/vfat/lun0.img: Operation not supported
+
+EXIT=1

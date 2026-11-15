@@ -1,0 +1,174 @@
+### anas-zfs zfs-2.4.2 read-absent
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/a/lun0.img
+--- stdout 0
+
+--- stderr 70
+/rpool/filemarkgt/a/lun0.img: trusted.anas.restore: No such attribute
+
+EXIT=1
+### anas-zfs zfs-2.4.2 set-writing
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /rpool/filemarkgt/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 read-writing
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/a/lun0.img
+--- stdout 360
+# file: /rpool/filemarkgt/a/lun0.img
+trusted.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 set-unverified
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a22756e7665726966696564222c22726561736f6e223a222f782f6c756e302e696d6720697320302062797465732c206e6f742074686520696d61676527732031303438353736227d -- /rpool/filemarkgt/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 read-unverified
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/a/lun0.img
+--- stdout 484
+# file: /rpool/filemarkgt/a/lun0.img
+trusted.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a22756e7665726966696564222c22726561736f6e223a222f782f6c756e302e696d6720697320302062797465732c206e6f742074686520696d61676527732031303438353736227d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 remove
+$ setfattr -x trusted.anas.restore -- /rpool/filemarkgt/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 remove-absent
+$ setfattr -x trusted.anas.restore -- /rpool/filemarkgt/a/lun0.img
+--- stdout 0
+
+--- stderr 58
+setfattr: /rpool/filemarkgt/a/lun0.img: No such attribute
+
+EXIT=1
+### anas-zfs zfs-2.4.2 read-missing-file
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/a/gone.img
+--- stdout 0
+
+--- stderr 66
+getfattr: /rpool/filemarkgt/a/gone.img: No such file or directory
+
+EXIT=1
+### anas-zfs zfs-2.4.2 set-missing-file
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /rpool/filemarkgt/a/gone.img
+--- stdout 0
+
+--- stderr 66
+setfattr: /rpool/filemarkgt/a/gone.img: No such file or directory
+
+EXIT=1
+### anas-zfs zfs-2.4.2 set-empty
+$ setfattr -n trusted.anas.restore -v 0x -- /rpool/filemarkgt/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 read-empty
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/a/lun0.img
+--- stdout 62
+# file: /rpool/filemarkgt/a/lun0.img
+trusted.anas.restore=0x
+
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 set-odd
+$ setfattr -n trusted.anas.restore -v 0xfffe0a7b -- /rpool/filemarkgt/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 read-odd
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/a/lun0.img
+--- stdout 70
+# file: /rpool/filemarkgt/a/lun0.img
+trusted.anas.restore=0xfffe0a7b
+
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 set-newline
+$ setfattr -n trusted.anas.restore -v 0x7b0a7d -- /rpool/filemarkgt/a/lun0.img
+--- stdout 0
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 read-newline
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/a/lun0.img
+--- stdout 68
+# file: /rpool/filemarkgt/a/lun0.img
+trusted.anas.restore=0x7b0a7d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 readonly-read
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/ro/lun0.img
+--- stdout 67
+# file: /rpool/filemarkgt/ro/lun0.img
+trusted.anas.restore=0x7b7d
+
+
+--- stderr 0
+
+EXIT=0
+### anas-zfs zfs-2.4.2 readonly-set
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /rpool/filemarkgt/ro/lun0.img
+--- stdout 0
+
+--- stderr 63
+setfattr: /rpool/filemarkgt/ro/lun0.img: Read-only file system
+
+EXIT=1
+### anas-zfs zfs-2.4.2 readonly-remove
+$ setfattr -x trusted.anas.restore -- /rpool/filemarkgt/ro/lun0.img
+--- stdout 0
+
+--- stderr 63
+setfattr: /rpool/filemarkgt/ro/lun0.img: Read-only file system
+
+EXIT=1
+### anas-zfs zfs-2.4.2 full-read
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/full/lun0.img
+--- stdout 0
+
+--- stderr 73
+/rpool/filemarkgt/full/lun0.img: trusted.anas.restore: No such attribute
+
+EXIT=1
+### anas-zfs zfs-2.4.2 full-set
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /rpool/filemarkgt/full/lun0.img
+--- stdout 0
+
+--- stderr 63
+setfattr: /rpool/filemarkgt/full/lun0.img: Disk quota exceeded
+
+EXIT=1
+### anas-zfs zfs-2.4.2 full-remove
+$ setfattr -x trusted.anas.restore -- /rpool/filemarkgt/full/lun0.img
+--- stdout 0
+
+--- stderr 61
+setfattr: /rpool/filemarkgt/full/lun0.img: No such attribute
+
+EXIT=1

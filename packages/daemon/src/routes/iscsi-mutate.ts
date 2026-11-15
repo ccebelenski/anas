@@ -8,7 +8,7 @@ import type { IscsiState, TargetObject } from '../services/iscsi-guard.js'
 import type { IscsiBackstoreAttributes, IscsiMutateOptions, IscsiRefusal, ResolvedAhrPool } from '../services/iscsi-mutate.js'
 import type { IscsiRepairItem, IscsiRepairPlan } from '../services/iscsi-repair.js'
 import type { IscsiPaths } from '../services/iscsi.js'
-import type { RestoreMarkRead } from '../services/restore-mark.js'
+import type { RestoreJobRecord, RestoreMarkRead } from '../services/restore-mark.js'
 import {
   aclAuthRequirement,
   aclSatisfiesAuth,
@@ -87,7 +87,7 @@ import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
 import { assertRepairable, guardRepairPlan, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { iscsiAvailability, targetTpgs } from '../services/iscsi.js'
-import { clearMarkCommand, clearRestoreMark, describeMarkSet, describeRestoreMark, enableMarkVerdict, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkRefusal, restoreMarkState } from '../services/restore-mark.js'
+import { clearMarkCommand, clearRestoreMark, consultsJobRecord, describeMarkSet, describeRestoreMark, enableMarkVerdict, jobRecordOnly, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkRefusal, restoreVerdict } from '../services/restore-mark.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -248,14 +248,22 @@ async function removeOrphanedBackstore(executor: CommandExecutor, plugin: string
  * What a restore mark says about a hole's backing, as a clause for the Repair
  * refusal (cr3.lunrestore, review2 E): no leading capital, no stop.
  */
-function repairMarkClause(read: RestoreMarkRead, state: IscsiRestoreMarkState, running: string | undefined): string {
+function repairMarkClause(read: RestoreMarkRead, state: IscsiRestoreMarkState, running: string | undefined, record?: RestoreJobRecord): string {
   if (read.state === 'unknown')
     return `ANAS could not read the restore mark on ${read.dataset} (${read.reason}), so it cannot tell whether it holds a partially restored image`
   if (state === 'in-progress')
     return `a whole-image restore is writing it right now (job ${running})`
-  if (read.state !== 'present')
+  if (read.state !== 'present') {
+    // review S3: an image file with no mark whose failed restore record stands.
+    if (record) {
+      const how = record.outcome === 'unverified'
+        ? 'wrote it, and the client reported the image complete, but ANAS could not verify it'
+        : 'did not finish, so it may hold a partial image'
+      return `the whole-image restore job ${record.job} onto it ${how}. ${jobRecordOnly(read)}`
+    }
     return 'it carries a restore mark'
-  const what = describeRestoreMark(read)
+  }
+  const what = `${describeRestoreMark(read)}${record ? ` (job ${record.job})` : ''}`
   return state === 'unverified'
     ? `${what} wrote ${read.dataset}, and the client reported the image complete, but its size was not verified${read.mark?.reason ? ` (${read.mark.reason})` : ''}`
     : `${what} onto ${read.dataset} did not finish, so it holds a partial image`
@@ -299,12 +307,17 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       // refusal's sentence is built from it in `assertRepairable`.
       const read = reads.get(item.backingPath)!
       const running = restoreJobs.restoreRunning(item.backingPath)
-      const state = restoreMarkState(read, running)
-      if (state === null) {
+      // review S3: the one rule every door uses (`restoreVerdict`): a file
+      // with no mark whose failed restore record stands is held back here as
+      // Enable asks about it there.
+      const record = consultsJobRecord(read) ? restoreJobs.restoreFailed(item.backingPath, item.targetIqn) : undefined
+      const verdict = restoreVerdict(read, running, record)
+      if (verdict === null) {
         repairable.push(item)
         continue
       }
-      blocked.push({ ...item, restoreMark: state, restoreMarkDataset: read.state === 'present' || read.state === 'unknown' ? read.dataset : null, blockedReason: repairMarkClause(read, state, running) })
+      const state = verdict.state
+      blocked.push({ ...item, restoreMark: state, restoreMarkDataset: read.state === 'present' || read.state === 'unknown' ? read.dataset : null, blockedReason: repairMarkClause(read, state, running, record) })
     }
     return { repairable, blocked }
   }

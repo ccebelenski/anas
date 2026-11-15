@@ -15,9 +15,11 @@ import { currentLane } from '../../executor/deadline.js'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { iscsiTargetClaim, zfsDatasetClaims, znameClaim } from '../../safety/guard.js'
 import { createServer } from '../../server.js'
+import { withFileMarks } from '../../services/__tests__/file-mark-fixtures.js'
 import { volsizeArgs } from '../../services/backup-restore.js'
 import { PBC } from '../../services/backup-runner.js'
 import { withIscsiLock } from '../../services/iscsi-mutate.js'
+import { GETFATTR, SETFATTR } from '../../services/restore-mark.js'
 
 /** The captured mount trees (`findmnt --json`). */
 const MOUNTS_FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/mounts')
@@ -1890,6 +1892,24 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
 
     const MARK = JSON.stringify({ v: 1, repo: 'pbs-main', ns: 'gtrestore', snapshot: SNAP, archive: 'vol.img', started: '2026-11-14T10:00:00.000Z', state: 'writing' })
 
+    /**
+     * cr3.lunrestore.filemark: a node with the attr tools — the image files
+     * keep `trusted.anas.restore` (setfattr stores it, getfattr answers from
+     * it, every answer a captured one: `withFileMarks`). `marks` carries the
+     * state across a daemon restart (a new server over the same files).
+     */
+    function fileMarksFollow(mock: MockExecutor, marks: Map<string, string> = new Map()) {
+      const inner = mock.exec.bind(mock)
+      const files = withFileMarks({ exec: inner, pipeline: mock.pipeline.bind(mock), execToStream: mock.execToStream.bind(mock) }, Object.fromEntries(marks))
+      mock.exec = async (command, args, o) => {
+        if (command !== GETFATTR && command !== SETFATTR)
+          return inner(command, args, o)
+        mock.calls.push({ command, args })
+        return files.executor.exec(command, args, o)
+      }
+      return files
+    }
+
     async function enable(headers: Record<string, string> = {}) {
       return server!.inject({ method: 'POST', url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}/state`, headers: { ...IDENTITY, 'content-type': 'application/json', ...headers }, payload: { action: 'enable' } })
     }
@@ -2100,7 +2120,8 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       const job = await waitForJob(res.body.job!.id)
       assert.equal(job.status, 'failed')
       assert.equal(job.error!.code, 'IMAGE_PARTIAL')
-      assert.match(job.error!.message, /while ANAS keeps this job's record; an image file carries no restore mark/)
+      // cr3.lunrestore.filemark (re-pinned): this mock node has no attr tools; the sentence says why the file carries no mark.
+      assert.match(job.error!.message, /while ANAS keeps this job's record; this image file carries no restore mark because setfattr and getfattr \(the attr package, which install\.sh installs\) are not installed on this node/)
 
       const row = (await healthRows()).find(r => r.lunIndex === 1)
       assert.deepEqual([row?.state, row?.source, row?.job], ['interrupted', 'job', job.id])
@@ -2109,7 +2130,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       const err = (ask.json() as { error: { code: string, message: string, warnings: string[] } }).error
       assert.equal(err.code, 'CONFIRMATION_REQUIRED')
       assert.match(err.message, /serves a LUN whose whole-image restore did not finish$/)
-      assert.match(err.warnings.join(' '), new RegExp(`LUN 1 \\('lun2'\\): the whole-image restore job ${job.id} onto ${imagePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')} did not finish, so the LUN may hold a partial image\\. An initiator will be served that image\\. ANAS knows this only from that job's record in this run of the ANAS daemon: an image file carries no restore mark, so the record is lost when the ANAS daemon restarts, or when the daemon holds more than 100 such records and more than 1000 jobs \\(the oldest record goes first\\)\\.`))
+      assert.match(err.warnings.join(' '), new RegExp(`LUN 1 \\('lun2'\\): the whole-image restore job ${job.id} onto ${imagePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')} did not finish, so the LUN may hold a partial image\\. An initiator will be served that image\\. ANAS knows this only from that job's record in this run of the ANAS daemon: this image file carries no restore mark because setfattr and getfattr \\(the attr package, which install\\.sh installs\\) are not installed on this node, so the record is lost when the ANAS daemon restarts, or when the daemon holds more than 100 such records and more than 1000 jobs \\(the oldest record goes first\\)\\.`))
       const acl = await server!.inject({ method: 'PUT', url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}`, headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: { acls: [{ initiatorIqn: INITIATOR }, { initiatorIqn: 'iqn.2026-01.org.example:new' }] } })
       assert.equal(acl.statusCode, 409, acl.body)
       assert.match(acl.body, /The whole-image restore job .* onto LUN 1 \('lun2'\) of .* did not finish, so it may hold a partial image\. ANAS knows this only from/)
@@ -2280,6 +2301,71 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.doesNotMatch(err.message, /\.\./)
     })
 
+    it('cr3.lunrestore.filemark: Repair over a hole whose IMAGE FILE carries the mark is held back, with the setfattr way out; unmarked, it is repaired', async () => {
+      // The file LUN 1 is in the saved configuration and not live: a hole on an image file.
+      const imageDir = join(dir, 'gtiscsi', 'images')
+      const imagePath = join(imageDir, 'lun2.raw')
+      await mkdir(imageDir, { recursive: true })
+      await writeFile(imagePath, '')
+      await truncate(imagePath, IMAGE_SIZE)
+      const hole = async () => {
+        await rm(join(dir, 'target'), { recursive: true, force: true, maxRetries: 5 })
+        await serve({
+          manifest: anasManifest(),
+          saveconfigText: anasSaveconfig(false, imagePath),
+          backingPresent: `${ZVOL_PATH}:${imagePath}`,
+          deviceStat: `${ZVOL_PATH}=230:16;${imagePath}=file:66306:4242`,
+        })
+        const mock = mockOf()
+        const mounts = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/backup/findmnt-nested.json'), 'utf-8')
+          .replace('"target": "/gtiscsi/images"', `"target": ${JSON.stringify(imageDir)}`)
+        mock.prependFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: mounts, stderr: '', exitCode: 0 } })
+        mock.prependFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: `gtiscsi\t${join(dir, 'gtiscsi')}\ngtiscsi/images\t${imageDir}\n`, stderr: '', exitCode: 0 } })
+        marksFollow(mock)
+        return mock
+      }
+      const files = fileMarksFollow(await hole(), new Map([[imagePath, Buffer.from(MARK, 'utf8').toString('hex')]]))
+      const r = await server!.inject({ method: 'POST', url: '/v1/iscsi/health/repair', headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: {} })
+      assert.equal(r.statusCode, 409, r.body)
+      const err = (r.json() as { error: { reason: string, message: string } }).error
+      assert.equal(err.reason, 'restore-mark')
+      assert.match(err.message, new RegExp(`One hole is held back by a restore mark on the backing: LUN 1 of .* \\(backstore 'lun2', ${imagePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\): a whole-image restore of vol\\.img .* onto ${imagePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')} did not finish, so it holds a partial image\\.`))
+      assert.match(err.message, new RegExp(`clear its restore mark \\('setfattr -x trusted\\.anas\\.restore ${imagePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}'\\) and run Repair again`))
+      assert.match(err.message, /the image file keeps its mark, and the image can then be restored as a new LUN\./)
+      assert.equal(files.stateOf(imagePath), 'writing', 'Repair touched nothing')
+
+      // The same hole with the mark removed by hand: nothing holds it back.
+      await server!.close()
+      server = undefined
+      const again = await hole()
+      fileMarksFollow(again)
+      const ok = await server!.inject({ method: 'POST', url: '/v1/iscsi/health/repair', headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: {} })
+      assert.equal(ok.statusCode, 202, ok.body)
+      await waitForJob((ok.json() as { job: { id: string } }).job.id)
+    })
+
+    it('review S3: Repair over a hole whose image FILE carries no mark but whose failed restore record stands is held back, as Enable asks (one verdict at every door)', async () => {
+      const { imagePath } = await serveImageLun()
+      const mock = mockOf()
+      // No attr tools on this mock node: the file cannot carry a mark, the job record stands in.
+      const g = pauseAtMapAndStream(mock, { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 })
+      g.atStream.open()
+      const ask = await restore(imageBody())
+      const res = await restore(imageBody(), { 'x-anas-confirm': String(ask.headers['x-anas-confirm-code']) })
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.error?.code, 'IMAGE_PARTIAL')
+      // The LUN is lost from the live tree (and its backstore with it): a hole the saved configuration still names.
+      await rm(join(dir, 'target', 'iscsi', ANAS_IQN, 'tpgt_1', 'lun', 'lun_1'), { recursive: true, force: true })
+      await rm(join(dir, 'target', 'core', 'fileio_0', 'lun2'), { recursive: true, force: true })
+      const r = await server!.inject({ method: 'POST', url: '/v1/iscsi/health/repair', headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: {} })
+      assert.equal(r.statusCode, 409, r.body)
+      const err = (r.json() as { error: { reason: string, message: string } }).error
+      assert.equal(err.reason, 'restore-mark')
+      assert.match(err.message, new RegExp(`One hole is held back by a restore mark on the backing: LUN 1 of .* \\(backstore 'lun2', ${imagePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\): the whole-image restore job ${job.id} onto it did not finish, so it may hold a partial image\\. ANAS knows this only from that job's record in this run of the ANAS daemon: this image file carries no restore mark because setfattr and getfattr`))
+      assert.doesNotMatch(err.message, /clear its restore mark|keeps its mark/)
+      assert.doesNotMatch(err.message, /\.\./)
+    })
+
     // --- review2 F (6): every sentence true on the path that prints it ------
 
     it('review2 F2 (6): adding an initiator while a restore RUNS says it runs — never "did not finish"', async () => {
@@ -2366,14 +2452,87 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.doesNotMatch(off, /enables the target again/)
     })
 
-    it('review2 F1 (6): the in-place confirm on an image FILE says the job record is the only record', async () => {
+    it('review2 F1 (6): the in-place confirm on an image FILE that cannot carry a mark (no attr tools) says the job record is the only record, and why', async () => {
       await serveImageLun()
       const res = (await restore(imageBody())).body as unknown as { error: { warnings: string[] } }
       const w = res.error.warnings.join('\n')
-      assert.match(w, /Enable asks you to confirm before it serves that image while ANAS keeps the restore job's record; an image file carries no restore mark, so the record is lost when the ANAS daemon restarts, or when the daemon holds more than 100 such records and more than 1000 jobs \(the oldest record goes first\)\./)
+      // cr3.lunrestore.filemark (re-pinned): the door reads the file's mark; on this mock node there are no attr tools.
+      assert.match(w, /Enable asks you to confirm before it serves that image while ANAS keeps the restore job's record; this image file carries no restore mark because setfattr and getfattr \(the attr package, which install\.sh installs\) are not installed on this node, so the record is lost when the ANAS daemon restarts, or when the daemon holds more than 100 such records and more than 1000 jobs \(the oldest record goes first\)\./)
       assert.doesNotMatch(w, /anas:restore/)
       // review3 4: the three endings, true for a file: a failed restore that opened it never comes back enabled.
       assert.match(w, /When the restore ends, the target is enabled again only if the image is complete and its size verified, and put back as it was if the restore fails before it opens the image file and the file is still the image's size \(opening it for the restore empties it\); in every other case it stays disabled and the restore job says why\./)
+    })
+
+    it('cr3.lunrestore.filemark: the in-place confirm on an image FILE that carries the mark promises the mark, and the endings true for a marked file', async () => {
+      await serveImageLun()
+      fileMarksFollow(mockOf())
+      const w = ((await restore(imageBody())).body as unknown as { error: { warnings: string[] } }).error.warnings.join('\n')
+      assert.match(w, /If the restore fails part-way, the LUN holds a HALF-WRITTEN image: the target stays disabled and the image file keeps the restore mark trusted\.anas\.restore, so Enable asks you to confirm before it serves that image\./)
+      assert.match(w, /put back as it was if the restore fails before it opens the image file, the file is still the image's size and it is left with no restore mark \(opening it for the restore empties it; an earlier restore's mark, put back, keeps it disabled\)/)
+      assert.doesNotMatch(w, /keeps the restore job's record|the record is lost/)
+    })
+
+    it('cr3.lunrestore.filemark — THE ORACLE for a file LUN: a restore that fails part-way leaves the mark on the file; after a daemon restart (an empty queue) the health row, the add-initiator refusal and Enable still say so; the confirm removes the mark and enables once', async () => {
+      const { imagePath } = await serveImageLun()
+      const first = mockOf()
+      marksFollow(first)
+      const files = fileMarksFollow(first)
+      const g = pauseAtMapAndStream(first, { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 })
+      const ask0 = await restore(imageBody())
+      const res = await restore(imageBody(), { 'x-anas-confirm': String(ask0.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      await g.atStream.reached
+      // The mark is on the file BEFORE the stream opened it (the open empties it).
+      assert.equal(files.stateOf(imagePath), 'writing')
+      const setAt = first.calls.findIndex(c => c.command === SETFATTR && c.args[0] === '-n')
+      const readAt = first.calls.findIndex(c => c.command === GETFATTR)
+      assert.ok(readAt >= 0 && setAt > readAt, 'the earlier mark is read first, then this run\'s is set')
+      g.atStream.open()
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      assert.equal(job.error!.code, 'IMAGE_PARTIAL')
+      assert.match(job.error!.message, new RegExp(`removes the restore mark on ${imagePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\. To restore the image again in place, first set`))
+      assert.doesNotMatch(job.error!.message, /the record is lost/)
+      assert.equal(files.stateOf(imagePath), 'writing', 'the failed run leaves its mark')
+      assert.ok(!first.calls.some(c => c.command === SETFATTR && c.args[0] === '-x'), 'never removed after a partial write')
+
+      // THE RESTART: a new daemon over the same node — an empty job queue, the file keeps its mark.
+      await server!.close()
+      server = undefined
+      // The configfs tree is materialized afresh (the node's LIO, as it boots).
+      await rm(join(dir, 'target'), { recursive: true, force: true })
+      await serveImageLun()
+      const second = mockOf()
+      marksFollow(second)
+      const after = fileMarksFollow(second, files.marks)
+      await disableInConfigfs()
+      const row = (await healthRows()).find(r => r.lunIndex === 1)
+      assert.deepEqual([row?.state, row?.source, row?.dataset, row?.job], ['interrupted', 'mark', null, undefined])
+      assert.match(row?.detail ?? '', /A whole-image restore of vol\.img from .* did not finish: it holds a partial image\. To restore the image again in place, first set /)
+      const card = (await statusMessages()).find(m => /is disabled/.test(m)) ?? ''
+      assert.match(card, /did not finish: it holds a partial image/)
+      assert.match(card, /Enable on the iSCSI screen asks you to confirm and removes the restore mark\./)
+      assert.doesNotMatch(card, /Enable it from the iSCSI screen when you are ready/)
+      const acl = await server!.inject({ method: 'PUT', url: `/v1/iscsi/targets/${encodeURIComponent(ANAS_IQN)}`, headers: { ...IDENTITY, 'content-type': 'application/json' }, payload: { acls: [{ initiatorIqn: INITIATOR }, { initiatorIqn: 'iqn.2026-01.org.example:new' }] } })
+      assert.equal(acl.statusCode, 409, acl.body)
+      assert.equal((acl.json() as { error: { reason: string } }).error.reason, 'restore-mark')
+      assert.match(acl.body, /the restore mark trusted\.anas\.restore on /)
+      const ask = await enable()
+      assert.equal(ask.statusCode, 409, ask.body)
+      const err = (ask.json() as { error: { code: string, message: string, warnings: string[] } }).error
+      assert.equal(err.code, 'CONFIRMATION_REQUIRED')
+      assert.match(err.message, /serves a LUN whose whole-image restore did not finish$/)
+      assert.match(err.warnings.join(' '), /LUN 1 \('lun2'\): a whole-image restore of vol\.img .* did not finish, so the LUN holds a partial image\. An initiator will be served that partial image\. Confirming removes the restore mark\. To restore the image again in place/)
+      assert.doesNotMatch(err.warnings.join(' '), /the record is lost/)
+      const ok = await enable({ 'x-anas-confirm': String(ask.headers['x-anas-confirm-code']) })
+      assert.equal(ok.statusCode, 202, ok.body)
+      const ej = await waitForJob((ok.json() as { job: { id: string } }).job.id)
+      assert.equal(ej.status, 'completed', JSON.stringify(ej.error))
+      const removeAt = second.calls.findIndex(c => c.command === SETFATTR && c.args.join(' ') === `-x trusted.anas.restore -- ${imagePath}`)
+      const enableAt = second.calls.findIndex(c => c.command === TARGETCLI && c.args.join(' ') === `/iscsi/${ANAS_IQN}/tpg1 enable`)
+      assert.ok(removeAt >= 0 && enableAt > removeAt, 'the mark goes, then the target is enabled')
+      assert.equal(after.stateOf(imagePath), 'none')
+      assert.equal((await healthRows()).find(r => r.lunIndex === 1), undefined)
     })
 
     it('review2 F (6): an add-LUN over a backstore a restore is writing names the job, ends with its stop, and does not say delete it', async () => {

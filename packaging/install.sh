@@ -37,6 +37,12 @@ ANAS_ENV_FILE="${ANAS_ENV_FILE:-/etc/default/anas}"
 DEFAULT_PORT=3000
 SS_BIN="${SS_BIN:-ss}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
+# The two `attr` binaries the preflight probes and the install step checks
+# (cr3.lunrestore.filemark): the exact paths the daemon executes
+# (services/restore-mark.ts), never whatever PATH finds (review S2); indirected
+# so the dependency test can take them away.
+SETFATTR_BIN="${SETFATTR_BIN:-/usr/bin/setfattr}"
+GETFATTR_BIN="${GETFATTR_BIN:-/usr/bin/getfattr}"
 PORT_FLAG=""            # set by --port; explicit operator intent
 RESOLVED_PORT=""        # filled by resolve_port()
 # HEALTH_PORT is derived from the resolved port (retires the old standalone
@@ -108,7 +114,7 @@ Options:
   --install-deps   Auto-install Node.js (>= ${MIN_NODE_MAJOR}) via the NodeSource setup_22.x
                    repository if it is absent or too old. Everything else ANAS
                    requires (acl, mdadm, btrfs-progs, samba, nfs-kernel-server,
-                   targetcli-fb, python3-rtslib-fb, rclone) is a HARD dependency
+                   targetcli-fb, python3-rtslib-fb, rclone, attr) is a HARD dependency
                    and is installed regardless of this flag.
   --yes            Non-interactive; assume "yes" to prompts.
   --prefix DIR     Install location (default: /opt/anas).
@@ -350,6 +356,7 @@ NEED_SAMBA_INSTALL=0
 NEED_NFS_INSTALL=0
 NEED_TARGETCLI_INSTALL=0
 NEED_RCLONE_INSTALL=0
+NEED_ATTR_INSTALL=0
 FATAL=()
 RELEASE_MISSING=()
 
@@ -544,6 +551,23 @@ phase0_preflight() {
     info "rclone missing — will auto-install"
   fi
 
+  # attr (setfattr, getfattr) — required for the restore mark on an image file
+  # (cr3.lunrestore.filemark): a whole-image restore onto a file-backed LUN sets
+  # the extended attribute trusted.anas.restore on the image before the first
+  # byte and removes it only once the image is complete and verified, so an
+  # interrupted restore is known after a daemon restart. PVE 9 does not install
+  # attr on its own: on a stock node it arrives only as a Recommends of samba
+  # (Debian 13's 4.22; the 4.24 backport merely Suggests it), and an install
+  # with --no-install-recommends never gets it. Same rule as samba/nfs: the
+  # restore is always available, so the binaries are a HARD dependency.
+  # Probing both catches a node with only one of the pair on PATH.
+  if [ -x "${SETFATTR_BIN}" ] && [ -x "${GETFATTR_BIN}" ]; then
+    info "attr (setfattr, getfattr) present"
+  else
+    NEED_ATTR_INSTALL=1
+    info "attr (setfattr/getfattr) missing — will auto-install"
+  fi
+
   # Resolve the gateway port (issue #2) before anything binds. This owns the
   # port-in-use logic: --port intent, preserving a configured port on upgrade,
   # and auto-scanning past a foreign listener on a fresh install. May exit here
@@ -575,8 +599,9 @@ phase0_preflight() {
 # Install the dependencies preflight marked missing: Node.js via NodeSource
 # (opted in with --install-deps), then the hard dependencies that are installed
 # regardless — acl, mdadm + btrfs-progs, samba + nfs-kernel-server,
-# targetcli-fb + python3-rtslib-fb, rclone. This mutates
-# the system but only adds standard Debian packages; it is NOT rolled back on a
+# targetcli-fb + python3-rtslib-fb, rclone, attr. This mutates
+# the system but only adds standard Debian packages (and marks attr manually
+# installed); it is NOT rolled back on a
 # later failure (leaving deps installed is harmless). It runs on every install
 # AND every upgrade, so an existing node picks up a dependency added by a newer
 # ANAS release the next time the installer is run.
@@ -687,6 +712,39 @@ phase0b_install_deps() {
     command -v rclone >/dev/null 2>&1 \
       || { err "rclone install failed (rclone still missing) — ANAS requires it for cloud sync remotes; nothing was modified"; exit 1; }
     info "rclone installed"
+  fi
+  if [ "${NEED_ATTR_INSTALL}" -eq 1 ]; then
+    log "Installing attr..."
+    # Same shape as rclone above. The restore mark on an image file is set and
+    # read with setfattr/getfattr; without them a file-backed LUN's interrupted
+    # restore is known only from the daemon's job record, which a restart of
+    # the daemon loses. The package lays down two binaries and no
+    # configuration. This runs BEFORE the rollback trap arms, so no ANAS step
+    # has touched the node. It also runs on every upgrade: a node installed
+    # before this release picks attr up the next time the installer runs.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y attr; then
+      err "failed to install the required package 'attr'."
+      err "ANAS requires it for the restore mark on image files (file-backed iSCSI LUNs) — whole-image restore is always available, so it is a hard dependency, not optional."
+      err "Nothing on this node was modified (this step runs before any install action)."
+      err "On an air-gapped node, preseed it first (e.g. 'apt-get install -y --no-download attr' from a local mirror, or pre-place the .deb file) and re-run this installer."
+      exit 1
+    fi
+    [ -x "${SETFATTR_BIN}" ] && [ -x "${GETFATTR_BIN}" ] \
+      || { err "attr install failed (setfattr or getfattr still missing) — ANAS requires it for the restore mark on image files; nothing was modified"; exit 1; }
+    info "attr installed"
+  fi
+  # Review S1: the restore mark is a safety record, so attr must not be left as
+  # an automatically installed package. On a stock node it arrives as samba's
+  # Recommends (marked automatic); the samba 4.24 backport only Suggests it, so
+  # after such an upgrade `apt autoremove` would remove it, and every mark on
+  # an image file would then read as "cannot carry one". Marking it manual is
+  # what `apt-get install attr` does to an installed automatic package; it is
+  # done on every install and upgrade. A failure (attr not from a Debian
+  # package) is said and changes nothing else.
+  if apt-mark manual attr >/dev/null 2>&1; then
+    info "attr marked as manually installed (apt autoremove keeps it)"
+  else
+    info "could not mark attr as manually installed ('apt-mark manual attr' failed): if attr came with another package, 'apt autoremove' may remove it with that package, and image files then carry no restore mark; run 'apt-mark manual attr' to keep it"
   fi
 }
 

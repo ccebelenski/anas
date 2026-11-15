@@ -247,9 +247,10 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
       // Enable — and no promise about the end (review2 F1): the restore
       // enables only what it disabled, only over an image it proved.
       // review3 4: the three ways it can end, per backing kind (a file's row
-      // has no volume).
+      // has no volume; cr3.lunrestore.filemark: a file whose row comes from
+      // its mark carries one).
       tail = ` ${running.detail} Enable is refused until the restore ends. `
-        + `${restoreEndSentence(running.dataset === null ? 'file' : 'zvol', 'a target the restore disabled')} `
+        + `${restoreEndSentence(running.dataset !== null ? 'zvol' : running.source === 'mark' ? 'marked-file' : 'file', 'a target the restore disabled')} `
         + `A target the restore did not disable is left as it is.`
     }
     else if (partial.length > 0) {
@@ -258,10 +259,13 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
       // what Enable does for the rows it has.
       // review3 2: restoring again in place is the way out for a volume; an
       // image file's own row says what it needs first (its length).
+      // cr3.lunrestore.filemark: an image file's mark is removed by the
+      // confirm too; its row already says how to restore it again in place.
       const marked = partial.filter(m => m.source === 'mark').length
-      const again = marked === 0
+      const onVolumes = partial.filter(m => m.source === 'mark' && m.dataset !== null).length
+      const again = onVolumes === 0
         ? ''
-        : marked === partial.length ? ' Restoring the image again is the other way out.' : ' For a LUN on a volume, restoring the image again is the other way out.'
+        : onVolumes === partial.length ? ' Restoring the image again is the other way out.' : ' For a LUN on a volume, restoring the image again is the other way out.'
       tail = ` ${partial.map(m => m.detail).join(' ')} Enabling the target serves ${partial.length === 1 ? 'that image' : 'those images'} `
         + `to initiators: Enable on the iSCSI screen asks you to confirm${marked > 0 ? ` and removes the restore mark${marked === 1 ? '' : 's'}` : ''}.`
         + `${again}${said}`
@@ -285,7 +289,7 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
       level: 'critical',
       category: 'iscsi',
       message: `${m.detail} Target ${m.targetIqn} is enabled, so initiators are being served that image now. `
-        + `Disable the target, then ${m.source === 'job' ? 'accept it with Enable\'s confirm, or restore it again in place as said above' : 'restore the image again or accept it with Enable\'s confirm'}.`,
+        + `Disable the target, then ${m.source === 'job' || m.dataset === null ? 'accept it with Enable\'s confirm, or restore it again in place as said above' : 'restore the image again or accept it with Enable\'s confirm'}.`,
       ref: m.targetIqn,
     })
   }
@@ -319,14 +323,14 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     }
     else if (row?.state === 'unverified') {
       what = `${row.detail} No initiator can see it. ${held}${saved} ${remove} If you have checked the image, `
-        + `${row.source === 'mark' && row.dataset ? `clear the mark ('${clearMarkCommand(row.dataset)}') and ` : ''}map the backstore with targetcli.`
+        + `${row.source === 'mark' ? `clear the mark ('${clearMarkCommand(row.dataset ?? row.backingPath)}') and ` : ''}map the backstore with targetcli.`
     }
     else if (row?.state === 'unreadable') {
       what = `${row.detail} No initiator can see it. ${held}${saved} ${remove}`
     }
     else {
       // N3: no mark — say only what is known.
-      what = `A backstore no LUN maps holds this storage${dataset ? ', and no restore mark is on it' : ' (an image file carries no restore mark)'}: `
+      what = `A backstore no LUN maps holds this storage${dataset ? ', and no restore mark is on it' : ', and no restore mark is on the image file'}: `
         + `ANAS cannot tell what it holds. No initiator can see it. ${held}${saved} ${remove}`
     }
     warnings.push({

@@ -72,7 +72,7 @@ import {
 } from './iscsi-mutate.js'
 import { servedElsewhere } from './iscsi-served.js'
 import { attributesFromPersisted, normalizePlugin, targetTpgs } from './iscsi.js'
-import { clearMarkCommand } from './restore-mark.js'
+import { clearMarkCommand, isFileMark, unreadableFileWay } from './restore-mark.js'
 
 /** One hole, with everything the replay needs, read off the PERSISTED config. */
 export interface IscsiRepairItem {
@@ -135,8 +135,8 @@ export interface IscsiRepairItem {
    * its mark could not be read, or a restore is writing it now. Blocked:
    * re-creating the LUN would map that image into its target again.
    * `blockedReason` is then a clause saying what the mark says (no stop), and
-   * `restoreMarkDataset` the volume it is on (null when it could not be read
-   * off the path).
+   * `restoreMarkDataset` where it is — the volume, or the image file's path
+   * (null when it could not be read off the path).
    */
   restoreMark?: IscsiRestoreMarkState
   restoreMarkDataset?: string | null
@@ -343,15 +343,30 @@ function restoreMarkClause(marked: IscsiRepairItem[]): string {
   const ways: string[] = []
   const settled = marked.filter(b => b.restoreMark === 'interrupted' || b.restoreMark === 'unverified')
   if (settled.length > 0) {
-    const clear = settled.map(b => (b.restoreMarkDataset ? `'${clearMarkCommand(b.restoreMarkDataset)}'` : null)).filter(Boolean)
-    ways.push(`Repair would map ${settled.length === 1 ? 'that image' : 'those images'} into the target again, so it does not. `
-      + `If you accept ${settled.length === 1 ? 'the image' : 'an image'} as it is, clear its restore mark${clear.length ? ` (${clear.join(', ')})` : ''} `
-      + `and run Repair again. If you do not, saving the iSCSI configuration by hand ('targetcli saveconfig') removes `
-      + `the LUN from the saved configuration for good, together with every other missing LUN; the volume keeps its mark, `
-      + `and the image can then be restored as a new LUN.`)
+    // cr3.lunrestore.filemark: the mark is on the volume, or on the image
+    // file itself; review S3: or there is none, and a restore job's record
+    // holds the hole back (no mark to clear).
+    const marked = settled.filter(b => b.restoreMarkDataset)
+    const recorded = settled.length - marked.length
+    const clear = marked.map(b => `'${clearMarkCommand(b.restoreMarkDataset!)}'`)
+    const onFiles = marked.filter(b => isFileMark(b.restoreMarkDataset!)).length
+    const keeper = onFiles === 0 ? 'the volume keeps' : onFiles === marked.length ? 'the image file keeps' : 'each volume or image file keeps'
+    const accept = marked.length > 0
+      ? `If you accept ${marked.length === 1 ? 'the image' : 'an image'} as it is, clear its restore mark (${clear.join(', ')}) and run Repair again. `
+      : ''
+    const record = recorded > 0
+      ? 'An image file known only from a restore job\'s record has no mark to clear: the record stands until a later restore onto that file, or an Enable of its target, completes. '
+      : ''
+    const drop = `${marked.length > 0 ? 'If you do not, saving' : 'Saving'} the iSCSI configuration by hand ('targetcli saveconfig') removes `
+      + `the LUN from the saved configuration for good, together with every other missing LUN${marked.length > 0 ? `; ${keeper} its mark,` : ','} `
+      + `and the image can then be restored as a new LUN.`
+    ways.push(`Repair would map ${settled.length === 1 ? 'that image' : 'those images'} into the target again, so it does not. ${accept}${record}${drop}`)
   }
-  if (marked.some(b => b.restoreMark === 'unreadable'))
-    ways.push('Repair is refused for a LUN whose restore mark could not be read until it can be read.')
+  if (marked.some(b => b.restoreMark === 'unreadable')) {
+    // review S4: for an image file, the command that shows it.
+    const see = marked.filter(b => b.restoreMark === 'unreadable' && b.restoreMarkDataset).map(b => unreadableFileWay(b.restoreMarkDataset!, 'Repair')).join('')
+    ways.push(`Repair is refused for a LUN whose restore mark could not be read until it can be read.${see}`)
+  }
   if (marked.some(b => b.restoreMark === 'in-progress'))
     ways.push('Repair is refused for a LUN a restore is writing until the restore ends.')
   return ` ${marked.length === 1 ? 'One hole is' : `${marked.length} holes are`} held back by a restore mark on the backing: ${named}. ${ways.join(' ')}`

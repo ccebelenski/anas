@@ -1,0 +1,89 @@
+### anas-zfs zfs-2.4.2-pve1 7.0.2-6-pve
+$ zfs create -p -o xattr=off rpool/filemarkgt/xoff && zfs create rpool/filemarkgt/xoffafter && zfs create rpool/filemarkgt/size
+exit=0
+$ zfs get -H -o name,property,value xattr rpool/filemarkgt/xoff rpool/filemarkgt/xoffafter; findmnt -n -o TARGET,OPTIONS --target /rpool/filemarkgt/xoff
+rpool/filemarkgt/xoff	xattr	off
+rpool/filemarkgt/xoffafter	xattr	sa
+/rpool/filemarkgt/xoff rw,relatime,noxattr,noacl,casesensitive
+exit=0
+## xattr=off: set, read, remove
+$ truncate -s 1M /rpool/filemarkgt/xoff/lun0.img
+exit=0
+$ setfattr -n trusted.anas.restore -v 0x7b7d -- /rpool/filemarkgt/xoff/lun0.img
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/xoff/lun0.img'
+# file: /rpool/filemarkgt/xoff/lun0.img
+trusted.anas.restore=0x7b7d
+
+exit=0
+$ setfattr -x trusted.anas.restore -- /rpool/filemarkgt/xoff/lun0.img
+exit=0
+## a mark set before the dataset is switched to xattr=off
+$ truncate -s 1M /rpool/filemarkgt/xoffafter/lun0.img && setfattr -n trusted.anas.restore -v 0x7b7d -- /rpool/filemarkgt/xoffafter/lun0.img && zfs set xattr=off rpool/filemarkgt/xoffafter
+exit=0
+$ findmnt -n -o OPTIONS --target /rpool/filemarkgt/xoffafter
+rw,relatime,noxattr,noacl,casesensitive
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/xoffafter/lun0.img'
+# file: /rpool/filemarkgt/xoffafter/lun0.img
+trusted.anas.restore=0x7b7d
+
+exit=0
+## two files in one getfattr, one of them missing
+$ truncate -s 1M /rpool/filemarkgt/size/a.img /rpool/filemarkgt/size/b.img && setfattr -n trusted.anas.restore -v 0x7b7d -- /rpool/filemarkgt/size/a.img
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- /rpool/filemarkgt/size/a.img /rpool/filemarkgt/size/b.img /rpool/filemarkgt/size/gone.img
+/rpool/filemarkgt/size/b.img: trusted.anas.restore: No such attribute
+getfattr: /rpool/filemarkgt/size/gone.img: No such file or directory
+# file: /rpool/filemarkgt/size/a.img
+trusted.anas.restore=0x7b7d
+
+exit=1
+## value sizes on ZFS (xattr=sa)
+$ setfattr -n trusted.anas.restore -v "$(head -c 65536 /dev/zero | tr '\0' a)" -- '/rpool/filemarkgt/size/a.img' && getfattr --only-values --absolute-names -n trusted.anas.restore -- '/rpool/filemarkgt/size/a.img' | wc -c
+65536
+exit=0
+$ setfattr -n trusted.anas.restore -v "$(head -c 65537 /dev/zero | tr '\0' a)" -- '/rpool/filemarkgt/size/a.img' && getfattr --only-values --absolute-names -n trusted.anas.restore -- '/rpool/filemarkgt/size/a.img' | wc -c
+setfattr: /rpool/filemarkgt/size/a.img: Argument list too long
+exit=1
+## the package
+$ dpkg -S /usr/bin/setfattr /usr/bin/getfattr
+attr: /usr/bin/setfattr
+attr: /usr/bin/getfattr
+exit=0
+$ dpkg-query -W -f='${Package} ${Version} ${Priority}\n' attr
+attr 1:2.5.2-3 optional
+exit=0
+$ apt-mark showauto attr; apt-mark showmanual attr
+attr
+exit=0
+$ apt-cache rdepends --installed attr
+attr
+Reverse Depends:
+  xfsprogs
+  samba
+  xfsprogs
+  samba
+exit=0
+$ apt-cache depends --installed samba xfsprogs | grep -E '^[a-z]|attr$'
+samba
+  Recommends: attr
+xfsprogs
+  Suggests: attr
+exit=0
+$ apt-cache show samba | grep -E '^(Version|Recommends|Suggests):'
+Version: 2:4.22.11+dfsg-0+deb13u1
+Recommends: attr, python3-samba, samba-ad-dc
+Suggests: ctdb, ufw, winbind, samba-vfs-ceph, samba-vfs-glusterfs
+Version: 2:4.22.10+dfsg-0+deb13u2
+Suggests: ctdb, ufw, winbind, samba-vfs-ceph, samba-vfs-glusterfs
+Recommends: attr, python3-samba, samba-ad-dc
+exit=0
+$ zgrep -h -E ' install (samba|attr|proxmox-ve):' /var/log/dpkg.log*
+2026-11-13 21:55:41 install proxmox-ve:all <none> 9.2.0
+2026-11-13 21:57:43 install samba:amd64 <none> 2:4.22.11+dfsg-0+deb13u1
+2026-11-13 21:57:46 install attr:amd64 <none> 1:2.5.2-3
+exit=0
+## cleanup
+$ zfs destroy -R rpool/filemarkgt
+exit=0

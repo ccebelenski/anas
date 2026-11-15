@@ -24,7 +24,7 @@ import type { RestoreMarkRead } from '../restore-mark.js'
 import type { LioTree, RecordedCall } from './lio-model.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, stat, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -40,12 +40,13 @@ import { describeUnmappedHolder, findUnmappedBackstoreHolder } from '../iscsi-co
 import { lunNameFreeGate } from '../iscsi-guard.js'
 import { computeIscsiHealth, unmappedLiveBackstores } from '../iscsi-health.js'
 import { heldByLunRefusal, heldHolderPhrase, pickHolder } from '../iscsi-held.js'
-import { assertSaveable, claimsFromState, createAndMapLun, createLunBackstore, mapLunIntoTarget, saveIscsiConfig, TARGETCLI, withIscsiLock, ZFS } from '../iscsi-mutate.js'
+import { assertSaveable, claimsFromState, createAndMapLun, createLunBackstore, createSparseImage, mapLunIntoTarget, saveIscsiConfig, TARGETCLI, withIscsiLock, ZFS } from '../iscsi-mutate.js'
 import { readRestoreMarks } from '../iscsi-quarantine.js'
 import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../iscsi-repair.js'
 import { buildIscsiWarnings } from '../iscsi-warnings.js'
 import { buildIscsiTargets } from '../iscsi.js'
-import { decodeRestoreMark, describeMarkSet, enableMarkVerdict, encodeRestoreMark, imageRestorePin, JOB_RECORD_ONLY, markDataset, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkGetArgs, restoreMarkRefusal, restoreMarksGetArgs, unverifiedMark, writingMark } from '../restore-mark.js'
+import { ATTR_NOT_INSTALLED, consultsJobRecord, decodeRestoreMark, describeMarkSet, enableMarkVerdict, encodeRestoreMark, GETFATTR, imageRestorePin, JOB_RECORD_ONLY, jobRecordLifetime, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkGetArgs, restoreMarkRefusal, restoreMarksGetArgs, restoreVerdict, SETFATTR, unverifiedMark, writingMark } from '../restore-mark.js'
+import { hexOf, withFileMarks } from './file-mark-fixtures.js'
 import { contextOf, recording, replayLio, targetObjectOf } from './lio-model.js'
 
 const IQN = 'iqn.2026-08.nas.anas:vmstore'
@@ -725,8 +726,11 @@ describe('cr3.lunrestore Part B — the restore mark reader (tri-state, plus "th
     assert.equal((await at('')).state, 'unknown', 'an exit 0 that printed nothing saw nothing')
   })
 
-  it('an image FILE carries no mark: unsupported (the attr question is held for the operator)', async () => {
-    assert.deepEqual(await readRestoreMark(new MockExecutor(), { path: '/tank/images/x.raw' }), { state: 'unsupported' })
+  // cr3.lunrestore.filemark (re-pinned): an image file carries its own mark
+  // now (file-mark.test.ts); without getfattr on the node it reads
+  // unsupported, and says why.
+  it('an image FILE on a node without getfattr: unsupported, naming the package (file-mark.test.ts holds the file mark itself)', async () => {
+    assert.deepEqual(await readRestoreMark(new MockExecutor(), { path: '/tank/images/x.raw' }), { state: 'unsupported', reason: ATTR_NOT_INSTALLED })
   })
 
   it('the value written is the bounded JSON the reader validates, round trip', () => {
@@ -1070,8 +1074,10 @@ describe('cr3.lunrestore review2 (3, defect C) — an in-place restore onto a FI
       const rec = recording(inPlaceMock())
       await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), (err: Error) => {
         assert.equal(err.message, `the client reported the image complete, but ${path} is 268435456 bytes, not the image's 536870912: target ${IQN} stays disabled. `
-        + 'Enable on the iSCSI screen asks you to confirm that you accept it while ANAS keeps this job\'s record; an image file carries no '
-        + 'restore mark, so the record is lost when the ANAS daemon restarts, or when the daemon holds more than 100 such records and more than 1000 jobs '
+        // cr3.lunrestore.filemark (re-pinned): the mock node has no attr
+        // tools, so the record's sentence says why this file carries no mark.
+        + 'Enable on the iSCSI screen asks you to confirm that you accept it while ANAS keeps this job\'s record; this image file carries no '
+        + `restore mark because ${ATTR_NOT_INSTALLED}, so the record is lost when the ANAS daemon restarts, or when the daemon holds more than 100 such records and more than 1000 jobs `
         + `(the oldest record goes first). To restore the image again in place, first set ${path} to the image's 536870912 bytes with 'truncate -s 536870912 ${path}' `
         + '(the in-place restore refuses a file of any other size, and a failed restore can leave the file shorter); deleting this LUN and restoring the image as a new LUN is the other way out.')
         assert.equal(codeOf(err), 'IMAGE_UNVERIFIED')
@@ -1263,7 +1269,8 @@ describe('cr3.lunrestore review2 (4, defect D) — an image FILE carries no mark
     const after = new JobQueue()
     assert.equal(restoreJobsOf(after).restoreFailed(FILE, IQN), undefined)
     const facts = await readLunMarks(new MockExecutor(), [{ index: 1, name: 'lun2', backingPath: FILE }], { ...restoreJobsOf(after), targetIqn: IQN })
-    assert.deepEqual(enableMarkVerdict(IQN, facts), { kind: 'clear' }, 'nothing on the object says otherwise (no file mark yet)')
+    // cr3.lunrestore.filemark (re-pinned message): the mock node has no attr tools, so the file cannot carry a mark.
+    assert.deepEqual(enableMarkVerdict(IQN, facts), { kind: 'clear' }, 'nothing on the object says otherwise (a node without the attr tools: no file mark)')
   })
 
   it('a restore RUNNING onto a file LUN refuses Enable although the file carries no mark (the reviewer\'s restore-mark.ts:252, marked.map)', async () => {
@@ -1438,8 +1445,10 @@ describe('cr3.lunrestore review2 (7) — the marks of every volume in ONE zfs ge
     const { m, run } = batch(`tank/a\t${VALUE}\tlocal\ntank/b\t-\t-\ntank/c\t${VALUE}\tinherited from tank\n`)
     const reads = await run()
     assert.deepEqual(states(reads), ['present', 'absent', 'absent', 'unsupported'])
-    assert.equal(m.calls.length, 1)
-    assert.deepEqual(m.calls[0].args, ['get', '-Hp', '-o', 'name,value,source', 'anas:restore', '--', 'tank/a', 'tank/b', 'tank/c'])
+    // cr3.lunrestore.filemark (re-pinned): the file is read with its own
+    // getfattr (none on this mock node: unsupported); the volumes still in one.
+    assert.equal(m.calls.filter(c => c.command === ZFS).length, 1)
+    assert.deepEqual(m.calls.find(c => c.command === ZFS)?.args, ['get', '-Hp', '-o', 'name,value,source', 'anas:restore', '--', 'tank/a', 'tank/b', 'tank/c'])
   })
 
   it('a value that runs on past a newline makes THAT volume unknown, never absent; the others stand', async () => {
@@ -1461,7 +1470,8 @@ describe('cr3.lunrestore review2 (7) — the marks of every volume in ONE zfs ge
       mm.addFixture({ command: ZFS, args: restoreMarkGetArgs('tank/c'), result: { stdout: '', stderr: 'cannot get property: pool I/O is currently suspended', exitCode: 1 } })
     })
     assert.deepEqual(states(await run()), ['present', 'absent', 'unknown', 'unsupported'])
-    assert.equal(m.calls.length, 4, 'the batch, then one per volume')
+    // cr3.lunrestore.filemark (re-pinned): the file's own getfattr is not counted.
+    assert.equal(m.calls.filter(c => c.command === ZFS).length, 4, 'the batch, then one per volume')
   })
 
   it('the single read: a value spanning lines is unknown (it used to read the first line)', async () => {
@@ -1571,23 +1581,47 @@ const IN_PLACE_ZVOL: InPlaceRow[] = [
   { at: 8, call: 'saveconfig', live: 'on', reboot: 'off', image: 'verified', mark: 'none', enable: 'clear', card: 'none', rebootCard: 'disabled: invites Enable' },
 ]
 
-// In place, IMAGE FILE, the target enabled when the restore starts. The file
-// carries no mark and the job record died with the daemon: the row at the
-// stream is THE GAP (Enable is not asked after a restart), stated, not hidden.
+// In place, IMAGE FILE on a node with the attr tools (cr3.lunrestore.filemark):
+// the file carries the mark (trusted.anas.restore), so after a daemon restart
+// it says what the zvol's says — the row at the stream asks Enable to confirm.
 const IN_PLACE_FILE: InPlaceRow[] = [
-  { at: 0, call: 'targetcli tpg1 disable', live: 'on', reboot: 'on', image: 'untouched', mark: 'n/a (a file carries none)', enable: 'clear', card: 'none', rebootCard: 'none' },
-  { at: 1, call: 'saveconfig', live: 'off', reboot: 'on', image: 'untouched', mark: 'n/a (a file carries none)', enable: 'clear', card: 'disabled: invites Enable', rebootCard: 'none' },
-  { at: 2, call: 'the image stream', live: 'off', reboot: 'off', image: 'PARTIAL', mark: 'n/a (a file carries none)', enable: 'clear', card: 'disabled: invites Enable', rebootCard: 'disabled: invites Enable' },
-  { at: 3, call: 'targetcli tpg1 enable (size verified by stat before it)', live: 'off', reboot: 'off', image: 'verified', mark: 'n/a (a file carries none)', enable: 'clear', card: 'disabled: invites Enable', rebootCard: 'disabled: invites Enable' },
-  { at: 4, call: 'saveconfig', live: 'on', reboot: 'off', image: 'verified', mark: 'n/a (a file carries none)', enable: 'clear', card: 'none', rebootCard: 'disabled: invites Enable' },
+  { at: 0, call: 'getfattr trusted.anas.restore (the mark already there)', live: 'on', reboot: 'on', image: 'untouched', mark: 'none', enable: 'clear', card: 'none', rebootCard: 'none' },
+  { at: 1, call: 'targetcli tpg1 disable', live: 'on', reboot: 'on', image: 'untouched', mark: 'none', enable: 'clear', card: 'none', rebootCard: 'none' },
+  { at: 2, call: 'saveconfig', live: 'off', reboot: 'on', image: 'untouched', mark: 'none', enable: 'clear', card: 'disabled: invites Enable', rebootCard: 'none' },
+  { at: 3, call: 'setfattr trusted.anas.restore (writing)', live: 'off', reboot: 'off', image: 'untouched', mark: 'none', enable: 'clear', card: 'disabled: invites Enable', rebootCard: 'disabled: invites Enable' },
+  { at: 4, call: 'the image stream', live: 'off', reboot: 'off', image: 'PARTIAL', mark: 'writing', enable: 'confirm', card: 'disabled: Enable asks (partial)', rebootCard: 'disabled: Enable asks (partial)' },
+  { at: 5, call: 'setfattr -x trusted.anas.restore (size verified by stat before it)', live: 'off', reboot: 'off', image: 'verified', mark: 'writing', enable: 'confirm', card: 'disabled: Enable asks (partial)', rebootCard: 'disabled: Enable asks (partial)' },
+  { at: 6, call: 'targetcli tpg1 enable', live: 'off', reboot: 'off', image: 'verified', mark: 'none', enable: 'clear', card: 'disabled: invites Enable', rebootCard: 'disabled: invites Enable' },
+  { at: 7, call: 'saveconfig', live: 'on', reboot: 'off', image: 'verified', mark: 'none', enable: 'clear', card: 'none', rebootCard: 'disabled: invites Enable' },
+]
+
+// In place, IMAGE FILE on a node WITHOUT the attr tools: the file cannot carry
+// a mark (the first getfattr says so) and the job record died with the
+// daemon: the row at the stream is THE GAP where a file cannot carry a mark
+// (Enable is not asked after a restart), stated, not hidden. (Re-pinned by
+// cr3.lunrestore.filemark: the getfattr that finds no tools is call 0.)
+const IN_PLACE_FILE_NO_ATTR: InPlaceRow[] = [
+  { at: 0, call: 'getfattr (not installed: no mark possible)', live: 'on', reboot: 'on', image: 'untouched', mark: 'n/a (the file cannot carry one)', enable: 'clear', card: 'none', rebootCard: 'none' },
+  { at: 1, call: 'targetcli tpg1 disable', live: 'on', reboot: 'on', image: 'untouched', mark: 'n/a (the file cannot carry one)', enable: 'clear', card: 'none', rebootCard: 'none' },
+  { at: 2, call: 'saveconfig', live: 'off', reboot: 'on', image: 'untouched', mark: 'n/a (the file cannot carry one)', enable: 'clear', card: 'disabled: invites Enable', rebootCard: 'none' },
+  { at: 3, call: 'the image stream', live: 'off', reboot: 'off', image: 'PARTIAL', mark: 'n/a (the file cannot carry one)', enable: 'clear', card: 'disabled: invites Enable', rebootCard: 'disabled: invites Enable' },
+  { at: 4, call: 'targetcli tpg1 enable (size verified by stat before it)', live: 'off', reboot: 'off', image: 'verified', mark: 'n/a (the file cannot carry one)', enable: 'clear', card: 'disabled: invites Enable', rebootCard: 'disabled: invites Enable' },
+  { at: 5, call: 'saveconfig', live: 'on', reboot: 'off', image: 'verified', mark: 'n/a (the file cannot carry one)', enable: 'clear', card: 'none', rebootCard: 'disabled: invites Enable' },
 ]
 
 describe('cr3.lunrestore review2 — the IN-PLACE crash tables (zvol and image file), machine-checked', () => {
-  for (const [kind, table] of [['zvol', IN_PLACE_ZVOL], ['file', IN_PLACE_FILE]] as const) {
+  // cr3.lunrestore.filemark: an image file on a node with the attr tools
+  // carries its mark like a volume; `file without attr` is the node without.
+  const nodeFor = (kind: 'zvol' | 'file' | 'file without attr') => {
+    const zfs = withMarks(inPlaceMock())
+    const files = withFileMarks(zfs.executor)
+    return { executor: kind === 'file' ? files.executor : zfs.executor, zfs, files }
+  }
+  for (const [kind, table] of [['zvol', IN_PLACE_ZVOL], ['file', IN_PLACE_FILE], ['file without attr', IN_PLACE_FILE_NO_ATTR]] as const) {
     it(`${kind}: the successful run is exactly the ${table.length} calls the table names`, async () => {
       await withRoot(async (root) => {
         const path = kind === 'zvol' ? VOL1 : await imageFile(root, IMAGE_SIZE)
-        const rec = recording(withMarks(inPlaceMock()).executor)
+        const rec = recording(nodeFor(kind).executor)
         await runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {})
         assert.equal(rec.calls.length, table.length, argv(rec.calls).join('\n'))
       })
@@ -1597,7 +1631,7 @@ describe('cr3.lunrestore review2 — the IN-PLACE crash tables (zvol and image f
       it(`${kind}: a stop inside call ${row.at} (${row.call}) — live ${row.live}, after reboot ${row.reboot}, image ${row.image}, mark ${row.mark}, Enable ${row.enable}, dashboard "${row.card}"`, async () => {
         await withRoot(async (root) => {
           const path = kind === 'zvol' ? VOL1 : await imageFile(root, IMAGE_SIZE)
-          const node = withMarks(inPlaceMock())
+          const node = nodeFor(kind)
           const rec = recording(node.executor, { haltAt: row.at })
           const run = runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {})
           run.catch(() => {})
@@ -1608,8 +1642,8 @@ describe('cr3.lunrestore review2 — the IN-PLACE crash tables (zvol and image f
             const stream = rec.calls.findIndex(c => c.command === PBC)
             const verify = kind === 'zvol' ? rec.calls.findIndex(c => c.args.join(' ') === volsizeArgs('tank/vol1').join(' ')) : stream + 1
             const image: Image = stream < 0 || row.at < stream ? 'untouched' : row.at === stream ? 'PARTIAL' : row.at <= verify && kind === 'zvol' ? 'written, not verified' : 'verified'
-            const raw = node.marks.get('tank/vol1')
-            const mark = kind === 'file' ? 'n/a (a file carries none)' : raw ? JSON.parse(raw).state : 'none'
+            const raw = node.zfs.marks.get('tank/vol1')
+            const mark = kind === 'file without attr' ? 'n/a (the file cannot carry one)' : kind === 'file' ? node.files.stateOf(path) : raw ? JSON.parse(raw).state : 'none'
             const base = kind === 'zvol' ? SOURCE_BASE : { iqn: IQN, tag: 1, backstores: [{ name: 'vmdisk1', plugin: 'fileio', dev: path, wwn: SOURCE_SERIAL }], luns: [{ iqn: IQN, tag: 1, index: 0, backstore: 'vmdisk1', plugin: 'fileio' }] }
             const now = await verdictsOn(base, tpg.live, node.executor)
             const reboot = await verdictsOn(base, tpg.saved, node.executor)
@@ -1620,12 +1654,13 @@ describe('cr3.lunrestore review2 — the IN-PLACE crash tables (zvol and image f
             // THE INVARIANT: a target ANAS serves (live, or after a reboot) holds an untouched or a verified image.
             if (tpg.live || tpg.saved)
               assert.ok(image === 'untouched' || image === 'verified', `served with image ${image}`)
-            // A zvol whose image is not proven is never served on Enable without the confirm.
-            if (kind === 'zvol' && (image === 'PARTIAL' || image === 'written, not verified'))
+            // A zvol — and an image file that carries the mark — whose image is
+            // not proven is never served on Enable without the confirm.
+            if (kind !== 'file without attr' && (image === 'PARTIAL' || image === 'written, not verified'))
               assert.notEqual(now.enable, 'clear')
-            // The file GAP, stated: after a daemon restart nothing marks the partial image.
-            if (kind === 'file' && image === 'PARTIAL')
-              assert.equal(now.enable, 'clear', 'GAP (until a file mark exists): the job record died with the daemon')
+            // The GAP where a file cannot carry a mark, stated: after a daemon restart nothing marks the partial image.
+            if (kind === 'file without attr' && image === 'PARTIAL')
+              assert.equal(now.enable, 'clear', 'GAP (where a file cannot carry a mark): the job record died with the daemon')
           }
           finally {
             rec.resume()
@@ -1652,17 +1687,42 @@ const NEW_LUN_ZVOL_VERDICTS: { at: number, enable: string, card: Card }[] = [
   { at: 12, enable: 'clear', card: 'none' },
 ]
 
-// New LUN, IMAGE FILE (the sparse file is created before call 0, by Node, not a command).
-const NEW_LUN_FILE: { at: number, call: string, node: 'backing only' | 'unmapped backstore' | 'complete LUN', enable: string, card: Card }[] = [
-  { at: 0, call: 'backstore create', node: 'backing only', enable: 'clear', card: 'none' },
-  { at: 1, call: 'set emulate_tpu', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
-  { at: 2, call: 'set emulate_tpws', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
-  { at: 3, call: 'set max_unmap_lba_count', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
-  { at: 4, call: 'set emulate_write_cache', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
-  { at: 5, call: 'the image stream', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
-  { at: 6, call: 'map (luns create; size verified by stat before it)', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
-  { at: 7, call: 'ACL grant', node: 'complete LUN', enable: 'clear', card: 'none' },
-  { at: 8, call: 'saveconfig', node: 'complete LUN', enable: 'clear', card: 'none' },
+interface NewLunFileRow { at: number, call: string, node: 'backing only' | 'unmapped backstore' | 'complete LUN', enable: string, card: Card }
+
+// New LUN, IMAGE FILE on a node with the attr tools (cr3.lunrestore.filemark;
+// the sparse file is created before call 0, by Node, not a command): the file
+// carries the mark from before the backstore exists until its size is
+// verified, so a stop anywhere in between leaves a card that says "partial".
+// The marked file no backstore holds yet (call 1) has no card: the zvol's
+// open item, the same here.
+const NEW_LUN_FILE: NewLunFileRow[] = [
+  { at: 0, call: 'setfattr trusted.anas.restore (the mark)', node: 'backing only', enable: 'clear', card: 'none' },
+  { at: 1, call: 'backstore create', node: 'backing only', enable: 'clear', card: 'none' },
+  { at: 2, call: 'set emulate_tpu', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: partial (mark)' },
+  { at: 3, call: 'set emulate_tpws', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: partial (mark)' },
+  { at: 4, call: 'set max_unmap_lba_count', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: partial (mark)' },
+  { at: 5, call: 'set emulate_write_cache', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: partial (mark)' },
+  { at: 6, call: 'the image stream', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: partial (mark)' },
+  { at: 7, call: 'setfattr -x trusted.anas.restore (size verified by stat before it)', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: partial (mark)' },
+  { at: 8, call: 'map (luns create)', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
+  { at: 9, call: 'ACL grant', node: 'complete LUN', enable: 'clear', card: 'none' },
+  { at: 10, call: 'saveconfig', node: 'complete LUN', enable: 'clear', card: 'none' },
+]
+
+// New LUN, IMAGE FILE on a node WITHOUT the attr tools: the set finds no
+// setfattr (call 0) and the run goes on with no mark, as before file marks.
+// (Re-pinned by cr3.lunrestore.filemark: the set that finds no tools is call 0.)
+const NEW_LUN_FILE_NO_ATTR: NewLunFileRow[] = [
+  { at: 0, call: 'setfattr (not installed: no mark possible)', node: 'backing only', enable: 'clear', card: 'none' },
+  { at: 1, call: 'backstore create', node: 'backing only', enable: 'clear', card: 'none' },
+  { at: 2, call: 'set emulate_tpu', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
+  { at: 3, call: 'set emulate_tpws', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
+  { at: 4, call: 'set max_unmap_lba_count', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
+  { at: 5, call: 'set emulate_write_cache', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
+  { at: 6, call: 'the image stream', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
+  { at: 7, call: 'map (luns create; size verified by stat before it)', node: 'unmapped backstore', enable: 'clear', card: 'unmapped: content unknown' },
+  { at: 8, call: 'ACL grant', node: 'complete LUN', enable: 'clear', card: 'none' },
+  { at: 9, call: 'saveconfig', node: 'complete LUN', enable: 'clear', card: 'none' },
 ]
 
 describe('cr3.lunrestore review2 — the NEW-LUN crash tables: Enable verdict and dashboard (zvol), and the image-file table', () => {
@@ -1687,42 +1747,58 @@ describe('cr3.lunrestore review2 — the NEW-LUN crash tables: Enable verdict an
     })
   }
 
-  it(`file: the successful run is exactly the ${NEW_LUN_FILE.length} calls the table names`, async () => {
-    await withRoot(async (root) => {
-      const rec = recording(mockWith())
-      await runNewLunImageRestore(rec.executor, newFileDeps(rec, root), () => {})
-      assert.equal(rec.calls.length, NEW_LUN_FILE.length, argv(rec.calls).join('\n'))
-    })
-  })
-
-  for (const row of NEW_LUN_FILE) {
-    it(`file: a stop inside call ${row.at} (${row.call}) — ${row.node}, Enable ${row.enable}, dashboard "${row.card}"`, async () => {
+  for (const [kind, table] of [['file', NEW_LUN_FILE], ['file without attr', NEW_LUN_FILE_NO_ATTR]] as const) {
+    // cr3.lunrestore.filemark: the file's mark lives in `files` (a node with
+    // the attr tools); `file without attr` runs on the bare mock.
+    const nodeFor = () => {
+      const files = withFileMarks(mockWith())
+      return { files, executor: kind === 'file' ? files.executor : mockWith() }
+    }
+    it(`${kind}: the successful run is exactly the ${table.length} calls the table names`, async () => {
       await withRoot(async (root) => {
-        const rec = recording(mockWith(), { haltAt: row.at })
-        const run = runNewLunImageRestore(rec.executor, newFileDeps(rec, root), () => {})
-        run.catch(() => {})
-        await rec.halted
-        try {
-          const halted = rec.calls.slice(0, row.at)
-          const live = replayLio(halted)
-          const mapped = live.luns.some(l => l.backstore === 'newvol')
-          const node = mapped ? 'complete LUN' : live.backstores.some(b => b.name === 'newvol') ? 'unmapped backstore' : 'backing only'
-          assert.equal(node, row.node)
-          // Mapped only after a stream that exited 0 (its size then checked by stat).
-          if (mapped)
-            assert.equal(halted.find(c => c.command === PBC)?.exitCode, 0)
-          // The image lands on an AHR pool's filesystem (ANAS storage, so an unmapped backstore on it is reported).
-          const v = await verdictsOn(SOURCE_BASE, true, withMarks(new MockExecutor()).executor, live, (ctx) => {
-            ctx.inputs.ahrMountpoints = new Map([['ahr1', root]])
-          })
-          assert.deepEqual(v, { enable: row.enable, card: row.card })
-        }
-        finally {
-          rec.resume()
-          await run.catch(() => {})
-        }
+        const rec = recording(nodeFor().executor)
+        await runNewLunImageRestore(rec.executor, newFileDeps(rec, root), () => {})
+        assert.equal(rec.calls.length, table.length, argv(rec.calls).join('\n'))
       })
     })
+
+    for (const row of table) {
+      it(`${kind}: a stop inside call ${row.at} (${row.call}) — ${row.node}, Enable ${row.enable}, dashboard "${row.card}"`, async () => {
+        await withRoot(async (root) => {
+          const node = nodeFor()
+          const rec = recording(node.executor, { haltAt: row.at })
+          const run = runNewLunImageRestore(rec.executor, newFileDeps(rec, root), () => {})
+          run.catch(() => {})
+          await rec.halted
+          try {
+            const halted = rec.calls.slice(0, row.at)
+            const live = replayLio(halted)
+            const mapped = live.luns.some(l => l.backstore === 'newvol')
+            const at = mapped ? 'complete LUN' : live.backstores.some(b => b.name === 'newvol') ? 'unmapped backstore' : 'backing only'
+            assert.equal(at, row.node)
+            // Mapped only after a stream that exited 0 (its size then checked by stat).
+            if (mapped)
+              assert.equal(halted.find(c => c.command === PBC)?.exitCode, 0)
+            // A file that carries the mark is never mapped while it carries it.
+            if (mapped && kind === 'file')
+              assert.equal(node.files.stateOf(join(root, 'new.raw')), 'none')
+            // The image lands on an AHR pool's filesystem (ANAS storage, so an unmapped backstore on it is reported).
+            // The node after the stop: the source volume unmarked, the new file's mark as the run left it.
+            const reader = kind === 'file'
+              ? withFileMarks(withMarks(new MockExecutor()).executor, Object.fromEntries(node.files.marks)).executor
+              : withMarks(new MockExecutor()).executor
+            const v = await verdictsOn(SOURCE_BASE, true, reader, live, (ctx) => {
+              ctx.inputs.ahrMountpoints = new Map([['ahr1', root]])
+            })
+            assert.deepEqual(v, { enable: row.enable, card: row.card })
+          }
+          finally {
+            rec.resume()
+            await run.catch(() => {})
+          }
+        })
+      })
+    }
   }
 
   function newFileDeps(rec: ReturnType<typeof recording>, root: string): NewLunRestoreDeps {
@@ -1887,6 +1963,427 @@ describe('cr3.lunrestore review3 (6) — an exit 0 the byte count does not prove
       })
       assert.equal(isNewvolLun(replayLio(rec.calls)), false)
       assertNeverExposedHalf(rec.calls)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// cr3.lunrestore.filemark — an image FILE carries the restore mark itself
+// (trusted.anas.restore, set and read with setfattr/getfattr; every answer of
+// the fake below is one captured on the stunt nodes: file-mark-fixtures.ts).
+// One test per door per state; the "file without attr" world keeps the tests
+// above.
+// ---------------------------------------------------------------------------
+
+describe('cr3.lunrestore.filemark — the rule when a mark and a job record both speak (restoreVerdict)', () => {
+  const F = '/tank/images/lun2.raw'
+  const present = (state: 'writing' | 'unverified'): RestoreMarkRead => ({ state: 'present', dataset: F, raw: '{}', mark: { v: 1, repo: 'r', snapshot: 's', archive: 'a.img', started: 't', state } })
+  const rec = { job: 'j-9', outcome: 'partial' as const }
+
+  it('the mark is the truth: its state wins over the record, and the record adds the job id', () => {
+    assert.deepEqual(restoreVerdict(present('unverified'), undefined, rec), { state: 'unverified', source: 'mark', job: 'j-9' })
+    assert.deepEqual(restoreVerdict(present('writing'), undefined, undefined), { state: 'interrupted', source: 'mark' })
+  })
+
+  it('an image file whose mark is absent: the record still stands (a restore that ran where no mark could be set); a volume\'s absent mark: nothing (a volume always carried one)', () => {
+    assert.deepEqual(restoreVerdict({ state: 'absent', dataset: F }, undefined, rec), { state: 'interrupted', source: 'job', job: 'j-9' })
+    assert.equal(restoreVerdict({ state: 'absent', dataset: 'tank/vol1' }, undefined, rec), null)
+    assert.equal(consultsJobRecord({ state: 'absent', dataset: 'tank/vol1' }), false)
+    assert.equal(consultsJobRecord({ state: 'absent', dataset: F }), true)
+  })
+
+  it('unreadable beats everything; running beats a mark; unsupported falls back to the record', () => {
+    assert.deepEqual(restoreVerdict({ state: 'unknown', dataset: F, reason: 'x' }, 'j-1', rec), { state: 'unreadable', source: 'mark' })
+    assert.deepEqual(restoreVerdict(present('writing'), 'j-1', rec), { state: 'in-progress', source: 'mark', job: 'j-1' })
+    assert.deepEqual(restoreVerdict({ state: 'unsupported', reason: ATTR_NOT_INSTALLED }, undefined, rec), { state: 'interrupted', source: 'job', job: 'j-9' })
+    assert.equal(restoreVerdict({ state: 'unsupported', reason: ATTR_NOT_INSTALLED }, undefined, undefined), null)
+  })
+
+  it('the one sentence helper: why the file has no mark, per read', () => {
+    assert.match(jobRecordLifetime({ state: 'unsupported', reason: ATTR_NOT_INSTALLED }), /^this image file carries no restore mark because setfattr and getfattr \(the attr package, which install\.sh installs\) are not installed on this node, so the record is lost when the ANAS daemon restarts/)
+    assert.match(jobRecordLifetime({ state: 'unsupported', reason: 'the filesystem it is on refuses extended attributes (Operation not supported)' }), /because the filesystem it is on refuses extended attributes/)
+    assert.match(jobRecordLifetime({ state: 'absent', dataset: F }), /^this image file carries no restore mark now, so the record is lost/)
+    assert.equal(jobRecordLifetime(undefined), JOB_RECORD_ONLY.slice(JOB_RECORD_ONLY.indexOf(': ') + 2))
+  })
+})
+
+describe('cr3.lunrestore.filemark — every door that reads the mark, per state, for an image FILE', () => {
+  const MARKED = JSON.stringify({ v: 1, repo: 'pbs-main', snapshot: SNAP, archive: 'vol.img', started: '2026-11-14T10:00:00.000Z', state: 'writing' })
+  const UNV = JSON.stringify({ ...JSON.parse(MARKED), state: 'unverified', reason: 'size could not be re-read' })
+  const hex = (s: string) => Buffer.from(s, 'utf8').toString('hex')
+  const F = '/tank/images/lun2.raw'
+  const LUNS = [{ index: 1, name: 'lun2', backingPath: F }]
+  type FileState = 'writing' | 'unverified' | 'absent' | 'unreadable' | 'unsupported'
+  const nodeIn = (s: FileState) => withFileMarks(new MockExecutor(), s === 'writing' ? { [F]: hex(MARKED) } : s === 'unverified' ? { [F]: hex(UNV) } : {}, {
+    ...(s === 'unreadable' ? { unreadable: new Set([F]) } : {}),
+    ...(s === 'unsupported' ? { unsupported: new Set([F]) } : {}),
+  })
+  interface JobsOpt { running?: string, record?: { job: string, outcome: 'partial' | 'unverified', imageBytes?: number } }
+  const jobsWith = (o: JobsOpt = {}) => ({
+    restoreRunning: (p: string) => (p === F ? o.running : undefined),
+    restoreFailed: (p: string) => (p === F ? o.record : undefined),
+    targetIqn: IQN,
+  })
+  const factsIn = async (s: FileState, o: JobsOpt = {}) => readLunMarks(nodeIn(s).executor, LUNS, jobsWith(o))
+
+  // ---- Enable --------------------------------------------------------------
+  const enableTable: [FileState, JobsOpt, string, RegExp | null][] = [
+    ['writing', {}, 'confirm', /^LUN 1 \('lun2'\): a whole-image restore of vol\.img .* onto \/tank\/images\/lun2\.raw did not finish, so the LUN holds a partial image\. An initiator will be served that partial image\. Confirming removes the restore mark\. To restore the image again in place, first set \/tank\/images\/lun2\.raw to the image's exact size/],
+    ['unverified', {}, 'confirm', /ended with the client reporting the image complete, but its size was not verified \(size could not be re-read\)\. An initiator will be served an image ANAS could not verify\. Confirming removes the restore mark\./],
+    ['writing', { record: { job: 'j-7', outcome: 'partial', imageBytes: IMAGE_SIZE } }, 'confirm', /a whole-image restore of vol\.img .* \(job j-7\) onto \/tank\/images\/lun2\.raw did not finish.* first set \/tank\/images\/lun2\.raw to the image's 536870912 bytes/],
+    ['absent', {}, 'clear', null],
+    ['absent', { record: { job: 'j-7', outcome: 'partial' } }, 'confirm', /the whole-image restore job j-7 onto \/tank\/images\/lun2\.raw did not finish, so the LUN may hold a partial image\. An initiator will be served that image\. ANAS knows this only from that job's record in this run of the ANAS daemon: this image file carries no restore mark now, so the record is lost/],
+    ['unreadable', {}, 'refuse (restore-mark-unreadable)', null],
+    ['writing', { running: 'j-1' }, 'refuse (restore-in-progress)', null],
+    ['unsupported', {}, 'clear', null],
+    ['unsupported', { record: { job: 'j-7', outcome: 'unverified' } }, 'confirm', /ANAS knows this only from that job's record in this run of the ANAS daemon: this image file carries no restore mark because the filesystem it is on refuses extended attributes \(Operation not supported\), so the record is lost/],
+  ]
+  for (const [state, jobs, verdict, warning] of enableTable) {
+    it(`Enable: a file ${state}${jobs.record ? ` with a job record` : ''}${jobs.running ? ' with a restore running' : ''} -> ${verdict}`, async () => {
+      const v = enableMarkVerdict(IQN, await factsIn(state, jobs))
+      assert.equal(v.kind === 'refuse' ? `refuse (${v.reason})` : v.kind, verdict)
+      if (warning)
+        assert.match(v.kind === 'confirm' ? v.warnings[0] : '', warning)
+      if (v.kind === 'refuse' && v.reason === 'restore-mark-unreadable')
+        assert.match(v.message, /the restore mark could not be read \(\/tank\/images\/lun2\.raw: Command timed out after 12000ms/)
+      if (v.kind === 'confirm' && state !== 'absent' && state !== 'unsupported')
+        assert.doesNotMatch(v.warnings.join(' '), /the record is lost/, 'a mark is not a record')
+    })
+  }
+
+  it('Enable binds the file mark\'s BYTES: another value is another confirm (markSignature)', async () => {
+    const a = markSignature(await factsIn('writing'))
+    const b = markSignature(await factsIn('unverified'))
+    assert.deepEqual(a, [`${F}=0x${hex(MARKED)}`])
+    assert.notDeepEqual(a, b)
+  })
+
+  // ---- add an initiator ------------------------------------------------------
+  const aclTable: [FileState, JobsOpt, string | null, RegExp | null][] = [
+    ['writing', {}, 'restore-mark', /^A whole-image restore of vol\.img .* onto LUN 1 \('lun2'\) of .* did not finish: it holds a partial image \(the restore mark trusted\.anas\.restore on \/tank\/images\/lun2\.raw\)\. Adding an initiator to this target would serve that image to initiators and is refused\. M\. To restore the image again in place, first set /],
+    ['unverified', {}, 'restore-mark', /wrote LUN 1 \('lun2'\) of .*, and the client reported the image complete, but its size was not verified \(size could not be re-read\) \(the restore mark trusted\.anas\.restore on \/tank\/images\/lun2\.raw\)/],
+    ['writing', { record: { job: 'j-7', outcome: 'partial' } }, 'restore-mark', /^A whole-image restore of vol\.img .* \(job j-7\) onto LUN 1/],
+    ['absent', {}, null, null],
+    ['absent', { record: { job: 'j-7', outcome: 'partial' } }, 'restore-mark', /^The whole-image restore job j-7 onto .* this image file carries no restore mark now, so the record is lost/],
+    ['unreadable', {}, 'restore-mark-unreadable', /^ANAS could not read the restore mark on \/tank\/images\/lun2\.raw \(Command timed out after 12000ms/],
+    ['writing', { running: 'j-1' }, 'restore-in-progress', /right now \(job j-1\)\. Adding an initiator to this target is refused until the restore ends\.$/],
+    ['unsupported', {}, null, null],
+    ['unsupported', { record: { job: 'j-7', outcome: 'partial' } }, 'restore-mark', /because the filesystem it is on refuses extended attributes/],
+  ]
+  for (const [state, jobs, reason, message] of aclTable) {
+    it(`add an initiator: a file ${state}${jobs.record ? ' with a job record' : ''}${jobs.running ? ' with a restore running' : ''} -> ${reason ?? 'allowed'}`, async () => {
+      const [f] = await factsIn(state, jobs)
+      const r = restoreMarkRefusal(f.read, `LUN 1 ('lun2') of ${IQN}`, 'Adding an initiator to this target', { mark: 'M.', job: 'J.' }, f)
+      assert.equal(r?.reason ?? null, reason)
+      if (message)
+        assert.match(r?.message ?? '', message)
+    })
+  }
+
+  // ---- add a marked backing as a LUN ----------------------------------------
+  it('add a LUN: a file LUN is always a NEW image created with O_EXCL, so an existing (marked) image file is refused, never adopted', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      await assert.rejects(createSparseImage(path, IMAGE_SIZE), /already exists — refusing to overwrite it; pick another LUN name/)
+    })
+  })
+
+  // ---- the dashboard card ---------------------------------------------------
+  async function cards(state: FileState, enabled: boolean, o: JobsOpt = {}, unmapped = false) {
+    const tree: LioTree = unmapped
+      ? { backstores: [{ name: 'lun2', plugin: 'fileio', dev: F, wwn: 's2' }], luns: [] }
+      : { backstores: [{ name: 'lun2', plugin: 'fileio', dev: F, wwn: 's2' }], luns: [{ iqn: IQN, tag: 1, index: 1, backstore: 'lun2', plugin: 'fileio' }] }
+    const ctx = contextOf(tree, null, SOURCE_BASE)
+    ctx.live.targets[0].tpgs[0].enabled = enabled
+    ctx.inputs.ahrMountpoints = new Map([['ahr1', '/tank/images']])
+    const targets = await buildIscsiTargets(ctx)
+    targets[0].ownership = 'anas'
+    const reader = withFileMarks(withMarks(new MockExecutor()).executor, state === 'writing' ? { [F]: hex(MARKED) } : state === 'unverified' ? { [F]: hex(UNV) } : {}, {
+      ...(state === 'unreadable' ? { unreadable: new Set([F]) } : {}),
+      ...(state === 'unsupported' ? { unsupported: new Set([F]) } : {}),
+    })
+    const marks = await readRestoreMarks(reader.executor, ctx, targets)
+    const j = jobsWith(o)
+    const health = computeIscsiHealth(ctx, targets, { marks, restoreRunning: j.restoreRunning, restoreFailed: j.restoreFailed })
+    return { health, msgs: buildIscsiWarnings(health).map(w => w.message) }
+  }
+
+  it('dashboard: a disabled target over an interrupted FILE mark asks Enable to confirm, names the truncate, never invites Enable', async () => {
+    const { health, msgs } = await cards('writing', false)
+    assert.deepEqual(health.restoreMarks?.map(r => [r.lunIndex, r.state, r.source, r.dataset]), [[1, 'interrupted', 'mark', null]])
+    const card = msgs.find(m => /is disabled/.test(m)) ?? ''
+    assert.match(card, /onto LUN 1 \('lun2'\) of .* did not finish: it holds a partial image\. To restore the image again in place, first set \/tank\/images\/lun2\.raw/)
+    assert.match(card, /Enable on the iSCSI screen asks you to confirm and removes the restore mark\./)
+    assert.doesNotMatch(card, /Enable it from the iSCSI screen when you are ready|Restoring the image again is the other way out|the record is lost/)
+  })
+
+  it('dashboard: an ENABLED target over a FILE mark is critical, and the way out says restore it in place as said', async () => {
+    const { msgs } = await cards('unverified', true)
+    const crit = msgs.find(m => /initiators are being served that image now/.test(m)) ?? ''
+    assert.match(crit, /Disable the target, then accept it with Enable's confirm, or restore it again in place as said above\.$/)
+  })
+
+  // review S4: an unreadable FILE mark gives a path to confirm or fix: what
+  // the read returned, the exact command ANAS runs, and when the door opens.
+  const S4_CMD = `LC_ALL=C getfattr --absolute-names -e hex -n trusted.anas.restore -- ${F}`
+  const S4_WAY = (door: string) => new RegExp(`To see what ANAS sees, run '${S4_CMD.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}' as root\\. When it prints a 'trusted\\.anas\\.restore=0x' line \\(the mark\\) or ends with 'No such attribute' \\(no mark\\), ANAS reads the same and ${door} is no longer refused for it\\.`)
+
+  it('review S4: Enable over an unreadable FILE mark names what the read returned, the command to see it, and when Enable opens again', async () => {
+    const v = enableMarkVerdict(IQN, await factsIn('unreadable'))
+    assert.ok(v.kind === 'refuse')
+    assert.match(v.message, /\(\/tank\/images\/lun2\.raw: Command timed out after 12000ms/)
+    assert.match(v.message, S4_WAY('enabling the target'))
+    assert.doesNotMatch(v.message, /…/)
+  })
+
+  it('review S4: adding an initiator over an unreadable FILE mark says the same', async () => {
+    const [f] = await factsIn('unreadable')
+    const r = restoreMarkRefusal(f.read, `LUN 1 ('lun2') of ${IQN}`, 'Adding an initiator to this target', { mark: 'M.', job: 'J.' }, f)
+    assert.match(r?.message ?? '', S4_WAY('adding an initiator to this target'))
+  })
+
+  it('review S4: the dashboard row of an unreadable FILE mark carries the read\'s answer and the command', async () => {
+    const card = (await cards('unreadable', false)).msgs.find(m => /is disabled/.test(m)) ?? ''
+    assert.match(card, /ANAS could not read the restore mark on \/tank\/images\/lun2\.raw \(Command timed out after 12000ms/)
+    assert.match(card, S4_WAY('enabling the target'))
+  })
+
+  it('review S4: Repair over a hole whose FILE mark cannot be read names the command', () => {
+    const item = { targetIqn: IQN, tpgTag: 1, lunIndex: 1, backstoreName: 'lun2', plugin: 'fileio', backingPath: F, backingPresent: true, stubBacking: false, serial: 's', size: null, writeBack: false, attributes: {} as IscsiRepairItem['attributes'], aclInitiators: [], restoreMark: 'unreadable' as const, restoreMarkDataset: F, blockedReason: `ANAS could not read the restore mark on ${F} (Command timed out after 12000ms), so it cannot tell whether it holds a partially restored image` }
+    const r = assertRepairable({ repairable: [], blocked: [item] })
+    assert.match(r?.message ?? '', S4_WAY('Repair'))
+  })
+
+  it('dashboard: a FILE mark that cannot be read refuses Enable on the card; a running restore is progress; absent says nothing', async () => {
+    assert.match((await cards('unreadable', false)).msgs.find(m => /is disabled/.test(m)) ?? '', /ANAS could not read the restore mark on \/tank\/images\/lun2\.raw \(Command timed out after 12000ms.*\), so it cannot tell whether LUN 1 .* Enable is refused until the mark can be read\./)
+    const running = (await cards('writing', false, { running: 'j-1' })).msgs.find(m => /is disabled/.test(m)) ?? ''
+    assert.match(running, /is writing LUN 1 \('lun2'\) of .* right now \(job j-1\)\. Enable is refused until the restore ends\. When the restore ends, a target the restore disabled is enabled again only if the image is complete and its size verified, and put back as it was if the restore fails before it opens the image file, the file is still the image's size and it is left with no restore mark/)
+    assert.equal((await cards('absent', true)).health.restoreMarks?.length, 0)
+  })
+
+  it('dashboard: an unmapped backstore over an UNVERIFIED file mark names the setfattr that clears it; with no mark, says none is on the image file', async () => {
+    const unv = (await cards('unverified', true, {}, true)).msgs.find(m => /is not mapped as a LUN/.test(m)) ?? ''
+    assert.match(unv, /If you have checked the image, clear the mark \('setfattr -x trusted\.anas\.restore \/tank\/images\/lun2\.raw'\) and map the backstore with targetcli\./)
+    const none = (await cards('absent', true, {}, true)).msgs.find(m => /is not mapped as a LUN/.test(m)) ?? ''
+    assert.match(none, /A backstore no LUN maps holds this storage, and no restore mark is on the image file: ANAS cannot tell what it holds\./)
+  })
+})
+
+describe('cr3.lunrestore.filemark — the in-place restore onto an image FILE that carries the mark', () => {
+  const MARKED = JSON.stringify({ v: 1, repo: 'pbs-main', snapshot: 'host/x/2026-01-01T00:00:00Z', archive: 'vol.img', started: '2026-11-13T09:00:00.000Z', state: 'writing' })
+  const codeOf = (err: Error) => (err as Error & { jobErrorCode?: string }).jobErrorCode
+  const order = (calls: RecordedCall[]) => calls.map(c => (c.command === PBC ? 'stream' : c.command === SETFATTR ? `setfattr ${c.args[0]}` : c.command === GETFATTR ? 'getfattr' : c.args.join(' ').includes('tpg1 ') ? `tpg1 ${c.args[1]}` : c.args[0] === 'saveconfig' ? 'saveconfig' : 'other'))
+
+  it('the order: the earlier mark read, disable, mark set BEFORE the stream opens the file, the mark removed only after exit 0, the complete line and the size, then enable', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      const node = withFileMarks(inPlaceMock())
+      const rec = recording(node.executor)
+      const result = await runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {})
+      assert.equal(result.complete, true)
+      assert.deepEqual(order(rec.calls), ['getfattr', 'tpg1 disable', 'saveconfig', 'setfattr -n', 'stream', 'setfattr -x', 'tpg1 enable', 'saveconfig'])
+      assert.equal(node.stateOf(path), 'none')
+    })
+  })
+
+  it('a partial write: the mark stays (writing), the target stays disabled, and the job says how to accept it and how to restore again in place', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      const node = withFileMarks(inPlaceMock({ stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 }))
+      const rec = recording(node.executor)
+      await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), (err: Error) => {
+        assert.equal(codeOf(err), 'IMAGE_PARTIAL')
+        assert.match(err.message, new RegExp(`Enable on the iSCSI screen asks you to confirm that you accept the partial image, and removes the restore mark on ${path.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\. To restore the image again in place`))
+        assert.doesNotMatch(err.message, /the record is lost/)
+        return true
+      })
+      assert.equal(node.stateOf(path), 'writing')
+      assert.ok(!enabledBy(rec.calls))
+      assert.ok(!rec.calls.some(c => c.command === SETFATTR && c.args[0] === '-x'))
+    })
+  })
+
+  it('exit 0 with no "restore complete" line, or a wrong size: the mark turns unverified with the reason, the target stays disabled', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      const node = withFileMarks(inPlaceMock({ stderr: '', exitCode: 0, bytesWritten: 0 }))
+      const rec = recording(node.executor)
+      await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), (err: Error) => {
+        assert.equal(codeOf(err), 'IMAGE_UNVERIFIED')
+        assert.match(err.message, /and the restore mark on .* now says the image was not verified/)
+        assert.doesNotMatch(err.message, /Restoring again is the other way out/)
+        return true
+      })
+      assert.equal(node.stateOf(path), 'unverified')
+      assert.ok(!enabledBy(rec.calls))
+    })
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE / 2)
+      const node = withFileMarks(inPlaceMock())
+      const rec = recording(node.executor)
+      const deps = { ...inPlaceDeps(rec.executor, { enabled: true, path }), reverify: async () => ({ target: { ...targetDetail(), luns: [lunAt(path)] }, lun: lunAt(path), size: IMAGE_SIZE }) }
+      await assert.rejects(runImageRestore(rec.executor, deps, () => {}), /is 268435456 bytes, not the image's 536870912/)
+      assert.equal(node.stateOf(path), 'unverified')
+    })
+  })
+
+  it('nothing written, the file untouched (the client never started): an EARLIER mark is put back BYTE-EXACT (even bytes that are not UTF-8) and the target stays disabled', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      const node = withFileMarks(inPlaceMock(new StreamNotStartedError('spawn /usr/bin/proxmox-backup-client ENOENT', 'ENOENT')), { [path]: 'fffe0a7b' })
+      const rec = recording(node.executor)
+      await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), /could not be started.*carries the restore mark of a whole-image restore \(its details could not be read\) again, as it did before this restore/)
+      assert.equal(node.marks.get(path), 'fffe0a7b')
+      assert.ok(!enabledBy(rec.calls), 'the earlier image is not served without the confirm')
+    })
+  })
+
+  it('nothing written, no earlier mark: this run\'s mark is removed and the target comes back', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      const node = withFileMarks(inPlaceMock(new StreamNotStartedError('spawn /usr/bin/proxmox-backup-client ENOENT', 'ENOENT')))
+      const rec = recording(node.executor)
+      await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), /could not be started/)
+      assert.equal(node.stateOf(path), 'none')
+      assert.ok(enabledBy(rec.calls))
+    })
+  })
+
+  it('the open EMPTIED the file and then the client refused: this run\'s mark stays (the file no longer holds any earlier image), IMAGE_PARTIAL', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      const base = inPlaceMock(REFUSED_STREAM)
+      const stream = base.execToStream.bind(base)
+      base.execToStream = async (c, a, t, o) => {
+        await truncate(path, 0)
+        return stream(c, a, t, o)
+      }
+      const node = withFileMarks(base, { [path]: hexOf(MARKED) })
+      const rec = recording(node.executor)
+      await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), (err: Error) => {
+        assert.equal(codeOf(err), 'IMAGE_PARTIAL')
+        assert.match(err.message, /is 0 bytes now, not 536870912: the image file is emptied when it is opened for the restore, so it no longer holds the image it held, and target .* stays disabled; it keeps this restore's mark trusted\.anas\.restore\./)
+        return true
+      })
+      // This run's mark (another start time), not the earlier one put back.
+      assert.equal(node.stateOf(path), 'writing')
+      assert.notEqual(node.marks.get(path), hexOf(MARKED))
+      assert.ok(!enabledBy(rec.calls))
+    })
+  })
+
+  it('review S4: the in-place restore refused over an unreadable FILE mark names the command to see it', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      const node = withFileMarks(inPlaceMock(), {}, { unreadable: new Set([path]) })
+      const rec = recording(node.executor)
+      await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), (err: Error) => {
+        assert.ok(err.message.includes(`To see what ANAS sees, run 'LC_ALL=C getfattr --absolute-names -e hex -n trusted.anas.restore -- ${path}' as root.`), err.message)
+        assert.match(err.message, /ANAS reads the same and the restore is no longer refused for it\./)
+        return true
+      })
+    })
+  })
+
+  it('an earlier mark that cannot be READ refuses before anything is disabled or written', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      const node = withFileMarks(inPlaceMock(), {}, { unreadable: new Set([path]) })
+      const rec = recording(node.executor)
+      await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), /ANAS could not read the restore mark trusted\.anas\.restore on .* The restore is refused until the mark can be read\. Nothing was disabled and nothing was written\./)
+      assert.ok(!disabledBy(rec.calls))
+      assert.ok(!rec.calls.some(c => c.command === PBC))
+    })
+  })
+
+  it('a mark that cannot be SET (read-only filesystem) refuses the restore: nothing written, the target back', async () => {
+    await withRoot(async (root) => {
+      const path = await imageFile(root, IMAGE_SIZE)
+      const node = withFileMarks(inPlaceMock(), {}, { readOnly: new Set([path]) })
+      const rec = recording(node.executor)
+      await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), /could not set the restore mark trusted\.anas\.restore on .*Read-only file system; a restore that cannot leave its mark is refused\. Nothing was written to /)
+      assert.ok(!rec.calls.some(c => c.command === PBC))
+      assert.ok(enabledBy(rec.calls))
+    })
+  })
+
+  it('a file that CANNOT carry a mark (vfat; or no attr tools): the restore runs as before file marks, and the job record\'s sentence says why', async () => {
+    for (const opts of [{ unsupported: true }, { notInstalled: true }]) {
+      await withRoot(async (root) => {
+        const path = await imageFile(root, IMAGE_SIZE)
+        const node = withFileMarks(inPlaceMock({ stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 }), {}, opts.unsupported ? { unsupported: new Set([path]) } : { notInstalled: true })
+        const rec = recording(node.executor)
+        await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), (err: Error) => {
+          assert.equal(codeOf(err), 'IMAGE_PARTIAL')
+          assert.match(err.message, opts.unsupported
+            ? /while ANAS keeps this job's record; this image file carries no restore mark because the filesystem it is on refuses extended attributes \(Operation not supported\), so the record is lost/
+            : /while ANAS keeps this job's record; this image file carries no restore mark because setfattr and getfattr \(the attr package, which install\.sh installs\) are not installed on this node, so the record is lost/)
+          return true
+        })
+        assert.ok(!rec.calls.some(c => c.command === SETFATTR), 'a read that said unsupported is not followed by a set')
+      })
+    }
+  })
+})
+
+describe('cr3.lunrestore.filemark — the new-LUN restore onto an image FILE that carries the mark', () => {
+  function fileDeps(rec: ReturnType<typeof recording>, root: string, path: string): NewLunRestoreDeps {
+    return depsFor(rec, root, {
+      backing: { path, plugin: 'fileio', dataset: 'tank/images' },
+      refreshAfterCreate: async () => targetObjectOf(targetDetail(), contextOf(replayLio(rec.calls), null, SOURCE_BASE)),
+      readLive: async () => ({ ctx: contextOf(replayLio(rec.calls), null, SOURCE_BASE) }),
+    })
+  }
+
+  it('kept UNVERIFIED: the file keeps its mark saying so, and the way to serve it clears the mark with setfattr first', async () => {
+    await withRoot(async (root) => {
+      const path = join(root, 'newimg.raw')
+      const base = mockWith()
+      const stream = base.execToStream.bind(base)
+      base.execToStream = async (c, a, t, o) => {
+        await truncate(path, IMAGE_SIZE * 2)
+        return stream(c, a, t, o)
+      }
+      const node = withFileMarks(base)
+      const rec = recording(node.executor)
+      await assert.rejects(runNewLunImageRestore(rec.executor, fileDeps(rec, root, path), () => {}), (err: Error) => {
+        assert.match(err.message, new RegExp(`keeps its restore mark, now saying the size was not verified, so nothing treats the image as good\\..* If you have checked the image and want to serve it, clear the restore mark with 'setfattr -x trusted\\.anas\\.restore ${path.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}', then map it`))
+        return true
+      })
+      assert.equal(node.stateOf(path), 'unverified')
+      assert.ok(!isNewvolLun(replayLio(rec.calls)))
+    })
+  })
+
+  it('a partial stream: the run is undone and the image unlinked — its mark goes with the file', async () => {
+    await withRoot(async (root) => {
+      const path = join(root, 'newimg.raw')
+      const node = withFileMarks(mockWith(() => {}, { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 }))
+      const rec = recording(node.executor)
+      await assert.rejects(runNewLunImageRestore(rec.executor, fileDeps(rec, root, path), () => {}), /ANAS has removed backstore 'newvol', image /)
+      await assert.rejects(stat(path), /ENOENT/)
+    })
+  })
+
+  it('a filesystem that refuses extended attributes: the run goes on unmarked and the LUN is mapped only once verified', async () => {
+    await withRoot(async (root) => {
+      const path = join(root, 'newimg.raw')
+      const node = withFileMarks(mockWith(), {}, { unsupported: new Set([path]) })
+      const rec = recording(node.executor)
+      const result = await runNewLunImageRestore(rec.executor, fileDeps(rec, root, path), () => {})
+      assert.equal(result.complete, true)
+      assert.deepEqual(rec.calls.filter(c => c.command === SETFATTR).map(c => c.args[0]), ['-n'], 'one set, refused; no remove')
+    })
+  })
+
+  it('a mark that cannot be set for another reason (read-only) refuses the run before the backstore exists, and undoes the file', async () => {
+    await withRoot(async (root) => {
+      const path = join(root, 'newimg.raw')
+      const node = withFileMarks(mockWith(), {}, { readOnly: new Set([path]) })
+      const rec = recording(node.executor)
+      await assert.rejects(runNewLunImageRestore(rec.executor, fileDeps(rec, root, path), () => {}), /Read-only file system/)
+      assert.ok(!rec.calls.some(c => c.command === TARGETCLI && c.args[1] === 'create'))
+      assert.ok(!rec.calls.some(c => c.command === PBC))
     })
   })
 })

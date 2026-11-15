@@ -354,9 +354,10 @@ async function read(
 }
 
 /**
- * The restore mark of every zvol backing the health read reports on — each
+ * The restore mark of every backing the health read reports on — each
  * present LUN's and each live backstore no LUN maps — in one `zfs get`
- * (cr3.lunrestore, review2 (7)). A file backing carries none (`unsupported`).
+ * (cr3.lunrestore, review2 (7)). An image file's mark is read off the file
+ * itself, one `getfattr` each (cr3.lunrestore.filemark).
  */
 export async function readRestoreMarks(
   executor: CommandExecutor,

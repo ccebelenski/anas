@@ -13,6 +13,8 @@ import { StreamNotStartedError } from '../../executor/stream-errors.js'
 import { newLunZvolCreateArgs, runNewLunImageRestore, volsizeArgs } from '../backup-restore.js'
 import { buildBackupEnv, PBC } from '../backup-runner.js'
 import { ISCSI_MAX_UNMAP_LBA_COUNT, TARGETCLI, withIscsiLock, ZFS } from '../iscsi-mutate.js'
+import { SETFATTR } from '../restore-mark.js'
+import { capturedCase } from './file-mark-fixtures.js'
 import { contextOf, replayLio, targetObjectOf } from './lio-model.js'
 
 /**
@@ -343,6 +345,8 @@ function assertSourceUntouched(mock: MockExecutor): void {
 function noop(): void {}
 
 const MARK_VALUE_RE = /^anas:restore=\{.*\}$/
+/** An image file's mark value (cr3.lunrestore.filemark): the JSON as hex, starting `{"v":1`. */
+const FILE_MARK_VALUE_RE = /^0x7b2276223a31[0-9a-f]*$/
 
 /** The call log with the restore mark's JSON value elided (it carries the start time). */
 function argvOf(mock: MockExecutor): string[] {
@@ -415,12 +419,16 @@ describe('runNewLunImageRestore — the happy sequence, as an exact call log', (
     })
   })
 
-  it('a FILE: a sparse image at the manifest size, a fileio backstore, stream into the file, and only THEN map, grant, saveconfig', async () => {
+  it('a FILE: a sparse image at the manifest size, its restore mark, a fileio backstore, stream into the file, the mark removed, and only THEN map, grant, saveconfig', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'anas-newlun-image-'))
     try {
       const file = join(dir, 'newvol.raw')
       const mock = new MockExecutor()
       mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      // cr3.lunrestore.filemark (re-pinned): a node with the attr tools; a
+      // set and a remove answer as captured on anas-pve (exit 0, no output).
+      const set = capturedCase('anas-pve', 'ext4', 'set-writing')
+      mock.addFixture({ command: SETFATTR, result: { stdout: set.stdout, stderr: set.stderr, exitCode: set.exitCode } })
       mock.addStreamFixture({
         command: PBC,
         result: { stderr: 'restore complete (512 MiB processed in 0.6s)    \n', exitCode: 0, bytesWritten: IMAGE_SIZE },
@@ -436,14 +444,18 @@ describe('runNewLunImageRestore — the happy sequence, as an exact call log', (
         assert.match(serial, UUID_RE)
         assert.notEqual(serial, SOURCE_SERIAL)
 
-        assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.join(' ')}`), [
-          // No zfs at all — the file half creates the image itself (real file I/O).
+        assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.map(a => (FILE_MARK_VALUE_RE.test(a) ? '0x<mark>' : a)).join(' ')}`), [
+          // No zfs at all — the file half creates the image itself (real file I/O),
+          // cr3.lunrestore.filemark: and marks it before anything can write to it.
+          `${SETFATTR} -n trusted.anas.restore -v 0x<mark> -- ${file}`,
           `${TARGETCLI} /backstores/fileio create name=newvol file_or_dev=${file} size=${IMAGE_SIZE} write_back=false wwn=${serial}`,
           `${TARGETCLI} /backstores/fileio/newvol set attribute emulate_tpu=1`,
           `${TARGETCLI} /backstores/fileio/newvol set attribute emulate_tpws=1`,
           `${TARGETCLI} /backstores/fileio/newvol set attribute max_unmap_lba_count=${ISCSI_MAX_UNMAP_LBA_COUNT.fileio}`,
           `${TARGETCLI} /backstores/fileio/newvol set attribute emulate_write_cache=0`,
           `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
+          // The size is read back by stat (no command); then the mark goes.
+          `${SETFATTR} -x trusted.anas.restore -- ${file}`,
           `${TARGETCLI} /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/fileio/newvol lun=1`,
           `${TARGETCLI} /iscsi/${IQN}/tpg1/acls/${INITIATOR} create 1 1`,
           `${TARGETCLI} saveconfig`,

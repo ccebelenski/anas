@@ -22,6 +22,7 @@ import { PVE_NOTIFY_BUDGET_MS, pveNotify } from '../services/pve-notify.js'
 import { PROBE_TIMEOUT_S, probeArgs } from '../services/rclone-probe.js'
 import { scanHostKeys } from '../services/replication-remotes.js'
 import { buildSshArgv } from '../services/replication-transport.js'
+import { fileMarkGetArgs, fileMarkRemoveArgs, fileMarkSetArgs, GETFATTR, SETFATTR } from '../services/restore-mark.js'
 import { zfsStampSourceArgs, zfsTreeSnapshotListArgs } from '../services/snapshot-schedules.js'
 import { UDEVADM_SETTLE_ARGS, UDEVADM_SETTLE_BUDGET_MS } from '../services/udev-settle.js'
 
@@ -87,6 +88,10 @@ describe('cr.35 §6.3 per-command budgets: the table, against the argv the call 
       // routes/mounts.ts listHolders and services/busy-diagnosis.ts diagnoseBusyPath.
       ['lsof', '/usr/bin/lsof', ['+f', '--', '/mnt/anas-nfs'], rowMs('lsof')],
       ['fuser', '/usr/bin/fuser', ['-m', '/mnt/anas-nfs'], rowMs('fuser')],
+      // services/restore-mark.ts readFileMark, setRestoreMark, clearRestoreMark (review S5).
+      ['getfattr', GETFATTR, fileMarkGetArgs('/tank/images/lun2.raw'), rowMs('getfattr')],
+      ['setfattr', SETFATTR, fileMarkSetArgs('/tank/images/lun2.raw', '7b7d'), rowMs('setfattr')],
+      ['setfattr', SETFATTR, fileMarkRemoveArgs('/tank/images/lun2.raw'), rowMs('setfattr')],
     ]
     for (const [id, cmd, args, budget] of cases) {
       assert.equal(commandBudgetRow(cmd, args)?.id, id, `${cmd} ${args.join(' ')}`)
@@ -127,6 +132,16 @@ describe('cr.35 §6.3 per-command budgets: the table, against the argv the call 
     assert.equal((await budgetOf('/usr/bin/lsof', ['+f', '--', '/x'], 'job')).budgetMs, rowMs('lsof'))
     // Boot/background pulls too.
     assert.equal((await budgetOf(SMARTCTL, ['-n', 'standby', '-iH', '--json', '/dev/sda'], 'background')).budgetMs, rowMs('smartctl'))
+  })
+
+  it('review S5: getfattr and setfattr (the restore mark on an image file) keep a short bound in every lane, so a hung filesystem never holds a job, or the iSCSI lock, for the job lane\'s 300 s', async () => {
+    const p = '/tank/images/lun2.raw'
+    for (const lane of ['request', 'job', 'background'] as const) {
+      assert.equal((await budgetOf(GETFATTR, fileMarkGetArgs(p), lane)).budgetMs, rowMs('getfattr'), `getfattr, ${lane}`)
+      assert.equal((await budgetOf(SETFATTR, fileMarkSetArgs(p, '7b7d'), lane)).budgetMs, rowMs('setfattr'), `setfattr -n, ${lane}`)
+      assert.equal((await budgetOf(SETFATTR, fileMarkRemoveArgs(p), lane)).budgetMs, rowMs('setfattr'), `setfattr -x, ${lane}`)
+    }
+    assert.ok(rowMs('getfattr') <= LANE_BUDGET_MS.request && rowMs('setfattr') <= LANE_BUDGET_MS.request)
   })
 
   it('ssh-keyscan carries `-T 10` and gets its row budget on the request path', async () => {

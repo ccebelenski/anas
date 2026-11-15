@@ -396,6 +396,13 @@ fi
 # else), and the config store is ANAS's DATA — every cloud remote and its
 # credentials. Deleting it would be an owner's move, not a guest's; a reinstall
 # picks the store straight back up.
+#
+# Likewise the attr package (cr3.lunrestore.filemark), and any restore mark
+# (the extended attribute trusted.anas.restore) on an image file: attr is a
+# dependency the node may use for something else, and a mark records that the
+# image in that file is not proven whole — it is a fact about the data, read
+# again by a reinstall, and clearing it by hand is the operator's call
+# ('setfattr -x trusted.anas.restore <file>').
 
 # 5. Revert the PVE UI integration if its uninstaller is still present — LAST
 # before the prefix (see ORDER above): it may restart pveproxy.

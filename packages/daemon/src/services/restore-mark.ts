@@ -16,12 +16,24 @@
  * does not revert it; a plain `zfs send` (ANAS replication) and a clone do not
  * carry it; `zfs inherit <prop> <vol>` clears it.
  *
- * FILE-backed LUNs (an image on a dataset or an AHR pool) carry NO mark: the
- * mark there would be an extended attribute, and setting one needs the `attr`
- * package (`setfattr`/`getfattr`), which ANAS does not install and Node's fs
- * cannot do. Held for the operator's word; until then a file backing reads
- * `unsupported` — never "absent", never "unknown" — and the doors treat it as
- * they did before this story.
+ * An image FILE (a file-backed LUN on a dataset or an AHR pool) carries the
+ * same mark as the extended attribute `trusted.anas.restore` on the file
+ * itself (cr3.lunrestore.filemark; operator ruling: `attr` is an installer
+ * dependency "like other tooling we use"), set and read with
+ * `setfattr`/`getfattr` — same JSON, same states, same lifecycle. Where the
+ * technology differs (ground truth, `fixtures/restore-mark/README.md`):
+ *  - `trusted.` is root's namespace: a share user who can write the image
+ *    cannot read, set or remove the mark (`user.` would let them);
+ *  - the attribute is on the inode, so the restore's `'w'` open (O_TRUNC) and
+ *    a `truncate -s` keep it; it travels with the file's data where a volume's
+ *    property does not: `cp -a`, `mv`, a plain `zfs send`, a clone and a btrfs
+ *    snapshot carry it, and a `zfs rollback` brings back the mark the snapshot
+ *    holds (a plain `cp` and `rsync` without `-X` drop it);
+ *  - a node without `setfattr`/`getfattr`, a filesystem that refuses extended
+ *    attributes, or a device path that is not a volume reads `unsupported`
+ *    (with the reason): never "absent", never "unknown". There the daemon's
+ *    job record stands in, as before this story, and every sentence that
+ *    relies on it says why.
  */
 
 import type { IscsiRestoreMarkState, Job, RestoreMark as RestoreMarkType } from '@anas/shared'
@@ -32,18 +44,59 @@ import { ImageRestoreFailureCode, RESTORE_MARK_PROPERTY, RestoreMark, zvolDatase
 import { DEFAULT_MAX_PINNED, DEFAULT_MAX_RETAINED } from '../jobs/queue.js'
 import { ZFS } from './iscsi-mutate.js'
 
+/**
+ * The restore mark on an image FILE: an extended attribute in the `trusted.`
+ * namespace (cr3.lunrestore.filemark). Ground truth (ZFS 2.4.2, ext4, btrfs):
+ * root sets and reads it; an unprivileged user, even with write access to the
+ * image, reads "No such attribute" and gets "Operation not permitted" on a set
+ * or remove.
+ */
+export const FILE_RESTORE_MARK_ATTR = 'trusted.anas.restore'
+
+/** `getfattr` / `setfattr`, from the `attr` package (install.sh installs it). */
+export const GETFATTR = '/usr/bin/getfattr'
+export const SETFATTR = '/usr/bin/setfattr'
+
+/** Why an image file carries no mark on a node without the `attr` binaries. */
+export const ATTR_NOT_INSTALLED = 'setfattr and getfattr (the attr package, which install.sh installs) are not installed on this node'
+
+/** Why a block device that is not a ZFS volume carries no mark. */
+export const NOT_A_VOLUME = 'it is a device that is not a ZFS volume'
+
+/**
+ * Every `getfattr` and `setfattr` runs in the C locale (review D1): the reader
+ * and the writer match their English error lines ("No such attribute",
+ * "Operation not supported"), and systemd hands anasd the node's own locale,
+ * under which those lines are translated (attr 2.6.0 under de_DE: "Kein
+ * solches Attribut"). The project's pattern: `ahr-topology.ts`, `share-path.ts`,
+ * `zpool-list.ts`.
+ */
+export const ATTR_EXEC_OPTS = { env: { LC_ALL: 'C' } }
+
+/** The one stderr line of each `getfattr`/`setfattr` refusal the reader and writer tell apart (fixtures/restore-mark). */
+const NO_SUCH_ATTRIBUTE = 'No such attribute'
+const NO_SUCH_FILE = 'No such file or directory'
+const NOT_SUPPORTED = 'Operation not supported'
+/** `trusted.anas.restore=0x<hex>`, the value line of `getfattr -e hex`. */
+const HEX_VALUE_RE = /^0x((?:[0-9a-f]{2})*)$/
+const DEV_PREFIX = '/dev/'
+
 /** The article `describeRestoreMark` leads with. */
 const LEADING_A_RE = /^a /
 
 /** zfs's stderr for a named dataset that is not there. */
 const ZFS_ABSENT_RE = /dataset does not exist/
 
-/** What one read of an object's mark found — tri-state plus "this kind carries none". */
+/**
+ * What one read of an object's mark found — tri-state plus "this object
+ * carries none". `dataset` names where the mark is ({@link markOn}): the
+ * volume (`pool/vol`), or the image file's own absolute path.
+ */
 export type RestoreMarkRead
-  = | { state: 'present', mark: RestoreMarkType | null, raw: string, dataset: string }
+  = | { state: 'present', mark: RestoreMarkType | null, raw: string, dataset: string, /** An image file's value, byte-exact (lower-case hex). */ hex?: string }
     | { state: 'absent', dataset: string }
     | { state: 'unknown', reason: string, dataset: string }
-    | { state: 'unsupported' }
+    | { state: 'unsupported', /** Why the object carries no mark (a clause, lower-case). */ reason?: string }
 
 /** The backing an image restore writes, as far as the mark is concerned. */
 export interface MarkableBacking {
@@ -60,6 +113,32 @@ export interface MarkableBacking {
  */
 export function markDataset(path: string): string | null {
   return zvolDatasetFromPath(path)
+}
+
+/**
+ * Where a backing's restore mark lives, named as every sentence and writer
+ * names it (cr3.lunrestore.filemark): the volume for a zvol, the image file's
+ * own path for a file. Null for a device that is not a volume (a block
+ * backstore over a disk): it carries none. A volume name never starts with
+ * `/`, an image path always does — {@link isFileMark} reads the kind back.
+ */
+export function markOn(path: string): string | null {
+  const dataset = markDataset(path)
+  if (dataset !== null)
+    return dataset
+  if (!path.startsWith('/') || path.startsWith(DEV_PREFIX))
+    return null
+  return path
+}
+
+/** Is this mark location an image file (else a volume)? */
+export function isFileMark(on: string): boolean {
+  return on.startsWith('/')
+}
+
+/** The mark's own name on that object: the ZFS user property, or the extended attribute. */
+export function markName(on: string): string {
+  return isFileMark(on) ? FILE_RESTORE_MARK_ATTR : RESTORE_MARK_PROPERTY
 }
 
 /** The property value, bounded by the schema. */
@@ -141,10 +220,154 @@ async function readOne(executor: CommandExecutor, dataset: string): Promise<Rest
  * never "absent".
  */
 export async function readRestoreMark(executor: CommandExecutor, backing: MarkableBacking): Promise<RestoreMarkRead> {
-  const dataset = markDataset(backing.path)
-  if (dataset === null)
-    return { state: 'unsupported' }
-  return readOne(executor, dataset)
+  const on = markOn(backing.path)
+  if (on === null)
+    return { state: 'unsupported', reason: NOT_A_VOLUME }
+  return isFileMark(on) ? readFileMark(executor, on) : readOne(executor, on)
+}
+
+// ---------------------------------------------------------------------------
+// The mark on an image FILE (cr3.lunrestore.filemark)
+// ---------------------------------------------------------------------------
+
+/** `getfattr --absolute-names -e hex -n trusted.anas.restore -- <file>`: the value as hex, byte-exact. */
+export function fileMarkGetArgs(path: string): string[] {
+  return ['--absolute-names', '-e', 'hex', '-n', FILE_RESTORE_MARK_ATTR, '--', path]
+}
+
+/** `setfattr -n trusted.anas.restore -v 0x<hex> -- <file>`: hex, so no value is ever read as setfattr's own syntax. */
+export function fileMarkSetArgs(path: string, hex: string): string[] {
+  return ['-n', FILE_RESTORE_MARK_ATTR, '-v', `0x${hex}`, '--', path]
+}
+
+/** `setfattr -x trusted.anas.restore -- <file>`. */
+export function fileMarkRemoveArgs(path: string): string[] {
+  return ['-x', FILE_RESTORE_MARK_ATTR, '--', path]
+}
+
+/** The command that shows an image file's mark exactly as ANAS reads it (review S4). */
+export function fileMarkReadCommand(path: string): string {
+  return `LC_ALL=C ${GETFATTR.slice(GETFATTR.lastIndexOf('/') + 1)} ${fileMarkGetArgs(path).join(' ')}`
+}
+
+/**
+ * The way to confirm or fix an image file's mark that could not be read
+ * (review S4; operator: a diagnostic gives a path to confirm or fix): the
+ * exact command the reader runs, and when the door opens again. `door` is the
+ * refused act, lower-case ("enabling the target"). '' for a volume. Starts
+ * with a space; ends with its stop.
+ */
+export function unreadableFileWay(on: string, door: string): string {
+  if (!isFileMark(on))
+    return ''
+  return ` To see what ANAS sees, run '${fileMarkReadCommand(on)}' as root. When it prints a '${FILE_RESTORE_MARK_ATTR}=0x' line (the mark) `
+    + `or ends with '${NO_SUCH_ATTRIBUTE}' (no mark), ANAS reads the same and ${door} is no longer refused for it.`
+}
+
+/** The text bytes of a value as the writer's hex (lower-case). */
+function textHex(text: string): string {
+  return Buffer.from(text, 'utf8').toString('hex')
+}
+
+/** A tool that is not on the node: execFile's spawn ENOENT (the callers read the shell's exit 127 the same way). */
+function notInstalled(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT'
+}
+
+/** The one stderr line of a `getfattr`/`setfattr` refusal; null when there is not exactly one. */
+function oneLine(stderr: string): string | null {
+  const lines = stderr.split('\n').filter(l => l.length > 0)
+  return lines.length === 1 ? lines[0] : null
+}
+
+/**
+ * Parse `getfattr --absolute-names -e hex -n <attr> -- <file>` output for ONE
+ * file (exit 0): a `# file: <path>` line, the `<attr>=0x<hex>` line, blank
+ * lines. Anything else — a second file, a second value, a value that is not
+ * hex — is not read as a mark: the caller says unknown.
+ */
+export function parseFileMarkHex(stdout: string): { hex: string } | { error: string } {
+  const lines = stdout.split('\n').filter(l => l.length > 0)
+  const files = lines.filter(l => l.startsWith('# file: '))
+  const values = lines.filter(l => l.startsWith(`${FILE_RESTORE_MARK_ATTR}=`))
+  if (files.length !== 1 || values.length !== 1 || lines.length !== 2)
+    return { error: `getfattr printed ${lines.length === 0 ? 'nothing' : `'${lines.join(' | ').slice(0, 200)}'`}` }
+  const m = HEX_VALUE_RE.exec(values[0].slice(FILE_RESTORE_MARK_ATTR.length + 1))
+  if (!m)
+    return { error: `getfattr printed a value that is not hex: '${values[0].slice(0, 200)}'` }
+  return { hex: m[1] }
+}
+
+/**
+ * Read the mark on an image file. Ground truth (fixtures/restore-mark): the
+ * attribute not set is exit 1 with `<path>: trusted.anas.restore: No such
+ * attribute` — absent; a file that is not there is `getfattr: <path>: No such
+ * file or directory` — absent, as a volume that is not there; a filesystem
+ * that refuses extended attributes is `<path>: trusted.anas.restore: Operation
+ * not supported` — unsupported; no `getfattr` on the node is unsupported.
+ * Every other failure is unknown, never absent.
+ */
+export async function readFileMark(executor: CommandExecutor, path: string): Promise<RestoreMarkRead> {
+  let r
+  try {
+    r = await executor.exec(GETFATTR, fileMarkGetArgs(path), ATTR_EXEC_OPTS)
+  }
+  catch (err) {
+    if (notInstalled(err))
+      return { state: 'unsupported', reason: ATTR_NOT_INSTALLED }
+    return { state: 'unknown', dataset: path, reason: err instanceof Error ? err.message : String(err) }
+  }
+  if (r.exitCode === 127)
+    return { state: 'unsupported', reason: ATTR_NOT_INSTALLED }
+  if (r.exitCode !== 0) {
+    const line = oneLine(r.stderr)
+    if (line === `${path}: ${FILE_RESTORE_MARK_ATTR}: ${NO_SUCH_ATTRIBUTE}` || line === `getfattr: ${path}: ${NO_SUCH_FILE}`)
+      return { state: 'absent', dataset: path }
+    if (line === `${path}: ${FILE_RESTORE_MARK_ATTR}: ${NOT_SUPPORTED}`)
+      return { state: 'unsupported', reason: `the filesystem it is on refuses extended attributes (${NOT_SUPPORTED})` }
+    return { state: 'unknown', dataset: path, reason: line ?? (r.stderr.trim().split('\n')[0] || `getfattr exited with code ${r.exitCode}`) }
+  }
+  const parsed = parseFileMarkHex(r.stdout)
+  if ('error' in parsed)
+    return { state: 'unknown', dataset: path, reason: parsed.error }
+  const raw = Buffer.from(parsed.hex, 'hex').toString('utf8')
+  return { state: 'present', dataset: path, raw, hex: parsed.hex, mark: decodeRestoreMark(raw) }
+}
+
+/**
+ * The object cannot carry a mark (cr3.lunrestore.filemark): no `setfattr` on
+ * the node, or a filesystem that refuses extended attributes. Thrown by a
+ * writer instead of a plain failure, so a restore that found no earlier mark
+ * can go on as it did before marks existed — on the job record — and say why.
+ */
+export class RestoreMarkUnsupportedError extends Error {
+  constructor(readonly reason: string) {
+    super(`the image file cannot carry a restore mark: ${reason}`)
+    this.name = 'RestoreMarkUnsupportedError'
+  }
+}
+
+/** Run one `setfattr`; throws the sentence (or {@link RestoreMarkUnsupportedError}). `absentIsDone`: a remove of an attribute that is not there succeeded. */
+async function runSetfattr(executor: CommandExecutor, args: string[], path: string, doing: string, absentIsDone = false): Promise<void> {
+  let r
+  try {
+    r = await executor.exec(SETFATTR, args, ATTR_EXEC_OPTS)
+  }
+  catch (err) {
+    if (notInstalled(err))
+      throw new RestoreMarkUnsupportedError(ATTR_NOT_INSTALLED)
+    throw new Error(`could not ${doing} the restore mark ${FILE_RESTORE_MARK_ATTR} on ${path}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  if (r.exitCode === 0)
+    return
+  if (r.exitCode === 127)
+    throw new RestoreMarkUnsupportedError(ATTR_NOT_INSTALLED)
+  const line = oneLine(r.stderr)
+  if (absentIsDone && line === `setfattr: ${path}: ${NO_SUCH_ATTRIBUTE}`)
+    return
+  if (line === `setfattr: ${path}: ${NOT_SUPPORTED}`)
+    throw new RestoreMarkUnsupportedError(`the filesystem it is on refuses extended attributes (${NOT_SUPPORTED})`)
+  throw new Error(`could not ${doing} the restore mark ${FILE_RESTORE_MARK_ATTR} on ${path}: ${r.stderr.trim() || `setfattr exited with code ${r.exitCode}`}`)
 }
 
 /**
@@ -168,14 +391,22 @@ export async function readRestoreMark(executor: CommandExecutor, backing: Markab
 export async function readRestoreMarksBatch(executor: CommandExecutor, paths: string[]): Promise<Map<string, RestoreMarkRead>> {
   const out = new Map<string, RestoreMarkRead>()
   const byDataset = new Map<string, string[]>()
+  const files: string[] = []
   for (const path of new Set(paths)) {
     const dataset = markDataset(path)
     if (dataset === null) {
-      out.set(path, { state: 'unsupported' })
+      // cr3.lunrestore.filemark: an image file carries its own mark, read
+      // with its own getfattr (one per file; a file LUN is rare).
+      if (markOn(path) === null)
+        out.set(path, { state: 'unsupported', reason: NOT_A_VOLUME })
+      else
+        files.push(path)
       continue
     }
     byDataset.set(dataset, [...(byDataset.get(dataset) ?? []), path])
   }
+  for (const [path, read] of await Promise.all(files.map(async p => [p, await readFileMark(executor, p)] as const)))
+    out.set(path, read)
   const datasets = [...byDataset.keys()]
   const reads = new Map<string, RestoreMarkRead>()
   if (datasets.length === 1) {
@@ -249,8 +480,15 @@ export async function readRestoreMarksBatch(executor: CommandExecutor, paths: st
   return out
 }
 
-/** Set (or replace) the mark. Throws a sentence when zfs refuses. */
-export async function setRestoreMark(executor: CommandExecutor, dataset: string, mark: RestoreMarkType): Promise<void> {
+/**
+ * Set (or replace) the mark on `on` ({@link markOn}). Throws a sentence when
+ * zfs or setfattr refuses; {@link RestoreMarkUnsupportedError} when an image
+ * file cannot carry one.
+ */
+export async function setRestoreMark(executor: CommandExecutor, on: string, mark: RestoreMarkType): Promise<void> {
+  if (isFileMark(on))
+    return runSetfattr(executor, fileMarkSetArgs(on, textHex(encodeRestoreMark(mark))), on, 'set')
+  const dataset = on
   const r = await executor.exec(ZFS, ['set', `${RESTORE_MARK_PROPERTY}=${encodeRestoreMark(mark)}`, '--', dataset])
   if (r.exitCode !== 0)
     throw new Error(`could not set the restore mark ${RESTORE_MARK_PROPERTY} on ${dataset}: ${r.stderr.trim() || `zfs set exited with code ${r.exitCode}`}`)
@@ -261,20 +499,41 @@ export async function setRestoreMark(executor: CommandExecutor, dataset: string,
  * review2 A): the mark an earlier restore left, after a run that wrote nothing.
  * The raw value is written as read — never re-encoded, so a mark that did not
  * parse comes back as the same unparsed mark. Throws a sentence when zfs refuses.
+ * An image file's value is put back from its bytes (`hex`), never re-encoded.
  */
-export async function putBackRestoreMark(executor: CommandExecutor, dataset: string, raw: string): Promise<void> {
+export async function putBackRestoreMark(executor: CommandExecutor, on: string, raw: string, hex?: string): Promise<void> {
+  if (isFileMark(on))
+    return runSetfattr(executor, fileMarkSetArgs(on, hex ?? textHex(raw)), on, 'put back')
+  const dataset = on
   const r = await executor.exec(ZFS, ['set', `${RESTORE_MARK_PROPERTY}=${raw}`, '--', dataset])
   if (r.exitCode !== 0)
     throw new Error(`could not put back the restore mark ${RESTORE_MARK_PROPERTY} on ${dataset}: ${r.stderr.trim() || `zfs set exited with code ${r.exitCode}`}`)
 }
 
-/** The one command that clears a mark by hand. */
-export function clearMarkCommand(dataset: string): string {
-  return `zfs inherit ${RESTORE_MARK_PROPERTY} ${dataset}`
+/** The one command that clears a mark by hand, on a volume or an image file. */
+export function clearMarkCommand(on: string): string {
+  return isFileMark(on) ? `setfattr -x ${FILE_RESTORE_MARK_ATTR} ${on}` : `zfs inherit ${RESTORE_MARK_PROPERTY} ${on}`
 }
 
-/** Clear the mark (`zfs inherit`, capture F). Throws a sentence when zfs refuses. */
-export async function clearRestoreMark(executor: CommandExecutor, dataset: string): Promise<void> {
+/**
+ * Clear the mark (`zfs inherit`, capture F; `setfattr -x` on an image file,
+ * where an attribute that is not there is already cleared). Throws a sentence
+ * when zfs or setfattr refuses.
+ */
+export async function clearRestoreMark(executor: CommandExecutor, on: string): Promise<void> {
+  if (isFileMark(on)) {
+    try {
+      await runSetfattr(executor, fileMarkRemoveArgs(on), on, 'remove', true)
+    }
+    catch (err) {
+      // A remove that cannot run leaves the mark where it is: a plain failure.
+      if (err instanceof RestoreMarkUnsupportedError)
+        throw new Error(`could not remove the restore mark ${FILE_RESTORE_MARK_ATTR} from ${on}: ${err.reason}`)
+      throw err
+    }
+    return
+  }
+  const dataset = on
   const r = await executor.exec(ZFS, ['inherit', RESTORE_MARK_PROPERTY, '--', dataset])
   if (r.exitCode !== 0)
     throw new Error(`could not remove the restore mark ${RESTORE_MARK_PROPERTY} from ${dataset}: ${r.stderr.trim() || `zfs inherit exited with code ${r.exitCode}`}`)
@@ -341,20 +600,21 @@ export interface RestoreJobFacts {
    * unless a LATER restore onto the backing completed (a complete, verified
    * image) or an Enable of `targetIqn` completed after it (the operator's
    * confirm accepted that image). A failure without a code — a refusal, a
-   * run that wrote nothing — never supersedes it. Consulted only for a
-   * backing that carries no mark (an image file).
+   * run that wrote nothing — never supersedes it. Consulted where
+   * {@link consultsJobRecord} says (cr3.lunrestore.filemark).
    */
   restoreFailed: (backingPath: string, targetIqn?: string) => RestoreJobRecord | undefined
 }
 
 /**
  * The job-record answers for one daemon (one queue). THE GAP, stated where
- * the knowledge lives: for an image FILE this is the ONLY record that a
- * restore left a partial or unverified image, and it is in memory — a restart
- * of the ANAS daemon (or the job's eviction from the queue) forgets it, and the
- * LUN then reads as any other. That stays until a file can carry a mark of its
- * own (an extended attribute, held for the operator's word). A zvol's mark is
- * on the object and does not depend on this.
+ * the knowledge lives: for an image FILE that cannot carry a mark (no
+ * `setfattr`/`getfattr` on the node, a filesystem that refuses extended
+ * attributes) this is the ONLY record that a restore left a partial or
+ * unverified image, and it is in memory — a restart of the ANAS daemon (or
+ * the job's eviction from the queue) forgets it, and the LUN then reads as any
+ * other. A zvol's mark, and a file's where it can carry one, is on the object
+ * and does not depend on this.
  */
 export function restoreJobsOf(jobs: ImageRestoreJobView): RestoreJobFacts {
   return {
@@ -413,12 +673,31 @@ export function imageRestorePin(jobs: ImageRestoreJobView): (job: Job, params: R
   }
 }
 
+/** The tail every "the record is lost" clause shares. */
+const RECORD_LOST = 'so the record is lost when the ANAS daemon restarts, '
+  + `or when the daemon holds more than ${DEFAULT_MAX_PINNED} such records and more than ${DEFAULT_MAX_RETAINED} jobs (the oldest record goes first)`
+
 /**
  * When the job record of a failed restore onto an image file is lost — said
- * wherever such a record is relied on (review3 1).
+ * wherever such a record is relied on (review3 1). The form for a caller that
+ * has no read of the file; {@link jobRecordLifetime} says why for one that has.
  */
-export const JOB_RECORD_LIFETIME = 'an image file carries no restore mark, so the record is lost when the ANAS daemon restarts, '
-  + `or when the daemon holds more than ${DEFAULT_MAX_PINNED} such records and more than ${DEFAULT_MAX_RETAINED} jobs (the oldest record goes first)`
+export const JOB_RECORD_LIFETIME = `an image file carries no restore mark, ${RECORD_LOST}`
+
+/**
+ * THE one helper that decides the "record is lost" sentence
+ * (cr3.lunrestore.filemark): where a job record stands in for an image file's
+ * mark, say why the file has none — it cannot carry one here (the read's
+ * reason), or its mark is gone — and when the record is lost. Lower-case, no
+ * final stop.
+ */
+export function jobRecordLifetime(read?: RestoreMarkRead): string {
+  if (read?.state === 'unsupported' && read.reason)
+    return `this image file carries no restore mark because ${read.reason}, ${RECORD_LOST}`
+  if (read?.state === 'absent')
+    return `this image file carries no restore mark now, ${RECORD_LOST}`
+  return JOB_RECORD_LIFETIME
+}
 
 /**
  * How to restore an image FILE again in place (review3 2), lower-case, no
@@ -441,12 +720,17 @@ export function fileRestoreAgain(path: string, imageBytes: number | undefined): 
  * again. Failed before anything was written: as it was — except a volume left
  * with a restore mark (an earlier restore's, put back, or this run's that
  * could not be removed), and an image file the restore opened (the open
- * empties it). Anything else: disabled, and the job says why.
+ * empties it). Anything else: disabled, and the job says why. `marked-file`:
+ * an image file that carries the mark (cr3.lunrestore.filemark) — both
+ * exceptions hold; `file`: one that cannot carry it.
  */
-export function restoreEndSentence(kind: 'zvol' | 'file', subject: string): string {
+export function restoreEndSentence(kind: 'zvol' | 'file' | 'marked-file', subject: string): string {
   const asItWas = kind === 'zvol'
     ? 'put back as it was if the restore fails before writing anything and leaves the volume with no restore mark (an earlier restore\'s mark, put back, keeps it disabled)'
-    : 'put back as it was if the restore fails before it opens the image file and the file is still the image\'s size (opening it for the restore empties it)'
+    : kind === 'marked-file'
+      ? 'put back as it was if the restore fails before it opens the image file, the file is still the image\'s size and it is left with no restore mark '
+      + '(opening it for the restore empties it; an earlier restore\'s mark, put back, keeps it disabled)'
+      : 'put back as it was if the restore fails before it opens the image file and the file is still the image\'s size (opening it for the restore empties it)'
   return `When the restore ends, ${subject} is enabled again only if the image is complete and its size verified, and ${asItWas}; `
     + `in every other case it stays disabled and the restore job says why.`
 }
@@ -454,53 +738,100 @@ export function restoreEndSentence(kind: 'zvol' | 'file', subject: string): stri
 /** The sentence every verdict drawn from a job record carries (never from a mark). */
 export const JOB_RECORD_ONLY = `ANAS knows this only from that job's record in this run of the ANAS daemon: ${JOB_RECORD_LIFETIME}`
 
+/** {@link JOB_RECORD_ONLY}, saying why for the file read in hand. */
+export function jobRecordOnly(read?: RestoreMarkRead): string {
+  return `ANAS knows this only from that job's record in this run of the ANAS daemon: ${jobRecordLifetime(read)}`
+}
+
 /**
- * The state a backing's restore facts mean now. `null` = nothing to say.
- * Precedence: a mark that could not be read; a restore running; the mark on
- * the volume; for a backing that carries no mark, the job record.
+ * Whether a read's backing has a job record worth asking for
+ * (cr3.lunrestore.filemark): every backing whose mark was read, for the job id
+ * a mark's verdict carries; and an image file whose mark is absent, where the
+ * record of a restore that ran where no mark could be set still stands. Not a
+ * volume with no mark: a volume always carried one.
  */
-export function restoreMarkState(read: RestoreMarkRead | undefined, running: string | undefined, record?: RestoreJobRecord): IscsiRestoreMarkState | null {
+export function consultsJobRecord(read: RestoreMarkRead | undefined): boolean {
+  if (!read)
+    return false
+  if (read.state === 'present' || read.state === 'unsupported')
+    return true
+  return read.state === 'absent' && isFileMark(read.dataset)
+}
+
+/** What a backing's restore facts say: the state, where it comes from, and the job named. */
+export interface RestoreVerdict {
+  state: IscsiRestoreMarkState
+  source: 'mark' | 'job'
+  /** The running restore (`in-progress`), or the failed restore's job. */
+  job?: string
+}
+
+/**
+ * THE rule when a mark and a job record both speak (cr3.lunrestore.filemark),
+ * in one place: the MARK IS THE TRUTH. Precedence: a mark that could not be
+ * read (unreadable); a restore running; a mark that is there (its own state —
+ * a job record of the failed restore onto the backing only adds that job's
+ * id); and only where the object carries no mark (it cannot carry one, or an
+ * image file's is gone) the job record alone. `null` = nothing to say.
+ */
+export function restoreVerdict(read: RestoreMarkRead | undefined, running: string | undefined, record?: RestoreJobRecord): RestoreVerdict | null {
   if (!read)
     return null
   if (read.state === 'unknown')
-    return 'unreadable'
+    return { state: 'unreadable', source: 'mark' }
   if (running)
-    return 'in-progress'
+    return { state: 'in-progress', source: read.state === 'present' ? 'mark' : 'job', job: running }
   if (read.state === 'present')
-    return read.mark?.state === 'unverified' ? 'unverified' : 'interrupted'
-  if (read.state === 'unsupported' && record)
-    return record.outcome === 'unverified' ? 'unverified' : 'interrupted'
+    return { state: read.mark?.state === 'unverified' ? 'unverified' : 'interrupted', source: 'mark', ...(record ? { job: record.job } : {}) }
+  if (record && consultsJobRecord(read))
+    return { state: record.outcome === 'unverified' ? 'unverified' : 'interrupted', source: 'job', job: record.job }
   return null
+}
+
+/** The state of {@link restoreVerdict}. */
+export function restoreMarkState(read: RestoreMarkRead | undefined, running: string | undefined, record?: RestoreJobRecord): IscsiRestoreMarkState | null {
+  return restoreVerdict(read, running, record)?.state ?? null
 }
 
 /**
  * The one sentence a health row carries, true for where it comes from. `again`
- * (review3 2): for a job record of a failed restore onto a LUN's image file,
- * how restoring it again in place is possible ({@link fileRestoreAgain}).
+ * (review3 2): for a failed restore onto a LUN's image file — its mark, or
+ * its job record — how restoring it again in place is possible
+ * ({@link fileRestoreAgain}). `dataset`: where the mark is ({@link markOn}).
+ * `read`: the file's read, so a job record's sentence says why the file has
+ * no mark ({@link jobRecordOnly}). A mark's sentence names the restore job
+ * when the record of it is still held (the mark is the truth; the record adds
+ * the id).
  */
-export function restoreMarkDetail(row: { state: IscsiRestoreMarkState, source: 'mark' | 'job', mark: RestoreMarkType | null, job?: string, what: string, dataset: string | null, again?: string }): string {
+export function restoreMarkDetail(row: { state: IscsiRestoreMarkState, source: 'mark' | 'job', mark: RestoreMarkType | null, job?: string, what: string, dataset: string | null, again?: string, read?: RestoreMarkRead, unreadableDoor?: string }): string {
   const what = capitalize(describeRestoreMark({ mark: row.mark }))
+  const again = row.again ? ` ${capitalize(row.again)}.` : ''
   if (row.source === 'job') {
-    const again = row.again ? ` ${capitalize(row.again)}.` : ''
     switch (row.state) {
       case 'in-progress':
         return `A whole-image restore (job ${row.job}) is writing ${row.what} right now.`
       case 'unverified':
         return `The whole-image restore job ${row.job} wrote ${row.what}, and the client reported the image complete, but ANAS could not `
-          + `verify it: treat its content as unproven. ${JOB_RECORD_ONLY}.${again}`
+          + `verify it: treat its content as unproven. ${jobRecordOnly(row.read)}.${again}`
       default:
-        return `The whole-image restore job ${row.job} onto ${row.what} did not finish, so it may hold a partial image. ${JOB_RECORD_ONLY}.${again}`
+        return `The whole-image restore job ${row.job} onto ${row.what} did not finish, so it may hold a partial image. ${jobRecordOnly(row.read)}.${again}`
     }
   }
+  const job = row.job ? ` (job ${row.job})` : ''
   switch (row.state) {
-    case 'unreadable':
-      return `ANAS could not read the restore mark on ${row.dataset}, so it cannot tell whether ${row.what} holds a partially restored image.`
+    case 'unreadable': {
+      // review S4: an image file's row says what the read returned and how to see it.
+      const file = row.dataset !== null && isFileMark(row.dataset)
+      const said = file && row.read?.state === 'unknown' ? ` (${row.read.reason})` : ''
+      const way = file && row.unreadableDoor ? unreadableFileWay(row.dataset!, row.unreadableDoor) : ''
+      return `ANAS could not read the restore mark on ${row.dataset}${said}, so it cannot tell whether ${row.what} holds a partially restored image.${way}`
+    }
     case 'in-progress':
       return `${what} is writing ${row.what} right now (job ${row.job}).`
     case 'unverified':
-      return `${what} wrote ${row.what}, and the client reported the image complete, but its size was not verified${row.mark?.reason ? ` (${row.mark.reason})` : ''}: treat its content as unproven.`
+      return `${what}${job} wrote ${row.what}, and the client reported the image complete, but its size was not verified${row.mark?.reason ? ` (${row.mark.reason})` : ''}: treat its content as unproven.${again}`
     default:
-      return `${what} onto ${row.what} did not finish: it holds a partial image.`
+      return `${what}${job} onto ${row.what} did not finish: it holds a partial image.${again}`
   }
 }
 
@@ -533,7 +864,7 @@ export function restoreMarkRefusal(
     return {
       reason: 'restore-mark-unreadable',
       message: `ANAS could not read the restore mark on ${read.dataset} (${read.reason}), so it cannot tell whether ${what} holds a `
-        + `partially restored image. ${action} is refused until the mark can be read.`,
+        + `partially restored image. ${action} is refused until the mark can be read.${unreadableFileWay(read.dataset, `${action[0].toLowerCase()}${action.slice(1)}`)}`,
     }
   }
   if (jobs.running) {
@@ -542,13 +873,13 @@ export function restoreMarkRefusal(
       message: `A whole-image restore is writing ${what} right now (job ${jobs.running}). ${action} is refused until the restore ends.`,
     }
   }
-  if (read.state === 'unsupported' && jobs.record) {
+  if (read.state !== 'present' && jobs.record && consultsJobRecord(read)) {
     const how = jobs.record.outcome === 'unverified'
       ? `wrote ${what}, and the client reported the image complete, but ANAS could not verify it`
       : `onto ${what} did not finish, so it may hold a partial image`
     return {
       reason: 'restore-mark',
-      message: `The whole-image restore job ${jobs.record.job} ${how}. ${JOB_RECORD_ONLY}. `
+      message: `The whole-image restore job ${jobs.record.job} ${how}. ${jobRecordOnly(read)}. `
         + `${action} would serve that image to initiators and is refused. ${way.job}`
         + `${jobs.backingPath ? ` ${capitalize(fileRestoreAgain(jobs.backingPath, jobs.record.imageBytes))}.` : ''}`,
     }
@@ -558,10 +889,14 @@ export function restoreMarkRefusal(
   const how = read.mark?.state === 'unverified'
     ? `wrote ${what}, and the client reported the image complete, but its size was not verified${read.mark.reason ? ` (${read.mark.reason})` : ''}`
     : `onto ${what} did not finish: it holds a partial image`
+  // cr3.lunrestore.filemark: the record adds the job's id; an image file's
+  // way back in place needs its length first.
+  const job = jobs.record ? ` (job ${jobs.record.job})` : ''
+  const again = jobs.backingPath && isFileMark(read.dataset) ? ` ${capitalize(fileRestoreAgain(jobs.backingPath, jobs.record?.imageBytes))}.` : ''
   return {
     reason: 'restore-mark',
-    message: `${capitalize(describeRestoreMark(read))} ${how} (the restore mark ${RESTORE_MARK_PROPERTY} on ${read.dataset}). `
-      + `${action} would serve that image to initiators and is refused. ${way.mark}`,
+    message: `${capitalize(describeRestoreMark(read))}${job} ${how} (the restore mark ${markName(read.dataset)} on ${read.dataset}). `
+      + `${action} would serve that image to initiators and is refused. ${way.mark}${again}`,
   }
 }
 
@@ -578,7 +913,7 @@ export interface LunMarkFact {
   read: RestoreMarkRead
   /** A restore running onto the backing now. */
   running?: string
-  /** For a backing that carries no mark: the retained failed restore onto it. */
+  /** The retained failed restore onto the backing, where {@link consultsJobRecord} asks for it. */
   record?: RestoreJobRecord
 }
 
@@ -599,7 +934,7 @@ export async function readLunMarks(
     .map((l) => {
       const read = reads.get(l.backingPath)!
       const running = jobs?.restoreRunning(l.backingPath)
-      const record = read.state === 'unsupported' ? jobs?.restoreFailed(l.backingPath, jobs.targetIqn) : undefined
+      const record = consultsJobRecord(read) ? jobs?.restoreFailed(l.backingPath, jobs.targetIqn) : undefined
       return { index: l.index, name: l.name, backingPath: l.backingPath, read, ...(running ? { running } : {}), ...(record ? { record } : {}) }
     })
 }
@@ -616,7 +951,7 @@ export function lunMarkState(f: LunMarkFact): IscsiRestoreMarkState | null {
 export function markSignature(facts: LunMarkFact[]): string[] {
   return facts
     .flatMap(f => (f.read.state === 'present'
-      ? [`${f.read.dataset}=${f.read.raw}`]
+      ? [f.read.hex !== undefined ? `${f.read.dataset}=0x${f.read.hex}` : `${f.read.dataset}=${f.read.raw}`]
       : f.record ? [`${f.backingPath}=job:${f.record.job}:${f.record.outcome}`] : []))
     .sort()
 }
@@ -666,7 +1001,8 @@ export function enableMarkVerdict(iqn: string, facts: LunMarkFact[]): EnableMark
       reason: 'restore-mark-unreadable',
       message: `ANAS could not check whether ${unreadable.map(f => `LUN ${f.index} ('${f.name}')`).join(', ')} of ${iqn} `
         + `holds a partially restored image: the restore mark could not be read (${unreadable.map(f => (f.read.state === 'unknown' ? `${f.read.dataset}: ${f.read.reason}` : '')).join('; ')}). `
-        + `Enabling is refused until it can be read.`,
+        + `Enabling is refused until it can be read.`
+        + `${unreadable.map(f => (f.read.state === 'unknown' ? unreadableFileWay(f.read.dataset, 'enabling the target') : '')).join('')}`,
     }
   }
   // review2 D/F1: a running restore onto ANY backing of the target — including
@@ -692,13 +1028,18 @@ export function enableMarkVerdict(iqn: string, facts: LunMarkFact[]): EnableMark
         ? `ended with the client reporting the image complete, but its size was not verified${read.mark.reason ? ` (${read.mark.reason})` : ''}. `
         + `An initiator will be served an image ANAS could not verify.`
         : `did not finish, so the LUN holds a partial image. An initiator will be served that partial image.`
-      return `${head}${describeRestoreMark(read)} onto ${read.dataset} ${how} Confirming removes the restore mark; restoring the image again is the other way out.`
+      // cr3.lunrestore.filemark: the record adds the job's id; an image file
+      // restored again in place needs its length first.
+      const job = f.record ? ` (job ${f.record.job})` : ''
+      return isFileMark(read.dataset)
+        ? `${head}${describeRestoreMark(read)}${job} onto ${read.dataset} ${how} Confirming removes the restore mark. ${capitalize(fileRestoreAgain(f.backingPath, f.record?.imageBytes))}.`
+        : `${head}${describeRestoreMark(read)}${job} onto ${read.dataset} ${how} Confirming removes the restore mark; restoring the image again is the other way out.`
     }
     const rec = f.record!
     const how = rec.outcome === 'unverified'
       ? `ended with the client reporting the image complete, but ANAS could not verify it. An initiator will be served an image ANAS could not verify.`
       : `did not finish, so the LUN may hold a partial image. An initiator will be served that image.`
-    return `${head}the whole-image restore job ${rec.job} onto ${f.backingPath} ${how} ${JOB_RECORD_ONLY}. ${capitalize(fileRestoreAgain(f.backingPath, rec.imageBytes))}.`
+    return `${head}the whole-image restore job ${rec.job} onto ${f.backingPath} ${how} ${jobRecordOnly(f.read)}. ${capitalize(fileRestoreAgain(f.backingPath, rec.imageBytes))}.`
   })
   const partial = unproven.filter(f => lunMarkState(f) === 'interrupted').length
   const lead = `Enabling ${iqn} serves ${unproven.length === 1 ? 'a LUN' : `${unproven.length} LUNs`}`

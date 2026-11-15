@@ -1,0 +1,86 @@
+### anas-pve 7.0.14-28-pve
+$ mkdir -p /mnt/filemarkgt/ext4 /mnt/filemarkgt/full /mnt/filemarkgt/btrfs && truncate -s 64M /mnt/filemarkgt/full.img && mkfs.ext4 -q -F /mnt/filemarkgt/full.img && mount -o loop /mnt/filemarkgt/full.img /mnt/filemarkgt/full && truncate -s 512M /mnt/filemarkgt/btrfs.img && mkfs.btrfs -q /mnt/filemarkgt/btrfs.img && mount -o loop /mnt/filemarkgt/btrfs.img /mnt/filemarkgt/btrfs
+exit=0
+$ findmnt -n -o TARGET,FSTYPE --target /mnt/filemarkgt/ext4; tune2fs -l $(findmnt -n -o SOURCE --target /mnt/filemarkgt/ext4) | grep -E '^(Block size|Inode size):'
+/ ext4
+Block size:               4096
+Inode size:               256
+exit=0
+## value sizes on ext4 (the root filesystem: 4 KiB blocks, 256-byte inodes)
+$ truncate -s 1M /mnt/filemarkgt/ext4/a.img
+exit=0
+$ setfattr -n trusted.anas.restore -v "$(head -c 4032 /dev/zero | tr '\0' a)" -- '/mnt/filemarkgt/ext4/a.img' && getfattr --only-values --absolute-names -n trusted.anas.restore -- '/mnt/filemarkgt/ext4/a.img' | wc -c
+4032
+exit=0
+$ setfattr -n trusted.anas.restore -v "$(head -c 4033 /dev/zero | tr '\0' a)" -- '/mnt/filemarkgt/ext4/a.img' && getfattr --only-values --absolute-names -n trusted.anas.restore -- '/mnt/filemarkgt/ext4/a.img' | wc -c
+setfattr: /mnt/filemarkgt/ext4/a.img: No space left on device
+exit=1
+$ setfattr -n trusted.anas.restore -v "$(head -c 4096 /dev/zero | tr '\0' a)" -- '/mnt/filemarkgt/ext4/a.img' && getfattr --only-values --absolute-names -n trusted.anas.restore -- '/mnt/filemarkgt/ext4/a.img' | wc -c
+setfattr: /mnt/filemarkgt/ext4/a.img: No space left on device
+exit=1
+## value sizes on btrfs
+$ truncate -s 1M /mnt/filemarkgt/btrfs/a.img
+exit=0
+$ setfattr -n trusted.anas.restore -v "$(head -c 8000 /dev/zero | tr '\0' a)" -- '/mnt/filemarkgt/btrfs/a.img' && getfattr --only-values --absolute-names -n trusted.anas.restore -- '/mnt/filemarkgt/btrfs/a.img' | wc -c
+8000
+exit=0
+$ setfattr -n trusted.anas.restore -v "$(head -c 65536 /dev/zero | tr '\0' a)" -- '/mnt/filemarkgt/btrfs/a.img' && getfattr --only-values --absolute-names -n trusted.anas.restore -- '/mnt/filemarkgt/btrfs/a.img' | wc -c
+setfattr: /mnt/filemarkgt/btrfs/a.img: No space left on device
+exit=1
+## ext4 filled to its last block (root's reserve included)
+$ truncate -s 1M /mnt/filemarkgt/full/lun0.img; dd if=/dev/zero of=/mnt/filemarkgt/full/fill bs=64k status=none; sync; df -h /mnt/filemarkgt/full | tail -1
+dd: error writing '/mnt/filemarkgt/full/fill': No space left on device
+/dev/loop6       55M   54M     0 100% /mnt/filemarkgt/full
+exit=0
+$ setfattr -n trusted.anas.restore -v 0x7b7d -- /mnt/filemarkgt/full/lun0.img
+exit=0
+$ setfattr -n trusted.anas.restore -v "$(head -c 1400 /dev/zero | tr '\0' a)" -- '/mnt/filemarkgt/full/lun0.img' && getfattr --only-values --absolute-names -n trusted.anas.restore -- '/mnt/filemarkgt/full/lun0.img' | wc -c
+setfattr: /mnt/filemarkgt/full/lun0.img: No space left on device
+exit=1
+## the package
+$ dpkg -S /usr/bin/setfattr /usr/bin/getfattr
+attr: /usr/bin/setfattr
+attr: /usr/bin/getfattr
+exit=0
+$ dpkg-query -W -f='${Package} ${Version} ${Priority}\n' attr
+attr 1:2.5.2-3 optional
+exit=0
+$ echo auto: $(apt-mark showauto attr); echo manual: $(apt-mark showmanual attr)
+auto:
+manual: attr
+exit=0
+$ zgrep -h -E '^(Start-Date|Commandline):' /var/log/apt/history.log* | grep -B1 -E 'Commandline:.* attr( |$)'
+Start-Date: 2026-11-15  02:58:29
+Commandline: apt-get install -y targetcli-fb python3-rtslib-fb rclone attr
+exit=0
+$ apt-cache rdepends --installed attr
+attr
+Reverse Depends:
+  samba
+  samba
+  samba
+exit=0
+$ apt-cache depends --installed samba xfsprogs | grep -E '^[a-z]|attr$'
+samba
+  Recommends: attr
+xfsprogs
+  Suggests: attr
+exit=0
+$ apt-cache show samba | grep -E '^(Version|Recommends|Suggests):'
+Version: 2:4.24.7+dfsg-1~bpo13+1
+Suggests: ctdb, ufw, winbind, python3-samba, samba-vfs-ceph, samba-vfs-glusterfs, attr
+Version: 2:4.22.11+dfsg-0+deb13u1
+Recommends: attr, python3-samba, samba-ad-dc
+Suggests: ctdb, ufw, winbind, samba-vfs-ceph, samba-vfs-glusterfs
+Version: 2:4.22.10+dfsg-0+deb13u2
+Suggests: ctdb, ufw, winbind, samba-vfs-ceph, samba-vfs-glusterfs
+Recommends: attr, python3-samba, samba-ad-dc
+exit=0
+$ zgrep -h -E ' install (samba|attr|proxmox-ve):' /var/log/dpkg.log*
+2026-10-12 17:30:46 install proxmox-ve:all <none> 9.2.0
+2026-10-12 17:32:48 install samba:amd64 <none> 2:4.22.11+dfsg-0+deb13u1
+2026-10-12 17:32:48 install attr:amd64 <none> 1:2.5.2-3
+exit=0
+## cleanup
+$ umount /mnt/filemarkgt/full && umount /mnt/filemarkgt/btrfs && rm -rf /mnt/filemarkgt
+exit=0

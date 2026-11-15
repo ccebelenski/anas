@@ -47,7 +47,7 @@ import type { IscsiReadContext } from './iscsi.js'
 import type { RestoreJobFacts, RestoreMarkRead } from './restore-mark.js'
 import { classifyBacking } from './iscsi-ownership.js'
 import { iscsiAvailability, liveUnreadablePaths, normalizePlugin, targetTpgs } from './iscsi.js'
-import { fileRestoreAgain, restoreMarkDetail, restoreMarkState } from './restore-mark.js'
+import { consultsJobRecord, fileRestoreAgain, isFileMark, markDataset, restoreMarkDetail, restoreMarkState, restoreVerdict } from './restore-mark.js'
 
 /** One live backstore that no live LUN maps (cr3.lunrestore). */
 export interface UnmappedBackstoreFacts {
@@ -148,9 +148,9 @@ export interface IscsiHealthOptions {
    */
   restoreRunning?: (backingPath: string) => string | undefined
   /**
-   * cr3.lunrestore (review2 D): the retained failed restore onto a backing
-   * that carries no mark (an image file), as the caller's job view says —
-   * `restoreJobsOf(queue).restoreFailed`. Forgotten on a daemon restart.
+   * cr3.lunrestore (review2 D): the retained failed restore onto a backing,
+   * as the caller's job view says — `restoreJobsOf(queue).restoreFailed`,
+   * asked where `consultsJobRecord` says. Forgotten on a daemon restart.
    */
   restoreFailed?: RestoreJobFacts['restoreFailed']
   /**
@@ -390,20 +390,24 @@ export function computeIscsiHealth(
   const markRow = (backingPath: string, backstoreName: string, what: string, lun?: { targetIqn: string, tpgTag: number, lunIndex: number }): IscsiRestoreMarkState | null => {
     const read = opts.marks?.get(backingPath)
     const running = opts.restoreRunning?.(backingPath)
-    // review2 D: a backing that carries no mark (an image file) is judged
-    // from this daemon's job records — a running restore, or the retained
-    // failed one (forgotten on a restart).
-    const record = read?.state === 'unsupported' ? opts.restoreFailed?.(backingPath, lun?.targetIqn) : undefined
-    const state = restoreMarkState(read, running, record)
-    if (state === null || !read)
+    // review2 D, cr3.lunrestore.filemark: the job records are asked where
+    // `consultsJobRecord` says — a backing that cannot carry a mark (or an
+    // image file whose mark is gone) is judged from them, and a mark's own
+    // verdict takes the job's id from them. `restoreVerdict` is the rule.
+    const record = consultsJobRecord(read) ? opts.restoreFailed?.(backingPath, lun?.targetIqn) : undefined
+    const verdict = restoreVerdict(read, running, record)
+    if (verdict === null || !read)
       return null
-    const source = read.state === 'present' || read.state === 'unknown' ? 'mark' as const : 'job' as const
+    const { state, source, job } = verdict
     const mark = read.state === 'present' ? read.mark : null
-    const dataset = read.state === 'unsupported' ? null : read.dataset
-    const job = state === 'in-progress' ? running : record?.job
+    // Where the mark is (a volume, or the image file itself); the row's
+    // `dataset` names a VOLUME only (an image file's mark is on `backingPath`).
+    const on = read.state === 'unsupported' ? null : read.dataset
+    const dataset = on !== null && !isFileMark(on) ? on : null
     // review3 2: an image file a LUN serves, whose failed restore stands —
     // restoring it again in place needs the file at the image's length first.
-    const again = record && lun && state !== 'in-progress' ? fileRestoreAgain(backingPath, record.imageBytes) : undefined
+    const isFile = on === null ? markDataset(backingPath) === null : isFileMark(on)
+    const again = isFile && lun && (state === 'interrupted' || state === 'unverified') ? fileRestoreAgain(backingPath, record?.imageBytes) : undefined
     restoreMarks.push({
       backingPath,
       dataset,
@@ -413,7 +417,7 @@ export function computeIscsiHealth(
       source,
       mark,
       ...(job ? { job } : {}),
-      detail: restoreMarkDetail({ state, source, mark, ...(job ? { job } : {}), what, dataset, ...(again ? { again } : {}) }),
+      detail: restoreMarkDetail({ state, source, mark, ...(job ? { job } : {}), what, dataset: on, ...(again ? { again } : {}), read, ...(lun ? { unreadableDoor: 'enabling the target' } : {}) }),
     })
     return state
   }

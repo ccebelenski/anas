@@ -1,0 +1,79 @@
+ls: cannot access '/mnt/filemarkgt': No such file or directory
+### anas-pve 7.0.14-28-pve
+$ mkdir -p /mnt/filemarkgt/ext4 /mnt/filemarkgt/btrfs && truncate -s 512M /mnt/filemarkgt/btrfs.img && mkfs.btrfs -q /mnt/filemarkgt/btrfs.img && mount -o loop /mnt/filemarkgt/btrfs.img /mnt/filemarkgt/btrfs
+exit=0
+$ findmnt -n -o TARGET,FSTYPE --target /mnt/filemarkgt/ext4; findmnt -n -o TARGET,FSTYPE --target /mnt/filemarkgt/btrfs
+/ ext4
+/mnt/filemarkgt/btrfs btrfs
+exit=0
+$ truncate -s 1M /mnt/filemarkgt/ext4/img.raw
+exit=0
+$ setfattr -n trusted.anas.restore -v 0x7b7d -- '/mnt/filemarkgt/ext4/img.raw'
+exit=0
+## across filesystems, ext4 -> btrfs: cp, cp -a, rsync, rsync -aX, mv
+$ cp /mnt/filemarkgt/ext4/img.raw /mnt/filemarkgt/btrfs/cp.raw
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/mnt/filemarkgt/btrfs/cp.raw'
+/mnt/filemarkgt/btrfs/cp.raw: trusted.anas.restore: No such attribute
+exit=1
+$ cp -a /mnt/filemarkgt/ext4/img.raw /mnt/filemarkgt/btrfs/cp-a.raw
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/mnt/filemarkgt/btrfs/cp-a.raw'
+# file: /mnt/filemarkgt/btrfs/cp-a.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+$ rsync /mnt/filemarkgt/ext4/img.raw /mnt/filemarkgt/btrfs/rsync.raw
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/mnt/filemarkgt/btrfs/rsync.raw'
+/mnt/filemarkgt/btrfs/rsync.raw: trusted.anas.restore: No such attribute
+exit=1
+$ rsync -aX /mnt/filemarkgt/ext4/img.raw /mnt/filemarkgt/btrfs/rsync-aX.raw
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/mnt/filemarkgt/btrfs/rsync-aX.raw'
+# file: /mnt/filemarkgt/btrfs/rsync-aX.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+$ cp -a /mnt/filemarkgt/ext4/img.raw /mnt/filemarkgt/ext4/mv.raw && mv /mnt/filemarkgt/ext4/mv.raw /mnt/filemarkgt/btrfs/mv.raw
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/mnt/filemarkgt/btrfs/mv.raw'
+# file: /mnt/filemarkgt/btrfs/mv.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+## across filesystems, btrfs -> ext4: mv
+$ mv /mnt/filemarkgt/btrfs/mv.raw /mnt/filemarkgt/ext4/mv-back.raw
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/mnt/filemarkgt/ext4/mv-back.raw'
+# file: /mnt/filemarkgt/ext4/mv-back.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+## btrfs snapshots of a subvolume holding a marked image (read-write and read-only)
+$ btrfs subvolume create /mnt/filemarkgt/btrfs/sv
+Create subvolume '/mnt/filemarkgt/btrfs/sv'
+exit=0
+$ truncate -s 1M /mnt/filemarkgt/btrfs/sv/img.raw
+exit=0
+$ setfattr -n trusted.anas.restore -v 0x7b7d -- '/mnt/filemarkgt/btrfs/sv/img.raw'
+exit=0
+$ btrfs subvolume snapshot /mnt/filemarkgt/btrfs/sv /mnt/filemarkgt/btrfs/sv-snap
+Create snapshot of '/mnt/filemarkgt/btrfs/sv' in '/mnt/filemarkgt/btrfs/sv-snap'
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/mnt/filemarkgt/btrfs/sv-snap/img.raw'
+# file: /mnt/filemarkgt/btrfs/sv-snap/img.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+$ btrfs subvolume snapshot -r /mnt/filemarkgt/btrfs/sv /mnt/filemarkgt/btrfs/sv-rosnap
+Create readonly snapshot of '/mnt/filemarkgt/btrfs/sv' in '/mnt/filemarkgt/btrfs/sv-rosnap'
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/mnt/filemarkgt/btrfs/sv-rosnap/img.raw'
+# file: /mnt/filemarkgt/btrfs/sv-rosnap/img.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+## cleanup
+$ umount /mnt/filemarkgt/btrfs && rm -rf /mnt/filemarkgt
+exit=0

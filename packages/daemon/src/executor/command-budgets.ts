@@ -70,6 +70,8 @@ const ZPOOL_BIN = '/usr/sbin/zpool'
 const ZFS_BIN = '/usr/sbin/zfs'
 const LSOF_BIN = '/usr/bin/lsof'
 const FUSER_BIN = '/usr/bin/fuser'
+const GETFATTR_BIN = '/usr/bin/getfattr'
+const SETFATTR_BIN = '/usr/bin/setfattr'
 
 /** `-t <types>` names snapshots (`snapshot`, `snap`, `all`, or a comma list holding one). */
 function typesIncludeSnapshots(args: readonly string[]): boolean {
@@ -110,6 +112,13 @@ export const COMMAND_BUDGETS: readonly CommandBudget[] = Object.freeze([
   // hangs — 10 s", in a job too (the busy-unmount diagnosis runs in one).
   { id: 'lsof', budgetMs: 10_000, allLanes: true, matches: c => c === LSOF_BIN },
   { id: 'fuser', budgetMs: 10_000, allLanes: true, matches: c => c === FUSER_BIN },
+  // cr3.lunrestore.filemark (review S5): the restore mark on an image file.
+  // One xattr on one inode, milliseconds on a live filesystem; it hangs where
+  // the filesystem hangs (a dead NFS or a stuck pool). Every lane: Enable
+  // re-reads the marks inside its job, under the iSCSI lock, and a restore
+  // sets and removes its mark inside its job; 300 s there would hold the lock.
+  { id: 'getfattr', budgetMs: 10_000, allLanes: true, matches: c => c === GETFATTR_BIN },
+  { id: 'setfattr', budgetMs: 10_000, allLanes: true, matches: c => c === SETFATTR_BIN },
 ])
 
 /** The row this argv belongs to, if any (lane aside). */

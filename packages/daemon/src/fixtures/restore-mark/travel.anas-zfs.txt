@@ -1,0 +1,76 @@
+### anas-zfs zfs-2.4.2-pve1 7.0.2-6-pve
+$ zfs create -p rpool/filemarkgt/a && zfs create rpool/filemarkgt/b
+exit=0
+$ findmnt -n -o TARGET,FSTYPE,SOURCE --target /rpool/filemarkgt/a; findmnt -n -o TARGET,FSTYPE,SOURCE --target /rpool/filemarkgt/b; stat -c '%d %n' /rpool/filemarkgt/a /rpool/filemarkgt/b
+/rpool/filemarkgt/a zfs rpool/filemarkgt/a
+/rpool/filemarkgt/b zfs rpool/filemarkgt/b
+60 /rpool/filemarkgt/a
+61 /rpool/filemarkgt/b
+exit=0
+$ truncate -s 1M /rpool/filemarkgt/a/img.raw
+exit=0
+$ setfattr -n trusted.anas.restore -v 0x7b7d -- '/rpool/filemarkgt/a/img.raw'
+exit=0
+## mv across filesystems (dataset a -> dataset b, two mounts)
+$ cp -a /rpool/filemarkgt/a/img.raw /rpool/filemarkgt/a/mv.raw && mv /rpool/filemarkgt/a/mv.raw /rpool/filemarkgt/b/mv.raw
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/b/mv.raw'
+# file: /rpool/filemarkgt/b/mv.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+## the .zfs/snapshot copy, plain zfs send | zfs recv, zfs clone
+$ zfs snapshot rpool/filemarkgt/a@s1
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/a/.zfs/snapshot/s1/img.raw'
+# file: /rpool/filemarkgt/a/.zfs/snapshot/s1/img.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+$ zfs send rpool/filemarkgt/a@s1 | zfs recv rpool/filemarkgt/recvd
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/recvd/img.raw'
+# file: /rpool/filemarkgt/recvd/img.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+$ zfs clone rpool/filemarkgt/a@s1 rpool/filemarkgt/clone
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/clone/img.raw'
+# file: /rpool/filemarkgt/clone/img.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+## zfs rollback: a mark removed after the snapshot comes back
+$ setfattr -x trusted.anas.restore -- /rpool/filemarkgt/a/img.raw
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/a/img.raw'
+/rpool/filemarkgt/a/img.raw: trusted.anas.restore: No such attribute
+exit=1
+$ zfs rollback rpool/filemarkgt/a@s1
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/a/img.raw'
+# file: /rpool/filemarkgt/a/img.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+## zfs rollback: a mark set after the snapshot goes
+$ truncate -s 1M /rpool/filemarkgt/a/late.raw
+exit=0
+$ zfs snapshot rpool/filemarkgt/a@s2
+exit=0
+$ setfattr -n trusted.anas.restore -v 0x7b7d -- '/rpool/filemarkgt/a/late.raw'
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/a/late.raw'
+# file: /rpool/filemarkgt/a/late.raw
+trusted.anas.restore=0x7b7d
+
+exit=0
+$ zfs rollback rpool/filemarkgt/a@s2
+exit=0
+$ getfattr --absolute-names -e hex -n trusted.anas.restore -- '/rpool/filemarkgt/a/late.raw'
+/rpool/filemarkgt/a/late.raw: trusted.anas.restore: No such attribute
+exit=1
+## cleanup
+$ zfs destroy -R rpool/filemarkgt
+exit=0

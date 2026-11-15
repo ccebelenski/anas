@@ -156,7 +156,7 @@ import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
 import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
-import { JOB_RECORD_LIFETIME, restoreEndSentence, restoreJobsOf } from '../services/restore-mark.js'
+import { FILE_RESTORE_MARK_ATTR, jobRecordLifetime, readRestoreMark, restoreEndSentence, restoreJobsOf } from '../services/restore-mark.js'
 import { datasetSourceClaims, pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
 import { notThereClause, readSourceGuardFacts, unmountedMountFor, unreadableFactsRefusal } from '../services/source-guard.js'
 import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
@@ -2516,6 +2516,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // choice the operator is allowed to make, and the warnings say exactly what
     // it costs.
     const otherLuns = target.luns.filter(l => l.index !== lun.index).length
+    // cr3.lunrestore.filemark: whether this image FILE can carry the restore
+    // mark decides what the warnings promise (one read; the job reads it again
+    // under the lock and refuses a mark it cannot read). A read that could not
+    // see is not "cannot carry one": only `unsupported` takes the record's words.
+    const fileMark = lun.kind === 'zvol' ? null : await readRestoreMark(executor, { path: lun.backingPath })
+    const fileUnmarked = fileMark?.state === 'unsupported'
     // cr3.backup (backup-panel second review): the daemon takes no task here —
     // the LUN is named explicitly and signed by serial — but a block task's
     // group IS its LUN's identity (`lun-<serial>`, backup2.9). An image from
@@ -2554,13 +2560,16 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         // cr3.lunrestore (review2 F1, review3 4): true on every path — the
         // three ways a restore can end, per backing kind.
         target.enabled
-          ? restoreEndSentence(lun.kind === 'zvol' ? 'zvol' : 'file', 'the target')
+          ? restoreEndSentence(lun.kind === 'zvol' ? 'zvol' : fileUnmarked ? 'file' : 'marked-file', 'the target')
           : 'The target is disabled now; a restore leaves a target it did not disable as it finds it.',
         lun.kind === 'zvol'
           ? 'If the restore fails part-way, the LUN holds a HALF-WRITTEN image: the target stays disabled and the volume '
           + 'keeps the restore mark anas:restore, so Enable asks you to confirm before it serves that image.'
-          : 'If the restore fails part-way, the LUN holds a HALF-WRITTEN image and the target stays disabled. Enable asks you '
-            + `to confirm before it serves that image while ANAS keeps the restore job's record; ${JOB_RECORD_LIFETIME}.`,
+          : !fileUnmarked
+              ? 'If the restore fails part-way, the LUN holds a HALF-WRITTEN image: the target stays disabled and the image file '
+              + `keeps the restore mark ${FILE_RESTORE_MARK_ATTR}, so Enable asks you to confirm before it serves that image.`
+              : 'If the restore fails part-way, the LUN holds a HALF-WRITTEN image and the target stays disabled. Enable asks you '
+                + `to confirm before it serves that image while ANAS keeps the restore job's record; ${jobRecordLifetime(fileMark ?? undefined)}.`,
       ],
     })) {
       return reply

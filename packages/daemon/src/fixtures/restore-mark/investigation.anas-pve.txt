@@ -1,0 +1,585 @@
+################ ext4-root-anas-pve  dir=/mnt/filemarkgt/root-ext4  fs=ext4 src=/dev/sda1
+== 1. namespaces
+-- trusted.anas.restore set (root)
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- trusted.anas.restore read --only-values (root)
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- trusted.anas.restore read -e hex (root)
+$ getfattr -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(364 bytes): # file: mnt/filemarkgt/root-ext4/img.raw
+trusted.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- trusted.anas.restore read --only-values -e hex (root)
+$ getfattr --only-values -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- trusted.anas.restore read as nobody
+$ asuser getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: /mnt/filemarkgt/root-ext4/img.raw: trusted.anas.restore: No such attribute
+<EOT>
+exit=1
+-- trusted.anas.restore dump all as nobody
+$ asuser getfattr -d -m - -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- trusted.anas.restore set as nobody (file is 0666)
+$ asuser setfattr -n trusted.anas.restore -v 0x41 -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/root-ext4/img.raw: Operation not permitted
+<EOT>
+exit=1
+-- trusted.anas.restore remove as nobody
+$ asuser setfattr -x trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/root-ext4/img.raw: Operation not permitted
+<EOT>
+exit=1
+-- trusted.anas.restore remove (root)
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- trusted.anas.restore remove absent (root)
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/root-ext4/img.raw: No such attribute
+<EOT>
+exit=1
+-- trusted.anas.restore read absent (root)
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: /mnt/filemarkgt/root-ext4/img.raw: trusted.anas.restore: No such attribute
+<EOT>
+exit=1
+-- user.anas.restore set (root)
+$ setfattr -n user.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- user.anas.restore read --only-values (root)
+$ getfattr --only-values -n user.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore read -e hex (root)
+$ getfattr -e hex -n user.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(361 bytes): # file: mnt/filemarkgt/root-ext4/img.raw
+user.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore read --only-values -e hex (root)
+$ getfattr --only-values -e hex -n user.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore read as nobody
+$ asuser getfattr --only-values -n user.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore dump all as nobody
+$ asuser getfattr -d -m - -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(234 bytes): # file: mnt/filemarkgt/root-ext4/img.raw
+user.anas.restore="{\"v\":1,\"repo\":\"pbs-main\",\"snapshot\":\"vm/101/2026-11-14T10:00:00Z\",\"archive\":\"drive-scsi0.img\",\"started\":\"2026-11-14T10:00:00.000Z\",\"state\":\"writing\"}"
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore set as nobody (file is 0666)
+$ asuser setfattr -n user.anas.restore -v 0x41 -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- user.anas.restore remove as nobody
+$ asuser setfattr -x user.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- user.anas.restore remove (root)
+$ setfattr -x user.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/root-ext4/img.raw: No such attribute
+<EOT>
+exit=1
+-- user.anas.restore remove absent (root)
+$ setfattr -x user.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/root-ext4/img.raw: No such attribute
+<EOT>
+exit=1
+-- user.anas.restore read absent (root)
+$ getfattr --only-values -n user.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: /mnt/filemarkgt/root-ext4/img.raw: user.anas.restore: No such attribute
+<EOT>
+exit=1
+-- read on a missing file
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/no-such.img 
+stdout(0 bytes): <EOT>
+stderr: getfattr: /mnt/filemarkgt/root-ext4/no-such.img: No such file or directory
+<EOT>
+exit=1
+-- set on a missing file
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/root-ext4/no-such.img 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/root-ext4/no-such.img: No such file or directory
+<EOT>
+exit=1
+-- remove on a missing file
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/root-ext4/no-such.img 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/root-ext4/no-such.img: No such file or directory
+<EOT>
+exit=1
+-- read of a path that is a directory component missing
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/nodir/x.img 
+stdout(0 bytes): <EOT>
+stderr: getfattr: /mnt/filemarkgt/root-ext4/nodir/x.img: No such file or directory
+<EOT>
+exit=1
+-- text value (JSON as given, no 0x)
+$ setfattr -n trusted.anas.restore -v \{\"v\":1\,\"repo\":\"pbs-main\"\,\"snapshot\":\"vm/101/2026-11-14T10:00:00Z\"\,\"archive\":\"drive-scsi0.img\"\,\"started\":\"2026-11-14T10:00:00.000Z\"\,\"state\":\"writing\"\} -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- value starting 0s (base64 trap)
+$ setfattr -n trusted.anas.restore -v 0sQUJD -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(3 bytes): ABC<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- value with a newline, via hex
+$ setfattr -n trusted.anas.restore -v 0x7b0a7d -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(3 bytes): {
+}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+$ getfattr -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(72 bytes): # file: mnt/filemarkgt/root-ext4/img.raw
+trusted.anas.restore=0x7b0a7d
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- empty value
+$ setfattr -n trusted.anas.restore -v '' -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+$ getfattr -e hex -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(66 bytes): # file: mnt/filemarkgt/root-ext4/img.raw
+trusted.anas.restore=0x
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- read on a fifo / dir
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4 
+stdout(0 bytes): <EOT>
+stderr: /mnt/filemarkgt/root-ext4: trusted.anas.restore: No such attribute
+<EOT>
+exit=1
+== 2. survives the restore's open
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+inode before: 145265 size 4194304
+-- node fs.createWriteStream(path, {flags:'w'}) then 4 MiB written, the restore's open
+written
+inode after: 145265 size 4194304
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- emptied only (open 'w' and close: the simulated interruption)
+size 0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- truncate -s 4M
+$ truncate -s 4194304 /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+size 4194304
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- dd full overwrite (O_TRUNC)
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+== 5. value sizes (trusted.)
+-- 1400 bytes: set ok, read back 1400 bytes
+-- 4000 bytes: set ok, read back 4000 bytes
+-- 4096 bytes: set FAILED: setfattr: /mnt/filemarkgt/root-ext4/img.raw: No space left on device
+-- 8000 bytes: set FAILED: setfattr: /mnt/filemarkgt/root-ext4/img.raw: No space left on device
+-- 65536 bytes: set FAILED: setfattr: /mnt/filemarkgt/root-ext4/img.raw: No space left on device
+-- 65537 bytes: set FAILED: setfattr: /mnt/filemarkgt/root-ext4/img.raw: Argument list too long
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+== 4a. travel (same filesystem)
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/root-ext4/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+cp default: /mnt/filemarkgt/root-ext4/cp-default.raw: trusted.anas.restore: No such attribut
+cp -a: getfattr: Removing leading '/' from absolute path names
+{"v":1,"repo":"pbs-main"
+cp --preserve=all: getfattr: Removing leading '/' from absolute path names
+{"v":1,"repo":"pbs-main"
+rsync default: /mnt/filemarkgt/root-ext4/rsync-default.raw: trusted.anas.restore: No such attri
+rsync -aX: getfattr: Removing leading '/' from absolute path names
+{"v":1,"repo":"pbs-main"
+mv same fs: getfattr: Removing leading '/' from absolute path names
+{"v":1,"repo":"pbs-main"
+################ btrfs-loop-anas-pve  dir=/mnt/filemarkgt/btrfs/d  fs=btrfs src=/dev/loop6
+== 1. namespaces
+-- trusted.anas.restore set (root)
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- trusted.anas.restore read --only-values (root)
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- trusted.anas.restore read -e hex (root)
+$ getfattr -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(362 bytes): # file: mnt/filemarkgt/btrfs/d/img.raw
+trusted.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- trusted.anas.restore read --only-values -e hex (root)
+$ getfattr --only-values -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- trusted.anas.restore read as nobody
+$ asuser getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: /mnt/filemarkgt/btrfs/d/img.raw: trusted.anas.restore: No such attribute
+<EOT>
+exit=1
+-- trusted.anas.restore dump all as nobody
+$ asuser getfattr -d -m - -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: /mnt/filemarkgt/btrfs/d/img.raw: trusted.anas.restore: No such attribute
+<EOT>
+exit=0
+-- trusted.anas.restore set as nobody (file is 0666)
+$ asuser setfattr -n trusted.anas.restore -v 0x41 -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/btrfs/d/img.raw: Operation not permitted
+<EOT>
+exit=1
+-- trusted.anas.restore remove as nobody
+$ asuser setfattr -x trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/btrfs/d/img.raw: Operation not permitted
+<EOT>
+exit=1
+-- trusted.anas.restore remove (root)
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- trusted.anas.restore remove absent (root)
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/btrfs/d/img.raw: No such attribute
+<EOT>
+exit=1
+-- trusted.anas.restore read absent (root)
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: /mnt/filemarkgt/btrfs/d/img.raw: trusted.anas.restore: No such attribute
+<EOT>
+exit=1
+-- user.anas.restore set (root)
+$ setfattr -n user.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- user.anas.restore read --only-values (root)
+$ getfattr --only-values -n user.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore read -e hex (root)
+$ getfattr -e hex -n user.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(359 bytes): # file: mnt/filemarkgt/btrfs/d/img.raw
+user.anas.restore=0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore read --only-values -e hex (root)
+$ getfattr --only-values -e hex -n user.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore read as nobody
+$ asuser getfattr --only-values -n user.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore dump all as nobody
+$ asuser getfattr -d -m - -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(232 bytes): # file: mnt/filemarkgt/btrfs/d/img.raw
+user.anas.restore="{\"v\":1,\"repo\":\"pbs-main\",\"snapshot\":\"vm/101/2026-11-14T10:00:00Z\",\"archive\":\"drive-scsi0.img\",\"started\":\"2026-11-14T10:00:00.000Z\",\"state\":\"writing\"}"
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- user.anas.restore set as nobody (file is 0666)
+$ asuser setfattr -n user.anas.restore -v 0x41 -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- user.anas.restore remove as nobody
+$ asuser setfattr -x user.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- user.anas.restore remove (root)
+$ setfattr -x user.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/btrfs/d/img.raw: No such attribute
+<EOT>
+exit=1
+-- user.anas.restore remove absent (root)
+$ setfattr -x user.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/btrfs/d/img.raw: No such attribute
+<EOT>
+exit=1
+-- user.anas.restore read absent (root)
+$ getfattr --only-values -n user.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: /mnt/filemarkgt/btrfs/d/img.raw: user.anas.restore: No such attribute
+<EOT>
+exit=1
+-- read on a missing file
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/no-such.img 
+stdout(0 bytes): <EOT>
+stderr: getfattr: /mnt/filemarkgt/btrfs/d/no-such.img: No such file or directory
+<EOT>
+exit=1
+-- set on a missing file
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/btrfs/d/no-such.img 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/btrfs/d/no-such.img: No such file or directory
+<EOT>
+exit=1
+-- remove on a missing file
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/no-such.img 
+stdout(0 bytes): <EOT>
+stderr: setfattr: /mnt/filemarkgt/btrfs/d/no-such.img: No such file or directory
+<EOT>
+exit=1
+-- read of a path that is a directory component missing
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/nodir/x.img 
+stdout(0 bytes): <EOT>
+stderr: getfattr: /mnt/filemarkgt/btrfs/d/nodir/x.img: No such file or directory
+<EOT>
+exit=1
+-- text value (JSON as given, no 0x)
+$ setfattr -n trusted.anas.restore -v \{\"v\":1\,\"repo\":\"pbs-main\"\,\"snapshot\":\"vm/101/2026-11-14T10:00:00Z\"\,\"archive\":\"drive-scsi0.img\"\,\"started\":\"2026-11-14T10:00:00.000Z\"\,\"state\":\"writing\"\} -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- value starting 0s (base64 trap)
+$ setfattr -n trusted.anas.restore -v 0sQUJD -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(3 bytes): ABC<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- value with a newline, via hex
+$ setfattr -n trusted.anas.restore -v 0x7b0a7d -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(3 bytes): {
+}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+$ getfattr -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(70 bytes): # file: mnt/filemarkgt/btrfs/d/img.raw
+trusted.anas.restore=0x7b0a7d
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- empty value
+$ setfattr -n trusted.anas.restore -v '' -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+$ getfattr -e hex -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(64 bytes): # file: mnt/filemarkgt/btrfs/d/img.raw
+trusted.anas.restore=0x
+
+<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+-- read on a fifo / dir
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d 
+stdout(0 bytes): <EOT>
+stderr: /mnt/filemarkgt/btrfs/d: trusted.anas.restore: No such attribute
+<EOT>
+exit=1
+== 2. survives the restore's open
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+inode before: 259 size 4194304
+-- node fs.createWriteStream(path, {flags:'w'}) then 4 MiB written, the restore's open
+written
+inode after: 259 size 4194304
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- emptied only (open 'w' and close: the simulated interruption)
+size 0
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- truncate -s 4M
+$ truncate -s 4194304 /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+size 4194304
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+-- dd full overwrite (O_TRUNC)
+$ getfattr --only-values -n trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(149 bytes): {"v":1,"repo":"pbs-main","snapshot":"vm/101/2026-11-14T10:00:00Z","archive":"drive-scsi0.img","started":"2026-11-14T10:00:00.000Z","state":"writing"}<EOT>
+stderr: getfattr: Removing leading '/' from absolute path names
+<EOT>
+exit=0
+== 5. value sizes (trusted.)
+-- 1400 bytes: set ok, read back 1400 bytes
+-- 4000 bytes: set ok, read back 4000 bytes
+-- 4096 bytes: set ok, read back 4096 bytes
+-- 8000 bytes: set ok, read back 8000 bytes
+-- 65536 bytes: set FAILED: setfattr: /mnt/filemarkgt/btrfs/d/img.raw: No space left on device
+-- 65537 bytes: set FAILED: setfattr: /mnt/filemarkgt/btrfs/d/img.raw: Argument list too long
+$ setfattr -x trusted.anas.restore -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+== 4a. travel (same filesystem)
+$ setfattr -n trusted.anas.restore -v 0x7b2276223a312c227265706f223a227062732d6d61696e222c22736e617073686f74223a22766d2f3130312f323032362d31312d31345431303a30303a30305a222c2261726368697665223a2264726976652d73637369302e696d67222c2273746172746564223a22323032362d31312d31345431303a30303a30302e3030305a222c227374617465223a2277726974696e67227d -- /mnt/filemarkgt/btrfs/d/img.raw 
+stdout(0 bytes): <EOT>
+stderr: <EOT>
+exit=0
+cp default: /mnt/filemarkgt/btrfs/d/cp-default.raw: trusted.anas.restore: No such attribute
+cp -a: getfattr: Removing leading '/' from absolute path names
+{"v":1,"repo":"pbs-main"
+cp --preserve=all: getfattr: Removing leading '/' from absolute path names
+{"v":1,"repo":"pbs-main"
+rsync default: /mnt/filemarkgt/btrfs/d/rsync-default.raw: trusted.anas.restore: No such attribu
+rsync -aX: getfattr: Removing leading '/' from absolute path names
+{"v":1,"repo":"pbs-main"
+mv same fs: getfattr: Removing leading '/' from absolute path names
+{"v":1,"repo":"pbs-main"
