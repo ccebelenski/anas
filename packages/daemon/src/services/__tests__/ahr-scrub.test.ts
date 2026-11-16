@@ -93,14 +93,16 @@ function scrubStamp(when = new Date()): string {
   return `${days[when.getUTCDay()]} ${months[when.getUTCMonth()]} ${String(when.getUTCDate()).padStart(2, ' ')} ${p(when.getUTCHours())}:${p(when.getUTCMinutes())}:${p(when.getUTCSeconds())} ${when.getUTCFullYear()}`
 }
 
-function scrubStatus(status: string, opts?: { percent?: string, summary?: string }): string {
+function scrubStatus(status: string, opts?: { percent?: string, summary?: string, omitSummary?: boolean }): string {
   return [
     'UUID:             11111111-2222-3333-4444-555555555555',
     `Scrub started:    ${scrubStamp()}`,
     `Status:           ${status}`,
     'Duration:         0:00:04',
     ...(opts?.percent ? [`Bytes scrubbed:   721.09MiB  (${opts.percent}%)`] : ['Total to scrub:   6.66GiB']),
-    `Error summary:    ${opts?.summary ?? 'no errors found'}`,
+    // cr4 D-34: every btrfs-progs prints the line, so its ABSENCE is the
+    // truncated-read shape, not the clean one — omitSummary builds it.
+    ...(opts?.omitSummary ? [] : [`Error summary:    ${opts?.summary ?? 'no errors found'}`]),
     '',
   ].join('\n')
 }
@@ -1081,6 +1083,22 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     assert.doesNotMatch(warn.args[4], /not a clean bill/)
   })
 
+  it('cr4 D-34: a FINISHED scrub with NO Error summary line is an UNPROVEN pass, never clean', async () => {
+    // The status read did not arrive whole. btrfs-progs always prints the
+    // line, so its absence says nothing about the checksums — and reading it
+    // as "no errors found" let the mirror reconcile and the parity rewrite
+    // write on a pass that never proved anything.
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: scrubStatus('finished', { omitSummary: true }), stderr: '', exitCode: 0 } })
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1, mismatchDelayMs: 1 })
+    assert.match(result.btrfsUnproven ?? '', /finished but printed no error summary, so its result is not known/)
+    assert.equal(result.btrfsErrors, null, 'and nothing about it reads clean')
+    const warn = executor.calls.filter(c => c.command === '/usr/bin/perl').at(-1)!
+    assert.equal(warn.args[2], 'warning')
+    assert.match(warn.args[4], /printed no error summary/)
+    assert.match(warn.args[4], /Run the scrub again from the Scrubs screen/)
+  })
+
   it('refuses an unmounted pool', async () => {
     const executor = baseExecutor()
     await assert.rejects(scrubAhrPool(executor, pool('/dev/t2/t2-vol'), () => {}), /not mounted/)
@@ -1435,7 +1453,8 @@ describe('scrub summary counts + path assembly', () => {
   it('sums the Error summary counters', () => {
     assert.equal(countErrorSummary('csum=2'), 2)
     assert.equal(countErrorSummary('read=1 csum=12 super=1'), 14)
-    assert.equal(countErrorSummary(null), 0)
+    // cr4 D-34: an ABSENT summary is an unread result, not a zero count.
+    assert.equal(countErrorSummary(null), null)
   })
 
   // `subvolid-resolve` answers from the filesystem's TOP LEVEL, but a §12 pool
@@ -2716,6 +2735,16 @@ describe('btrfsScrubPass — fails CLOSED (cr3 review item 7)', () => {
 
   it('an EMPTY status is no verdict', async () => {
     await assert.rejects(btrfsScrubPass(fake(ok(''), ok('')), '/mnt', 'tank', () => {}, 1), ScrubVerdictUnknownError)
+  })
+
+  it('cr4 D-34: a `finished` status with NO `Error summary:` line has no verdict', async () => {
+    // The stamp is fresh (this pass), so the earlier-pass guard does not fire —
+    // the refusal here is the missing summary alone.
+    const noSummary = `UUID:             1111\nScrub started:    ${stamp(new Date())}\nStatus:           finished\nDuration:         0:00:04\n`
+    await assert.rejects(
+      btrfsScrubPass(fake(ok(''), ok(noSummary)), '/mnt', 'tank', () => {}, 1),
+      /finished but printed no error summary, so its result is not known/,
+    )
   })
 
   it('`scrub start` exiting 1 means the scrub did not run — the previous pass\'s clean status is not this pass\'s', async () => {

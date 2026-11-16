@@ -867,12 +867,15 @@ describe('selfheal mapping — md bad blocks (F8)', () => {
     assert.equal(parseBadBlocks(null), null, 'a member ANAS cannot ask about is not a member it calls clean')
   })
 
-  it('a range is matched in the member\'s OWN data coordinates', () => {
+  it('a range is matched in the member DEVICE\'s own sectors, the data offset included', () => {
     const geo = { ...RAID5, badBlocks: RAID5.members.map((_, role) => (role === 1 ? [{ startSector: 6368, lengthSectors: 8 }] : [])) }
-    // 1048576 is rd1's data offset, so sector 6368 of the data area is here:
-    const covered = 1048576 + 6368 * 512
+    // fixtures/ahr/md-bad-blocks-coordinates.txt settles the coordinates: the
+    // stored numbers are member-device sectors. Sector 6368 is member byte
+    // 6368×512 of the member's own device; no data offset is added or removed.
+    const covered = 6368 * 512
     assert.equal(memberHasBadBlock(geo, 1, covered), true)
     assert.equal(memberHasBadBlock(geo, 1, covered + 4096), false, 'the next block is outside the range')
+    assert.equal(memberHasBadBlock(geo, 1, covered - RAID5.dataOffsets[1]), false, 'the data-area reading does not hold: the range is not data-relative')
     assert.equal(memberHasBadBlock(geo, 0, covered), false, 'the range belongs to role 1 alone')
   })
 
@@ -929,46 +932,79 @@ describe('selfheal mapping — a data offset this node could not read (cr3 AHR-H
 })
 
 /**
- * cr3 AHR-HEAL-M5 — WHICH COORDINATES `rd<n>/bad_blocks` prints in is not
- * settled: the engine has always read the ranges as data-relative, and the
- * review's reading of md is that they are absolute member sectors. Nothing is
- * changed on a recollection. The capture below settles it; until it exists the
- * case is skipped, and once it does it is RED against the wrong value of
- * `MD_BAD_BLOCKS_COORDINATES` and GREEN against the right one.
+ * cr3 AHR-HEAL-M5 — which coordinates `rd<n>/bad_blocks` prints its ranges in
+ * is settled by a capture, not by a recollection. The engine had always read
+ * them as data-relative; the capture below shows member-device sectors, data
+ * offset included. The numbers this case uses come from the fixture, byte for
+ * byte as captured, so the case turns RED on `data-relative`.
  *
- * The capture (stunt node, a two-leg RAID1 LOOP rig, metadata 1.2 — never a
- * pool), written as `fixtures/selfheal/md-bad-blocks-coordinates.txt`:
- *
- *   D=$(cat /sys/block/mdX/md/rd0/offset)          # data offset, sectors
- *   S=$((D + 4096))                                # a range well inside the data area
- *   echo "$S 8" > /sys/block/mdX/md/rd0/bad_blocks
- *   SHOWN=$(cat /sys/block/mdX/md/rd0/bad_blocks)
- *   mdadm /dev/mdX --fail <leg 1>                  # leg 0 is now md's only source
- *   dd if=/dev/mdX of=/dev/null bs=4096 count=1 iflag=direct skip=$(( (S - D) / 8 )); A=$?
- *   dd if=/dev/mdX of=/dev/null bs=4096 count=1 iflag=direct skip=$(( S / 8 )); B=$?
- *
- * and the file holds, one per line: `DATA_OFFSET_SECTORS=<D>`,
- * `SHOWN=<the line bad_blocks printed>`, `EIO_MD_SECTOR=<S-D if A failed,
- * else S>`, `OK_MD_SECTOR=<the other one>`. md byte = md sector × 512 on RAID1,
- * and leg 0 holds md sector s at member sector D + s.
+ * The capture (PVE 9 test node, a two-leg RAID1 LOOP rig, metadata 1.2 — never
+ * a pool) is `fixtures/ahr/md-bad-blocks-coordinates.txt`: a data offset of
+ * 2048 sectors, the range `3048 8` stored in the member's `bad_blocks`, and two
+ * `dd` reads of the array — array sector 1000 (the row the range covers) fails,
+ * array sector 3048 (the stored start, read as if it were an array sector)
+ * succeeds. md byte = md sector × 512 on RAID1, and leg 0 holds md sector s at
+ * member sector D + s.
  */
 describe('selfheal mapping — md bad-block coordinates, the capture decides (cr3 AHR-HEAL-M5)', () => {
   const CAPTURE = 'md-bad-blocks-coordinates.txt'
-  let capture: Record<string, string> | null = null
+  const capturePath = join(__dirname, '../../fixtures/ahr', CAPTURE)
+  let capture: string | null = null
   try {
-    capture = Object.fromEntries(fixture(CAPTURE).split('\n').filter(l => l.includes('=')).map(l => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1).trim()]))
+    capture = readFileSync(capturePath, 'utf-8')
   }
   catch {
     capture = null
   }
 
-  it('the captured EIO row is the row the engine treats as bad-blocked', { skip: capture === null ? `awaiting the live capture fixtures/selfheal/${CAPTURE} (cr3 AHR-HEAL-M5; MD_BAD_BLOCKS_COORDINATES is '${MD_BAD_BLOCKS_COORDINATES}' until then)` : false }, () => {
-    const c = capture as Record<string, string>
-    const d = Number(c.DATA_OFFSET_SECTORS) * 512
-    const geo = { ...RAID1, dataOffsets: [d, d], badBlocks: [parseBadBlocks(c.SHOWN), []] }
+  /** The numbers the capture states: the data offset, the stored range and the two dd probes. */
+  function readCapture(text: string): { dataOffset: number, range: ReturnType<typeof parseBadBlocks>, eioSector: number, okSector: number } {
+    const offsetLine = /^\s*Data Offset\s*:\s*(\d+) sectors\s*$/m.exec(text)
+    const rangeLine = /^(\d+ \d+)\s*$/m.exec(text)
+    const probes = readDdProbes(text)
+    if (offsetLine === null || rangeLine === null || probes.failed.length !== 1 || probes.ok.length !== 1)
+      throw new Error(`the capture at ${capturePath} does not state one data offset, one stored range, one failing read and one succeeding read`)
+    return { dataOffset: Number(offsetLine[1]), range: parseBadBlocks(rangeLine[1]), eioSector: probes.failed[0], okSector: probes.ok[0] }
+  }
+
+  /**
+   * The `$ dd ... # ARRAY sector <n>` probes, sorted by whether dd copied any
+   * bytes: a read the member's bad-block range covers answers 0 bytes.
+   */
+  function readDdProbes(text: string): { failed: number[], ok: number[] } {
+    const lines = text.split('\n')
+    const failed: number[] = []
+    const ok: number[] = []
+    for (let i = 0; i < lines.length; i++) {
+      const cmd = /^\$ dd .*# ARRAY sector (\d+)\s*$/.exec(lines[i])
+      if (cmd === null)
+        continue
+      let zeroBytes: boolean | null = null
+      for (let j = i + 1; j < lines.length && !lines[j].startsWith('$'); j++) {
+        if (/^\d+ bytes\b/.test(lines[j]))
+          zeroBytes = lines[j].startsWith('0 bytes')
+      }
+      if (zeroBytes === null)
+        throw new Error(`the capture's dd probe on line ${i + 1} prints no byte count`)
+      if (zeroBytes)
+        failed.push(Number(cmd[1]))
+      else
+        ok.push(Number(cmd[1]))
+    }
+    return { failed, ok }
+  }
+
+  it('the constant is the reading the capture forces: member-device sectors', () => {
+    assert.equal(MD_BAD_BLOCKS_COORDINATES, 'absolute')
+  })
+
+  it('the captured EIO row is the row the engine treats as bad-blocked', { skip: capture === null ? `awaiting the live capture fixtures/ahr/${CAPTURE}` : false }, () => {
+    const c = readCapture(capture as string)
+    const d = c.dataOffset * 512
+    const geo = { ...RAID1, dataOffsets: [d, d], badBlocks: [c.range, []] }
     const memberByte = (mdSector: number): number => d + mdSector * 512
-    assert.equal(memberHasBadBlock(geo, 0, memberByte(Number(c.EIO_MD_SECTOR))), true, 'md refused this row: the engine must see the range over it')
-    assert.equal(memberHasBadBlock(geo, 0, memberByte(Number(c.OK_MD_SECTOR))), false, 'md served this row: the engine must not refuse it')
+    assert.equal(memberHasBadBlock(geo, 0, memberByte(c.eioSector)), true, 'md refused this row: the engine must see the range over it')
+    assert.equal(memberHasBadBlock(geo, 0, memberByte(c.okSector)), false, 'md served this row: the engine must not refuse it')
   })
 
   it('the two readings differ by exactly the member\'s data offset — the probe\'s own arithmetic', () => {

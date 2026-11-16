@@ -2374,11 +2374,11 @@ describe('selfheal repair — the finding\'s inode (F11)', () => {
 describe('selfheal repair — md bad blocks over the row (F8)', () => {
   useNode(() => new FakeNode())
 
-  /** One range covering the target row, in the member's own data coordinates. */
+  /** One range covering the target row, in the member device's own sectors (the data offset included). */
   function badBlockRow(role: number): void {
     const dir = join(node.sys, `rd${role}`)
     mkdirSync(dir, { recursive: true })
-    writeFileSync(join(dir, 'bad_blocks'), `${(MEMBER_OFFSET - 1048576) / 512} 8\n`)
+    writeFileSync(join(dir, 'bad_blocks'), `${MEMBER_OFFSET / 512} 8\n`)
   }
 
   it('RAID5: a sibling with a recorded range ends the reconstruction, by name', async () => {
@@ -2810,7 +2810,7 @@ describe('selfheal repair — md records a bad block DURING the run (cr3 review 
       ...OPTIONS,
       beforeStep: (name) => {
         if (name === 'rmw')
-          writeFileSync(join(node.sys, 'rd1/bad_blocks'), '6368 8\n')
+          writeFileSync(join(node.sys, 'rd1/bad_blocks'), `${MEMBER_OFFSET / 512} 8\n`)
       },
     })
     assert.equal(outcome.outcome, 'unrepairable', outcome.reason)

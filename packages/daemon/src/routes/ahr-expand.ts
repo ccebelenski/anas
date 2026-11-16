@@ -158,7 +158,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
         problems.push(`replacement disk '${body.replace.newDiskId}' is already a member of pool '${pool.name}'`)
       const role = otherRole(body.replace.newDiskId)
       if (role)
-        problems.push(`replacement disk '${body.replace.newDiskId}' is pool '${pool.name}''s ${role} — detach it first to use it as a member`)
+        problems.push(`replacement disk '${body.replace.newDiskId}' is a ${role} of pool '${pool.name}' — detach it first to use it as a member`)
       approvedIds.delete(body.replace.oldDiskId)
       approvedIds.add(body.replace.newDiskId)
     }
@@ -167,7 +167,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
         problems.push(`disk '${id}' is already a member of pool '${pool.name}'`)
       const role = otherRole(id)
       if (role)
-        problems.push(`disk '${id}' is pool '${pool.name}''s ${role} — detach it first to add it as a member`)
+        problems.push(`disk '${id}' is a ${role} of pool '${pool.name}' — detach it first to add it as a member`)
       approvedIds.add(id)
     }
     if (problems.length > 0) {

@@ -280,11 +280,12 @@ const LEADING_SLASH_RE = /^\/+/
 
 /**
  * A pool's layout, read EXPLICITLY (cr3, from the AHR core lane):
- * `subvolLayout` becomes `boolean | null` there, null when the kernel mount
- * table could not be read. `true` is §12, `false` is flat, `undefined` (an
- * older shape) is flat as it always was, and null is UNKNOWN — never the flat
- * layout a falsy test would read it as (which would put the pin inside the
- * mountpoint instead of `@snapshots`).
+ * `subvolLayout` becomes `boolean | null` there, null when the layout could
+ * not be read (the pool is not mounted, or the kernel mount table did not
+ * answer). `true` is §12, `false` is flat, `undefined` (an older shape) is
+ * flat as it always was, and null is UNKNOWN — never the flat layout a falsy
+ * test would read it as (which would put the pin inside the mountpoint
+ * instead of `@snapshots`).
  */
 export function poolLayout(pool: AhrPool | null | undefined): 'subvol' | 'flat' | 'unknown' {
   const v = (pool as { subvolLayout?: boolean | null } | null | undefined)?.subvolLayout

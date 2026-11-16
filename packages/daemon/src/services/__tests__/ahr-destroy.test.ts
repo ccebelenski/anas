@@ -1034,6 +1034,50 @@ describe('destroyAhrPool — the LVM teardown gate (H6)', () => {
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
   })
 
+  it('cr4: the `pvs` read AFTER vgremove failing skips pvremove and names the devices that may keep a label', async () => {
+    const executor = world()
+    const rows = [
+      { pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+      { pv_name: '/dev/md9', vg_name: 'media', pv_size: String(2 * GIB), pv_free: '0' },
+    ]
+    const okv = { stdout: report('pv', rows), stderr: '', exitCode: 0 }
+    // The VG and its one LV are the pool's (world()'s empty answers would
+    // refuse the teardown before it starts).
+    executor.prependFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: '1', lv_count: '1', vg_size: String(2 * GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
+    executor.prependFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', [{ lv_name: 't2-vol', vg_name: 't2', lv_attr: '-wi-ao----', lv_size: String(2 * GIB) }]), stderr: '', exitCode: 0 } })
+    // Every read succeeds until the one that picks the PVs to pvremove — the
+    // read AFTER the volume group is gone. Keyed on the `vgremove` act itself,
+    // never on a call count, so the test names the state the finding is about.
+    let vgRemoved = false
+    executor.prependFixture({
+      command: '/usr/sbin/pvs',
+      get result() {
+        return vgRemoved
+          ? { stdout: '', stderr: 'pvs: cannot access /dev/md127', exitCode: 5 }
+          : okv
+      },
+    })
+    for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgreduce', '/usr/sbin/mdadm', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({
+      command: '/usr/sbin/vgremove',
+      get result() {
+        vgRemoved = true
+        return { stdout: '', stderr: '', exitCode: 0 }
+      },
+    })
+
+    const result = await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    // The teardown still completes; the LVM labels may remain and the job says so.
+    assert.equal(result.destroyed, 't2')
+    assert.deepEqual(result.pvRemoveSkipped, ['/dev/md127'])
+    assert.equal(result.warnings?.length, 1, JSON.stringify(result.warnings))
+    assert.match(result.warnings![0], /could not be read after its volume group was removed \(pvs: pvs: cannot access \/dev\/md127\)/)
+    assert.match(result.warnings![0], /The devices that may still carry one are \/dev\/md127/)
+    assert.match(result.warnings![0], /Run `pvs` to list any that remain, and `pvremove <device>` each/)
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/pvremove'), 'pvremove was skipped, never guessed at')
+  })
+
   /**
    * cr.31b (fail closed): an unreadable `lvs` was read as "no LVs", and the
    * teardown went on — `vgremove -y` then removed the LVs itself, skipping the
@@ -1405,7 +1449,7 @@ describe('destroyAhrPool — cr3: failed reads stop it, and a path is not an ide
     executor.prependFixture({ command: '/usr/bin/realpath', args: ['-e', '--', '/dev/t2/t2-vol'], result: { stdout: '/dev/dm-0\n', stderr: '', exitCode: 0 } })
     await assert.rejects(
       destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
-      /a filesystem that is not 't2''s \(\/dev\/sdq1\) is mounted over pool 't2'/,
+      /a filesystem that does not belong to pool 't2' \(\/dev\/sdq1\) is mounted over pool 't2'/,
     )
     assert.deepEqual(acts(executor), [])
   })
@@ -1453,7 +1497,7 @@ describe('destroyAhrPool — cr3: failed reads stop it, and a path is not an ide
     const executor = world()
     await assert.rejects(
       destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
-      /has a line for .* with the spec UUID=1234-abcd, not 't2''s volume \/dev\/t2\/t2-vol — it cannot be told whether that line is this pool's or another filesystem's, so nothing was changed/,
+      /has a line for .* with the spec UUID=1234-abcd, not the volume of pool 't2' \(\/dev\/t2\/t2-vol\) — it cannot be told whether that line is this pool's or another filesystem's, so nothing was changed/,
     )
     assert.deepEqual(acts(executor), [])
     assert.equal(await readFile(fstabPath, 'utf8'), text)
@@ -1464,7 +1508,7 @@ describe('destroyAhrPool — cr3: failed reads stop it, and a path is not an ide
     executor.prependFixture({ command: '/usr/bin/realpath', result: { stdout: '', stderr: 'realpath: /dev/dm-0: No such file or directory', exitCode: 1 } })
     await assert.rejects(
       destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
-      /the mount at .* \(\/dev\/dm-0\[\/@data\]\) could not be identified as 't2''s or another device's/,
+      /the mount at .* \(\/dev\/dm-0\[\/@data\]\) could not be identified as belonging to pool 't2' or to another device/,
     )
     assert.deepEqual(acts(executor), [])
     assert.equal(await readFile(fstabPath, 'utf8'), FSTAB_SEED)

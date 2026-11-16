@@ -309,6 +309,15 @@
         return { html: card || '', level: level };
     }
 
+    // A byte value the read did not return is the same dash the grid and the
+    // detail rows show (cr4, P-3), never a blank.
+    function knownBytesOrDash(bytes) {
+        if (bytes === undefined || bytes === null || (typeof bytes === 'number' && isNaN(bytes))) {
+            return '—';
+        }
+        return ANAS.formatBytes(bytes);
+    }
+
     // The headline graphic: capacity gauge + state pill, an activity strip while
     // a scan runs, a bay per vdev (each member a health-coloured disk card so a
     // faulted drive shows RED right where it physically lives), and an advisory
@@ -330,12 +339,17 @@
                 pill = '';
             }
             var gauge = '';
-            var cap = Number(d.capacity);
-            if (!isNaN(cap)) {
+            // cr4 (P-3): `Number(null)` is 0, so a capacity the read did not
+            // return would draw a 0% gauge; the dash the detail rows use stands
+            // in for it instead.
+            var capKnown = (d.capacity !== undefined && d.capacity !== null
+                && !isNaN(Number(d.capacity)));
+            var cap = capKnown ? Number(d.capacity) : 0;
+            if (capKnown) {
                 try {
                     gauge = gfx.gauge(cap / 100, {
-                        label: ANAS.formatBytes(d.allocated) + ' / '
-                            + ANAS.formatBytes(d.size),
+                        label: knownBytesOrDash(d.allocated) + ' / '
+                            + knownBytesOrDash(d.size),
                         title: ANAS.t('Pool capacity'),
                     }) || '';
                 } catch (eG) {
@@ -1333,6 +1347,19 @@
 
     function summaryHtml(d) {
         var enc = ANAS.enc;
+        // cr4 (P-3): a value the `zpool list -j` read did not return is the same
+        // dash the grid shows, never a blank cell or a 0 the read never made.
+        var unknownValue = '—';
+        function known(fn) {
+            return function (value) {
+                if (value === undefined || value === null || (typeof value === 'number' && isNaN(value))) {
+                    return unknownValue;
+                }
+                return fn(value);
+            };
+        }
+        var bytes = known(ANAS.formatBytes);
+        var pct = known(ANAS.formatPercent);
         var rows = ''
             + kv(ANAS.t('State'), ANAS.renderState(d.state));
         // story 3.27: the pool root's mountpoint (absent on old daemons).
@@ -1345,11 +1372,11 @@
             rows += kv(ANAS.t('Mount'), mountVal);
         }
         rows += ''
-            + kv(ANAS.t('Size'), enc(ANAS.formatBytes(d.size)))
-            + kv(ANAS.t('Allocated'), enc(ANAS.formatBytes(d.allocated)))
-            + kv(ANAS.t('Free'), enc(ANAS.formatBytes(d.free)))
-            + kv(ANAS.t('Capacity'), enc(ANAS.formatPercent(d.capacity)))
-            + kv(ANAS.t('Fragmentation'), enc(ANAS.formatPercent(d.fragmentation)))
+            + kv(ANAS.t('Size'), enc(bytes(d.size)))
+            + kv(ANAS.t('Allocated'), enc(bytes(d.allocated)))
+            + kv(ANAS.t('Free'), enc(bytes(d.free)))
+            + kv(ANAS.t('Capacity'), enc(pct(d.capacity)))
+            + kv(ANAS.t('Fragmentation'), enc(pct(d.fragmentation)))
             // cr3: an absent ratio is a dash, never "0.00x" (1.00x = no dedup).
             + kv(ANAS.t('Dedup ratio'), enc((typeof d.dedupRatio === 'number' && isFinite(d.dedupRatio))
                 ? d.dedupRatio.toFixed(2) + 'x' : '—'))

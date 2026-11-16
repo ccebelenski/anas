@@ -77,7 +77,9 @@ import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle
  *      present to tell a dead cache from an unassembled band. It acts ONLY on
  *      `cache.state: 'failed'`, which needs evidence the cache is the
  *      problem; a cached volume that is merely inactive (a band that did not
- *      assemble, the cache SSD fine) reads `inactive` and is left alone.
+ *      assemble, the cache SSD fine) reads `inactive` and is left alone, and
+ *      one whose `dmsetup status` could not be read reads `unknown` — nothing
+ *      acts on a health that was not read.
  *      Like the udev and operator doors it refuses under an expansion intent
  *      (cr.61), and when the topology cannot be read while a VG carries a
  *      cache it tells the operator the cache went unchecked (cr.61).
@@ -474,7 +476,12 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
   // array is down reads `inactive`, and uncaching a partial VG over a healthy
   // SSD — then announcing the SSD missing — is exactly what this rung must not
   // do. Only `failed` (a failure word from dm, or the cache PV's device gone
-  // under the band guard) is evidence enough to act on.
+  // under the band guard) is evidence enough to act on. `unknown` is not
+  // evidence: an ACTIVE cache target whose `dmsetup status` did not answer has
+  // no verdict at all, and uncaching on it would drop a healthy, mounted cache
+  // (and announce a cache device failure that nobody read) — the rung says the
+  // cache went unchecked instead, exactly as it does for an unreadable
+  // topology.
   //
   // ONE `lvs` call gates the whole rung: most daemon starts have no cache on
   // the node at all, and the topology read this needs is a dozen commands.
@@ -496,11 +503,22 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
       const detail = err instanceof Error ? err.message : String(err)
       log(`ahr.boot cache-rung=skipped reason=topology-unreadable vgs=${[...cachedVgs].join(',')} detail=${detail}`)
       for (const vg of cachedVgs)
-        await notifyCacheUnchecked(executor, vg, detail)
+        await notifyCacheUnchecked(executor, vg, { kind: 'topology', detail })
     }
   }
   const bootGuard = ahrGuard({ executor, intentDir, iscsiPaths: () => ({}) })
   for (const pool of cacheCandidates) {
+    // An ACTIVE cache target whose `dmsetup status` did not answer carries no
+    // verdict (cr4 D-28). Nothing acts on it — and the operator is told the
+    // cache went unchecked, once per pool: silence would leave a pool that may
+    // be serving EIO with no signal at all, and a `failed` here would uncache
+    // a healthy cache. The body names this cause, not the unreadable topology
+    // above: the pool WAS read, which is how its cache state is known.
+    if (pool.cache?.state === 'unknown') {
+      log(`ahr.boot pool=${pool.name} cache-rung=skipped reason=status-unreadable`)
+      await notifyCacheUnchecked(executor, pool.name, { kind: 'pool-cache' })
+      continue
+    }
     if (pool.cache?.state !== 'failed')
       continue
     // "missing" only on the evidence of a missing device; a cache that is
@@ -552,7 +570,7 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
               executor,
               'warning',
               `AHR pool not re-mounted: ${target.name}`,
-              `ANAS dropped pool '${target.name}''s failed read cache at start-up (the pool now runs uncached), but did not mount the pool: ${why} `
+              `ANAS dropped the failed read cache of pool '${target.name}' at start-up (the pool now runs uncached), but did not mount the pool: ${why} `
               + `The pool's data is intact; it serves nothing until it is mounted — check its line in ${fstabPath} and mount it from the Hybrid RAID view.`,
             )
           }
@@ -710,23 +728,36 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
 const BOOT_CACHE_IDENTITY = { user: 'system:boot-cache', uid: 0 } as const
 
 /**
- * A cached VG the boot scan could not judge (cr.61, review M8): the AHR
- * topology was unreadable, so whether its cache failed is unknown and the
- * automatic recovery did not run. Not {@link notifyCacheRecoveryFailed}: that
- * body asserts a failed or missing cache and a pool that cannot serve reads,
- * which the scan has no evidence for here — and `lvs` names every cached VG on
- * the node, an operator's own lvmcache VG included.
+ * A cached VG the boot scan could not judge, said to the operator once per VG.
+ * Two causes, two bodies:
+ *
+ *  - `topology` (cr.61, review M8): the AHR topology was unreadable, so whether
+ *    the VG's cache failed is unknown. `lvs` names every cached VG on the node,
+ *    an operator's own lvmcache VG included, so whether the VG is an AHR pool
+ *    is not established here and the body says "if".
+ *  - `pool-cache` (cr4 D-28): the pool WAS read and its cache state is
+ *    `unknown` because `dmsetup status` on the pool volume did not answer, so
+ *    only the cache status could not be checked.
+ *
+ * Not {@link notifyCacheRecoveryFailed}: that body asserts a failed or missing
+ * cache and a pool that cannot serve reads, which the scan has no evidence for
+ * here.
  */
-async function notifyCacheUnchecked(executor: CommandExecutor, vg: string, detail: string): Promise<void> {
-  await pveNotify(
-    executor,
-    'warning',
-    `AHR read cache not checked: ${vg}`,
-    `Volume group '${vg}' carries a read cache, and ANAS could not read the AHR pools at start-up (${detail}), `
+async function notifyCacheUnchecked(
+  executor: CommandExecutor,
+  vg: string,
+  cause: { kind: 'topology', detail: string } | { kind: 'pool-cache' },
+): Promise<void> {
+  const body = cause.kind === 'topology'
+    ? `Volume group '${vg}' carries a read cache, and ANAS could not read the AHR pools at start-up (${cause.detail}), `
     + `so it could not check whether that cache has failed; the automatic recovery of a failed or missing cache device did not run. `
     + `If '${vg}' is an AHR pool whose cache device has failed, every read on the pool returns an I/O error until the cache is removed. `
-    + `Check the pool in the Hybrid RAID view and Detach the cache there if it reads failed.`,
-  )
+    + `Check the pool in the Hybrid RAID view and Detach the cache there if it reads failed.`
+    : `The read cache of AHR pool '${vg}' could not be checked at start-up because dmsetup status for the pool volume did not answer. `
+      + `The automatic recovery of a failed or missing cache device did not run. `
+      + `If the cache device has failed, every read on the pool returns an I/O error until the cache is removed. `
+      + `Open the Hybrid RAID view and reload it, and Detach the cache there if it reads failed.`
+  await pveNotify(executor, 'warning', `AHR read cache not checked: ${vg}`, body)
 }
 
 /**

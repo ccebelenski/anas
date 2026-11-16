@@ -376,8 +376,16 @@ export type AhrExpansionIntent = z.infer<typeof AhrExpansionIntent>
  * says why the volume is down. (An inactive volume whose cache PV IS missing
  * reads `failed` — LVM refuses to activate a partial cached LV, which is the
  * boot-time shape of a dead cache SSD.)
+ *
+ * `unknown` means the cache target and its device are both present, the volume
+ * is active, and `dmsetup status` could not be read (the command failed, or
+ * its line did not parse). The cache's health is not known — which is not the
+ * same as failed, and must never be reported as healthy either. No automatic
+ * recovery acts on it: the unattended rungs run only on a failure the node
+ * READ (a missing cache PV, or a `dmsetup status` that answered with a failure
+ * word). The cache reads its status again on the next topology read.
  */
-export const AhrCacheState = z.enum(['healthy', 'failed', 'absent', 'inactive'])
+export const AhrCacheState = z.enum(['healthy', 'failed', 'absent', 'inactive', 'unknown'])
 export type AhrCacheState = z.infer<typeof AhrCacheState>
 
 /**
@@ -407,8 +415,12 @@ export const AhrCache = z.object({
    * Flash dedicated to the cache, in bytes: the sum of the cache PVs' sizes.
    * Read from the PVs rather than from the cache LV because a PV reports its
    * size even when its device is missing, so the figure survives a failure.
+   *
+   * Null when a cache PV's size cell could not be read (cr4): one unread PV
+   * makes the SUM unknown, and a short total would understate the flash. An
+   * empty `devices` with a real figure is the leftover-slice shape below.
    */
-  sizeBytes: z.number().int().nonnegative(),
+  sizeBytes: z.number().int().nonnegative().nullable(),
   /** Always `writethrough` — the only mode ANAS attaches (§13 ruling). */
   mode: z.literal('writethrough'),
   /**

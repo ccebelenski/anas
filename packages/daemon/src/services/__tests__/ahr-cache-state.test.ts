@@ -158,6 +158,25 @@ describe('buildAhrCacheState — the pool `cache` block (ahrcache.1, §13)', () 
     assert.deepEqual(facts.diskIds, [])
   })
 
+  it('cr4: one cache PV with an unreadable size makes the cache size NULL, never a short total', () => {
+    // The PVs come from a report whose size cell could not be read. Summing
+    // what did arrive would understate the flash; the block says unknown.
+    const pvs = parsePvsReport(loadFixture('lvm-pvs-cached.json'))
+    const cachePv = pvs.find(p => p.name === '/dev/sdd1')!
+    cachePv.sizeBytes = null
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: parseLvsReport(loadFixture('lvs-cached-live.json'))[0],
+      pvs,
+      bandCount: 1,
+      partsByKernel: partsByKernel(),
+      byIdMap: BY_ID,
+      dmStatus: parseDmsetupStatus(loadFixture('dmsetup-status-cache-healthy.txt')),
+    })
+    assert.equal(facts.cache.sizeBytes, null)
+    assert.deepEqual(facts.cache.devices, [CACHE_DISK], 'the disk is still named')
+  })
+
   it('healthy: the cache disk by-id, the PV size, mode/policy from lvs, counters present', () => {
     const facts = buildAhrCacheState({
       poolName: POOL,
@@ -408,7 +427,7 @@ describe('buildAhrCacheState — ahrcache.1 review fixes', () => {
     assert.equal(facts.cache.deviceMissing, true)
   })
 
-  it('an ACTIVE cache target with no legible dm answer still reads `failed` (GT-23 asymmetry)', () => {
+  it('an ACTIVE cache target with no legible dm answer reads `unknown`, never `failed` (cr4 D-28)', () => {
     const facts = buildAhrCacheState({
       poolName: POOL,
       lv: parseLvsReport(loadFixture('lvs-cached-live.json'))[0],
@@ -418,8 +437,11 @@ describe('buildAhrCacheState — ahrcache.1 review fixes', () => {
       byIdMap: BY_ID,
       dmStatus: parseDmsetupStatus('Device does not exist.'),
     })
-    assert.equal(facts.cache.state, 'failed')
-    assert.equal(facts.deviceMissing, false, 'failed, but nothing says the device is gone')
+    // `failed` is a verdict the read did not supply, and the unattended rungs
+    // act on it: it would drop a healthy, mounted cache.
+    assert.equal(facts.cache.state, 'unknown')
+    assert.equal(facts.deviceMissing, false, 'unknown, but nothing says the device is gone')
+    assert.equal(facts.cache.hits, undefined, 'no counter rides a cache whose health is unread')
   })
 
   // ---- Finding 3: the idle pull ------------------------------------------

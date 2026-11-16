@@ -260,6 +260,11 @@ export function unmanagedPoolName(name: string): PoolUnmanaged | null {
 /**
  * Parse `zpool list -j` JSON output into pool summaries.
  * Note: This provides size/capacity data. State and health come from zpool-status parser.
+ *
+ * cr4 (P-3): a property this read did not return is NULL (unknown), the rule
+ * `parseZpoolGet` follows for the same bag — never a zero it did not read. A
+ * pool whose `properties` bag is absent entirely reads all six as unknown
+ * instead of throwing on the first lookup (the R2 probe's NOFIELD_ALL shape).
  */
 export function parseZpoolList(json: string | ZpoolListOutput): Omit<PoolSummary, 'scanRunning' | 'scanFunction' | 'trimSupported' | 'upgradeAvailable' | 'health' | 'pveStorages'>[] {
   // cr3: zpool's no-pools sentence (not JSON) is the honest empty — callers
@@ -268,17 +273,21 @@ export function parseZpoolList(json: string | ZpoolListOutput): Omit<PoolSummary
     return []
   const data: ZpoolListOutput = parseZfsJson(json, { pools: {} })
   return Object.values(data.pools).map((pool) => {
-    const prop = (name: string) => pool.properties[name]?.value ?? '-'
+    const prop = (name: string): string | undefined => pool.properties?.[name]?.value
+    const num = (name: string, parse: (value: string) => number): number | null => {
+      const value = prop(name)
+      return value === undefined ? null : parse(value)
+    }
 
     return {
       name: pool.name,
       state: pool.state as PoolSummary['state'],
-      size: parseHumanSize(prop('size')),
-      allocated: parseHumanSize(prop('allocated')),
-      free: parseHumanSize(prop('free')),
-      fragmentation: parsePercent(prop('fragmentation')),
-      capacity: parsePercent(prop('capacity')),
-      dedupRatio: parseDedupRatio(prop('dedupratio')),
+      size: num('size', parseHumanSize),
+      allocated: num('allocated', parseHumanSize),
+      free: num('free', parseHumanSize),
+      fragmentation: num('fragmentation', parsePercent),
+      capacity: num('capacity', parsePercent),
+      dedupRatio: num('dedupratio', parseDedupRatio),
     }
   })
 }

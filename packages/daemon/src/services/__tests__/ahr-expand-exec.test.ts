@@ -287,10 +287,10 @@ function notifyCalls(executor: MockExecutor, severity: string): { command: strin
 function pvsJson(rows: { name: string, vg: string | null, size: number }[]): string {
   return JSON.stringify({ report: [{ pv: rows.map(r => ({ pv_name: r.name, vg_name: r.vg ?? '', pv_size: String(r.size), pv_free: '0' })) }] })
 }
-function vgsJson(free: number): string {
+function vgsJson(free: number | string): string {
   return JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '2', lv_count: '1', vg_size: String(5 * GIB), vg_free: String(free) }] }] })
 }
-function lvsJson(size: number): string {
+function lvsJson(size: number | string): string {
   return JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-ao----', lv_size: String(size) }] }] })
 }
 function btrfsUsageJson(deviceSize: number): string {
@@ -755,8 +755,44 @@ unused devices: <none>
       executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: vgsJson(2 * GIB), stderr: '', exitCode: 0 } })
       const outcome = await run(executor, mkPlan([B1, B2], [{ kind: 'fs-grow', target: 'tank-vol' }]), [X, Y, Z])
       assert.equal(outcome.ok, false)
-      assert.match(outcome.error!, /refusing to grow the filesystem before its block device/)
+      // The whole sentence for THIS cause (the VG still has free space), not
+      // the tail both the "still free" and the "free size unread" refusals
+      // carry: a substring both share cannot tell the two worlds apart.
+      assert.equal(outcome.error, `lv-extend is not complete (VG 'tank' still has 2 GiB free) — refusing to grow the filesystem before its block device`)
       assert.deepEqual(mutatingCalls(executor), [])
+    })
+
+    // cr4: an LVM size cell that could not be read (`unknown` in the report)
+    // parses to null, never 0 — a 0 there made the three gates below read a
+    // failed read as a finished step.
+    it('lv-extend with an UNREAD vg_free runs the extend — an unread free size is not "nothing left"', async () => {
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: vgsJson('unknown'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/lvextend', result: { stdout: '', stderr: '', exitCode: 0 } })
+      const outcome = await run(executor, mkPlan([B1, B2], [{ kind: 'lv-extend', target: 'tank-vol' }]), [X, Y, Z])
+      assert.equal(outcome.ok, true, outcome.error)
+      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/sbin/lvextend', ...LVM_MIXED_BLOCK_ARGS, '-l', '+100%FREE', '/dev/tank/tank-vol']])
+    })
+
+    it('fs-grow REFUSES when vg_free could not be read — it cannot verify lv-extend finished', async () => {
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: vgsJson('unknown'), stderr: '', exitCode: 0 } })
+      const outcome = await run(executor, mkPlan([B1, B2], [{ kind: 'fs-grow', target: 'tank-vol' }]), [X, Y, Z])
+      assert.equal(outcome.ok, false)
+      assert.equal(outcome.error, `the free space of volume group 'tank' could not be read, so whether lv-extend finished cannot be verified — refusing to grow the filesystem before its block device. Check the pool's expansion in the Hybrid RAID view, then Resume it`)
+      assert.deepEqual(mutatingCalls(executor), [])
+    })
+
+    it('fs-grow with an UNREAD lv_size runs the resize — an unread LV size is not "already grown"', async () => {
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: vgsJson(0), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: lvsJson('unknown'), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/findmnt', result: { stdout: JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }] }), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: btrfsUsageJson(5 * GIB), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+      const outcome = await run(executor, mkPlan([B1, B2], [{ kind: 'fs-grow', target: 'tank-vol' }]), [X, Y, Z])
+      assert.equal(outcome.ok, true, outcome.error)
+      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/bin/btrfs', 'filesystem', 'resize', 'max', '/mnt/anas-ahr/tank']])
     })
 
     it('fs-grow runs btrfs resize max LAST — and skips when already grown', async () => {

@@ -125,7 +125,16 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
     // cr3 review 3: an UNKNOWN state (the mount table could not be read) is
     // said first — the layout below is unknown then, and the flat-layout
     // sentence would advise destroying a pool on a read that did not see.
-    async pool => pool.state === 'unknown' || pool.subvolLayout === null
+    async pool => pool.state === 'unknown'
+      ? { status: 409, code: 'CONFLICT', message: `Pool '${pool.name}' is in an unknown state — the kernel mount table could not be read, so its subvolume layout and whether it is read-only are not known. Retry once it can be read.` }
+      : null,
+    // cr4 D-30: an UNMOUNTED pool's layout cannot be read either, and it is
+    // not the flat layout — saying so sent the operator to destroy a pool
+    // that may well carry @data/@snapshots. Mount it, then the layout reads.
+    async pool => !pool.mounted
+      ? { status: 409, code: 'CONFLICT', message: `Pool '${pool.name}' is not mounted, so its layout cannot be read. Mount it from the Hybrid RAID view, then try again.` }
+      : null,
+    async pool => pool.subvolLayout === null
       ? { status: 409, code: 'CONFLICT', message: `Pool '${pool.name}' is in an unknown state — the kernel mount table could not be read, so its subvolume layout and whether it is read-only are not known. Retry once it can be read.` }
       : null,
     async pool => !pool.subvolLayout
@@ -168,9 +177,13 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
     if (!pool)
       return
     // cr3 review 3: a layout that could not be read is never "no snapshots".
-    if (pool.subvolLayout === null) {
+    // cr4 D-30: an unmounted pool's layout cannot be read either, and an empty
+    // list would say it has none.
+    if (pool.state === 'unknown' || pool.subvolLayout === null) {
       reply.code(503)
-      return { error: { code: 'UNAVAILABLE', message: `the kernel mount table could not be read, so the subvolume layout of AHR pool '${pool.name}' is unknown — its snapshots cannot be listed` } }
+      return { error: { code: 'UNAVAILABLE', message: !pool.mounted
+        ? `AHR pool '${pool.name}' is not mounted, so its layout cannot be read. Mount it from the Hybrid RAID view, then try again.`
+        : `the kernel mount table could not be read, so the subvolume layout of AHR pool '${pool.name}' is unknown — its snapshots cannot be listed` } }
     }
     if (!pool.subvolLayout)
       return { data: [] } // flat layout: no snapshots (the UI shows the advisory)

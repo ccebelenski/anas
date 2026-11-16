@@ -756,6 +756,26 @@ const POOL = (extra = {}) => ({ name: 'tank', state: 'ONLINE', scanRunning: fals
   ok('sweep: an absent dedup ratio is a dash, not 0.00x', !sum.includes('0.00x') && /Dedup ratio<\/td><td[^>]*>—/.test(sum), sum)
 }
 
+// --- cr4 P-3: a pool cell the zpool read did not return is a dash --------------
+// `zpool list -j` pool whose `properties` bag missed a field (or had no bag at
+// all) reads null in a real daemon answer; the panels must show the dash the
+// grid shows, never "0 B" / "0%" / a 0% gauge.
+{
+  const { ANAS } = loadPanels(['30-pools.js'])
+  const sum = ANAS.pools.summaryHtml({
+    state: 'ONLINE', size: null, allocated: null, free: null,
+    capacity: null, fragmentation: null, dedupRatio: null, errorCount: 0, guid: '1',
+  })
+  ok('P-3: an unread size says dash, never 0 B', /Size<\/td><td[^>]*>—/.test(sum) && !/Size<\/td><td[^>]*>0 B/.test(sum), sum)
+  ok('P-3: an unread allocated says dash, never 0 B', /Allocated<\/td><td[^>]*>—/.test(sum) && !/Allocated<\/td><td[^>]*>0 B/.test(sum), sum)
+  ok('P-3: an unread capacity says dash, never 0%', /Capacity<\/td><td[^>]*>—/.test(sum) && !/Capacity<\/td><td[^>]*>0%/.test(sum), sum)
+  ok('P-3: an unread fragmentation says dash', /Fragmentation<\/td><td[^>]*>—/.test(sum), sum)
+  const topo = ANAS.pools.topologyGfxHtml({
+    name: 'tank', state: 'ONLINE', capacity: null, size: null, allocated: null, vdevGroups: [],
+  })
+  ok('P-3: an unread capacity draws no 0% gauge', !topo.includes('anas-gfx-gauge'), topo)
+}
+
 // --- POOLS-PANEL-L8: every data value into a title, tooltip or intro is encoded --
 {
   const EVIL = '<img src=x onerror=alert(1)>'

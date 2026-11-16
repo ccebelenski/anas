@@ -96,9 +96,13 @@ export const PV_UNDERSIZE_MARGIN_BYTES = AHR_SIZE_GRANULARITY_BYTES
  * predicate behind both the resume planner's pv-resize catch-up and the
  * topology reader's stranded-capacity accounting, so the two can never disagree
  * about what "stranded" means.
+ *
+ * Null (a size cell that could not be read) is UNKNOWN, never under-sized
+ * (cr4): an unread size can neither show nor rule out stranded capacity, so
+ * both callers stay silent rather than act on a figure nobody read.
  */
-export function isPvUnderSized(pvSizeBytes: number, deviceSizeBytes: number): boolean {
-  if (pvSizeBytes <= 0 || deviceSizeBytes <= 0)
+export function isPvUnderSized(pvSizeBytes: number | null, deviceSizeBytes: number | null): boolean {
+  if (pvSizeBytes === null || deviceSizeBytes === null || pvSizeBytes <= 0 || deviceSizeBytes <= 0)
     return false
   return deviceSizeBytes - pvSizeBytes >= PV_UNDERSIZE_MARGIN_BYTES
 }
@@ -193,10 +197,12 @@ export { fmtBytes }
 
 /**
  * {@link fmtBytes} for a figure a live read may not have (cr3): `null` — the
- * read behind it could not be made — prints `unknown`, never `0 B`.
+ * read behind it could not be made — prints `unknown`, never `0 B`. A caller
+ * whose sentence needs the missing figure labelled passes `whenUnknown`
+ * (`'size unknown'`); the default reads in any slot that is already labelled.
  */
-export function fmtKnownBytes(n: number | null): string {
-  return n === null ? 'unknown' : fmtBytes(n)
+export function fmtKnownBytes(n: number | null, whenUnknown = 'unknown'): string {
+  return n === null ? whenUnknown : fmtBytes(n)
 }
 
 interface RoundedDisk {

@@ -723,7 +723,9 @@ export async function underSizedPvBands(executor: CommandExecutor, poolName: str
   const bands: number[] = []
   for (const [band, resolved] of arrays) {
     const pv = pvs.find(p => p.name === resolved.dev || p.name === `/dev/md/${poolName}-r${band}`)
-    if (!pv || pv.devSizeBytes <= 0)
+    // An unread size (null) is unknown, never under-sized — the plan never
+    // invents a pv-resize it cannot justify.
+    if (!pv || pv.devSizeBytes === null || pv.devSizeBytes <= 0)
       continue
     if (isPvUnderSized(pv.sizeBytes, pv.devSizeBytes))
       bands.push(band)
@@ -1128,7 +1130,9 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       if (!pv)
         throw new Error(`PV for array ${pool.name}-r${band} not found — the pool's LVM layer is inconsistent`)
       const arrayBytes = (resolved.md.blocks ?? 0) * 1024
-      if (arrayBytes > 0 && pv.sizeBytes >= arrayBytes - LVM_SLACK_BYTES)
+      // An unread PV size cannot prove the resize is done: run it, which is
+      // idempotent on an already-sized PV.
+      if (arrayBytes > 0 && pv.sizeBytes !== null && pv.sizeBytes >= arrayBytes - LVM_SLACK_BYTES)
         return true // already resized
       await execChecked(executor, PVRESIZE, [resolved.dev])
       return false
@@ -1167,7 +1171,9 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       const vg = vgs.find(v => v.name === pool.name)
       if (!vg)
         throw new Error(`volume group '${pool.name}' not found — cannot extend its LV`)
-      if (vg.freeBytes < VG_FREE_EPSILON_BYTES)
+      // An unread free size cannot prove there is nothing left: the extend is
+      // idempotent on a VG with nothing free.
+      if (vg.freeBytes !== null && vg.freeBytes < VG_FREE_EPSILON_BYTES)
         return true // nothing left to extend into — already done
       await execChecked(executor, LVEXTEND, [...LVM_MIXED_BLOCK_ARGS, '-l', '+100%FREE', `/dev/${pool.name}/${pool.lv.name}`])
       return false
@@ -1179,6 +1185,11 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       const vg = vgs.find(v => v.name === pool.name)
       if (!vg)
         throw new Error(`volume group '${pool.name}' not found — refusing to grow the filesystem`)
+      // An unread free size cannot verify that lv-extend finished, and this
+      // step runs only after that is PROVEN — so it refuses rather than grow a
+      // filesystem over a block device it could not confirm.
+      if (vg.freeBytes === null)
+        throw new Error(`the free space of volume group '${pool.name}' could not be read, so whether lv-extend finished cannot be verified — refusing to grow the filesystem before its block device. Check the pool's expansion in the Hybrid RAID view, then Resume it`)
       if (vg.freeBytes >= VG_FREE_EPSILON_BYTES)
         throw new Error(`lv-extend is not complete (VG '${pool.name}' still has ${fmtBytes(vg.freeBytes)} free) — refusing to grow the filesystem before its block device`)
       const lvs = parseLvsReport(await execChecked(executor, LVS, LVS_ARGS))
@@ -1198,7 +1209,9 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       const usageRes = await executor.exec(BTRFS, btrfsUsageArgs(mount.target))
       if (usageRes.exitCode === 0) {
         const usage = parseBtrfsUsage(usageRes.stdout)
-        if (usage.deviceSizeBytes !== null && usage.deviceSizeBytes >= lv.sizeBytes - LVM_SLACK_BYTES)
+        // An unread LV size cannot prove the filesystem already fills it: the
+        // resize below is idempotent, so it runs.
+        if (usage.deviceSizeBytes !== null && lv.sizeBytes !== null && usage.deviceSizeBytes >= lv.sizeBytes - LVM_SLACK_BYTES)
           return true // filesystem already fills the LV
       }
       await execChecked(executor, BTRFS, ['filesystem', 'resize', 'max', mount.target])

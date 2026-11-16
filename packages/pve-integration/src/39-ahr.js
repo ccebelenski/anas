@@ -1133,6 +1133,10 @@
     //   inactive → the pool volume is not active, so the cache's health
     //             cannot be read; a muted line, no verdict (the pool's own
     //             offline advisory says why the volume is down).
+    //   unknown  → the cache target and its device are there and the volume
+    //             is active, but `dmsetup status` did not answer; says so,
+    //             with no verdict either way (cr4: this must never fall
+    //             through to the healthy pill).
     //   healthy → the ONLINE pill, then the counters — which the schema only
     //             carries on healthy (a stale number presented as live is the
     //             failure GT-23 caught, so the fields are simply absent
@@ -1168,6 +1172,10 @@
             stateHtml = '<span style="color:var(--anas-muted)">'
                 + enc(t('health unknown — the pool volume is not active, so the cache cannot be read'))
                 + '</span>';
+        } else if (c.state === 'unknown') {
+            stateHtml = '<span style="color:var(--anas-warn)">'
+                + enc(t('Unknown: the cache status could not be read'))
+                + '</span>';
         } else {
             stateHtml = renderPoolState('healthy');
         }
@@ -1175,7 +1183,9 @@
         if (describable || leftover) {
             rows += capRow(t('Devices'),
                 (c.devices && c.devices.length) ? c.devices.join(', ') : t('device missing'));
-            rows += capRow(leftover ? t('Slice size') : t('Cache size'), fmtBytes(c.sizeBytes));
+            // cr4: null when a cache PV's size could not be read — the total is
+            // unknown, never a short one.
+            rows += capRow(leftover ? t('Slice size') : t('Cache size'), fsFigure(knownBytes(c.sizeBytes)));
         }
         if (describable) {
             rows += capRow(t('Mode'),
@@ -2050,12 +2060,24 @@
         // cr3: in the `unknown` state the daemon refuses every snapshot verb,
         // and `subvolLayout` reads false only because the mount options could
         // not be read — so the reason is the state, never "predates the layout".
+        // cr4 D-30: an UNMOUNTED pool sends `subvolLayout: null` (its layout
+        // was never read). "Predates the layout — destroy and recreate" is
+        // advice on a pool nobody looked at; the reason is the mount.
         var snapBtn = grid.down('#snapshots');
         if (snapBtn) {
-            var layout = has && !!sel[0].get('subvolLayout');
+            var layoutValue = has ? recField(sel[0], 'subvolLayout') : null;
+            var layout = layoutValue === true;
+            var snapMounted = has && recField(sel[0], 'mounted') === true;
             var stateUnknown = has && state === 'unknown';
+            var notMountedTip = t('The pool is not mounted, so its snapshot layout cannot be read. Mount it from the Hybrid RAID view, then try again.');
             snapBtn.setDisabled(!layout || stateUnknown);
-            snapBtn.setTooltip(!has ? '' : (stateUnknown ? t(STATE_UNKNOWN_REASON) : snapshotsTooltip(layout)));
+            snapBtn.setTooltip(!has
+                ? ''
+                : (stateUnknown
+                    ? t(STATE_UNKNOWN_REASON)
+                    : ((layoutValue === null || layoutValue === undefined) && !snapMounted
+                        ? notMountedTip
+                        : snapshotsTooltip(layout))));
         }
         // Resume/Abandon only exist for a halted expansion (§6.2) — and while
         // one is halted, a fresh Expand/Replace would 409 anyway, so swap them.

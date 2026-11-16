@@ -1047,8 +1047,8 @@ export async function poolRoutes(
       const ahr = name !== null ? ahrSliceLabelOwner(name) : null
       if (ahr) {
         problems.push(ahr.kind === 'member'
-          ? `partition '${id}' carries AHR pool '${ahr.pool}''s member slice label '${name}' — AHR still counts it as that pool's (an expansion resume writes md onto it); delete or relabel the partition first if it is really free`
-          : `partition '${id}' carries AHR pool '${ahr.pool}''s cache slice label '${name}' — AHR still counts it as that pool's (Detach cache reclaims it); delete or relabel the partition first if it is really free`)
+          ? `partition '${id}' carries a member slice label '${name}' of AHR pool '${ahr.pool}' — AHR still counts it as that pool's (an expansion resume writes md onto it); delete or relabel the partition first if it is really free`
+          : `partition '${id}' carries a cache slice label '${name}' of AHR pool '${ahr.pool}' — AHR still counts it as that pool's (Detach cache reclaims it); delete or relabel the partition first if it is really free`)
       }
       const found = blkidContentSignatures(sig.stdout)
       if (found.length > 0) {

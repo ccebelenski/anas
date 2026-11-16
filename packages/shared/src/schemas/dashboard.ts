@@ -42,11 +42,18 @@ export const PoolStatusBrief = z.object({
   /** Present when ANAS does not manage this pool (cr3; see `PoolUnmanaged`). */
   unmanaged: PoolUnmanaged.optional(),
   state: PoolState,
-  /** Capacity used, 0–100. */
-  capacity: z.number().min(0).max(100),
-  size: z.number().nonnegative(),
-  allocated: z.number().nonnegative(),
-  free: z.number().nonnegative(),
+  /**
+   * Capacity used, 0–100. `null` = unknown (cr4, P-3): the `zpool list -j`
+   * pool did not carry the field; the panel renders unknown and the capacity
+   * warning is not raised off a value nobody read.
+   */
+  capacity: z.number().min(0).max(100).nullable(),
+  /** Total size in bytes. `null` = unknown (cr4, P-3). */
+  size: z.number().nonnegative().nullable(),
+  /** Allocated space in bytes. `null` = unknown (cr4, P-3). */
+  allocated: z.number().nonnegative().nullable(),
+  /** Free space in bytes. `null` = unknown (cr4, P-3). */
+  free: z.number().nonnegative().nullable(),
   /**
    * A scan is running. `null` = unknown (cr3): `zpool status` could not be
    * read or did not report this pool; the `pools` section is then also listed

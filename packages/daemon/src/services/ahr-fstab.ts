@@ -167,9 +167,10 @@ export async function mountAhrPool(
   line: MountEntry | null,
 ): Promise<void> {
   // cr3 review 3: ANAS's defaults carry the layout (`subvol=@data` or not); a
-  // layout that could not be read (null) is never guessed into a mount.
+  // layout that could not be read (null) is never guessed into a mount. Null
+  // means the pool is not mounted, or the kernel mount table did not answer.
   if (line === null && pool.subvolLayout === null)
-    throw new Error(`pool '${pool.name}' has no fstab line and its subvolume layout could not be read (the kernel mount table did not answer) — not mounting it with guessed options`)
+    throw new Error(`pool '${pool.name}' has no fstab line, and its subvolume layout could not be read (the pool is not mounted, or the kernel mount table did not answer) — not mounting it with guessed options. Mount it from the Hybrid RAID view if it is not mounted, or retry once the kernel mount table can be read`)
   const entry = line ?? ahrFstabEntry(pool.name, pool.mountpoint, pool.subvolLayout === true)
   const args = ['-c', '-t', entry.fstype, ...directMountOptionArgs(entry), '--', entry.spec]
   const r = await mountThroughOpenedDir(executor, pool.mountpoint, args)
@@ -190,7 +191,7 @@ export async function ahrPoolLineForRemount(
 ): Promise<MountEntry | null> {
   const line = await readAhrPoolLine(fstabPath, name)
   if (line.kind === 'unreadable')
-    throw new Error(`could not read ${fstabPath} for pool '${name}''s own mount line (${line.detail}) — nothing was unmounted`)
+    throw new Error(`could not read ${fstabPath} for the mount line of pool '${name}' (${line.detail}) — nothing was unmounted`)
   if (line.kind === 'none') {
     say(`Pool '${name}' has no line in ${fstabPath} — re-mounting with ANAS's default options`)
     return null

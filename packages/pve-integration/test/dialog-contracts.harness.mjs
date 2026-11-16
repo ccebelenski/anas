@@ -15075,6 +15075,9 @@ const CACHE_HEALTHY = {
 const CACHE_ABSENT = { devices: [], sizeBytes: 0, mode: 'writethrough', policy: '', state: 'absent' }
 const CACHE_LEFTOVER = { devices: [HOT8], sizeBytes: 512 * MiB, mode: 'writethrough', policy: '', state: 'absent' }
 const CACHE_FAILED = { devices: [], sizeBytes: 512 * MiB, mode: 'writethrough', policy: 'smq', state: 'failed' }
+// An ACTIVE cache target whose `dmsetup status` did not answer (cr4 D-28):
+// the device and size are real, the health is not known, no counters.
+const CACHE_UNKNOWN = { devices: [HOT9], sizeBytes: 512 * MiB, mode: 'writethrough', policy: 'smq', state: 'unknown' }
 /** Freshly attached: healthy, counters present, nothing read through it yet. */
 const CACHE_COLD = {
   devices: [HOT9], sizeBytes: 512 * MiB, mode: 'writethrough', policy: 'smq',
@@ -15136,6 +15139,10 @@ async function ahrCacheBlockChecks() {
     ahrCacheRow('gtclean', { cache: CACHE_ABSENT }),
     ahrCacheRow('gtleft', { cache: CACHE_LEFTOVER }),
     ahrCacheRow('gtfail', { state: 'degraded', cache: CACHE_FAILED }),
+    ahrCacheRow('gtunk', { cache: CACHE_UNKNOWN }),
+    // cr4: a cache PV whose size cell could not be read makes the total
+    // unknown — the block says so instead of drawing a short one.
+    ahrCacheRow('gtunksize', { cache: { ...CACHE_UNKNOWN, sizeBytes: null } }),
     ahrCacheRow('gtold'),
     ahrCacheRow('gtoff', { state: 'offline', cache: CACHE_ABSENT }),
     // An offline pool that still carries a LIVE cache: the route refuses the
@@ -15223,6 +15230,21 @@ async function ahrCacheBlockChecks() {
     !/Hits \/ misses/.test(failed) && !/blocks used/.test(failed) && !/Dirty blocks/.test(failed),
     failed.slice(0, 600))
 
+
+  // cr4 D-28 — an ACTIVE cache target whose status could not be read. The
+  // state must never fall through to the healthy pill (that was the old
+  // catch-all else branch), and it must not claim a failure either.
+  const unknown = cacheSection(await detailHtmlOf(grid, 'gtunk'))
+  ok('cache(unknown): says the status could not be read',
+    /Unknown: the cache status could not be read/.test(unknown), unknown)
+  ok('cache(unknown): never the healthy pill', !/state-pill/.test(unknown) && !/ONLINE/.test(unknown), unknown)
+  ok('cache(unknown): never the failed line either', !/cache device failed/.test(unknown), unknown)
+  ok('cache(unknown): no counters are invented', !/Hits \/ misses/.test(unknown) && !/Dirty blocks/.test(unknown), unknown)
+  ok('cache(unknown): the device it was read on is still named', unknown.includes(HOT9), unknown)
+
+  const unksize = cacheSection(await detailHtmlOf(grid, 'gtunksize'))
+  ok('cache(unknown size): the size reads unknown, never 0 B or a blank row',
+    /unknown/.test(unksize) && !/0 B/.test(unksize), unksize)
 
   const old = await detailHtmlOf(grid, 'gtold')
   ok('cache(skew): a payload with no cache field renders NO section (cannot tell ≠ no cache)',

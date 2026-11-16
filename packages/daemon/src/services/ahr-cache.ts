@@ -366,10 +366,16 @@ export async function findCacheSlices(executor: CommandExecutor, pool: string): 
  * size, scoped to what ANAS labelled. "Every non-md PV in the VG" would count a
  * PV an operator added by hand as cache flash.
  */
-function cachePvBytes(pvs: LvmPv[], pool: string, sliceDevices: Set<string>): number {
-  return pvs
-    .filter(p => p.vgName === pool && sliceDevices.has(p.name))
-    .reduce((sum, p) => sum + p.sizeBytes, 0)
+function cachePvBytes(pvs: LvmPv[], pool: string, sliceDevices: Set<string>): number | null {
+  let total: number | null = 0
+  for (const pv of pvs.filter(p => p.vgName === pool && sliceDevices.has(p.name))) {
+    // One unread size makes the total unknown (cr4) — never a short one.
+    if (pv.sizeBytes === null)
+      total = null
+    else if (total !== null)
+      total += pv.sizeBytes
+  }
+  return total
 }
 
 /** Every LV of the pool VG as `lvs` reports it right now. */
@@ -418,7 +424,8 @@ export interface CacheAttachInput {
 export interface CacheAttachResult {
   pool: string
   devices: string[]
-  sizeBytes: number
+  /** The cache PVs' total; null when a PV size could not be read (cr4). */
+  sizeBytes: number | null
   /** Rides out as the job result's `warnings` — the established advisory home. */
   warnings?: string[]
 }

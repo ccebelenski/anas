@@ -11,7 +11,7 @@ import { attachAhrCache, cacheDeviceVerdict, detachAhrCache, notifyCacheRecovery
 import { inventoryUnreadableRefusal, isDiskStatusUnknown } from '../services/ahr-disk-recheck.js'
 import { ahrGuard } from '../services/ahr-guard.js'
 import { readPoolBandCount, requirePoolVg } from '../services/ahr-identity.js'
-import { fmtBytes } from '../services/ahr-layout.js'
+import { fmtKnownBytes } from '../services/ahr-layout.js'
 import { dmName } from '../services/ahr-topology.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
@@ -273,7 +273,7 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
         // check on purpose: an offline pool with a cache is refused for being
         // offline, because "detach it first" would send the operator nowhere.
         async pool => pool.cache && pool.cache.state !== 'absent'
-          ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' already has a read cache (${pool.cache.devices.join(', ') || 'device missing'}, ${fmtBytes(pool.cache.sizeBytes)}, state '${pool.cache.state}'). Detach it before attaching another` }
+          ? { status: 409, code: 'CONFLICT', message: `AHR pool '${pool.name}' already has a read cache (${pool.cache.devices.join(', ') || 'device missing'}, ${fmtKnownBytes(pool.cache.sizeBytes, 'size unknown')}, state '${pool.cache.state}'). Detach it before attaching another` }
           : null,
         async pool => pool.pick.unreadable.length > 0 ? inventoryUnreadableRefusal(pool.pick.unreadable) : null,
         async pool => pool.pick.problems.length > 0
@@ -517,12 +517,13 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
    *     READ — the GT-23 asymmetry in `buildAhrCacheState` — is no evidence on
    *     its own), or the cache PV's device gone: an `[unknown]` PV in the VG
    *     while every band has its own named md PV.
-   *  2. A cache target that reads `healthy` (or an unconfirmed `failed`) whose
-   *     cache PV no longer probes as itself — `cacheDeviceVerdict` compares
-   *     each cache PV's LVM UUID with what `blkid -p` reads on its device now.
-   *     Before cr3 this was a label sweep, and ANY disk carrying a
-   *     `<pool>-cache<n>` slice (a stale one left on an earlier cache disk —
-   *     detach keeps the slice) hid the loss of the live device.
+   *  2. A cache target that reads `healthy`, `unknown` (the status itself could
+   *     not be read) or an unconfirmed `failed`, whose cache PV no longer
+   *     probes as itself — `cacheDeviceVerdict` compares each cache PV's LVM
+   *     UUID with what `blkid -p` reads on its device now. Before cr3 this was
+   *     a label sweep, and ANY disk carrying a `<pool>-cache<n>` slice (a
+   *     stale one left on an earlier cache disk — detach keeps the slice) hid
+   *     the loss of the live device.
    *
    * Why the second exists, and why `healthy` alone is not the answer: dm-cache
    * enters Fail only after an I/O on the cache device fails. A removal on an
@@ -566,12 +567,14 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
         recover = false
       }
     }
-    // The evidence for a healthy-reading cache whose disk went away — and for
-    // a `failed` one whose dm answer could not be confirmed — is THE cache
+    // The evidence for a healthy-reading cache whose disk went away — and,
+    // when the status itself could not be read (`unknown`) or a `failed` one's
+    // dm answer could not be confirmed, the only evidence left — is THE cache
     // device's identity (cr3): every cache PV of the VG still probing as
     // itself. Never a GPT label sweep: a stale `<pool>-cache<n>` slice on an
-    // earlier cache disk hid the loss of the live one.
-    if (!recover && (pool.cache?.state === 'healthy' || pool.cache?.state === 'failed')) {
+    // earlier cache disk hid the loss of the live one. The guard below acts
+    // only on the probe's `missing` verdict, never on the status word.
+    if (!recover && (pool.cache?.state === 'healthy' || pool.cache?.state === 'failed' || pool.cache?.state === 'unknown')) {
       // A failed read here is a logged no-op (never a thrown 500): the old
       // sweep's catch answered the same way, and the boot rung re-checks.
       let device: Awaited<ReturnType<typeof cacheDeviceVerdict>>

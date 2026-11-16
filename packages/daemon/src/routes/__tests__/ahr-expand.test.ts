@@ -610,7 +610,7 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       withSpareTree()
       const res = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand/plan', payload: { addDisks: [F] } })
       assert.equal(res.statusCode, 400, res.body)
-      assert.match(res.json().error.message, new RegExp(`disk '${F}' is pool 'quad''s hot spare — detach it first`))
+      assert.match(res.json().error.message, new RegExp(`disk '${F}' is a hot spare of pool 'quad' — detach it first`))
       assert.deepEqual(mutatingCalls(executor), [])
     })
 
@@ -629,7 +629,7 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/plan', payload: { addDisks: [X] } })
       assert.equal(res.statusCode, 400, res.body)
       assert.ok(!res.json().error.message.includes('hot spare'), res.body)
-      assert.match(res.json().error.message, new RegExp(`disk '${X}' is pool 'tank''s member disk`))
+      assert.match(res.json().error.message, new RegExp(`disk '${X}' is a member disk .*of pool 'tank'`))
     })
 
     it('replace onto the spare answers 400 (a spare is never promoted to a member by Replace)', async () => {
@@ -637,7 +637,7 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       withSpareTree()
       const res = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: IDENTITY_HEADERS, payload: { newDiskId: F } })
       assert.equal(res.statusCode, 400, res.body)
-      assert.match(res.json().error.message, new RegExp(`replacement disk '${F}' is pool 'quad''s hot spare`))
+      assert.match(res.json().error.message, new RegExp(`replacement disk '${F}' is a hot spare of pool 'quad'`))
       assert.deepEqual(mutatingCalls(executor), [])
     })
   })

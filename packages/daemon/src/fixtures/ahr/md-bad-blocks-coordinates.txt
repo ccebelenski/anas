@@ -1,0 +1,25 @@
+# md bad-block coordinates. Captured 2026-11-15 on a PVE 9 test node (kernel 7.0.14-28-pve, mdadm v4.4).
+# Rig: one 200M loop device, `mdadm --create /dev/md99 --run --level=1 --raid-devices=2 --metadata=1.2 <loop> missing`
+# (a mirror with a single leg, so a bad block on that leg cannot be read around).
+# Commands and their output, in order.
+$ mdadm --examine <loop> | grep -iE "Data Offset|Bad Block"
+    Data Offset : 2048 sectors
+  Bad Block Log : 512 entries available at offset 16 sectors
+$ cat /sys/block/md99/md/dev-<loop>/offset
+2048
+$ cat /sys/block/md99/md/dev-<loop>/bad_blocks
+$ dd if=/dev/md99 of=/dev/null bs=512 skip=1000 count=8 iflag=direct      # baseline
+4096 bytes (4.1 kB, 4.0 KiB) copied
+$ echo "3048 8" > /sys/block/md99/md/dev-<loop>/bad_blocks                  # 3048 = data offset 2048 + 1000
+$ cat /sys/block/md99/md/dev-<loop>/bad_blocks
+3048 8
+$ cat /sys/block/md99/md/rd0/bad_blocks                                     # rd0 -> dev-<loop>
+3048 8
+$ dd if=/dev/md99 of=/dev/null bs=512 skip=1000 count=8 iflag=direct      # ARRAY sector 1000
+0+0 records out
+0 bytes copied
+$ dd if=/dev/md99 of=/dev/null bs=512 skip=3048 count=8 iflag=direct      # ARRAY sector 3048
+8+0 records out
+4096 bytes (4.1 kB, 4.0 KiB) copied
+# Reading: the stored range 3048+8 made ARRAY sector 1000 unreadable and left array sector 3048 readable.
+# rd<n>/bad_blocks is in sectors of the MEMBER DEVICE (it includes the data offset): `absolute`.

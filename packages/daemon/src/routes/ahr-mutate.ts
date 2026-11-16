@@ -1170,7 +1170,14 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // operator picked when they built the pool, and nothing else on this
     // screen names them.
     if (pool.cache && pool.cache.state !== 'absent' && pool.cache.devices.length > 0) {
-      warnings.push(`The read cache on ${pool.cache.devices.join(', ')} is removed with the pool: the ${fmtBytes(pool.cache.sizeBytes)} slice is wiped and the disk comes back available`)
+      // One cache can span several disks (attach takes a list). The size is
+      // the cache's total, so it is stated only for a single slice; an unread
+      // size is left out, never printed as "unknown".
+      const plural = pool.cache.devices.length > 1
+      const fate = plural
+        ? 'their slices are wiped and the disks come back available'
+        : `the ${pool.cache.sizeBytes === null ? '' : `${fmtKnownBytes(pool.cache.sizeBytes)} `}slice is wiped and the disk comes back available`
+      warnings.push(`The read cache on ${pool.cache.devices.join(', ')} is removed with the pool: ${fate}`)
     }
 
     // Fail-open is not fail-silent (D3), and story cr.24: name what STILL

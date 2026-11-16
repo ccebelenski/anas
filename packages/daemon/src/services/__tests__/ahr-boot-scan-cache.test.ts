@@ -29,7 +29,7 @@ import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../ahr-topology.js'
  * udev event runs, THEN activates and mounts — in that order, which is the
  * single fact this file exists to pin.
  *
- * Five worlds over a one-band pool `tank`:
+ * Six worlds over a one-band pool `tank`:
  *   'missing'   cache target, cache PV `[unknown]`, volume inactive, unmounted
  *   'healthy'   a live, working cache — must be left completely alone
  *   'bandsdown' cache PV AND the band's md PV missing, volume inactive —
@@ -40,6 +40,10 @@ import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../ahr-topology.js'
  *   'present'   the cache device PRESENT but dm reports it failed, volume
  *               active and mounted → recovered, and described as FAILED,
  *               never as a missing device
+ *   'dmunknown' the cache target and its device present, volume active and
+ *               mounted, but `dmsetup status` does not answer → `unknown`,
+ *               left alone and the operator told the cache went unchecked
+ *               (cr4 D-28: an uncache here would drop a healthy cache)
  */
 
 const GIB = 1024 ** 3
@@ -71,16 +75,16 @@ function ok(stdout: string) {
 /** An empty capacity record — the intent's before/after are not read by the cache rung. */
 const CAP: AhrCapacity = { rawBytes: 0, usableBytes: 0, usedBytes: 0, freeBytes: 0, redundancyOverheadBytes: 0, unprotectedWastedBytes: 0, pendingBytes: 0 }
 
-type World = 'missing' | 'healthy' | 'bandsdown' | 'bandonly' | 'present'
+type World = 'missing' | 'healthy' | 'bandsdown' | 'bandonly' | 'present' | 'dmunknown'
 
 /** The cache SSD and its `tank-cache1` slice are attached and named in `pvs`. */
 function cachePresent(world: World): boolean {
-  return world === 'healthy' || world === 'bandonly' || world === 'present'
+  return world === 'healthy' || world === 'bandonly' || world === 'present' || world === 'dmunknown'
 }
 
 /** The pool volume is active and mounted. */
 function volumeUp(world: World): boolean {
-  return world === 'healthy' || world === 'present'
+  return world === 'healthy' || world === 'present' || world === 'dmunknown'
 }
 
 function ahrLsblkJson(world: World): string {
@@ -180,12 +184,15 @@ function pvsJson(world: World): string {
 
 const DM_STATUS: Record<World, string> = {
   // An INACTIVE LV is not in the device-mapper table at all: dmsetup exits
-  // non-zero with prose, and the reader gets no line to judge. Over a
-  // cache-target LV that reads `failed`, never `absent` — the deliberate
-  // asymmetry in `buildAhrCacheState` (GT-23's failure shape).
+  // non-zero with prose, and the reader gets no line to judge. Over an
+  // inactive cache-target LV that reads `inactive`, never `failed` — the
+  // deliberate asymmetry in `buildAhrCacheState`.
   missing: 'Device does not exist.\n',
   bandsdown: 'Device does not exist.\n',
   bandonly: 'Device does not exist.\n',
+  // An ACTIVE cache target whose status read did NOT answer: the command
+  // failed, so the cache's health was not read at all — `unknown` (cr4 D-28).
+  dmunknown: 'Device does not exist.\n',
   present: '0 4186624 cache Fail\n',
   healthy: '0 4186624 cache 8 24/2048 128 8/8000 152 28 0 0 0 8 0 2 metadata2 writethrough 2 migration_threshold 2048 mq 10 random_threshold 0 sequential_threshold 0 discard_promote_adjustment 0 read_promote_adjustment 0 write_promote_adjustment 0 rw - \n',
 }
@@ -220,7 +227,7 @@ function buildExecutor(world: World): MockExecutor {
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: ok(lvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_STATE_ARGS, result: ok(lvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/pvs', args: [...PVS_ARGS], result: ok(pvsJson(world)) })
-  executor.addFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: volumeUp(world)
+  executor.addFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: volumeUp(world) && world !== 'dmunknown'
     ? ok(DM_STATUS[world])
     : { stdout: '', stderr: DM_STATUS[world], exitCode: 1 } })
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: ok(JSON.stringify({
@@ -354,7 +361,7 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
     assert.ok(!titles.some(t => /cache recovery FAILED/.test(t!)), titles.join(' | '))
     const unmounted = notices(executor).find(n => n[1] === 'AHR pool not re-mounted: tank')
     assert.ok(unmounted, titles.join(' | '))
-    assert.match(unmounted![2]!, /dropped pool 'tank''s failed read cache/)
+    assert.match(unmounted![2]!, /dropped the failed read cache of pool 'tank'/)
     assert.match(unmounted![2]!, /mounting it at '.*gone\/tank' failed: Mountpoint .* does not exist as a directory/)
   })
 
@@ -472,6 +479,35 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
     assert.ok(!perl!.args[4].includes('was missing'), perl!.args[4])
     // Mounted and active: nothing to activate or mount afterwards.
     assert.ok(!rungCalls(executor).some(c => c[0] === '/usr/sbin/vgchange' || c[0] === '/usr/bin/mount'))
+  })
+
+  it('a cache whose dmsetup status could not be READ is left alone and reported unchecked (cr4 D-28)', async () => {
+    // The one fault: `dmsetup status` exits 1. Everything else says the cache
+    // is there — target present, device named, volume active and mounted. The
+    // state is `unknown`, and the rung must not act on it: before cr4 this read
+    // `failed`, and the rung uncached a healthy, mounted cache at every daemon
+    // start whose dm read hiccuped, announcing a cache device failure nobody
+    // had read.
+    const executor = buildExecutor('dmunknown')
+    const lines: string[] = []
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.cacheRecovered, [])
+    assert.deepEqual(rungCalls(executor), [], 'no uncache of a cache whose health was not read')
+    assert.ok(lines.includes('ahr.boot pool=tank cache-rung=skipped reason=status-unreadable'), lines.join('\n'))
+    const perl = executor.calls.find(c => c.command === '/usr/bin/perl')
+    assert.ok(perl, 'the operator is told the cache went unchecked')
+    assert.equal(perl!.args[3], 'AHR read cache not checked: tank')
+    // The whole body: the pools WERE read (that is how the unknown state is
+    // known), so the notice names only the unread cache status.
+    assert.equal(
+      perl!.args[4],
+      `The read cache of AHR pool 'tank' could not be checked at start-up because dmsetup status for the pool volume did not answer. `
+      + `The automatic recovery of a failed or missing cache device did not run. `
+      + `If the cache device has failed, every read on the pool returns an I/O error until the cache is removed. `
+      + `Open the Hybrid RAID view and reload it, and Detach the cache there if it reads failed.`,
+    )
+    assert.ok(!perl!.args[4].includes('failed on pool'), perl!.args[4])
+    assert.ok(!perl!.args[4].includes('could not read the AHR pools'), 'the pools were read')
   })
 
   it('never takes the daemon down when the rung throws', async () => {
@@ -629,10 +665,17 @@ describe('ahr-boot-scan branch (d) — the skips the rung must not keep silent o
     const [, , severity, title, body] = perl[0].args
     assert.equal(severity, 'warning')
     assert.equal(title, 'AHR read cache not checked: tank')
-    // It names the unreadable read, and claims only what is known.
-    assert.match(body, /could not read the AHR pools at start-up \(.*mdadm --detail --export \/dev\/md127/)
-    assert.match(body, /could not check whether that cache has failed/)
-    assert.match(body, /automatic recovery of a failed or missing cache device did not run/)
+    // The whole body for this cause: it names the unreadable read, keeps the
+    // "if this VG is an AHR pool" hedge (lvs names every cached VG on the
+    // node), and claims only what is known.
+    const detail = 'the AHR topology could not be read (mdadm --detail --export /dev/md127 exited 1: mdadm: cannot open /dev/md127: Input/output error)'
+    assert.equal(
+      body,
+      `Volume group 'tank' carries a read cache, and ANAS could not read the AHR pools at start-up (${detail}), `
+      + `so it could not check whether that cache has failed; the automatic recovery of a failed or missing cache device did not run. `
+      + `If 'tank' is an AHR pool whose cache device has failed, every read on the pool returns an I/O error until the cache is removed. `
+      + `Check the pool in the Hybrid RAID view and Detach the cache there if it reads failed.`,
+    )
     assert.ok(!/recovery FAILED|whose device is missing/.test(body), body)
   })
 

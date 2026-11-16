@@ -332,7 +332,7 @@ describe('nf.1 — attach / replace onto a by-id partition (wave-3 D1)', () => {
       blkid = ok(withName('ahr0-d3-b2'))
       const res = await post(PART(2))
       assert.equal(res.statusCode, 400, res.body)
-      assert.equal(res.json().error.message, `Ineligible disk selection: partition '${PART(4)}' carries AHR pool 'ahr0''s member slice label 'ahr0-d3-b2' — AHR still counts it as that pool's (an expansion resume writes md onto it); delete or relabel the partition first if it is really free`)
+      assert.equal(res.json().error.message, `Ineligible disk selection: partition '${PART(4)}' carries a member slice label 'ahr0-d3-b2' of AHR pool 'ahr0' — AHR still counts it as that pool's (an expansion resume writes md onto it); delete or relabel the partition first if it is really free`)
       assert.deepEqual(mutations(), [])
     })
 
@@ -341,7 +341,7 @@ describe('nf.1 — attach / replace onto a by-id partition (wave-3 D1)', () => {
       blkid = ok(withName('gtcache-cache1'))
       const res = await post(PART(2))
       assert.equal(res.statusCode, 400, res.body)
-      assert.match(res.json().error.message, new RegExp(`partition '${PART(4)}' carries AHR pool 'gtcache''s cache slice label 'gtcache-cache1'`))
+      assert.match(res.json().error.message, new RegExp(`partition '${PART(4)}' carries a cache slice label 'gtcache-cache1' of AHR pool 'gtcache'`))
       assert.deepEqual(mutations(), [])
     })
 

@@ -234,18 +234,22 @@ export const PoolSummary = z.object({
   /** Present when ANAS does not manage this pool ({@link PoolUnmanaged}): offer no verb on it. */
   unmanaged: PoolUnmanaged.optional(),
   state: PoolState,
-  /** Total pool size in bytes */
-  size: z.number().nonnegative(),
-  /** Allocated space in bytes */
-  allocated: z.number().nonnegative(),
-  /** Free space in bytes */
-  free: z.number().nonnegative(),
-  /** Fragmentation percentage 0–100 */
-  fragmentation: z.number().min(0).max(100),
-  /** Capacity percentage 0–100 */
-  capacity: z.number().min(0).max(100),
-  /** Dedup ratio as a float (1.0 = no dedup) */
-  dedupRatio: z.number().nonnegative(),
+  /**
+   * Total pool size in bytes. `null` = unknown (cr4, P-3): a `zpool list -j`
+   * pool whose `properties` bag did not carry this field — the same rule
+   * `parseZpoolGet` follows, so an absent cell never reads as 0 bytes.
+   */
+  size: z.number().nonnegative().nullable(),
+  /** Allocated space in bytes. `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  allocated: z.number().nonnegative().nullable(),
+  /** Free space in bytes. `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  free: z.number().nonnegative().nullable(),
+  /** Fragmentation percentage 0–100. `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  fragmentation: z.number().min(0).max(100).nullable(),
+  /** Capacity percentage 0–100. `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  capacity: z.number().min(0).max(100).nullable(),
+  /** Dedup ratio as a float (1.0 = no dedup). `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  dedupRatio: z.number().nonnegative().nullable(),
   /**
    * Whether a scan (scrub/resilver) is currently running. `null` = unknown:
    * `zpool status` could not be read, or did not report this pool (cr3, the
@@ -337,13 +341,18 @@ export const PoolDetail = z.object({
   state: PoolState,
   /** Pool GUID as string (64-bit, exceeds JS safe integer range) */
   guid: z.string(),
-  /** Total pool size in bytes */
-  size: z.number().nonnegative(),
-  allocated: z.number().nonnegative(),
-  free: z.number().nonnegative(),
-  fragmentation: z.number().min(0).max(100),
-  capacity: z.number().min(0).max(100),
-  dedupRatio: z.number().nonnegative(),
+  /** Total pool size in bytes. `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  size: z.number().nonnegative().nullable(),
+  /** Allocated space in bytes. `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  allocated: z.number().nonnegative().nullable(),
+  /** Free space in bytes. `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  free: z.number().nonnegative().nullable(),
+  /** Fragmentation percentage 0–100. `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  fragmentation: z.number().min(0).max(100).nullable(),
+  /** Capacity percentage 0–100. `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  capacity: z.number().min(0).max(100).nullable(),
+  /** Dedup ratio as a float (1.0 = no dedup). `null` = unknown (cr4, P-3: the `zpool list -j` pool did not carry the field), never 0. */
+  dedupRatio: z.number().nonnegative().nullable(),
   /** Health message, present only when pool is not ONLINE */
   health: PoolHealthMessage.optional(),
   /** Total error count for the pool */

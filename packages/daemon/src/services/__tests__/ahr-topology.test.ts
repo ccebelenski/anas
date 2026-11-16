@@ -181,7 +181,11 @@ function pve5Executor(overrides?: { mdstat?: string, vgs?: string, lvs?: string 
   // cr3 AHR-CORE-M5: pvs answers (no rows, what an unanswered pvs used to read as) — an unanswered one now makes the AHR topology unreadable.
   mock.addFixture({ command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [] }] }), stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(overrides?.lvs ?? pve5Lvs()) })
-  mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('') })
+  // The captured shape of "nothing ANAS mounts is mounted": findmnt answers
+  // with an empty table. (An empty STDOUT is what an UNREADABLE answer looks
+  // like — cr4: that now reads the pool's state as `unknown`, which is not
+  // what these worlds mean.)
+  mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('{"filesystems":[]}') })
   return mock
 }
 
@@ -843,6 +847,16 @@ unused devices: <none>
       // Activity, not fault: the §10 "only failures card" policy must stay
       // silent for the whole multi-day build.
       assert.deepEqual(buildAhrWarnings([pool]), [])
+    })
+
+    it('an UNMOUNTED pool reads its layout as UNKNOWN, never the flat one (cr4 D-30)', async () => {
+      // Nothing is mounted in this world: findmnt answered with an empty
+      // table. A flat pool and an unmounted one are indistinguishable without
+      // a mount, and `false` here told a snapshot create to advise destroying
+      // a pool whose subvolumes nobody had looked at.
+      const pool = await pve5Pool()
+      assert.equal(pool.mounted, false)
+      assert.equal(pool.subvolLayout, null)
     })
 
     it('the unrelated clean pool in the same mdstat stays healthy', async () => {

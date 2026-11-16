@@ -201,9 +201,15 @@ export function parseScrubStamp(text: string): number | null {
   return Date.UTC(Number(m[6]), month, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]))
 }
 
-/** A clean btrfs error summary (`no errors found`). */
-function isCleanSummary(summary: string | null): boolean {
-  return summary === null || summary === 'no errors found'
+/**
+ * A clean btrfs error summary (`no errors found`).
+ *
+ * Takes a STRING only (cr4 D-34): an ABSENT summary line is not a clean one —
+ * it is a result nobody read, and the finished-pass path refuses on it
+ * ({@link ScrubVerdictUnknownError}) rather than calling it clean.
+ */
+function isCleanSummary(summary: string): boolean {
+  return summary === 'no errors found'
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -788,10 +794,15 @@ const TRAILING_SLASH_RE = /\/+$/
 const SURROUNDING_SLASH_RE = /^\/+|\/+$/g
 const LEADING_SLASH_RE = /^\/+/
 
-/** Sum of the `key=N` counters in a btrfs `Error summary` (`csum=2 read=1`). */
-export function countErrorSummary(summary: string | null): number {
-  if (!summary)
-    return 0
+/**
+ * Sum of the `key=N` counters in a btrfs `Error summary` (`csum=2 read=1`).
+ * Null when there is no summary to count (cr4 D-34): an absent line is an
+ * unread result, and summing it to 0 would say "no errors" about a line
+ * nobody read.
+ */
+export function countErrorSummary(summary: string | null): number | null {
+  if (summary === null)
+    return null
   let total = 0
   for (const m of summary.matchAll(SUMMARY_COUNT_RE))
     total += Number(m[1])
@@ -869,8 +880,9 @@ async function mountedSubvolume(executor: CommandExecutor, pool: AhrPool): Promi
     // fall through to the pool's own reading
   }
   // cr3 (from the AHR core lane): the pool's own reading, compared
-  // EXPLICITLY — null means the kernel mount table could not be read, and is
-  // returned as "unknown", never as the top level a falsy test would make it.
+  // EXPLICITLY — null means the layout could not be read (the pool is not
+  // mounted, or the kernel mount table did not answer), and is returned as
+  // "unknown", never as the top level a falsy test would make it.
   const layout = (pool as { subvolLayout?: boolean | null }).subvolLayout
   if (layout === null)
     return null
@@ -1632,13 +1644,13 @@ export async function btrfsScrubPass(
   // (or whether it could be read at all).
   if (startExit === 3) {
     const summary = attemptResult.verdict?.errorSummary ?? null
-    return { startedAt, btrfsErrors: isCleanSummary(summary) ? 'uncorrectable errors (btrfs scrub start exited 3)' : summary }
+    return { startedAt, btrfsErrors: summary === null || isCleanSummary(summary) ? 'uncorrectable errors (btrfs scrub start exited 3)' : summary }
   }
   if (attemptResult.verdict === undefined)
     throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}' finished but its status could not be read: ${firstErrorLine(attemptResult.error)}`)
   const verdict = attemptResult.verdict
   if (verdict.status === 'aborted')
-    throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}' was aborted${isCleanSummary(verdict.errorSummary) ? '' : ` (${verdict.errorSummary})`}`)
+    throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}' was aborted${verdict.errorSummary !== null && !isCleanSummary(verdict.errorSummary) ? ` (${verdict.errorSummary})` : ''}`)
   if (verdict.status === 'finished') {
     // The status describes the LAST pass; it must be THIS one. A stamp from
     // before this pass began (seconds are floored, so a 2 s margin) is
@@ -1650,6 +1662,15 @@ export async function btrfsScrubPass(
     const stampMs = stampText === null ? null : parseScrubStamp(stampText)
     if (stampMs !== null && stampMs < startedAt.getTime() - 2000)
       throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}': the status read after this pass describes an earlier pass (started ${stampText}), not this one`)
+    // cr4 D-34: every btrfs-progs since 4.x prints the line, so its absence
+    // means the status did not arrive whole. An absent summary is not
+    // "no errors found" — it is a result nobody read, and calling it clean let
+    // the mirror reconcile and the parity rewrite write on checksums no pass
+    // proved.
+    if (verdict.errorSummary === null) {
+      throw new ScrubVerdictUnknownError(`btrfs scrub on '${label}' finished but printed no error summary, so its result is not known. `
+        + `Run the scrub again from the Scrubs screen; if it repeats, run \`btrfs scrub status ${mountpoint}\` and read the Error summary line.`)
+    }
     return { startedAt, btrfsErrors: isCleanSummary(verdict.errorSummary) ? null : verdict.errorSummary }
   }
   // No `Status:` line at all ("no stats available", an empty or unknown

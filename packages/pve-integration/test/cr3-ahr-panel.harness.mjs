@@ -410,6 +410,15 @@ function pool(extra) {
   A.updateButtons(gh)
   ok('S1: a healthy pool keeps Expand, Scrub, Snapshots with no reason', gh.btns.expand.disabled === false && gh.btns.expand.tip === ''
     && gh.btns.scrub.disabled === false && gh.btns.snapshots.disabled === false && !/could not be read/.test(gh.btns.snapshots.tip || ''))
+  // cr4 D-30: an UNMOUNTED pool sends subvolLayout null (the layout was never
+  // read). The old tooltip told the operator it "predates the layout" and to
+  // destroy and recreate the pool — advice on a pool nobody had looked at.
+  const gu = toolbarGrid(rec(pool({ mounted: false, mountpoint: '/dev/tank/tank-vol', subvolLayout: null })))
+  A.updateButtons(gu)
+  ok('D-30: Snapshots on an unmounted pool is off, and says to mount it',
+    gu.btns.snapshots.disabled === true
+      && /not mounted, so its snapshot layout cannot be read/.test(gu.btns.snapshots.tip || '')
+      && !/predates/.test(gu.btns.snapshots.tip || ''), gu.btns.snapshots.tip)
   // Every lookup over the state: a value the panel does not know is a
   // neutral pill with the daemon's word, never healthy, never blank.
   ok('S1: an unmapped state is neutral and named', A.renderPoolState('wobbly') === '[pill neutral:wobbly]')

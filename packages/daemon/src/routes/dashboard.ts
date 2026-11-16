@@ -924,20 +924,22 @@ function buildWarnings(
         ref: pool.name,
       })
     }
-    // Capacity thresholds: ≥95% critical, ≥90% warning.
-    if (pool.capacity >= 95) {
+    // Capacity thresholds: ≥95% critical, ≥90% warning. A capacity the read
+    // did not return (cr4, P-3) raises neither: nobody read the value.
+    const capacity = pool.capacity
+    if (capacity !== null && capacity >= 95) {
       warnings.push({
         level: 'critical',
         category: 'capacity',
-        message: `Pool '${pool.name}' is ${pool.capacity}% full`,
+        message: `Pool '${pool.name}' is ${capacity}% full`,
         ref: pool.name,
       })
     }
-    else if (pool.capacity >= 90) {
+    else if (capacity !== null && capacity >= 90) {
       warnings.push({
         level: 'warning',
         category: 'capacity',
-        message: `Pool '${pool.name}' is ${pool.capacity}% full`,
+        message: `Pool '${pool.name}' is ${capacity}% full`,
         ref: pool.name,
       })
     }

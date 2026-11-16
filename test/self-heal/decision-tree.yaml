@@ -1942,9 +1942,9 @@ nodes:
     gt: none
   - id: H5
     kind: action
-    label: 'the md geometry reads each member''s bad-block list (`md/rd<n>/bad_blocks` - the kernel''s own symlink to `dev-<name>`), one range per line. WHICH coordinates the ranges are in is UNSETTLED (`MD_BAD_BLOCKS_COORDINATES`, data-relative until `fixtures/selfheal/md-bad-blocks-coordinates.txt` is captured and its test decides). An UNREADABLE list of a present member is unknown, not clean, and refused everywhere'
+    label: 'the md geometry reads each member''s bad-block list (`md/rd<n>/bad_blocks` - the kernel''s own symlink to `dev-<name>`), one range per line, in ABSOLUTE member-device sectors (`MD_BAD_BLOCKS_COORDINATES` = `absolute`): the capture in `fixtures/ahr/md-bad-blocks-coordinates.txt` stored the range `3048 8` with a data offset of 2048 sectors and array sector 1000 stopped reading while array sector 3048 still read. An UNREADABLE list of a present member is unknown, not clean, and refused everywhere'
     code: 'packages/daemon/src/services/selfheal-map.ts:parseBadBlocks'
-    test: 'packages/daemon/src/services/__tests__/selfheal-map.test.ts:parses one range per line, ignoring anything that is not two numbers'
+    test: 'packages/daemon/src/services/__tests__/selfheal-map.test.ts:the captured EIO row is the row the engine treats as bad-blocked'
     gt: none
     next: [H6, H7]
   - id: H6

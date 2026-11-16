@@ -144,6 +144,8 @@ export interface CacheFacts {
  *   - the cache PV's device is gone (see below)  ⇒ failed
  *   - the pool LV is not active                  ⇒ inactive
  *   - `dmsetup status`: a failure word ⇒ failed · a real status line ⇒ healthy
+ *   - `dmsetup status` did not answer (the command failed, or its line did not
+ *     parse)                                     ⇒ unknown
  * The counters ride only on `healthy`; on a failed cache `lvs` still reports
  * the last numbers it read (GT-23), and presenting those as live is precisely
  * the mis-reading this story exists to fix.
@@ -162,10 +164,14 @@ export interface CacheFacts {
  *
  * ONE asymmetry, and it is deliberate: when the LV is an ACTIVE cache target
  * but dmsetup gave no legible answer — the command failed, the line did not
- * parse — the verdict is `failed`, never `absent`. `absent` claims there is no
- * cache, and the pool then reads healthy while potentially serving EIO to
- * every read: the exact GT-23 failure. An active cache target whose health
- * cannot be read is a cache whose health is not known to be good.
+ * parse — the verdict is `unknown`, never `absent` and never `failed`.
+ * `absent` claims there is no cache, and the pool then reads healthy while
+ * potentially serving EIO to every read: the exact GT-23 failure. `failed` is
+ * a claim of evidence the read did not supply, and the unattended rungs
+ * (`lvconvert --uncache`) act on `failed`: a status read that did not answer
+ * would then drop a healthy, mounted cache at the next daemon start. An active
+ * cache target whose health cannot be read is a cache whose health is not
+ * known — reported as such, and nothing acts on it.
  */
 export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   const { poolName, lv, pvs, bandCount, partsByKernel, byIdMap, dmStatus } = input
@@ -253,11 +259,19 @@ export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   else if (!lvActive)
     state = 'inactive'
   else
-    state = dmCacheHealth(dmStatus) ?? 'failed'
+    state = dmCacheHealth(dmStatus) ?? 'unknown'
   // Size from the PVs: a PV reports its size even when its device is missing,
   // so the figure survives the failure the block exists to report. With no PV
   // at all (a slice cut but not yet adopted) the on-disk slice size stands in.
-  const pvBytes = [...namedCachePvs, ...unknownPvs].reduce((sum, p) => sum + p.sizeBytes, 0)
+  // One PV whose size cell could not be read makes the SUM unknown (cr4): a
+  // short total would understate the flash.
+  let pvBytes: number | null = 0
+  for (const pv of [...namedCachePvs, ...unknownPvs]) {
+    if (pv.sizeBytes === null)
+      pvBytes = null
+    else if (pvBytes !== null)
+      pvBytes += pv.sizeBytes
+  }
 
   const counters = state === 'healthy' && lv
     ? {
@@ -272,7 +286,7 @@ export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   return {
     cache: {
       devices: diskIds,
-      sizeBytes: pvBytes > 0 ? pvBytes : labeledBytes,
+      sizeBytes: pvBytes === null ? null : (pvBytes > 0 ? pvBytes : labeledBytes),
       mode: 'writethrough',
       policy: lv?.cachePolicy ?? '',
       state,

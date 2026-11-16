@@ -40,11 +40,13 @@ describe('parseLvmSize', () => {
     assert.equal(parseLvmSize('532676608B'), 532676608)
   })
 
-  it('is fail-open: garbage yields 0', () => {
-    assert.equal(parseLvmSize(undefined), 0)
-    assert.equal(parseLvmSize(''), 0)
-    assert.equal(parseLvmSize('lots'), 0)
-    assert.equal(parseLvmSize('1.5x'), 0)
+  it('a cell that cannot be read is NULL, never 0 bytes (cr4)', () => {
+    // A garbled size is not an empty one: 0 would read as "no size" to every
+    // consumer, and a summing one as a short total.
+    assert.equal(parseLvmSize(undefined), null)
+    assert.equal(parseLvmSize(''), null)
+    assert.equal(parseLvmSize('lots'), null)
+    assert.equal(parseLvmSize('1.5x'), null)
   })
 })
 
@@ -74,6 +76,15 @@ describe('parsePvsReport', () => {
   it('is total: malformed JSON yields an empty list', () => {
     assert.deepEqual(parsePvsReport('not json'), [])
     assert.deepEqual(parsePvsReport('{}'), [])
+  })
+
+  it('cr4: a garbled size cell reads NULL, never 0 (the sum consumers treat it as unknown)', () => {
+    const json = JSON.stringify({
+      report: [{ pv: [{ pv_name: '/dev/md127', vg_name: 'ahr0', pv_size: 'lots', pv_free: '0', dev_size: '' }] }],
+    })
+    assert.deepEqual(parsePvsReport(json), [
+      { name: '/dev/md127', vgName: 'ahr0', sizeBytes: null, freeBytes: 0, devSizeBytes: null },
+    ])
   })
 })
 
@@ -216,8 +227,8 @@ describe('report ARGS', () => {
     assert.equal(parseVgsReport(JSON.stringify({ report: [{ vg: [{ vg_name: 't2' }] }] }))[0].uuid, null)
   })
 
-  it('a report without dev_size reads 0 — never a spurious resize', () => {
+  it('a report without dev_size reads NULL — the device size is unknown, and never a spurious resize (cr4)', () => {
     const json = JSON.stringify({ report: [{ pv: [{ pv_name: '/dev/md127', vg_name: 'ahr0', pv_size: '100', pv_free: '0' }] }] })
-    assert.equal(parsePvsReport(json)[0].devSizeBytes, 0)
+    assert.equal(parsePvsReport(json)[0].devSizeBytes, null)
   })
 })

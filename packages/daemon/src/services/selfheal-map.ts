@@ -179,22 +179,24 @@ export function parseBadBlocks(text: string | null): BadBlockRange[] | null {
  *
  *  - `data-relative` — sector 0 is the first sector of the member's DATA AREA,
  *    so the member's `rd<n>/offset` comes off before the comparison. This is
- *    what the engine has assumed since F8.
- *  - `absolute` — sector 0 is the first sector of the member DEVICE (the
- *    2026-11-14 review's reading of md: `rdev_set_badblocks` adds
- *    `rdev->data_offset` before recording, `is_badblock` adds it before
- *    looking, and `bad_blocks` prints the stored value raw).
+ *    what the engine assumed since F8.
+ *  - `absolute` — sector 0 is the first sector of the member DEVICE, data
+ *    offset included.
  *
- * NEITHER is ground truth yet (cr3 AHR-HEAL-M5): no capture backs the
- * decision tree's leaf H5. The constant stays at the value the engine has
- * always used until the capture named in `selfheal-map.test.ts`
- * ("md bad-block coordinates — the capture decides") is taken; that test turns
- * RED against the wrong value, and the fix is this one line.
+ * The capture settles it (cr3 AHR-HEAL-M5): on a RAID1 loop rig with a data
+ * offset of 2048 sectors, storing the range `3048 8` in the member's
+ * `bad_blocks` made ARRAY sector 1000 unreadable and left array sector 3048
+ * readable — 3048 is the data offset plus the row that failed, so the stored
+ * numbers are member-device sectors. The capture is
+ * `fixtures/ahr/md-bad-blocks-coordinates.txt` (2026-11-15), and the case
+ * "md bad-block coordinates — the capture decides" in `selfheal-map.test.ts`
+ * reads both numbers from it: RED against `data-relative`, GREEN against
+ * `absolute`.
  */
 export type BadBlockCoordinates = 'data-relative' | 'absolute'
 
-/** @see BadBlockCoordinates — UNSETTLED, pending the capture (cr3 AHR-HEAL-M5). */
-export const MD_BAD_BLOCKS_COORDINATES: BadBlockCoordinates = 'data-relative'
+/** @see BadBlockCoordinates — settled by `fixtures/ahr/md-bad-blocks-coordinates.txt`. */
+export const MD_BAD_BLOCKS_COORDINATES: BadBlockCoordinates = 'absolute'
 
 /**
  * Does the member in `role` carry a recorded bad-block range over the byte span

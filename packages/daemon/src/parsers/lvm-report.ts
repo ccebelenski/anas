@@ -108,16 +108,19 @@ export interface LvmPv {
   name: string
   /** Owning VG name, or null for an unassigned PV. */
   vgName: string | null
-  sizeBytes: number
-  freeBytes: number
+  /** PV size; null when the cell could not be read (cr4: never a made-up 0). */
+  sizeBytes: number | null
+  /** Free space on the PV; null when the cell could not be read. */
+  freeBytes: number | null
   /**
    * Size of the underlying device. `pv_size < devSizeBytes` means the PV has
    * not been resized to cover a grown array — the stranded-capacity signature
-   * (issue #13). 0 when the report did not carry the column (older captures /
-   * fixtures), which reads as "nothing to reclaim" — fail-safe, never a
-   * spurious resize.
+   * (issue #13). Null when the report did not carry the column (older captures
+   * / fixtures) or the cell could not be read: an unknown device size can
+   * neither show nor rule out stranded capacity, so no consumer may read it as
+   * "nothing to reclaim".
    */
-  devSizeBytes: number
+  devSizeBytes: number | null
 }
 
 /** One volume group (one per AHR pool, named after it). */
@@ -127,8 +130,10 @@ export interface LvmVg {
   uuid: string | null
   pvCount: number
   lvCount: number
-  sizeBytes: number
-  freeBytes: number
+  /** VG size; null when the cell could not be read. */
+  sizeBytes: number | null
+  /** VG free space; null when the cell could not be read. */
+  freeBytes: number | null
 }
 
 /** One logical volume (`<pool>-vol` in AHR pools). */
@@ -137,7 +142,8 @@ export interface LvmLv {
   vgName: string
   /** lv_attr string, e.g. "-wi-a-----" (a cached LV reads "Cwi-aoC---"). */
   attr: string
-  sizeBytes: number
+  /** LV size; null when the cell could not be read. */
+  sizeBytes: number | null
   /**
    * lvmcache columns (story ahrcache.1). `null` on every LV that is not a
    * cache target — the cells come back as empty strings there, and a 0 would
@@ -183,22 +189,23 @@ const SIZE_RE = /^[<>]?\s*([\d.]+)\s*([a-z]?)$/i
  * Parse an lvm size cell to integer bytes. Handles the exact byte form
  * (`--units b --nosuffix`), suffixed human forms (lowercase binary, uppercase
  * SI), display-rounding `<`/`>` prefixes, and lvm's trailing-space quirk
- * (`"0 "`). Unparseable input yields 0 (fail-open, consistent with the other
- * tolerant parsers).
+ * (`"0 "`). A cell that cannot be read is NULL (cr4): a garbled size is not
+ * zero bytes, and a caller that sums sizes treats one null as an unknown
+ * total rather than reporting a short one.
  */
-export function parseLvmSize(value: string | undefined): number {
+export function parseLvmSize(value: string | undefined): number | null {
   if (!value)
-    return 0
+    return null
   const m = value.trim().match(SIZE_RE)
   if (!m)
-    return 0
+    return null
   const num = Number.parseFloat(m[1])
   if (Number.isNaN(num))
-    return 0
+    return null
   const unit = m[2]
   const factor = unit === '' ? 1 : (BINARY_UNITS[unit] ?? SI_UNITS[unit])
   if (factor === undefined)
-    return 0
+    return null
   return Math.round(num * factor)
 }
 

@@ -20,7 +20,7 @@ import { foreignProgramHook, foreignProgramRefusal, installProgramHook, pinArray
 import { ahrLvPath, ahrMountBase } from './ahr-paths.js'
 import { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
 import { isAhrMountReadOnly } from './ahr-topology.js'
-import { editConfig } from './config-writer.js'
+import { editConfig, readConfig } from './config-writer.js'
 import { createMountpointThroughOpenedParent, mountThroughOpenedDir } from './mounts.js'
 import { pveNotify } from './pve-notify.js'
 import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
@@ -137,6 +137,16 @@ export async function clearGhostMdSignatures(
 // and ahr-boot-scan — the entry is the mount's identity everywhere).
 
 /**
+ * The fstab line that stands for a pool: its own active line, found by
+ * MOUNTPOINT or by LV spec, so an unmounted or hand-edited pool still matches.
+ * Never the `@snapshots` line, which shares the LV spec (cr3 AHR-CORE-M3).
+ * THE one line-finding rule (the move and the LUN ordering edge both use it).
+ */
+function findAhrPoolLine(text: string, name: string, mountpoint: string): MountEntry | undefined {
+  return parseFstab(text).find(e => !isAhrSnapshotsLine(e) && (e.mountpoint === mountpoint || isAhrPoolOwnLine(e, name)))
+}
+
+/**
  * Add {@link AHR_ISCSI_ORDERING_OPTION} and
  * {@link AHR_ISCSI_DEVICE_TIMEOUT_OPTION} to an EXISTING pool's fstab line,
  * once, surgically (story `iscsi.8`; device-timeout from live-proof O3).
@@ -166,7 +176,7 @@ export async function ensureAhrTargetOrdering(
   try {
     await editConfig(fstabPath, (current) => {
       // cr3 AHR-CORE-M3: never the @snapshots line, which shares the LV spec.
-      const existing = parseFstab(current).find(e => !isAhrSnapshotsLine(e) && (e.mountpoint === pool.mountpoint || isAhrPoolOwnLine(e, pool.name)))
+      const existing = findAhrPoolLine(current, pool.name, pool.mountpoint)
       if (!existing)
         return current
       // Two tokens, each added idempotently: the ordering edge (iscsi.8) and the
@@ -613,9 +623,12 @@ export async function remountAhrPool(
   updateProgress: (message: string) => void,
   opts: { fstabPath?: string } = {},
 ): Promise<{ mountpoint: string, readOnly: boolean }> {
-  // cr3 review 3: a layout that could not be read refuses before the unmount.
+  // cr3 review 3 / cr4 D-30: a layout that could not be read refuses before
+  // the unmount. The remount route's `systemPoolGate` proves the mount table
+  // readable at the confirm and again in the job, so a null layout here means
+  // the pool is not mounted — the one cause this sentence may name.
   if (pool.subvolLayout === null)
-    throw new Error(`the kernel mount table could not be read, so pool '${pool.name}''s mount cannot be verified — nothing was unmounted`)
+    throw new Error(`pool '${pool.name}' is not mounted, so its layout cannot be read and its mount cannot be verified — nothing was unmounted. Mount it from the Hybrid RAID view, then try again`)
   const line = await ahrPoolLineForRemount(opts.fstabPath ?? defaultAhrFstabPath(), pool.name, updateProgress)
 
   updateProgress(`Unmounting ${pool.mountpoint}`)
@@ -656,12 +669,26 @@ export async function changeAhrMountpoint(
   opts: { fstabPath: string },
 ): Promise<{ mountpoint: string }> {
   const { name } = pool
-  // cr3 review 3: a layout that could not be read refuses before the unmount
-  // (the move may have to write ANAS's own line, which carries the layout).
-  if (pool.subvolLayout === null)
-    throw new Error(`the kernel mount table could not be read, so pool '${name}''s subvolume layout is unknown — nothing was unmounted`)
   const subvolLayout = pool.subvolLayout
   const lvPath = ahrLvPath(name)
+  // cr3 review 3 / cr4 D-30: a layout that could not be read refuses BEFORE
+  // the unmount, because ANAS's own line (written only when the pool has none
+  // to carry) carries the layout. An unmounted pool reads its layout as null
+  // too — and a move of an unmounted pool is supported, carrying the pool's
+  // OWN line — so the refusal is narrowed to the shape that actually needs
+  // the layout: no movable line of the pool's own.
+  if (subvolLayout === null) {
+    let current: string
+    try {
+      current = await readConfig(opts.fstabPath)
+    }
+    catch (err) {
+      throw new Error(`could not read ${opts.fstabPath} for a line of pool '${name}' to carry (${err instanceof Error ? err.message : String(err)}), and the pool is not mounted so its layout cannot be read — nothing was unmounted`)
+    }
+    const movable = findAhrPoolLine(current, name, pool.mountpoint)
+    if (!movable || movable.spec !== lvPath || movable.disabled)
+      throw new Error(`pool '${name}' is not mounted, so its layout cannot be read, and it has no line of its own in ${opts.fstabPath} to carry — nothing was unmounted. Mount it from the Hybrid RAID view, then try again`)
+  }
 
   if (pool.mounted) {
     updateProgress(`Unmounting ${pool.mountpoint}`)
@@ -678,15 +705,24 @@ export async function changeAhrMountpoint(
     // fabricates a subvolume option the filesystem does not have.
     // cr3 AHR-CORE-M3: the @snapshots line carries the same LV spec; it is
     // never the pool's line, so a move never carries it off.
-    const existing = parseFstab(current).find(e => !isAhrSnapshotsLine(e) && (e.mountpoint === pool.mountpoint || isAhrPoolOwnLine(e, name)))
+    const existing = findAhrPoolLine(current, name, pool.mountpoint)
     const without = existing ? removeMount(current, existing.mountpoint) : current
     // cr.52s-a: the pool's OWN active line moves with only its mountpoint
     // changed — the operator's options (`noatime`, `compress=`, …) stay;
     // ANAS's defaults are written only when the pool had no line of its own (or
     // the line found by mountpoint names another device).
-    moved = existing && existing.spec === lvPath && !existing.disabled
-      ? { ...existing, mountpoint: newMountpoint }
-      : ahrFstabEntry(name, newMountpoint, subvolLayout)
+    if (existing && existing.spec === lvPath && !existing.disabled) {
+      moved = { ...existing, mountpoint: newMountpoint }
+    }
+    else if (subvolLayout === null) {
+      // The pre-check above found a movable line; reaching here means it went
+      // away between the check and the lock. The pool is unmounted by now, so
+      // say exactly that.
+      throw new Error(`the line of pool '${name}' in ${opts.fstabPath} went away during the move, and the pool is not mounted so its layout cannot be read — the pool is unmounted. Mount it from the Hybrid RAID view at '${pool.mountpoint}'`)
+    }
+    else {
+      moved = ahrFstabEntry(name, newMountpoint, subvolLayout)
+    }
     return addMount(without, moved)
   })
   await run(executor, SYSTEMCTL, ['daemon-reload'])

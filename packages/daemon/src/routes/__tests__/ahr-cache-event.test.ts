@@ -687,6 +687,50 @@ describe('the udev rung — the IDLE pull (ahrcache.1 review)', () => {
     assert.equal(lvconverts().length, 1)
   })
 
+  // ---- the cache status itself could not be read (`unknown`, cr4 D-28) ------
+  // An `unknown` status is exactly when the device's identity is the only
+  // evidence left: every other read named the cache PV. Recovery acts only on
+  // the identity probe's own `missing` verdict, never on the unknown status.
+  it('cache status unknown + the device probes as ANOTHER PV: the identity probe recovers', async () => {
+    await build('healthy')
+    // `dmsetup status` does not answer: the pool's cache state is `unknown`,
+    // the cache PV is still named.
+    executor.prependFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: { stdout: '', stderr: 'Command failed.', exitCode: 1 } })
+    // The named device now carries another PV's UUID: the cache device is gone.
+    executor.prependFixture({ command: '/usr/sbin/blkid', args: ['-p', '/dev/sds1'], result: ok('/dev/sds1: UUID="Other0-0000-0000-0000-0000-0000-000000" VERSION="LVM2 001" TYPE="LVM2_member" USAGE="raid" PART_ENTRY_NAME="tank-cache1"\n') })
+    const res = await postEvent()
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(lvconverts().length, 1)
+  })
+
+  it('cache status unknown + the device still probes as itself: nothing runs', async () => {
+    await build('healthy')
+    executor.prependFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: { stdout: '', stderr: 'Command failed.', exitCode: 1 } })
+    const res = await postEvent()
+    assert.equal(res.statusCode, 200, res.body)
+    assert.equal(res.json().data.recovered, false)
+    assert.equal(res.json().data.cacheState, 'unknown')
+    assert.equal(lvconverts().length, 0)
+    // The probe WAS asked (it is the only evidence left), and its `present`
+    // verdict is what stopped the recovery.
+    assert.ok(executor.calls.some(c => c.command === '/usr/sbin/blkid' && c.args.join(' ') === '-p /dev/sds1'))
+  })
+
+  it('cache status unknown + the device identity could not be read either: nothing runs', async () => {
+    await build('lvmstale')
+    // 'lvmstale' names the cache PV while no disk carries the slice, so
+    // `blkid -p /dev/sds1` cannot answer. Nothing proves the device gone.
+    executor.prependFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: { stdout: '', stderr: 'Command failed.', exitCode: 1 } })
+    const res = await postEvent()
+    assert.equal(res.statusCode, 200, res.body)
+    assert.equal(res.json().data.recovered, false)
+    assert.equal(res.json().data.cacheState, 'unknown')
+    assert.match(res.json().data.detail, /could not be read/)
+    assert.equal(lvconverts().length, 0)
+  })
+
   it('cr3: a STALE `tank-cache1` slice on another disk never hides the loss of the live cache device', async () => {
     // cr3 review2 3: the live device's loss in LVM's own shape ([unknown]).
     await build('idlepull')

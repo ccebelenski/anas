@@ -42,7 +42,8 @@ import { jobRoutes } from '../jobs.js'
  *   'offline'    cache, inactive LV  → both refuse; uncache needs a live volume;
  *                                      the cache reads `inactive`, never `failed`
  *   'poolfailed' no LV at all        → attach refuses, nothing to cache
- *   'unreadable' cache, ACTIVE LV, dmsetup fails → `failed` (GT-23 asymmetry)
+ *   'unreadable' cache, ACTIVE LV, dmsetup fails → `unknown` (cr4 D-28: a
+ *                health that was not read is not a verdict)
  *   'foreignpv'  'healthy' + a PV the operator added to the VG by hand on
  *                `U`'s partition → not a pool disk, an advisory
  */
@@ -122,8 +123,8 @@ const DM_STATUS: Record<World, string> = {
   // An INACTIVE LV is not in the device-mapper table at all: dmsetup would
   // exit non-zero with prose — so the reader does not ask (ahrcache.1 review).
   offline: 'Device does not exist.\n',
-  // An ACTIVE cache target whose dm answer cannot be read: reads `failed`,
-  // never `absent` (GT-23's failure shape).
+  // An ACTIVE cache target whose dm answer cannot be read: reads `unknown`,
+  // never `absent` and never `failed` (cr4 D-28).
   unreadable: 'Device does not exist.\n',
   foreignpv: '0 4186624 cache 8 24/2048 128 8/8000 152 28 0 0 0 8 0 2 metadata2 writethrough 2 migration_threshold 2048 mq 10 random_threshold 0 sequential_threshold 0 discard_promote_adjustment 0 read_promote_adjustment 0 write_promote_adjustment 0 rw - \n',
 }
@@ -465,14 +466,15 @@ describe('AHR read-cache routes (story ahrcache.1)', () => {
       assert.equal(pool.disks.find(d => d.id === C)?.role, 'cache')
     })
 
-    it('an ACTIVE cache target with NO legible dm answer reads FAILED, never absent', async () => {
+    it('an ACTIVE cache target with NO legible dm answer reads UNKNOWN, never absent and never failed', async () => {
       // `absent` would claim there is no cache at all — the GT-23 mis-reading
-      // in a different coat.
+      // in a different coat. `failed` would claim evidence the read did not
+      // supply, and the unattended rungs act on it (cr4 D-28).
       await build('unreadable')
       const pool = (await readAhrPools(executor)).find(p => p.name === 'tank')!
-      assert.equal(pool.cache?.state, 'failed')
-      assert.equal(pool.cache?.hits, undefined, 'and no counter rides an unverified cache')
-      assert.equal(pool.state, 'degraded')
+      assert.equal(pool.cache?.state, 'unknown')
+      assert.equal(pool.cache?.hits, undefined, 'and no counter rides an unread cache')
+      assert.ok(!pool.advisories.some(a => a.includes('cache device failed')), JSON.stringify(pool.advisories))
     })
 
     it('an INACTIVE cache target reads `inactive` — no dm question, no `failed` verdict (review)', async () => {

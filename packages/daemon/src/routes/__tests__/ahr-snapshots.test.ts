@@ -93,7 +93,7 @@ const DISKS = [
   { kernel: 'sds', id: Z, part: 'sds1' },
 ]
 
-function ahrLsblkJson(mountpoint: string): string {
+function ahrLsblkJson(mountpoint: string | null): string {
   const lvmNode = { name: 'tank-tank--vol', type: 'lvm', size: LV_SIZE, fstype: 'btrfs', mountpoint, partlabel: null }
   return JSON.stringify({ blockdevices: DISKS.map(d => ({
     name: d.kernel,
@@ -243,6 +243,24 @@ describe('AHR snapshot routes (story 11.12)', () => {
     // The list is never "no snapshots" from a read that did not see.
     const list = await server.inject({ method: 'GET', url: '/v1/ahr/tank/snapshots', headers: IDENTITY })
     assert.equal(list.statusCode, 503, list.body)
+    assert.deepEqual(mutatingCalls(), [])
+  })
+
+  // cr4 D-30: an UNMOUNTED pool's layout is unknown too, and it is not the
+  // flat layout — the first version of this sentence told the operator to
+  // destroy and recreate a pool nobody had looked at.
+  it('cr4 D-30: an UNMOUNTED pool — the snapshot verbs say "not mounted, mount it", never "flat layout ... destroy"', async () => {
+    await build()
+    executor.prependFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: '{"filesystems":[]}', stderr: '', exitCode: 0 } })
+    executor.prependFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: { stdout: ahrLsblkJson(null), stderr: '', exitCode: 0 } })
+    const create = await server.inject({ method: 'POST', url: '/v1/ahr/tank/snapshots', headers: IDENTITY, payload: { name: 'x' } })
+    assert.equal(create.statusCode, 409, create.body)
+    assert.match(create.json().error.message, /is not mounted, so its layout cannot be read\. Mount it from the Hybrid RAID view, then try again\./)
+    assert.ok(!create.body.includes('destroy and recreate'), create.body)
+    // The list is never "no snapshots" from a read that did not see.
+    const list = await server.inject({ method: 'GET', url: '/v1/ahr/tank/snapshots', headers: IDENTITY })
+    assert.equal(list.statusCode, 503, list.body)
+    assert.match(list.json().error.message, /is not mounted, so its layout cannot be read/)
     assert.deepEqual(mutatingCalls(), [])
   })
 

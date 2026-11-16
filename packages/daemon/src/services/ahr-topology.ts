@@ -950,17 +950,24 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       ?? (lsblk.lvmByDmName.get(dmName(poolName, lvName))?.mountpoint
         ? { target: lsblk.lvmByDmName.get(dmName(poolName, lvName))!.mountpoint!, source: mapperPath, fstype: 'btrfs', options: '' }
         : null)
-    // null = unknown: the mount came from lsblk because findmnt could not be
-    // read, and lsblk carries no options (INVENTED-STATE-H3).
-    const readonly: boolean | null = !mountsKnown && mount ? null : mount ? optionsReadOnly(mount.options) : false
+    // null = unknown: an unreadable mount table cannot say whether a mount is
+    // read-only, and lsblk (the fallback source of a mount) carries no options
+    // (INVENTED-STATE-H3). With NO mount either, `false` would claim the pool
+    // is writable on a read that never happened.
+    const readonly: boolean | null = !mountsKnown ? null : mount ? optionsReadOnly(mount.options) : false
     // §12 subvolume layout: read live from the mount's `subvol=` option — a
     // pool mounted `subvol=@data` carries the snapshot layout; a flat pool
-    // (subvol=/, subvolid=5) or an unmounted pool does not. The mount is the
-    // source of truth; nothing is precomputed or persisted (§5.3).
-    // cr3 review 3: unknown (null) when the mount came from lsblk because
-    // findmnt could not be read — lsblk carries no options, and `false` told
-    // the operator a snapshot-layout pool was a flat one to destroy.
-    const subvolLayout: boolean | null = !mountsKnown && mount ? null : mount ? isSubvolLayoutMount(mount.options) : false
+    // (subvol=/, subvolid=5) does not. The mount is the source of truth;
+    // nothing is precomputed or persisted (§5.3).
+    // null (unknown) in the two shapes that read nothing:
+    //  - the mount table could not be read (and lsblk carries no options, so
+    //    `false` would tell the operator a snapshot-layout pool was a flat one
+    //    to destroy — cr3 review 3);
+    //  - the pool is NOT MOUNTED (cr4 D-30): a flat pool and an unmounted one
+    //    are indistinguishable without a mount, and `false` sent a snapshot
+    //    create to advise destroying a pool it had never looked at. Consumers
+    //    refuse an unmounted pool and say so.
+    const subvolLayout: boolean | null = mount === null || !mountsKnown ? null : isSubvolLayoutMount(mount.options)
     if (!mount)
       advisories.push(notMountedAdvisory(poolName))
     if (!mountsKnown) {
@@ -1040,7 +1047,7 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       // quiet: every fully-resized PV is a few MiB under its device (metadata
       // + PE rounding), which a bare `<` comparison read as stranded capacity
       // and rendered as the nonsensical "0 GiB is grown into the RAID arrays".
-      if (!pv || !isPvUnderSized(pv.sizeBytes, pv.devSizeBytes))
+      if (!pv || pv.sizeBytes === null || pv.devSizeBytes === null || !isPvUnderSized(pv.sizeBytes, pv.devSizeBytes))
         continue
       belowLvmBytes += pv.devSizeBytes - pv.sizeBytes
     }

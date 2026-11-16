@@ -181,6 +181,12 @@ export interface AhrDestroyResult {
   /** Same-named md arrays that are NOT this pool's — left running, untouched. */
   foreignArrays?: string[]
   /**
+   * The owned PVs `pvremove` was SKIPPED on because the `pvs` read that picks
+   * them failed after `vgremove` (cr4). Their LVM labels may still be on the
+   * disks; `warnings` carries the sentence and the command that lists them.
+   */
+  pvRemoveSkipped?: string[]
+  /**
    * Story cr.24 (ruling (j)): references to the pool the JOB found that the
    * confirm did not list — the operator confirmed a destroy, so the record
    * says what was still pointing at it when it ran.
@@ -249,6 +255,8 @@ export async function destroyAhrPool(
   const identity = await readAhrPoolIdentity(executor, name, { mdadmConfPath, extraUuids: pool.createdArrayUuids })
   const liveArrays = identity.arrays.map(a => a.dev) // e.g. /dev/md127
   const foreignArrays = identity.foreign.map(f => `/dev/${f.kernelName}`)
+  /** Warnings the job result carries beside the route's advisories (cr4). */
+  const warnings: string[] = []
   for (const f of identity.foreign) {
     updateProgress(
       `Leaving md array /dev/${f.kernelName} alone: it is named '${name}-r${f.band}' but it is not this pool's `
@@ -437,7 +445,7 @@ export async function destroyAhrPool(
     // retry. Refused before any change.
     const unresolved = candidates.filter(m => resolvedSource.get(stripSubvolSuffix(m.source)) === null || ownNodes.size === 0)
     if (unresolved.length > 0)
-      throw new Error(`the mount at ${unresolved[0].target} (${unresolved[0].source}) could not be identified as '${name}''s or another device's (realpath could not resolve it or the pool's volume) — nothing was changed`)
+      throw new Error(`the mount at ${unresolved[0].target} (${unresolved[0].source}) could not be identified as belonging to pool '${name}' or to another device (realpath could not resolve it or the pool's volume) — nothing was changed`)
   }
   const isOwnMount = (m: FindmntNode): boolean => {
     if (spelledOwn(m))
@@ -455,7 +463,7 @@ export async function destroyAhrPool(
     // The pool's filesystem is UNDER someone else's: `umount` would take the
     // other one off, and lvremove would then fail on the pool's busy LV.
     if (mounts.some(m => m.target === target && isOwnMount(m)))
-      throw new Error(`a filesystem that is not '${name}''s (${top.source}) is mounted over ${what} at ${target} — unmount it first; nothing was changed`)
+      throw new Error(`a filesystem that does not belong to pool '${name}' (${top.source}) is mounted over ${what} at ${target} — unmount it first; nothing was changed`)
     updateProgress(`Leaving the mount at ${target} alone: its source ${top.source} is not a volume of '${name}'`)
     return false
   }
@@ -499,7 +507,7 @@ export async function destroyAhrPool(
     ? entries.filter(e => e.mountpoint === mountpoint && e.spec !== lvSpec)
     : []
   if (othersAtPath.length > 0 && !ownMountpoints.includes(mountpoint!)) {
-    throw new Error(`${opts.fstabPath} has a line for ${mountpoint} with the spec ${othersAtPath[0].spec}, not '${name}''s volume ${lvSpec} — it cannot be told whether that line is this pool's or another filesystem's, so nothing was changed. Point the pool's line at ${lvSpec} (or remove the other line) and retry`)
+    throw new Error(`${opts.fstabPath} has a line for ${mountpoint} with the spec ${othersAtPath[0].spec}, not the volume of pool '${name}' (${lvSpec}) — it cannot be told whether that line is this pool's or another filesystem's, so nothing was changed. Point the pool's line at ${lvSpec} (or remove the other line) and retry`)
   }
   const writtenLines = (pool.fstabEntriesWritten ?? [])
     .filter(e => parseFstabDoc(fstabText).some(l => l.kind === 'entry' && !l.disabled && l.raw === serializeMountLine(e)))
@@ -518,7 +526,7 @@ export async function destroyAhrPool(
 
   // --- fstab: drop the pool's lines (by spec, never by path) -----------------
   for (const other of othersAtPath)
-    updateProgress(`Leaving the /etc/fstab line for ${other.spec} at ${other.mountpoint} alone: it is not '${name}''s volume`)
+    updateProgress(`Leaving the /etc/fstab line for ${other.spec} at ${other.mountpoint} alone: it is not the volume of pool '${name}'`)
   for (const mp of ownMountpoints) {
     updateProgress(`Removing /etc/fstab entry for ${mp}`)
     await editConfig(opts.fstabPath, current => removeSpecLineAt(current, lvSpec, mp))
@@ -582,10 +590,23 @@ export async function destroyAhrPool(
   // never a PV some other VG holds, never a PV the gate did not prove.
   const ownedPvs = new Set([...proven.owned, ...liveArrays])
   const pvsRes = await executor.exec(PVS, PVS_ARGS)
+  // cr4: a failed read here used to skip pvremove silently, leaving the pool's
+  // LVM labels on disks that read clean afterwards. pvremove is still SKIPPED
+  // (the devices cannot be confirmed), and the job says which labels may
+  // remain and the command that lists them.
+  // eslint-disable-next-line e18e/prefer-array-to-sorted -- toSorted() is ES2023; this package targets ES2022 (no such lib member)
+  const pvRemoveSkipped = pvsRes.exitCode === 0 ? [] : [...ownedPvs].sort()
   const pvs = pvsRes.exitCode === 0
     ? parsePvsReport(pvsRes.stdout).filter(pv =>
         pv.name !== UNKNOWN_PV_NAME && ownedPvs.has(pv.name) && (pv.vgName === null || pv.vgName === name))
     : []
+  if (pvRemoveSkipped.length > 0) {
+    const detail = pvsRes.stderr.trim().split('\n')[0] || `exit ${pvsRes.exitCode}`
+    warnings.push(
+      `the physical volumes of pool '${name}' could not be read after its volume group was removed (pvs: ${detail}), so their LVM labels were not removed. `
+      + `The devices that may still carry one are ${pvRemoveSkipped.join(', ')}. Run \`pvs\` to list any that remain, and \`pvremove <device>\` each`,
+    )
+  }
   for (const pv of pvs) {
     updateProgress(`Removing physical volume ${pv.name}`)
     await run(executor, PVREMOVE, ['-y', pv.name])
@@ -718,5 +739,7 @@ export async function destroyAhrPool(
     ...(sweepFailures.length > 0 ? { sweepFailures } : {}),
     ...(absentDisks.length > 0 ? { absentDisks } : {}),
     ...(foreignArrays.length > 0 ? { foreignArrays } : {}),
+    ...(pvRemoveSkipped.length > 0 ? { pvRemoveSkipped } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
   }
 }

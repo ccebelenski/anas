@@ -302,6 +302,12 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `AHR pool '${target.pool}' not found` } })
       return false
     }
+    // cr4 D-30: an UNMOUNTED pool's layout reads null as well, and it is not
+    // the flat layout — point at the mount before anything else.
+    if (!pool.mounted) {
+      reply.code(409).send({ error: { code: 'CONFLICT', message: `AHR pool '${target.pool}' is not mounted, so its layout cannot be read. Mount it from the Hybrid RAID view, then try again - nothing was changed` } })
+      return false
+    }
     // cr3 (merge): null is "the mount table could not be read", not the flat layout.
     if (pool.subvolLayout === null) {
       reply.code(503).send({ error: { code: 'UNAVAILABLE', message: `The layout of AHR pool '${target.pool}' could not be read (the kernel mount table did not answer), so whether it can hold snapshots is not known - nothing was changed; try again` } })
