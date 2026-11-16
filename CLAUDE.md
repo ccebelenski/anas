@@ -4,7 +4,7 @@
 
 1. Read `docs/PRINCIPLES.md` — these are non-negotiable. If your planned change conflicts with a principle, stop and discuss with the user.
 2. Read `docs/EPICS.md` — only implement work that traces to a story. If it's not in a story, it's not in scope. Its §2 standing rulings are binding; `docs/EPICS-HISTORY.md` holds the shipped-story ledger and is consulted only for the rationale behind a ruling.
-3. Read `docs/DESIGN.md` — the architecture, API, and tech stack are decided. Do not introduce new dependencies, change the API shape, or alter the architecture without discussion.
+3. Read `docs/DESIGN.md` — it is the index: it says which file under `docs/design/` covers what. Read the file for the area your story touches, and `docs/design/owners.md` before you read, parse or write a config file. The architecture, API, and tech stack are decided. Do not introduce new dependencies, change the API shape, or alter the architecture without discussion.
 
 ## Key decisions (do not revisit without discussion)
 
@@ -24,7 +24,7 @@
 ## When implementing a story
 
 - Identify which epic and story number you're working on
-- Check the API resource model in DESIGN.md for the correct endpoints
+- Check the area's file under `docs/design/` for the correct endpoints (`docs/design/api.md` has the rules every endpoint follows and the full route index)
 - Use shared Zod schemas — do not define types inline
 - Use execFile, never exec — arguments as arrays
 - Validate in anasd against the shared schemas (it is the schema boundary); the anas gateway authenticates, checks the PVE privilege and forwards the body unparsed (ruling 2026-11-14)
