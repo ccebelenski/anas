@@ -470,6 +470,29 @@ check "pveproxy NOT restarted" "[ ! -f '${RESTART_MARK}' ]"
 check "warning names perl -c" "grep -qi 'perl -c' '${WORK}/uninstall.log'"
 check "warning tells the operator how to finish by hand" \
   "grep -qi 'by hand' '${WORK}/uninstall.log'"
+# What the surviving block now points at (cr4): AnasProxy.pm is the module the
+# block requires, and the uninstall removes it regardless of the gate. Block
+# present, its module gone — that pair is exactly why /anas answers an error,
+# and why the last line says so.
+check "AnasProxy.pm removed even though the block stayed" \
+  "[ ! -f '${PERL_DIR}/AnasProxy.pm' ]"
+check "the log says the proxy module was removed" \
+  "grep -qF 'removed ${PERL_DIR}/AnasProxy.pm' '${WORK}/uninstall.log'"
+# cr4 P-1: the LAST line must tell the truth about this branch: the block is
+# still in the module with its line numbers, /anas answers an error until it
+# goes, and what ends it. The old script ended with "PVE UI integration
+# uninstalled." here — a false story. Exit status stays 0 (pinned above).
+LAST_LINE="$(tail -n 1 "${WORK}/uninstall.log")"
+check "the last line says the block could not be removed safely and is still in the module" \
+  "grep -qF 'could not be removed safely and is still in ${PVE_PM}' <<<\"${LAST_LINE}\""
+check "the last line names the block's line numbers" \
+  "grep -qE '\\(lines [0-9]+-[0-9]+\\)' <<<\"${LAST_LINE}\""
+check "the last line says /anas answers an error until the block is removed" \
+  "grep -qF '/anas answers an error until the block is removed' <<<\"${LAST_LINE}\""
+check "the last line names both endings: reinstall, or the lines gone by hand" \
+  "grep -qF 'Reinstall ANAS' <<<\"${LAST_LINE}\" && grep -qF 'remove those lines by hand' <<<\"${LAST_LINE}\""
+check "the last line does not claim the integration was uninstalled" \
+  "! grep -qF 'PVE UI integration uninstalled' <<<\"${LAST_LINE}\""
 rm -rf "${WORK}"
 
 echo "== 12. apt hook line: runs the logging wrapper, never fails apt (installer.1) =="

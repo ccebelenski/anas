@@ -117,7 +117,10 @@ Options:
                    targetcli-fb, python3-rtslib-fb, rclone, attr) is a HARD dependency
                    and is installed regardless of this flag.
   --yes            Non-interactive; assume "yes" to prompts.
-  --prefix DIR     Install location (default: /opt/anas).
+  --prefix DIR     Install location (default: /opt/anas). Must start with
+                   '/' and carry only letters, digits and the path
+                   characters / . - _ : the installer cannot substitute a
+                   prefix containing anything else into its unit files.
   --port N         Loopback port for the ANAS gateway (default: ${DEFAULT_PORT}).
                    Written to ${ANAS_ENV_FILE}. Use this when another service
                    already holds ${DEFAULT_PORT}. An existing configured port is
@@ -142,6 +145,25 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# The parser accepts exactly the set the usage text states: '/' first, then
+# letters, digits and the path characters / . - _ (cr4 fold: the parser used
+# to be a deny-list of four characters, so a prefix carrying a space, '+' or
+# '%', or a relative path, passed and reached the unit files anyway). That
+# set is what install_units can carry: it rewrites every shipped unit with
+# `sed "s#/opt/anas#${PREFIX}#g"`, and the review measured — this fold
+# re-measured — that outside this set the substitution cannot do its job:
+# '&' re-inserts the matched text and '\' eats the next character, so the
+# unit file comes out silently wrong, while '#' and a newline stop sed
+# before any substitution happens. Both outcomes break the install, so the
+# error claims only what all four share: the prefix cannot be substituted.
+# Refuse at parse time — before the first read that matters and long before
+# the first change (cr4).
+case "${PREFIX}" in
+  *[!A-Za-z0-9./_-]*|[!/]*|"")
+    err "--prefix '${PREFIX}' cannot be substituted into the installer's unit files. A prefix must start with '/' and carry only letters, digits and the path characters '/', '.', '-', '_', for example /opt/anas or /srv/anas-1."
+    exit 2 ;;
+esac
 
 confirm() {
   # confirm "question" -> 0 if yes. Auto-yes with --yes / non-tty.
@@ -198,12 +220,20 @@ our_configured_port() {
   printf '%s' "${DEFAULT_PORT}"
 }
 
-# port_listening N -> 0 if something is LISTENing on N (via SS_BIN). If ss is
-# unavailable we cannot tell -> treat as free (return 1), matching the prior
-# best-effort behaviour.
+# port_listening N — one of three answers, carried by the return code: 0
+# something is LISTENing on N, 1 N is free, 2 could not check (SS_BIN missing,
+# or it exited non-zero). The third answer is the one that matters: a check
+# that could not run never passes (cr4 fold, probe C — an ss exiting non-zero
+# behind the old `|| true` read every port free, so the --port collision guard
+# could silently open and a fresh install could be pointed at a port a foreign
+# service holds). Phase 0 refuses on a missing ss and on any non-zero exit
+# (cr4); these returns only guard callers that run past that gate.
+# SS_CHECK_ERROR says why in answer 2, naming the command and its exit status,
+# for the preflight sentence.
+SS_CHECK_ERROR=""
 port_listening() {
-  local p="$1" out
-  command -v "${SS_BIN}" >/dev/null 2>&1 || return 1
+  local p="$1" out rc=0
+  command -v "${SS_BIN}" >/dev/null 2>&1 || { SS_CHECK_ERROR="${SS_BIN} not found"; return 2; }
   # Capture the listing FIRST, then match against a here-string (issue #21).
   # Piping ss straight into `grep -q` lets grep exit on its first hit, killing ss
   # with SIGPIPE (exit 141), which `set -o pipefail` then reports as a pipeline
@@ -211,8 +241,13 @@ port_listening() {
   # short listing ss usually finishes writing before grep exits, so the bug only
   # shows up when the listing is long: a genuinely intermittent wrong answer
   # about a port conflict, and an intermittent escape of the conflict guard. No
-  # pipe, no race. `|| true` keeps a non-zero ss from tripping `set -e`.
-  out="$("${SS_BIN}" -ltn 2>/dev/null || true)"
+  # pipe, no race. The exit status is kept, not swallowed: `|| rc=$?` shields
+  # `set -e` AND feeds the third answer.
+  out="$("${SS_BIN}" -ltn 2>/dev/null)" || rc=$?
+  if [ "${rc}" -ne 0 ]; then
+    SS_CHECK_ERROR="${SS_BIN} -ltn exited ${rc}"
+    return 2
+  fi
   grep -qE "[:.]${p}[[:space:]]" <<<"${out}"
 }
 
@@ -360,6 +395,23 @@ NEED_ATTR_INSTALL=0
 FATAL=()
 RELEASE_MISSING=()
 
+# What stands at PREFIX, for the two acts that replace or remove it: the
+# install moves an existing PREFIX aside and the uninstall removes it whole.
+# Echoes one word: absent, anas (it carries an ANAS install's VERSION file or
+# packages/daemon), empty (an empty directory), or foreign (anything else:
+# another directory such as / or /etc, a file, a link to either; a link to
+# an install or to an empty directory counts as what it points to).
+# uninstall.sh carries
+# the same function: the two scripts ship as separate files.
+prefix_kind() {
+  local p="$1"
+  if [ ! -e "${p}" ] && [ ! -L "${p}" ]; then echo absent; return; fi
+  if [ ! -d "${p}" ]; then echo foreign; return; fi
+  if [ -f "${p}/VERSION" ] || [ -d "${p}/packages/daemon" ]; then echo anas; return; fi
+  if [ -z "$(ls -A "${p}" 2>/dev/null)" ] && [ -r "${p}" ]; then echo empty; return; fi
+  echo foreign
+}
+
 phase0_preflight() {
   log "Preflight checks (no changes will be made)..."
 
@@ -411,6 +463,13 @@ phase0_preflight() {
   done
   if [ "${#RELEASE_MISSING[@]}" -gt 0 ]; then
     FATAL+=("$(release_incomplete_message)")
+  fi
+
+  # PREFIX is replaced whole (moved aside, then installed into): only an ANAS
+  # install, an empty directory or a path that does not exist yet may stand
+  # there. `--prefix /etc` or `--prefix /` is refused here, before any change.
+  if [ "$(prefix_kind "${PREFIX}")" = "foreign" ]; then
+    FATAL+=("${PREFIX} exists and is not an ANAS install (it has no VERSION file and no packages/daemon directory). The installer replaces its prefix whole, so it will not use this path. Choose a path that does not exist yet or an empty directory with --prefix, for example /opt/anas.")
   fi
 
   # Root.
@@ -566,6 +625,29 @@ phase0_preflight() {
   else
     NEED_ATTR_INSTALL=1
     info "attr (setfattr/getfattr) missing — will auto-install"
+  fi
+
+  # ss (iproute2) — the only reader of the LISTEN socket table the installer
+  # has. Without it port_listening() sees nothing and every port reads free, so
+  # a port check that could not run would hand back a wrong answer (cr4): a
+  # fresh install could pick a port a foreign service already holds, and a
+  # --port collision guard would silently open. PVE always ships iproute2, so
+  # a node without it is broken in a way choosing a different port cannot fix
+  # — refuse here, naming the tool and the package, while the node is still
+  # untouched.
+  if ! command -v "${SS_BIN}" >/dev/null 2>&1; then
+    FATAL+=("ss not found (package iproute2) — the installer cannot check whether a port is already in use. Install it: apt-get install -y iproute2, then re-run.")
+  else
+    # A PRESENT ss that fails its listing call is the same blind spot as a
+    # missing one (cr4 fold, probe C: with `|| true` the failed run answered
+    # "port free" for every port). Probe once here, before resolve_port reads
+    # any answer, and refuse on the third answer (could not check), naming the
+    # command that failed and its exit status.
+    local ss_probe_rc=0
+    port_listening "${DEFAULT_PORT}" || ss_probe_rc=$?
+    if [ "${ss_probe_rc}" -eq 2 ]; then
+      FATAL+=("${SS_CHECK_ERROR} — the installer could not read the LISTEN table, so no port can be checked. Run '${SS_BIN} -ltn' to see its error and fix the cause, then re-run.")
+    fi
   fi
 
   # Resolve the gateway port (issue #2) before anything binds. This owns the
@@ -768,9 +850,14 @@ INSTALL_DONE=0
 # before it, the rollback disabled anasd/anas/the recycle timer and never
 # enabled them again (the restored install ran until the next reboot, then
 # never started), re-installed the unit files from the NEW release, and left
-# an env file --port had overwritten. Contents are held in memory (small text
-# files), so nothing is written to the node to remember them.
-declare -A PRIOR_FILE_CONTENT=()
+# an env file --port had overwritten. Each saved file is kept as a BYTE copy
+# in one scratch directory this run makes in TMPDIR, on first need (cr4 D-5a:
+# content held in a shell variable via $( cat ) loses NUL bytes, and the
+# rollback wrote the shortened file back). finish_success removes the scratch
+# with the backup; a rollback that restored everything removes it too, and a
+# rollback that could NOT restore everything keeps it, names it, and says what
+# it holds — there it may be the only copy of the old bytes.
+declare -A PRIOR_FILE_SAVE=()    # file -> its byte copy inside PRIOR_STATE_DIR
 declare -A PRIOR_FILE_MODE=()
 declare -A PRIOR_FILE_OWNER=()   # uid:gid of the file (through a symlink)
 declare -A PRIOR_LINK=()         # the path was a symlink: its target, as written
@@ -782,6 +869,8 @@ CREATED_DIRS=()                  # directories THIS run created (removed on roll
 CREATED_PATHS=()                 # files THIS run created where nothing was (appended as each is installed)
 RESTORE_FAILED=()                # paths the rollback could not put back
 PRIOR_ENABLED=()        # units enabled before this run, enabled again on rollback
+PRIOR_ACTIVE_ANASD=0    # the anasd service was RUNNING before this run
+PRIOR_ACTIVE_ANAS=0     # the anas service was RUNNING before this run
 PRIOR_TIMER_ACTIVE=0    # the recycle timer was running before this run
 UI_WAS_PRESENT=0        # the PVE UI integration was installed before this run
 ROLLBACK_SHELL_PID=""   # the shell that armed the ERR trap: the only one that rolls back
@@ -817,10 +906,45 @@ prior_state_files() {
   done
 }
 
+# The scratch directory holding the byte copies of the prior files (cr4 D-5a),
+# made in TMPDIR on FIRST need (a fresh install, where nothing is outside the
+# prefix yet, never makes one) and named so a kept one is recognisable.
+PRIOR_STATE_DIR=""
+prior_state_dir_ready() {
+  [ -n "${PRIOR_STATE_DIR}" ] && return 0
+  PRIOR_STATE_DIR="$(mktemp -d -- "${TMPDIR:-/tmp}/.anas-prior-state.XXXXXX" 2>/dev/null)"
+}
+remove_prior_state_dir() {
+  if [ -n "${PRIOR_STATE_DIR}" ]; then
+    rm -rf -- "${PRIOR_STATE_DIR}"
+    PRIOR_STATE_DIR=""
+  fi
+}
+# Set when the rollback keeps the scratch ON PURPOSE (a path could not be put
+# back: the copies may be the only record of the old bytes, and the operator is
+# told to compare them and remove the directory themselves). The EXIT path
+# below must then leave it alone (cr4 fold, probe E).
+PRIOR_STATE_KEPT=0
+# The ONE EXIT path for the scratch (cr4 fold, probe D): an install killed by
+# an operator (Ctrl-C, a dropped ssh session) never reaches the rollback or
+# finish_success, and its directory of prior byte copies would outlive the run
+# on a node where nothing will ever name or remove it. bash runs an EXIT trap
+# for an untrapped SIGTERM or SIGINT too, so one EXIT trap covers the orderly
+# ends and a kill alike; bash resets traps in subshells, so the command
+# substitutions around it never fire it. finish_success and a clean rollback
+# remove the scratch first, so by the time this runs on an orderly end there
+# is nothing left to do.
+scratch_exit_cleanup() {
+  if [ "${PRIOR_STATE_KEPT}" -eq 0 ]; then
+    remove_prior_state_dir
+  fi
+}
+
 # Read, before phase 1's first act, what a rollback must restore (CORE-M2):
 # each file's bytes, mode, owner and (when it has one) POSIX ACL, which units
-# are enabled, whether the recycle timer runs, whether the PVE UI integration
-# is in place. Read-only.
+# are enabled, which of anasd/anas are running, whether the recycle timer
+# runs, whether the PVE UI integration is in place. Read-only, except for the
+# scratch directory holding the byte copies.
 #
 # A path that is a SYMLINK (an env file an operator keeps elsewhere, a unit
 # linked in from another tree) is remembered as the link, the file it resolves
@@ -828,12 +952,17 @@ prior_state_files() {
 # always 777). The preflight has already refused a dangling link and anything
 # that is neither a file nor a link (preflight_owned_paths).
 #
-# A read that fails STOPS the install here, before phase 1's first act, with a
-# sentence naming the file (cr3 review 2): `$(cat f; printf x)` swallowed a
-# failed cat and saved empty content, which the rollback then wrote over the
-# file.
+# A file that cannot be read or copied STOPS the install here, before phase
+# 1's first act, with a sentence naming the file (cr3 review 2): the read used
+# to be a `$(cat f; printf x)`, which swallowed a failed cat (empty content
+# was saved, and the rollback wrote it over the file) and dropped NUL bytes
+# (cr4 D-5a).
 save_prior_state() {
-  local f content mode owner acl u
+  local f save mode owner acl u n=0
+  # Arm the ONE EXIT path for the scratch BEFORE it can first be made below
+  # (cr4 fold, probe D). Harmless when nothing is ever saved: the cleanup
+  # finds an empty PRIOR_STATE_DIR and does nothing.
+  trap 'scratch_exit_cleanup' EXIT
   while IFS= read -r f; do
     if [ ! -e "${f}" ] && [ ! -L "${f}" ]; then
       PRIOR_ABSENT["${f}"]=1
@@ -842,19 +971,35 @@ save_prior_state() {
     if [ -L "${f}" ]; then
       if ! PRIOR_LINK["${f}"]="$(readlink -- "${f}")" || ! PRIOR_LINK_REAL["${f}"]="$(readlink -f -- "${f}")"; then
         err "cannot read the symlink ${f} — the node was NOT modified"
+        remove_prior_state_dir
         exit 1
       fi
     fi
     if [ -f "${f}" ]; then
-      # The trailing x keeps the file's own trailing newlines through $( ).
-      if ! content="$(cat -- "${f}" && printf x)" \
-         || ! mode="$(stat -L -c '%a' -- "${f}")" \
+      if ! mode="$(stat -L -c '%a' -- "${f}")" \
          || ! owner="$(stat -L -c '%u:%g' -- "${f}")" \
          || ! PRIOR_FILE_MTIME["${f}"]="$(stat -L -c '%.9Y' -- "${f}")"; then
         err "cannot read ${f} (a rollback could not put it back) — the node was NOT modified"
+        remove_prior_state_dir
         exit 1
       fi
-      PRIOR_FILE_CONTENT["${f}"]="${content%x}"
+      # The bytes are SAVED, not memorised (cr4 D-5a): a shell variable cannot
+      # hold a NUL byte, and `cp` copies exactly what is on the disk. One copy
+      # per file, numbered, in this run's scratch directory. Three failures live
+      # in these steps and each names itself (cr4 fold, probe B2: all three
+      # used to say "cannot read ${f}", and only one of them is a read).
+      if ! prior_state_dir_ready; then
+        err "cannot create the scratch directory ${TMPDIR:-/tmp}/.anas-prior-state.XXXXXX to save rollback copies of ${f} — set TMPDIR to a writable directory, or free space there. The node was NOT modified"
+        remove_prior_state_dir
+        exit 1
+      fi
+      save="${PRIOR_STATE_DIR}/$((n += 1))"
+      if ! cp -p -- "${f}" "${save}"; then
+        err "cannot copy ${f} into ${PRIOR_STATE_DIR} for rollback — fix the cause the cp message above names and re-run. The node was NOT modified"
+        remove_prior_state_dir
+        exit 1
+      fi
+      PRIOR_FILE_SAVE["${f}"]="${save}"
       PRIOR_FILE_MODE["${f}"]="${mode}"
       PRIOR_FILE_OWNER["${f}"]="${owner}"
       # An extended ACL (anything beyond the mode): `--skip-base` prints
@@ -872,6 +1017,15 @@ save_prior_state() {
       PRIOR_ENABLED+=("${u}")
     fi
   done
+  # Which of the two services this run is about to stop were RUNNING, recorded
+  # per unit (cr4 D-5b): the rollback used to restart both whatever had been
+  # active, starting a service the operator had deliberately stopped.
+  if systemctl is-active --quiet anasd 2>/dev/null; then
+    PRIOR_ACTIVE_ANASD=1
+  fi
+  if systemctl is-active --quiet anas 2>/dev/null; then
+    PRIOR_ACTIVE_ANAS=1
+  fi
   if systemctl is-active --quiet "${RECYCLE_TIMER}" 2>/dev/null; then
     PRIOR_TIMER_ACTIVE=1
   fi
@@ -953,12 +1107,13 @@ restore_mtime() {
   touch -m -d "@${PRIOR_FILE_MTIME[$2]}" -- "$1" 2>/dev/null || true
 }
 
-# Does regular file `$1` hold exactly bytes `$2`, mode `$3`, owner `$4`?
+# Does regular file `$1` hold exactly the saved copy's bytes `$2`, mode `$3`,
+# owner `$4`? Byte-to-byte `cmp` (cr4 D-5a): a NUL byte is compared, not lost.
 file_matches() {
   [ -f "$1" ] || return 1
   [ "$(stat -L -c '%a' -- "$1")" = "$3" ] || return 1
   [ "$(stat -L -c '%u:%g' -- "$1")" = "$4" ] || return 1
-  cmp -s -- "$1" <(printf '%s' "$2")
+  cmp -s -- "$1" "$2"
 }
 
 # Put the saved bytes of `$1` (the saved-set path `$2` names the record) back
@@ -981,7 +1136,9 @@ restore_file() {
     RESTORE_FAILED+=("${f}")
     return 1
   fi
-  if ! { printf '%s' "${PRIOR_FILE_CONTENT[${key}]}" > "${tmp}" && sync -f -- "${tmp}"; } 2>/dev/null; then
+  # `cp`, not `printf %s`: the saved copy is restored byte for byte, NUL
+  # bytes included (cr4 D-5a).
+  if ! { cp -p -- "${PRIOR_FILE_SAVE[${key}]}" "${tmp}" && sync -f -- "${tmp}"; } 2>/dev/null; then
     rm -f -- "${tmp:?}"
     RESTORE_FAILED+=("${f}")
     return 1
@@ -1053,8 +1210,8 @@ restore_prior_files() {
     if [ -n "${PRIOR_LINK[${f}]+set}" ]; then
       real="${PRIOR_LINK_REAL[${f}]}"
       if [ -L "${f}" ] && [ "$(readlink -- "${f}")" = "${PRIOR_LINK[${f}]}" ]; then
-        if [ -n "${PRIOR_FILE_CONTENT[${f}]+set}" ]; then
-          if file_matches "${real}" "${PRIOR_FILE_CONTENT[${f}]}" "${PRIOR_FILE_MODE[${f}]}" "${PRIOR_FILE_OWNER[${f}]}"; then
+        if [ -n "${PRIOR_FILE_SAVE[${f}]+set}" ]; then
+          if file_matches "${real}" "${PRIOR_FILE_SAVE[${f}]}" "${PRIOR_FILE_MODE[${f}]}" "${PRIOR_FILE_OWNER[${f}]}"; then
             restore_mtime "${real}" "${f}"
           else
             restore_file "${real}" "${f}" inplace
@@ -1062,8 +1219,8 @@ restore_prior_files() {
         fi
       elif [ -L "${f}" ]; then
         RESTORE_FAILED+=("${f} (re-pointed by another process to $(readlink -- "${f}") while ANAS was installing; left as it is)")
-        if [ "${how}" = inplace ] && [ -n "${PRIOR_FILE_CONTENT[${f}]+set}" ] \
-           && ! file_matches "${real}" "${PRIOR_FILE_CONTENT[${f}]}" "${PRIOR_FILE_MODE[${f}]}" "${PRIOR_FILE_OWNER[${f}]}"; then
+        if [ "${how}" = inplace ] && [ -n "${PRIOR_FILE_SAVE[${f}]+set}" ] \
+           && ! file_matches "${real}" "${PRIOR_FILE_SAVE[${f}]}" "${PRIOR_FILE_MODE[${f}]}" "${PRIOR_FILE_OWNER[${f}]}"; then
           RESTORE_FAILED+=("${real} (this installation wrote it through ${f}; not restored)")
         fi
       else
@@ -1071,8 +1228,8 @@ restore_prior_files() {
       fi
       continue
     fi
-    if [ -n "${PRIOR_FILE_CONTENT[${f}]+set}" ]; then
-      if [ ! -L "${f}" ] && file_matches "${f}" "${PRIOR_FILE_CONTENT[${f}]}" "${PRIOR_FILE_MODE[${f}]}" "${PRIOR_FILE_OWNER[${f}]}"; then
+    if [ -n "${PRIOR_FILE_SAVE[${f}]+set}" ]; then
+      if [ ! -L "${f}" ] && file_matches "${f}" "${PRIOR_FILE_SAVE[${f}]}" "${PRIOR_FILE_MODE[${f}]}" "${PRIOR_FILE_OWNER[${f}]}"; then
         restore_mtime "${f}" "${f}"
         continue
       fi
@@ -1157,16 +1314,42 @@ rollback() {
   # install used to run until the next reboot and then never start), and the
   # services this run stopped are started again; a service that was not running
   # before is left as it was.
-  local u
+  # Re-enabling and re-starting are RESTORE STEPS like the file copies: when
+  # one of them fails the node is NOT as it was, so the failure reaches the
+  # same end-of-rollback accounting as a failed restore (cr4 fold, probe A).
+  local u restart_units=() could_not_start=() could_not_enable=()
   for u in "${PRIOR_ENABLED[@]}"; do
-    systemctl enable "${u}" >/dev/null 2>&1 || true
+    if ! systemctl enable "${u}" >/dev/null 2>&1; then
+      could_not_enable+=("${u}")
+    fi
   done
+  # cr4 D-5b: start again only the services that were RUNNING before this run.
+  # This used to `systemctl restart anasd anas` whatever had been active, which
+  # started a service the operator had deliberately stopped.
   if [ "${SERVICES_STOPPED}" -eq 1 ]; then
-    info "restarting the previous anasd/anas"
-    systemctl restart anasd anas >/dev/null 2>&1 || true
+    if [ "${PRIOR_ACTIVE_ANASD}" -eq 1 ]; then
+      restart_units+=(anasd)
+    fi
+    if [ "${PRIOR_ACTIVE_ANAS}" -eq 1 ]; then
+      restart_units+=(anas)
+    fi
+    if [ "${#restart_units[@]}" -gt 0 ]; then
+      info "restarting the services that were running (${restart_units[*]})"
+      if ! systemctl restart "${restart_units[@]}" >/dev/null 2>&1; then
+        # One call covers the units and its exit status says nothing about
+        # WHICH came back, so ask each one (probe A). A unit that is ACTIVE
+        # after the failed call is not a lost service; a unit that is not is
+        # one the node had running before this run.
+        for u in "${restart_units[@]}"; do
+          systemctl is-active --quiet "${u}" 2>/dev/null || could_not_start+=("${u}")
+        done
+      fi
+    fi
   fi
   if [ "${PRIOR_TIMER_ACTIVE}" -eq 1 ]; then
-    systemctl start "${RECYCLE_TIMER}" >/dev/null 2>&1 || true
+    if ! systemctl start "${RECYCLE_TIMER}" >/dev/null 2>&1; then
+      systemctl is-active --quiet "${RECYCLE_TIMER}" 2>/dev/null || could_not_start+=("${RECYCLE_TIMER}")
+    fi
   fi
 
   # The UI integration this run's revert removed was there before it: the
@@ -1178,17 +1361,47 @@ rollback() {
       "${PREFIX}/packages/pve-integration/install.sh" >/dev/null 2>&1 || true
   fi
 
-  echo >&2
-  if [ "${#RESTORE_FAILED[@]}" -gt 0 ]; then
-    # Never "node unchanged" when something could not be put back (cr3 review 2).
-    err "installation failed — rolled back, but these paths could not be restored:"
-    local p
-    for p in "${RESTORE_FAILED[@]}"; do
-      printf '  - %s\n' "${p}" >&2
-    done
-    err "they hold what this installation wrote; restore them by hand."
+  # The scratch holding the byte copies (cr4 D-5a): gone with a rollback that
+  # restored everything. Kept otherwise — for a path that could not be put
+  # back it may hold the only copy of the old bytes — and named below.
+  if [ "${#RESTORE_FAILED[@]}" -eq 0 ]; then
+    remove_prior_state_dir
   else
+    # Kept on purpose, and named with the paths below: the EXIT path must
+    # leave it for the operator (cr4 fold, probe E).
+    PRIOR_STATE_KEPT=1
+  fi
+
+  echo >&2
+  if [ "${#RESTORE_FAILED[@]}" -eq 0 ] && [ "${#could_not_start[@]}" -eq 0 ] && [ "${#could_not_enable[@]}" -eq 0 ]; then
     err "installation failed — rolled back (node unchanged)."
+  else
+    if [ "${#RESTORE_FAILED[@]}" -gt 0 ]; then
+      # Never "node unchanged" when something could not be put back (cr3 review 2).
+      err "installation failed — rolled back, but these paths could not be restored:"
+      local p
+      for p in "${RESTORE_FAILED[@]}"; do
+        printf '  - %s\n' "${p}" >&2
+      done
+      err "they hold what this installation wrote; restore them by hand."
+    fi
+    if [ "${#could_not_start[@]}" -gt 0 ]; then
+      # cr4 fold (probe A): a service that ran before this run and stayed down
+      # is a restore step that failed; name each one and how to look at it.
+      err "installation failed — rolled back, but these services were running before this run and could not be started again: ${could_not_start[*]}"
+      for u in "${could_not_start[@]}"; do
+        err "run systemctl status ${u} and journalctl -u ${u} -b to see why; once the cause is fixed, systemctl start ${u}."
+      done
+    fi
+    if [ "${#could_not_enable[@]}" -gt 0 ]; then
+      err "these units were enabled before this run and could not be enabled again: ${could_not_enable[*]}. They will not start at the next boot."
+      for u in "${could_not_enable[@]}"; do
+        err "run systemctl enable ${u} to enable it again."
+      done
+    fi
+    if [ -n "${PRIOR_STATE_DIR}" ] && [ -d "${PRIOR_STATE_DIR}" ]; then
+      err "ANAS saved copies of the files it replaced in ${PRIOR_STATE_DIR}; compare the paths above with them, then remove that directory."
+    fi
   fi
   exit 1
 }
@@ -1417,6 +1630,8 @@ finish_success() {
   if [ -n "${BACKUP_PATH}" ] && [ -d "${BACKUP_PATH}" ]; then
     rm -rf "${BACKUP_PATH}"
   fi
+  # And the saved byte copies: nothing will roll back now (cr4 D-5a).
+  remove_prior_state_dir
   local ip
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   [ -n "${ip}" ] || ip="<node-ip>"

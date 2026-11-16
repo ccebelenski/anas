@@ -35,7 +35,7 @@ trap 'rm -rf "${WORK}"' EXIT
 
 # Recording stubs FIRST on PATH as well as the shell functions below, so no
 # path through install.sh can reach the real system tools.
-mkdir -p "${WORK}/bin"
+mkdir -p "${WORK}/bin" "${WORK}/tmp"
 for _tool in systemctl apt apt-get dpkg update-initramfs pveproxy service udevadm journalctl; do
   printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 0\n' "${_tool}" "${WORK}/bin/calls.log" > "${WORK}/bin/${_tool}"
   chmod +x "${WORK}/bin/${_tool}"
@@ -61,6 +61,9 @@ run_phase1() {
   local t="$1" state="$2" extra="$3"
   (
     export PREFIX="${t}/opt/anas" SYSTEMD_DIR="${t}/systemd-dir" ANAS_ENV_FILE="${t}/default-anas"
+    # The installer's scratch (saved byte copies of prior files) stays in the
+    # throwaway tree, never the machine's /tmp.
+    export TMPDIR="${WORK}/tmp"
     export HOOK_DEST="${t}/anas-md-event" CACHE_HOOK_DEST="${t}/anas-cache-event" UDEV_RULES_DIR="${t}/udev"
     export PVE_TEMPLATE_DIR="${t}/tpl/default" PVE_JS_DIR="${t}/js" PVE_TPL="${t}/index.html.tpl"
     export MDADM_CONF="${t}/mdadm.conf"
@@ -160,6 +163,160 @@ check "nothing is enabled that was not" "! grep -q '^enable ' '${T3}/rollback-ca
 check "nothing is started that was not running" "! grep -qE '^(restart|start) ' '${T3}/rollback-calls.log'"
 check "unit files this run created are removed" "[ ! -e '${T3}/systemd-dir/anasd.service' ]"
 check "... the recycle pair too" "[ ! -e '${T3}/systemd-dir/anas-recycle.timer' ] && [ ! -e '${T3}/systemd-dir/anas-recycle.service' ]"
+
+echo "== cr4 inst D-5b: the rollback starts only the service that was running before =="
+T28="${WORK}/one-active"
+new_tree "${T28}"
+mkdir -p "${T28}/opt/anas"
+echo "OLD" > "${T28}/opt/anas/VERSION"
+# anasd was enabled AND running; anas was enabled but deliberately stopped.
+# One systemctl stub answering is-active per unit, which run_phase1's single
+# state answer cannot express.
+run_phase1 "${T28}" "enabled" '
+  systemctl() {
+    printf "%s\n" "$*" >> "${t}/systemctl.log"
+    case "$1" in
+      is-enabled) return 0 ;;
+      is-active) [ "${3}" = "anasd" ] ;;
+      *) return 0 ;;
+    esac
+  }
+  health_check() { return 1; }
+'
+check "the installer failed (exit 1)" "[ \"\$(cat '${T28}/rc')\" = 1 ]"
+awk '/disable --now anasd anas/{on=1} on' "${T28}/systemctl.log" > "${T28}/rollback-calls.log"
+RESTART28="$(grep '^restart ' "${T28}/rollback-calls.log" || true)"
+check "the rollback restarted only anasd, the one that was running before" "[ \"${RESTART28}\" = 'restart anasd' ]"
+
+echo "== cr4 fold A: a failed restart of a unit that was running is a failed restore step =="
+T30="${WORK}/restart-fails"
+new_tree "${T30}"
+mkdir -p "${T30}/opt/anas"
+echo "OLD" > "${T30}/opt/anas/VERSION"
+# Both services were enabled AND running before the run (probe A's input).
+# After the rollback's first `disable --now`, every restart FAILS and every
+# is-active answer says INACTIVE: the units this run stopped do not come back,
+# so the node is left with both services down. The last line must not claim
+# "node unchanged" over that; it must name the units and say how to look.
+run_phase1 "${T30}" "enabled" '
+  ROLLBACK_BEGUN=0
+  systemctl() {
+    printf "%s\n" "$*" >> "${t}/systemctl.log"
+    case "$1" in
+      disable) ROLLBACK_BEGUN=1; return 0 ;;
+      is-enabled) return 0 ;;
+      is-active) [ "${ROLLBACK_BEGUN}" = 0 ] ;;
+      restart) [ "${ROLLBACK_BEGUN}" = 0 ] ;;
+      *) return 0 ;;
+    esac
+  }
+  health_check() { return 1; }
+'
+check "the installer failed (exit 1)" "[ \"\$(cat '${T30}/rc')\" = 1 ]"
+awk '/disable --now anasd anas/{on=1} on' "${T30}/systemctl.log" > "${T30}/rollback-calls.log"
+check "the rollback tried the restart of both services that were running" "grep -qx 'restart anasd anas' '${T30}/rollback-calls.log'"
+check "and asked which of them came back" "grep -qx 'is-active --quiet anasd' '${T30}/rollback-calls.log' && grep -qx 'is-active --quiet anas' '${T30}/rollback-calls.log'"
+check "the last line does NOT claim the node is unchanged" "! grep -q 'node unchanged' '${T30}/out.log'"
+check "it names the units that could not be started" "grep -q 'could not be started again: anasd anas' '${T30}/out.log'"
+check "it says to run systemctl status on each unit" "grep -q 'systemctl status anasd' '${T30}/out.log' && grep -q 'systemctl status anas' '${T30}/out.log'"
+check "it says to run journalctl -u <unit> -b on each" "grep -q 'journalctl -u anasd -b' '${T30}/out.log' && grep -q 'journalctl -u anas -b' '${T30}/out.log'"
+check "the previous install is still back at the prefix (the file restore itself worked)" "[ \"\$(cat '${T30}/opt/anas/VERSION')\" = OLD ]"
+
+echo "== cr4 fold A: a restart that fails while the unit is ACTIVE is not a lost service =="
+T30b="${WORK}/restart-succeeded-anyway"
+new_tree "${T30b}"
+mkdir -p "${T30b}/opt/anas"
+echo "OLD" > "${T30b}/opt/anas/VERSION"
+# The restart call exits non-zero but every unit answers is-active ACTIVE
+# afterwards: nothing was lost, so "node unchanged" must STAY true (the
+# installer does not guess a failure the unit itself denies).
+run_phase1 "${T30b}" "enabled" '
+  ROLLBACK_BEGUN=0
+  systemctl() {
+    printf "%s\n" "$*" >> "${t}/systemctl.log"
+    case "$1" in
+      disable) ROLLBACK_BEGUN=1; return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  health_check() { return 1; }
+'
+check "the last line still says the node is unchanged" "grep -q 'node unchanged' '${T30b}/out.log'"
+check "no service failure is claimed" "! grep -q 'could not be started again' '${T30b}/out.log'"
+
+echo "== cr4 inst D-5a: a saved file with NUL bytes is restored byte for byte (cmp) =="
+T29="${WORK}/nul-bytes"
+new_tree "${T29}"
+mkdir -p "${T29}/opt/anas" "${T29}/tmp"
+echo "OLD" > "${T29}/opt/anas/VERSION"
+# One NUL byte: exactly what $( cat ) drops, and what the rollback then wrote
+# back one byte short (reviewer probe: original=51 restored=50 bytes).
+printf 'ANAS_PORT=3005\nANAS_OPERATOR_BYTES=a\x00b\n' > "${T29}/default-anas"
+cp -p "${T29}/default-anas" "${T29}/default-anas.before"
+run_phase1 "${T29}" "enabled" 'TMPDIR="${t}/tmp"; export TMPDIR; health_check() { return 1; }'
+check "the installer failed (exit 1)" "[ \"\$(cat '${T29}/rc')\" = 1 ]"
+check "the rollback ran once" "[ \"\$(grep -c 'rolling back' '${T29}/out.log')\" = 1 ]"
+check "the restored env file is IDENTICAL to what was there, NUL byte included (cmp)" "cmp -s '${T29}/default-anas.before' '${T29}/default-anas'"
+check "'node unchanged'" "grep -q 'node unchanged' '${T29}/out.log'"
+check "the scratch holding the saved copies does not outlive a rollback that restored everything" "[ -z \"\$(ls -A '${T29}/tmp')\" ]"
+
+echo "== cr4 fold B2: a scratch directory that cannot be made says so, not 'cannot read' =="
+T31="${WORK}/scratchdir-fails"
+new_tree "${T31}"
+mkdir -p "${T31}/opt/anas"
+echo "OLD" > "${T31}/opt/anas/VERSION"
+printf 'ANAS_PORT=3005\n' > "${T31}/default-anas"
+# Probe B2's input: TMPDIR points at a directory that does not exist, so the
+# scratch mktemp fails on the first prior file. Every file is world-readable,
+# yet the sentence used to be "cannot read <file>". The scratch failure gets
+# its own sentence, naming the directory and the fix.
+run_phase1 "${T31}" "enabled" 'TMPDIR="${t}/no-such-dir"; export TMPDIR; health_check() { return 1; }'
+check "the install failed before phase 1 (exit 1)" "[ \"\$(cat '${T31}/rc')\" = 1 ]"
+check "it names the directory it could not create" "grep -qF 'cannot create the scratch directory ${T31}/no-such-dir/.anas-prior-state' '${T31}/out.log'"
+check "it gives the fix: a writable TMPDIR, or space there" "grep -qF 'set TMPDIR to a writable directory, or free space there' '${T31}/out.log'"
+check "the node was NOT modified is stated" "grep -qF 'The node was NOT modified' '${T31}/out.log'"
+check "no file is blamed for being unreadable" "! grep -q 'cannot read' '${T31}/out.log'"
+check "the env file is intact" "grep -qx 'ANAS_PORT=3005' '${T31}/default-anas'"
+check "no rollback ran (nothing was modified)" "! grep -q 'rolling back' '${T31}/out.log'"
+
+echo "== cr4 fold D: a killed run does not leave the scratch behind =="
+T32="${WORK}/killed-run"
+new_tree "${T32}"
+mkdir -p "${T32}/opt/anas" "${T32}/tmp"
+echo "OLD" > "${T32}/opt/anas/VERSION"
+printf 'ANAS_PORT=3005\n' > "${T32}/default-anas"
+# Probe D: the prior state is saved (the scratch is now ON DISK), then the
+# shell dies the way a Ctrl-C or a dropped ssh session kills an install: an
+# untrapped SIGTERM. No rollback runs, no finish_success runs; only the EXIT
+# path can take the scratch with the shell.
+# The braces keep the runner's own "Terminated ( ... )" notice (bash prints it
+# when a foreground child dies of SIGTERM) out of the suite's output; the
+# subshell's own stderr goes to out.log.
+{
+(
+  export PREFIX="${T32}/opt/anas" SYSTEMD_DIR="${T32}/systemd-dir" ANAS_ENV_FILE="${T32}/default-anas"
+  export TMPDIR="${T32}/tmp"
+  export HOOK_DEST="${T32}/anas-md-event" CACHE_HOOK_DEST="${T32}/anas-cache-event" UDEV_RULES_DIR="${T32}/udev"
+  export PVE_TEMPLATE_DIR="${T32}/tpl/default" PVE_JS_DIR="${T32}/js" PVE_TPL="${T32}/index.html.tpl"
+  export MDADM_CONF="${T32}/mdadm.conf"
+  export ANAS_INSTALL_LIB_ONLY=1
+  set --
+  # shellcheck disable=SC1090
+  source "${INSTALL}"
+  systemctl() { return 0; }
+  save_prior_state
+  printf 'SCRATCH:%s\n' "$(ls -A "${T32}/tmp")"
+  # The kill: an untrapped SIGTERM to this very subshell (BASHPID: $$ would
+  # be the test runner).
+  kill -TERM "${BASHPID}"
+  printf 'NEVER-REACHED\n'
+) > "${T32}/out.log" 2>&1
+echo $? > "${T32}/rc"
+} 2>/dev/null
+check "the scratch was on disk while the run lived (the kill's premise)" "grep -q 'SCRATCH:.anas-prior-state' '${T32}/out.log'"
+check "the run died of SIGTERM (exit 143)" "[ \"\$(cat '${T32}/rc')\" = 143 ]"
+check "neither a rollback nor an orderly end ran (what makes this every other test's blind spot)" "! grep -qE 'rolling back|NEVER-REACHED' '${T32}/out.log'"
+check "the killed run's scratch does not outlive it" "[ -z \"\$(ls -A '${T32}/tmp')\" ]"
 
 echo "== L4: an ERR inside a command substitution does not run a second rollback in the subshell =="
 T4="${WORK}/subshell"
@@ -301,6 +458,34 @@ check "the env file (written in place by phase 1) is restored IN PLACE: same ino
 check "... and with its old mtime (a restored file reads as never touched)" "[ \"\$(stat -c %.9Y '${T11b}/default-anas')\" = '${MT11}' ]"
 check "a rollback that restored everything still says 'node unchanged'" "grep -q 'node unchanged' '${T11b}/out.log'"
 
+echo "== cr4 fold E: a rollback that kept the scratch keeps it through the EXIT path =="
+if [ "$(id -u)" = 0 ] || { mkdir -p "${WORK}/ro33"; chmod 0555 "${WORK}/ro33"; touch "${WORK}/ro33/x" 2>/dev/null; }; then
+  echo "  skip: this user can write into a 0555 directory (root, or root in a user namespace): the failure cannot be staged"
+  T33_SKIP=1
+else
+  T33_SKIP=0
+fi
+chmod 0755 "${WORK}/ro33" 2>/dev/null || true
+rm -rf "${WORK}/ro33" 2>/dev/null || true
+if [ "${T33_SKIP}" = 0 ]; then
+  T33="${WORK}/kept-scratch"
+  new_tree "${T33}"
+  mkdir -p "${T33}/opt/anas" "${T33}/envdir" "${T33}/tmp"
+  echo "OLD" > "${T33}/opt/anas/VERSION"
+  printf 'ANAS_PORT=3005\n' > "${T33}/envdir/anas"
+  # Probe E's input: the env file lives in a directory phase 1 rewrites and the
+  # health check then makes read-only, so the restore fails and the rollback
+  # keeps the scratch and names it. The EXIT path armed by save_prior_state
+  # must respect that keep: the scratch has to still be there AFTER the shell
+  # that made it has exited.
+  run_phase1 "${T33}" "enabled" 'ANAS_ENV_FILE="${t}/envdir/anas"; TMPDIR="${t}/tmp"; export TMPDIR; health_check() { chmod 0555 "${t}/envdir"; return 1; }'
+  chmod 0755 "${T33}/envdir"
+  check "the rollback named the path it could not restore" "grep -q 'could not be restored' '${T33}/out.log' && grep -q '${T33}/envdir/anas' '${T33}/out.log'"
+  check "the message names the scratch it kept" "grep -q 'ANAS saved copies of the files it replaced in ${T33}/tmp/.anas-prior-state' '${T33}/out.log'"
+  check "the scratch is still on disk AFTER the installer shell exited (the EXIT path respected the keep)" "ls -d '${T33}'/tmp/.anas-prior-state.* >/dev/null 2>&1"
+  check "it still holds the saved byte copies" "[ \"\$(ls -A '${T33}'/tmp/.anas-prior-state.* | wc -l)\" -ge 1 ]"
+fi
+
 echo "== cr3 review 2 (3): a symlink phase 1 replaced is restored as the link, and the file behind it is not written =="
 T12="${WORK}/foreign-link"
 new_tree "${T12}"
@@ -339,7 +524,10 @@ else
   run_phase1 "${T14}" "enabled" 'health_check() { return 1; }'
   chmod 0644 "${T14}/anas-md-event"
   check "the install failed" "[ \"\$(cat '${T14}/rc')\" = 1 ]"
-  check "the sentence names the file" "grep -q 'cannot read ${T14}/anas-md-event' '${T14}/out.log'"
+  # stat succeeds on a 000-mode file; the failure is the COPY. Since the cr4
+  # fold split the shared sentence, this file is named as what failed: cp.
+  check "the sentence names the file" "grep -q 'cannot copy ${T14}/anas-md-event' '${T14}/out.log'"
+  check "it is not called a read failure (the read succeeded)" "! grep -q 'cannot read' '${T14}/out.log'"
   check "before phase 1: no rollback, the prefix never moved" "! grep -q 'rolling back' '${T14}/out.log' && [ \"\$(cat '${T14}/opt/anas/VERSION')\" = OLD ] && ! ls -d '${T14}'/opt/anas.bak.* >/dev/null 2>&1"
   check "the file keeps its bytes" "grep -q 'OLD hook body' '${T14}/anas-md-event'"
 fi

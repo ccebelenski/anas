@@ -41,7 +41,9 @@ line_of() {
 
 echo "== ORDER: the UI integration (pveproxy restart) is reverted after everything else, before the prefix =="
 UI="$(line_of '"${PREFIX}/packages/pve-integration/uninstall.sh" || true')"
-RM_PREFIX="$(line_of 'rm -rf "${PREFIX}"')"
+# The prefix is removed by remove_prefix; its CALL (a line that is only the
+# name), not its definition, is the step whose order matters.
+RM_PREFIX="$(grep -nx 'remove_prefix' "${UNINSTALL}" | head -n1 | cut -d: -f1)"
 check "the integration revert is found" "[ -n '${UI}' ]"
 for step in \
   'systemctl disable --now anasd anas' \
@@ -185,6 +187,53 @@ check "does not name a band member slice" "! grep -q 'tank-d0-b1' '${WORK}/out.l
 check "says how to recover by hand" "grep -q 'lvconvert --uncache' '${WORK}/out.log'"
 LSBLK_OUT=$'EFI\ntank-d0-b1\n' run_lib "warn_surviving_ahr_caches"
 check "says nothing when no cache slice remains" "[ ! -s '${WORK}/out.log' ]"
+
+echo "== cr4 3e: a symlinked env file: the link goes, the file stays, the log says so =="
+d="${WORK}/env.link"; mkdir -p "${d}"
+printf 'ANAS_PORT=3005\n' > "${d}/real-anas"
+ln -s real-anas "${d}/default-anas"
+ANAS_ENV_FILE="${d}/default-anas" ANAS_UNINSTALL_LIB_ONLY=1 \
+  bash -c "source '${UNINSTALL}'; remove_env_file" > "${d}/out" 2>&1
+check "3e the link is gone" "[ ! -L '${d}/default-anas' ]"
+check "3e the file it pointed to is untouched" "[ -f '${d}/real-anas' ] && grep -qx 'ANAS_PORT=3005' '${d}/real-anas'"
+check "3e the log says the symlink was removed" "grep -qF 'removed the symlink ${d}/default-anas' '${d}/out'"
+check "3e the log names the surviving file and says it was left" \
+  "grep -qF \"${d}/real-anas, was left in place\" '${d}/out'"
+check "3e the log does not claim the env file path itself was removed" \
+  "! grep -qF 'removed ${d}/default-anas' '${d}/out'"
+
+echo "== cr4 3e: a dangling symlink is removed too, and the log says the target does not exist =="
+d="${WORK}/env.dangling"; mkdir -p "${d}"
+ln -s gone-anas "${d}/default-anas"
+ANAS_ENV_FILE="${d}/default-anas" ANAS_UNINSTALL_LIB_ONLY=1 \
+  bash -c "source '${UNINSTALL}'; remove_env_file" > "${d}/out" 2>&1
+check "3e the dangling link is gone" "[ ! -L '${d}/default-anas' ]"
+check "3e the log calls it dangling and names the target" \
+  "grep -qF 'dangling symlink ${d}/default-anas' '${d}/out' && grep -qF 'gone-anas' '${d}/out'"
+check "3e the log does not claim a file was left" "! grep -qF 'was left in place' '${d}/out'"
+
+echo "== cr4 3e: a regular env file is still removed and the log says that =="
+d="${WORK}/env.plain"; mkdir -p "${d}"
+printf 'ANAS_PORT=3005\n' > "${d}/default-anas"
+ANAS_ENV_FILE="${d}/default-anas" ANAS_UNINSTALL_LIB_ONLY=1 \
+  bash -c "source '${UNINSTALL}'; remove_env_file" > "${d}/out" 2>&1
+check "3e the regular file is removed" "[ ! -e '${d}/default-anas' ]"
+check "3e the log says it was removed" "grep -qF \"removed ${d}/default-anas\" '${d}/out'"
+check "3e the log says nothing about symlinks" "! grep -qF 'symlink' '${d}/out'"
+
+# -----------------------------------------------------------------------------
+echo "== remove_prefix removes an ANAS install and leaves anything else =="
+rp() { ANAS_UNINSTALL_LIB_ONLY=1 PREFIX="$1" bash -c "source '${UNINSTALL}'; remove_prefix" > "${WORK}/rp.log" 2>&1; }
+d="${WORK}/rp"; rm -rf "${d}"; mkdir -p "${d}/etc-like/cron.d" "${d}/inst/packages/daemon" "${d}/empty"; : > "${d}/etc-like/passwd"
+rp "${d}/etc-like"
+check "a directory that is not an ANAS install is left whole" "[ -f '${d}/etc-like/passwd' ] && [ -d '${d}/etc-like/cron.d' ]"
+check "the log says it was left and names --prefix" "grep -qF 'is not an ANAS install' '${WORK}/rp.log' && grep -qF -- '--prefix' '${WORK}/rp.log'"
+rp "${d}/inst"
+check "an ANAS install is removed" "[ ! -e '${d}/inst' ]"
+rp "${d}/empty"
+check "an empty directory is removed" "[ ! -e '${d}/empty' ]"
+rp "${d}/never"
+check "an absent prefix says nothing to remove" "grep -qF 'not present (nothing to remove)' '${WORK}/rp.log'"
 
 echo
 echo "uninstall-order tests: ${PASS} passed, ${FAIL} failed"

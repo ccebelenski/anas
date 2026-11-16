@@ -16,8 +16,10 @@ RELEASE="${HERE}/../make-release.sh"
 
 PASS=0
 FAIL=0
+SKIP=0
 ok()   { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad()  { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
+skip() { echo "  SKIP $1"; SKIP=$((SKIP + 1)); }
 check(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
 
 echo "== the release smoke never starts the daemon =="
@@ -61,9 +63,18 @@ if [ -f "${DIST}/index.js" ]; then
   run_block "${WORK}/syntax"
   check "an index.js that does not parse fails the smoke" "grep -qx 'smoke_fail=1' '${WORK}/out.log' && grep -q 'does not parse' '${WORK}/out.log'"
 else
-  echo "  skip packages/daemon/dist not built (the static checks above stand)"
+  # Every check the un-built dist hides is named and counted (cr4): one
+  # unlabeled skip line let a green run look like the import check had passed.
+  # A SKIP, not an ok — the check did not run — and the summary carries the
+  # count.
+  echo "  (packages/daemon/dist not built — the static checks above stand)"
+  skip "the real graph loads (smoke_fail=0)"
+  skip "it says the daemon was not started"
+  skip "a missing module fails the smoke (smoke_fail=1)"
+  skip "a missing side-effect import fails the smoke"
+  skip "an index.js that does not parse fails the smoke"
 fi
 
 echo
-echo "release-smoke tests: ${PASS} passed, ${FAIL} failed"
+echo "release-smoke tests: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
 [ "${FAIL}" -eq 0 ]

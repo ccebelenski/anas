@@ -24,6 +24,8 @@
 #   5. no node at all: refused; with --install-deps, marked for installation.
 #   6. a `node --version` that fails is read as too old, never as OK
 #      (a read that could not see never says safe).
+#   7. every scenario pins the verdict's CLASS (a FATAL entry only on
+#      refusals) and refusals additionally the preflight abort status (cr4).
 #
 #   bash packaging/test/node-floor.test.sh
 #
@@ -66,8 +68,13 @@ fake_node() {
 }
 
 # Run ONLY the read-only preflight with NODE_BIN=$1; $2 = 1 sets --install-deps.
-# Output -> $LOG. The exit status is not asserted: on a non-PVE box the PVE
-# check is a FATAL of its own, so only the Node.js lines carry the verdict.
+# Output -> $LOG, exit status -> $RC (cr4: the status is asserted, not ignored).
+# On this box the root and PVE checks are FATAL entries of their own (EUID and
+# /usr/share/pve-manager/index.html.tpl are environment facts, deliberately not
+# faked), so a bare "status is 1" would hold even with the Node check deleted.
+# The Node verdict is therefore pinned by its CLASS — a refusal sits among the
+# FATAL entries the preflight abort prints (node_is_fatal), an OK read never
+# does — together with the abort status on the refusal path.
 preflight() {
   local node_bin="$1" deps_flag=""
   [ "${2:-0}" = "1" ] && deps_flag="--install-deps"   # parsed by install.sh's own argv loop
@@ -79,6 +86,7 @@ preflight() {
   SS_BIN="${WORK}/ss" SYSTEMCTL_BIN="${WORK}/systemctl" \
     bash -c 'source "$0" "$@"; phase0_preflight' \
       "${PKG}/install.sh" ${deps_flag} >"${LOG}" 2>&1
+  RC=$?
 }
 
 node_ok()        { grep -qE "Node\.js v[0-9.]+ \(>= 20\) OK" "${LOG}"; }
@@ -86,23 +94,39 @@ node_too_old()   { grep -qE "Node\.js v[0-9.]+ is too old \(need >= 20\)" "${LOG
 node_will_install(){ grep -q "will install via NodeSource (--install-deps)" "${LOG}"; }
 node_not_found() { grep -q "Node.js not found (need >= 20)" "${LOG}"; }
 
+# Is the Node verdict one of the hard failures? The preflight abort prints its
+# FATAL list under "preflight failed" with one "  - <entry>" line each, and the
+# only entries that can start "Node.js" are the Node verdict's. This is what
+# makes the exit status mean something: an OK read must never appear there, a
+# refusal must. Capture, then match: pipefail is set in this script, and
+# `sed | grep -q` is the issue-#21 SIGPIPE shape.
+node_is_fatal() {
+  local fatal_list
+  fatal_list="$(sed -n '/preflight failed/,$p' "${LOG}")"
+  grep -qE '^  - Node\.js' <<<"${fatal_list}"
+}
+
 # =============================================================================
 echo "== 1. the floor itself passes =="
 preflight "$(fake_node v20.0.0)"
 check "v20.0.0 reads OK" "node_ok"
 check "v20.0.0 is not refused" "! node_too_old"
+check "v20.0.0 is no FATAL entry: a passing node never blocks the install" "! node_is_fatal"
 
 echo "== 2. the Node the installer provides passes =="
 preflight "$(fake_node v22.23.3)"
 check "v22.23.3 reads OK" "node_ok"
+check "v22.23.3 is no FATAL entry" "! node_is_fatal"
 
 echo "== 3. a Node ahead of the floor passes and is never reinstalled =="
 for v in v24.14.0 v26.12.0; do
   preflight "$(fake_node "${v}")"
   check "${v} reads OK" "node_ok"
   check "${v} is not refused" "! node_too_old"
+  check "${v} is no FATAL entry" "! node_is_fatal"
   preflight "$(fake_node "${v}")" 1
   check "${v} with --install-deps reads OK" "node_ok"
+  check "${v} with --install-deps is no FATAL entry" "! node_is_fatal"
   check "${v} with --install-deps is not marked for installation" "! node_will_install"
   check "${v} with --install-deps: no NodeSource line at all" "! grep -q NodeSource '${LOG}'"
 done
@@ -113,21 +137,29 @@ check "v18.19.1 is refused naming the floor" "node_too_old"
 check "the refusal carries the fix" "grep -q 'curl -fsSL https://deb.nodesource.com/setup_22.x' '${LOG}'"
 check "the refusal is a preflight failure (node NOT modified)" "grep -q 'preflight failed — the node was NOT modified' '${LOG}'"
 check "v18.19.1 does not read OK" "! node_ok"
+check "the refusal is the preflight abort: exit status 1" "[ ${RC} -eq 1 ]"
+check "the too-old verdict is a FATAL entry, not a warning" "node_is_fatal"
 preflight "$(fake_node v18.19.1)" 1
 check "v18.19.1 with --install-deps is marked for installation" "node_will_install"
 check "v18.19.1 with --install-deps is not a Node.js FATAL" "! node_too_old"
+check "with --install-deps the node verdict leaves the FATAL list" "! node_is_fatal"
 
 echo "== 5. no node at all =="
 preflight "${WORK}/no-such-node"
 check "absent node is refused" "node_not_found"
 check "absent node does not read OK" "! node_ok"
+check "absent node refuses with the preflight abort status 1" "[ ${RC} -eq 1 ]"
+check "the absent-node verdict is a FATAL entry" "node_is_fatal"
 preflight "${WORK}/no-such-node" 1
 check "absent node with --install-deps is marked for installation" "node_will_install"
+check "absent node with --install-deps leaves the FATAL list" "! node_is_fatal"
 
 echo "== 6. a node --version that fails reads as too old, never OK =="
 preflight "$(fake_node '')"
 check "a failing --version is refused" "node_too_old"
 check "a failing --version does not read OK" "! node_ok"
+check "a failing --version refuses with the preflight abort status 1" "[ ${RC} -eq 1 ]"
+check "the failing --version is a FATAL entry, never a silent OK" "node_is_fatal"
 
 echo
 echo "node-floor: ${PASS} passed, ${FAIL} failed"

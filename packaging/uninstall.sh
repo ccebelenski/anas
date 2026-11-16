@@ -214,6 +214,31 @@ retire_md_program_hook() {
   return 0
 }
 
+# Remove the ANAS-owned gateway env file (issue #2, step 3e below). A symlink
+# is not the file: `rm` unlinks the LINK and leaves whatever it pointed to, and
+# that file lives outside everything ANAS owns, so it is never followed and
+# never deleted. The log says which of the two was removed and names the file
+# that survives (cr4) — the old line claimed "removed /etc/default/anas" while
+# the content behind that name stayed on the node. A dangling link is ANAS's
+# own leftover and goes too; its target does not exist, and the log says so.
+remove_env_file() {
+  local target
+  if [ -L "${ANAS_ENV_FILE}" ]; then
+    if [ -e "${ANAS_ENV_FILE}" ]; then
+      target="$(readlink -f "${ANAS_ENV_FILE}" 2>/dev/null || true)"
+      rm -f "${ANAS_ENV_FILE}"
+      info "removed the symlink ${ANAS_ENV_FILE}; the file it points to, ${target:-an unreadable target}, was left in place"
+    else
+      target="$(readlink "${ANAS_ENV_FILE}" 2>/dev/null || true)"
+      rm -f "${ANAS_ENV_FILE}"
+      info "removed the dangling symlink ${ANAS_ENV_FILE}, which pointed to ${target:-an unreadable target}; that target does not exist"
+    fi
+  elif [ -f "${ANAS_ENV_FILE}" ]; then
+    rm -f "${ANAS_ENV_FILE}"
+    info "removed ${ANAS_ENV_FILE}"
+  fi
+}
+
 # AHR read caches that survive the uninstall (CORE-L7): the recovery from a
 # lost cache device (`lvconvert --uncache`, AHR §13) is anasd's, triggered by
 # the udev rule this uninstall removes. Without ANAS, a cache device that
@@ -250,6 +275,27 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# What stands at PREFIX (the same function install.sh carries; the two scripts
+# ship as separate files). Echoes absent, anas, empty or foreign.
+prefix_kind() {
+  local p="$1"
+  if [ ! -e "${p}" ] && [ ! -L "${p}" ]; then echo absent; return; fi
+  if [ ! -d "${p}" ]; then echo foreign; return; fi
+  if [ -f "${p}/VERSION" ] || [ -d "${p}/packages/daemon" ]; then echo anas; return; fi
+  if [ -z "$(ls -A "${p}" 2>/dev/null)" ] && [ -r "${p}" ]; then echo empty; return; fi
+  echo foreign
+}
+
+# Remove the install prefix, and only an install prefix: a PREFIX that is not
+# an ANAS install (a mistyped --prefix such as /etc or /) is left as it is.
+remove_prefix() {
+  case "$(prefix_kind "${PREFIX}")" in
+    absent) info "${PREFIX} not present (nothing to remove)" ;;
+    anas|empty) info "removing ${PREFIX}"; rm -rf -- "${PREFIX}" ;;
+    *) warn "${PREFIX} is not an ANAS install (it has no VERSION file and no packages/daemon directory), so it was left as it is. If ANAS was installed somewhere else, run this again with --prefix naming that directory." ;;
+  esac
+}
 
 # ANAS_UNINSTALL_LIB_ONLY lets the test harness source this file to exercise
 # remove_schedule_units against a throwaway SYSTEMD_DIR with a faked systemctl —
@@ -382,12 +428,10 @@ if [ "${removed_template}" -eq 1 ]; then
   info "removed ANAS notification templates from ${PVE_TEMPLATE_DIR}"
 fi
 
-# 3e. Remove the ANAS-owned gateway env file (issue #2). ANAS-owned, so it is
-# safe to delete outright (unlike the surgical edits above).
-if [ -f "${ANAS_ENV_FILE}" ]; then
-  rm -f "${ANAS_ENV_FILE}"
-  info "removed ${ANAS_ENV_FILE}"
-fi
+# 3e. Remove the ANAS-owned gateway env file (issue #2); when the path is a
+# symlink the link goes and the file behind it stays, named in the log (see
+# remove_env_file).
+remove_env_file
 
 # 3f. Deliberately NOT removed, ever (stated so a later reader does not add the
 # removal): the rclone package, and /etc/anas/rclone.conf alongside the rest of
@@ -416,12 +460,7 @@ fi
 sweep_stale_tpl_backup
 
 # 6. Remove the install prefix.
-if [ -d "${PREFIX}" ]; then
-  info "removing ${PREFIX}"
-  rm -rf "${PREFIX}"
-else
-  info "${PREFIX} not present (nothing to remove)"
-fi
+remove_prefix
 
 echo
 log "ANAS uninstalled."

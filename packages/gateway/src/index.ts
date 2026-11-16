@@ -1,3 +1,4 @@
+import type { GatewayConfig } from './config.js'
 import { PROXY_KEY_PATH, removeProxyKey, writeProxyKey } from './auth/proxy-key.js'
 import { loadConfig } from './config.js'
 import { DEFAULT_PVE_LOCAL_PATH, describeNodeNameSource } from './node-name.js'
@@ -9,7 +10,17 @@ import { createServer } from './server.js'
  * no public origin and no TLS here — the cert lives on PVE's front door.
  */
 async function main() {
-  const config = loadConfig()
+  // A port variable that is not a plain number is refused here, before
+  // anything binds (cr4). Shown as one clean line in the journal, the same
+  // shape as the proxy-key failure below — the start simply does not happen.
+  let config: GatewayConfig
+  try {
+    config = loadConfig()
+  }
+  catch (err) {
+    console.error(`[config] ${(err as Error).message}`)
+    process.exit(1)
+  }
 
   // cr.27: the hand-off key pveproxy signs X-Anas-Auth with (auth/proxy-key.ts).
   // Written before the gateway listens, rotated by every start. Without it

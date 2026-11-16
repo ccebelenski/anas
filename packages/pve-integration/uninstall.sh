@@ -112,6 +112,11 @@ excise_our_hook_to() {
 SCRIPT_SRC="/pve2/js/anas.js"
 # Set when the proxy hook was excised: pveproxy is restarted at the very end.
 need_restart=0
+# Set when the perl -c gate refused the excision. The last line of this script
+# then says the block is still in the module, where it sits, and what ends it
+# (cr4 P-1) — "uninstalled" would be a false story.
+hook_gated=0
+hook_block_where=""
 
 # 1. Remove our line from the template — and only our line. We match on the
 #    anas.js source *path* as a substring so the whole tag line is removed
@@ -173,6 +178,28 @@ if [ -f "${PVE_HTTP_SERVER_PM}" ] && grep -qF "${ANAS_HOOK_MARKER}" "${PVE_HTTP_
   # hook only affects /anas URLs, which is a far cheaper failure than a dead UI.
   if command -v "${PERL_BIN}" >/dev/null 2>&1 && ! "${PERL_BIN}" -c "${candidate}" >/dev/null 2>&1; then
     rm -f "${candidate}"
+    hook_gated=1
+    # Where the surviving block sits in the LIVE module, so the last line can
+    # point at its line numbers (cr4 P-1). Capture, then match: pipefail is on,
+    # and a `grep | head` reader that stops early kills grep with SIGPIPE (the
+    # issue-#21 shape). No end marker found means the start marker stands alone;
+    # then the honest statement is "to the end of the file".
+    hook_marker_lines="$(grep -nF -- "${ANAS_HOOK_MARKER}" "${PVE_HTTP_SERVER_PM}" || true)"
+    hook_block_first="${hook_marker_lines%%:*}"
+    hook_block_last=""
+    if [ -n "${hook_block_first}" ] && [ "${hook_block_first}" != "${hook_marker_lines}" ]; then
+      hook_end_lines="$(grep -nF -- "${ANAS_HOOK_END}" "${PVE_HTTP_SERVER_PM}" || true)"
+      if [ -n "${hook_end_lines}" ]; then
+        hook_block_last="$(awk -F: -v n="${hook_block_first}" '$1 > n { print $1; exit }' <<<"${hook_end_lines}")"
+      fi
+      if [ -n "${hook_block_last}" ]; then
+        hook_block_where="lines ${hook_block_first}-${hook_block_last}"
+      else
+        hook_block_where="line ${hook_block_first} to the end of the file"
+      fi
+    else
+      hook_block_where="its start line could not be read"
+    fi
     echo "anas: WARNING: removing the hook from ${PVE_HTTP_SERVER_PM} yields a module that fails perl -c." >&2
     echo "anas: WARNING: left the live module and the ANAS hook block UNTOUCHED and did NOT restart pveproxy." >&2
     echo "anas: WARNING: remove the block between '${ANAS_HOOK_MARKER}' and '${ANAS_HOOK_END}' by hand." >&2
@@ -217,4 +244,13 @@ if [ "${need_restart}" -eq 1 ]; then
   fi
 fi
 
-echo "anas: PVE UI integration uninstalled."
+# The last line states what this run actually did (cr4 P-1). When the perl -c
+# gate refused the excision, the block is still in the module and /anas answers
+# an error until it goes; claiming "uninstalled" there would send the operator
+# off with a false story. The exit status stays 0 either way: the gate branch
+# is a warning state, not a failure (pinned by the proxy-install suite).
+if [ "${hook_gated}" -eq 1 ]; then
+  echo "anas: the ANAS hook block could not be removed safely and is still in ${PVE_HTTP_SERVER_PM} (${hook_block_where}). /anas answers an error until the block is removed. Reinstall ANAS, or remove those lines by hand and restart pveproxy, to end this."
+else
+  echo "anas: PVE UI integration uninstalled."
+fi

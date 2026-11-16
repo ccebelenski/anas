@@ -58,6 +58,33 @@ export interface GatewayConfig {
   forwardResponseTimeoutMs?: number
 }
 
+/** The one shape a port variable may take: digits, whole (`\d` is ASCII-only). */
+const PORT_PATTERN = /^\d+$/
+
+/**
+ * Read a port from the environment (cr4). Only a plain port number is a port:
+ * `Number.parseInt` read `3000abc` as 3000 (the trailing junk silently
+ * ignored) and `abc` as NaN, so one mis-typed line in /etc/default/anas could
+ * bind a port nobody chose, or none at all. Anything that is not digits in
+ * 1..65535 throws here — before the first bind — naming the variable, the
+ * value found and the file to fix. An unset or empty variable keeps the
+ * default, exactly as before.
+ */
+function portFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name]
+  if (raw === undefined || raw === '') {
+    return fallback
+  }
+  const port = PORT_PATTERN.test(raw) ? Number(raw) : Number.NaN
+  if (Number.isNaN(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `Invalid ${name}='${raw}'. ${name} must be a port number: digits only, from 1 to 65535. `
+      + `Set ${name} in /etc/default/anas to a number such as ${fallback}, or remove the line to use ${fallback}.`,
+    )
+  }
+  return port
+}
+
 export function loadConfig(
   env = process.env,
   hostname?: () => string,
@@ -65,8 +92,8 @@ export function loadConfig(
   const node = resolveNodeName(env, hostname)
   return {
     host: env.ANAS_HOST ?? '127.0.0.1',
-    port: env.ANAS_PORT ? Number.parseInt(env.ANAS_PORT, 10) : 3000,
-    pvePort: env.ANAS_PVE_PORT ? Number.parseInt(env.ANAS_PVE_PORT, 10) : 8006,
+    port: portFromEnv(env, 'ANAS_PORT', 3000),
+    pvePort: portFromEnv(env, 'ANAS_PVE_PORT', 8006),
     nodeName: node.nodeName,
     nodeNameSource: node.source,
     pveLocalPath: node.pveLocalPath,
