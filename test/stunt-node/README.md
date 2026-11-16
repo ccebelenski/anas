@@ -73,7 +73,8 @@ The VM runs on an isolated NAT network (`anas-test`, 192.168.200.0/24).
 | `remove-disk.sh <1\|2\|3>` | Hot-detach a disk |
 | `deploy-anas.sh` | Build + rsync + restart services |
 | `setup-test-data.sh` | Attach disks + create test pool and shares |
-| `run-tests.sh` | Full workflow: restore → deploy → test |
+| `run-tests.sh` | Run the integration suite against the node as it stands (nothing else) |
+| `restore-deploy-test.sh <snapshot> (--keep-current-as <name> \| --discard-current)` | Restore a snapshot, deploy, run the suite. Restoring discards the VM's current state; the caller says whether to snapshot it first |
 | `gtpools-fixture.sh <up\|down\|status>` | The standing `gtbackup`/`gtiscsi` file-backed pools (not in `baseline`; `up` once after a rebuild or restore) |
 | `ahrcache-fixture.sh <up\|down\|status\|pull-cache\|return-cache\|restart-daemon>` | ahrcache.1 live-proof fixture — the three virtual disks the AHR read-cache spec owns (`gtcache` pool + cache disk) |
 | `ahrexpand-fixture.sh <up\|down\|status>` | ahrexpand.1 live-proof fixture — the three disks the zero-gain expansion-guard spec owns (`gtexpand` pool + larger replacement disk) |
@@ -119,7 +120,34 @@ npx playwright test tests/integration/disks/ --project=integration
 ./test/stunt-node/run-tests.sh
 ```
 
-Restores the baseline snapshot, deploys current code, and runs Playwright.
+Runs Playwright against the node as it stands. It restores nothing and deploys nothing.
+
+### From a snapshot
+
+```bash
+./test/stunt-node/restore-deploy-test.sh baseline --keep-current-as before-restore
+```
+
+Restores the snapshot, deploys current code, and runs Playwright. The restore discards everything
+made on the VM's root disk since the snapshot; `--keep-current-as <name>` snapshots that state first,
+`--discard-current` says it may be lost.
+
+### After a restore
+
+`baseline` holds no test data. Bring the node back to where the suite expects it:
+
+```bash
+./test/stunt-node/ssh.sh 'zpool import testpool'        # the hot disks keep the pool; if they are new, setup-test-data.sh
+./test/stunt-node/gtpools-fixture.sh up
+./test/stunt-node/pvepool-fixture.sh up
+./test/stunt-node/smbsvc-fixture.sh up
+./test/stunt-node/add-spare-disks.sh
+./test/stunt-node/ssh.sh 'pveum user modify root@pam --email root@localhost'   # notifications need a recipient
+./test/stunt-node/ssh.sh 'apt-get install -y targetcli-fb python3-rtslib-fb'
+```
+
+The `[share1]` stanza in `/etc/samba/smb.conf` and the `/testpool/share1` line in `/etc/exports`
+(see `setup-test-data.sh`) are on the root disk and go with the restore too.
 
 ## Cleanup
 

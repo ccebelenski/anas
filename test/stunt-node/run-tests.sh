@@ -1,30 +1,15 @@
 #!/usr/bin/env bash
+# Run the integration suite against the stunt node AS IT STANDS.
+# Nothing else: no snapshot restore, no deploy. For those, see
+# restore-deploy-test.sh, which composes them under its own name.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-echo "=== ANAS Integration Test Run ==="
-echo
-
-SNAPSHOT="${1:-baseline}"
-
-# Restore snapshot
-echo "Restoring '${SNAPSHOT}' snapshot..."
-"${SCRIPT_DIR}/restore.sh" "$SNAPSHOT"
-echo
-
-# Deploy current code
-echo "Deploying current ANAS build..."
-"${SCRIPT_DIR}/deploy-anas.sh"
-echo
-
-# Run Playwright tests. A proof run: a spec whose fixture is not present
-# FAILS instead of skipping (tests/integration/fixtures/stunt-node.ts,
-# skipIfFixtureMissing) — a fixture that fell over never reads as green.
-echo "Running integration tests..."
+# A proof run: a spec whose fixture is not present FAILS instead of skipping
+# (tests/integration/fixtures/stunt-node.ts, skipIfFixtureMissing) — a fixture
+# that fell over never reads as green.
+echo "=== ANAS integration tests (node as it stands) ==="
 cd "$PROJECT_ROOT"
-ANAS_REQUIRE_FIXTURES=1 npx playwright test --project=integration
-
-echo
-echo "=== Integration tests complete ==="
+ANAS_REQUIRE_FIXTURES=1 npx playwright test --project=integration "$@"
