@@ -5,7 +5,7 @@ import type { ByIdMap } from '../parsers/lsblk.js'
 import type { LsblkIndex, PartInfo } from './ahr-topology.js'
 import { parseByIdToKernel, parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { effectiveMountAt, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
-import { parseFstab, parseFstabDoc, serializeFstabDoc, serializeMountLine } from '../parsers/fstab.js'
+import { hasExactMountLine, parseFstab, removeExactMountLine, removeMountLinesBySpec } from '../parsers/fstab.js'
 import { lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { isMdPvName, matchCachePartitionLabel, UNKNOWN_PV_NAME } from './ahr-cache-state.js'
 import { uncacheAhrLv } from './ahr-cache.js'
@@ -73,30 +73,6 @@ const REALPATH = '/usr/bin/realpath'
 /** First line of a command's stderr, or its exit code — the read named in a refusal. */
 function firstLine(res: { stderr: string, exitCode: number }): string {
   return res.stderr.trim().split('\n')[0] || `exit ${res.exitCode}`
-}
-
-/**
- * Remove the pool's line(s) at `mountpoint` from an fstab document — matched
- * by the spec ANAS wrote for this pool's LV, never by the path alone (cr3
- * review2 7). Every other line is emitted unchanged.
- */
-function removeSpecLineAt(text: string, spec: string, mountpoint: string): string {
-  const doc = parseFstabDoc(text).filter(l => !(l.kind === 'entry' && l.entry.spec === spec && l.entry.mountpoint === mountpoint))
-  return serializeFstabDoc(doc)
-}
-
-/**
- * Remove ONE line from an fstab document: the active entry whose serialized
- * form is exactly `entry`'s (the line a job wrote, matched whole). Every other
- * line is emitted unchanged; no match is a no-op.
- */
-function removeExactLine(text: string, entry: MountEntry): string {
-  const wanted = serializeMountLine(entry)
-  const doc = parseFstabDoc(text)
-  const idx = doc.findIndex(l => l.kind === 'entry' && !l.disabled && l.raw === wanted)
-  if (idx !== -1)
-    doc.splice(idx, 1)
-  return serializeFstabDoc(doc)
 }
 
 const BY_ID_DIR = '/dev/disk/by-id/'
@@ -511,7 +487,7 @@ export async function destroyAhrPool(
     throw new Error(`${opts.fstabPath} has a line for ${mountpoint} with the spec ${othersAtPath[0].spec}, not the volume of pool '${name}' (${lvSpec}) — it cannot be told whether that line is this pool's or another filesystem's, so nothing was changed. Point the pool's line at ${lvSpec} (or remove the other line) and retry`)
   }
   const writtenLines = (pool.fstabEntriesWritten ?? [])
-    .filter(e => parseFstabDoc(fstabText).some(l => l.kind === 'entry' && !l.disabled && l.raw === serializeMountLine(e)))
+    .filter(e => hasExactMountLine(fstabText, e))
 
   // ===== ACTS — from here on the system changes ==============================
 
@@ -530,11 +506,11 @@ export async function destroyAhrPool(
     updateProgress(`Leaving the /etc/fstab line for ${other.spec} at ${other.mountpoint} alone: it is not the volume of pool '${name}'`)
   for (const mp of ownMountpoints) {
     updateProgress(`Removing /etc/fstab entry for ${mp}`)
-    await editConfig(opts.fstabPath, current => removeSpecLineAt(current, lvSpec, mp))
+    await editConfig(opts.fstabPath, current => removeMountLinesBySpec(current, lvSpec, mp))
   }
   for (const entry of writtenLines) {
     updateProgress(`Removing the /etc/fstab entry this job wrote for ${entry.mountpoint}`)
-    await editConfig(opts.fstabPath, current => removeExactLine(current, entry))
+    await editConfig(opts.fstabPath, current => removeExactMountLine(current, entry))
   }
   if (ownMountpoints.length > 0 || writtenLines.length > 0) {
     await run(executor, SYSTEMCTL, ['daemon-reload'])

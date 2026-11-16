@@ -15,6 +15,7 @@ import {
   disableMount,
   enableMount,
   getMount,
+  hasExactMountLine,
   hasMount,
   inlineCommentIndex,
   linesFor,
@@ -22,7 +23,9 @@ import {
   mountOptionTokens,
   parseFstab,
   parseFstabDoc,
+  removeExactMountLine,
   removeMount,
+  removeMountLinesBySpec,
   replaceMount,
   serializeFstabDoc,
   serializeMountLine,
@@ -1156,5 +1159,73 @@ describe('mountLine: the one line a mountpoint is on', () => {
     const found = mountLine(`${marked}\n`, '/mnt/anas-nfs')!
     assert.equal(found.raw, marked)
     assert.equal(found.disabled, true)
+  })
+})
+
+describe('removeMountLinesBySpec — drop every line of one spec + mountpoint spelling', () => {
+  it('removes every line with exactly that spec and mountpoint, leaving all others byte for byte', () => {
+    const before = [
+      '# pool lines',
+      'UUID=poolvol /mnt/pool xfs nofail 0 0',
+      '   ',
+      '//srv/share /mnt/pool cifs credentials=/etc/cred 0 0',
+      'UUID=poolvol /mnt/other xfs defaults 0 0',
+      'UUID=poolvol /mnt/pool xfs nofail,x-systemd.automount 0 0',
+      'trailing comment line — kept',
+      '',
+    ].join('\n')
+    const after = removeMountLinesBySpec(before, 'UUID=poolvol', '/mnt/pool')
+    assert.equal(after, [
+      '# pool lines',
+      '   ',
+      '//srv/share /mnt/pool cifs credentials=/etc/cred 0 0',
+      'UUID=poolvol /mnt/other xfs defaults 0 0',
+      'trailing comment line — kept',
+      '',
+    ].join('\n'))
+  })
+
+  it('a `/mnt/x/` spelling is NOT removed when `/mnt/x` is asked — the mountpoint is the exact spelling read from this file', () => {
+    const text = 'UUID=poolvol /mnt/x/ xfs defaults 0 0\n'
+    assert.equal(removeMountLinesBySpec(text, 'UUID=poolvol', '/mnt/x'), text)
+  })
+})
+
+describe('removeExactMountLine — drop the one active line whose text matches whole', () => {
+  const activeLine = 'UUID=jobvol /mnt/job xfs nofail 0 0'
+
+  it('removes the one active line whose text is exactly the entry\'s serialized form', () => {
+    const text = `# job wrote this\n${activeLine}\nUUID=other /mnt/other ext4 ro 0 0\n`
+    const entry = getMount(`${activeLine}\n`, '/mnt/job')!
+    assert.equal(removeExactMountLine(text, entry), '# job wrote this\nUUID=other /mnt/other ext4 ro 0 0\n')
+  })
+
+  it('is a no-op against a disabled copy of the line', () => {
+    const text = 'UUID=jobvol /mnt/job xfs nofail,noauto,x-anas.disabled 0 0\n'
+    const entry = getMount(`${activeLine}\n`, '/mnt/job')!
+    assert.equal(removeExactMountLine(text, entry), text)
+  })
+
+  it('is a no-op against a line that differs by one option', () => {
+    const text = 'UUID=jobvol /mnt/job xfs nofail,noatime 0 0\n'
+    const entry = getMount(`${activeLine}\n`, '/mnt/job')!
+    assert.equal(removeExactMountLine(text, entry), text)
+  })
+})
+
+describe('hasExactMountLine — is the job-written line still in the file', () => {
+  const activeLine = 'UUID=jobvol /mnt/job xfs nofail 0 0'
+  const entry = getMount(`${activeLine}\n`, '/mnt/job')!
+
+  it('true for the active line whose text is exactly the entry\'s serialized form', () => {
+    assert.equal(hasExactMountLine(`# noise\n${activeLine}\n`, entry), true)
+  })
+
+  it('false against a disabled copy of the line', () => {
+    assert.equal(hasExactMountLine('UUID=jobvol /mnt/job xfs nofail,noauto,x-anas.disabled 0 0\n', entry), false)
+  })
+
+  it('false against a line that differs by one option', () => {
+    assert.equal(hasExactMountLine('UUID=jobvol /mnt/job xfs nofail,noatime 0 0\n', entry), false)
   })
 })

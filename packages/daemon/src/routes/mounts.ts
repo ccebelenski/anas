@@ -665,6 +665,22 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
   }
 
   /**
+   * Change the one /etc/fstab line of `mp`: refuses, with the file's bytes
+   * kept, when the mountpoint is on more than one line at the moment of the
+   * write; otherwise writes what `change` returns for the current text.
+   */
+  async function editMountLine(mp: string, change: (current: string) => string): Promise<void> {
+    await editConfig(fstabPath, (current) => {
+      // Last-moment backstop: a second line for the mountpoint appeared since
+      // the gate read — refuse, the file keeps its bytes.
+      const dup = duplicateFstabLines(current, mp)
+      if (dup)
+        throw new GuardRefusalError(dup)
+      return change(current)
+    })
+  }
+
+  /**
    * What rides the mountpoint (story cr.39, the cr.24 helper): one advisory
    * per share, export, backup/cloud task or nested mount whose path is at or
    * under it, and one per source that could not be read. Warn, never refuse
@@ -1356,14 +1372,9 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // on its own it is not a reason to rewrite a line nobody edited.
         updateProgress('Rewriting /etc/fstab entry')
         try {
-          await editConfig(fstabPath, (current) => {
+          await editMountLine(mp, (current) => {
             if (!hasMount(current, mp))
               throw new Error(`Mount '${mp}' is not in /etc/fstab`)
-            // cr4.conf D-21 last-moment backstop: a second line appeared since
-            // the gate read — refuse, the file keeps its bytes.
-            const dup = duplicateFstabLines(current, mp)
-            if (dup)
-              throw new GuardRefusalError(dup)
             return replaceMount(current, mp, merged)
           })
         }
@@ -1470,14 +1481,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         { ...identity, params: { mountpoint: mp } },
         guarded(spec, pre, async (_o, { updateProgress }) => {
           updateProgress(`Enabling ${mp} in /etc/fstab`)
-          await editConfig(fstabPath, (current) => {
-            // cr4.conf D-21 last-moment backstop: two lines for the mountpoint
-            // appeared since the gate read — refuse, the file keeps its bytes.
-            const dup = duplicateFstabLines(current, mp)
-            if (dup)
-              throw new GuardRefusalError(dup)
-            return enableMount(current, mp)
-          })
+          await editMountLine(mp, current => enableMount(current, mp))
           updateProgress('Reloading systemd (daemon-reload)')
           await daemonReload(executor)
           return { enabled: mp }
@@ -1544,12 +1548,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           // KEEP the credentials file.
           updateProgress(`Disabling ${mp} in /etc/fstab`)
           let automount = false
-          await editConfig(fstabPath, (current) => {
-            // cr4.conf D-21 last-moment backstop: two lines for the mountpoint
-            // appeared since the gate read — refuse, the file keeps its bytes.
-            const dup = duplicateFstabLines(current, mp)
-            if (dup)
-              throw new GuardRefusalError(dup)
+          await editMountLine(mp, (current) => {
             automount = carriesAutomount(current, mp) // the line BEFORE the change
             return disableMount(current, mp)
           })
@@ -1645,12 +1644,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         if (o.entry) {
           updateProgress('Removing /etc/fstab entry')
           let automount = false
-          await editConfig(fstabPath, (current) => {
-            // cr4.conf D-21 last-moment backstop: two lines for the mountpoint
-            // appeared since the gate read — refuse, the file keeps its bytes.
-            const dup = duplicateFstabLines(current, mp)
-            if (dup)
-              throw new GuardRefusalError(dup)
+          await editMountLine(mp, (current) => {
             automount = carriesAutomount(current, mp) // the line BEFORE the change
             return removeMount(current, mp)
           })

@@ -447,6 +447,44 @@ export function removeMount(text: string, mountpoint: string): string {
 }
 
 /**
+ * Remove every entry line with exactly this spec and this mountpoint spelling
+ * from an fstab document (the mountpoint compares by spelling: it is the one
+ * the caller read from this same file). Every other line is emitted unchanged.
+ */
+export function removeMountLinesBySpec(text: string, spec: string, mountpoint: string): string {
+  const doc = parseFstabDoc(text).filter(l => !(l.kind === 'entry' && l.entry.spec === spec && l.entry.mountpoint === mountpoint))
+  return serializeFstabDoc(doc)
+}
+
+/** Is this document line an ACTIVE entry line whose text is exactly `wanted`? */
+function isActiveLineMatching(l: FstabDocLine, wanted: string): boolean {
+  return l.kind === 'entry' && !l.disabled && l.raw === wanted
+}
+
+/**
+ * Remove ONE line from an fstab document: the active entry whose serialized
+ * form is exactly `entry`'s (the line a job wrote, matched whole). Every other
+ * line is emitted unchanged; no match is a no-op.
+ */
+export function removeExactMountLine(text: string, entry: MountEntry): string {
+  const wanted = serializeMountLine(entry)
+  const doc = parseFstabDoc(text)
+  const idx = doc.findIndex(l => isActiveLineMatching(l, wanted))
+  if (idx !== -1)
+    doc.splice(idx, 1)
+  return serializeFstabDoc(doc)
+}
+
+/**
+ * Does an fstab document hold an ACTIVE entry line whose text is exactly
+ * `entry`'s serialized form (the line a job wrote, matched whole)?
+ */
+export function hasExactMountLine(text: string, entry: MountEntry): boolean {
+  const wanted = serializeMountLine(entry)
+  return parseFstabDoc(text).some(l => isActiveLineMatching(l, wanted))
+}
+
+/**
  * The disable token(s) for an entry, per the 2026-10-14 ruling (§2 Mounts): a
  * line WITHOUT the operator's `noauto` gains `noauto,` + the token (the `noauto`
  * IS the disable — it keeps the mount from coming up at boot); a line that
