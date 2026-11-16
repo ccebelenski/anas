@@ -4709,13 +4709,20 @@
         };
 
         // Save-time verification (operator-sanctioned, warn-not-block): the
-        // effective namespace (the task's, else the chosen repo's own) plus the
-        // archive paths are checked before saving, and any problems are surfaced
-        // in ONE combined "create anyway?" confirm — never a stack of dialogs.
-        // Both checks fail-open: a broken check never blocks a save.
+        // namespace the RUN will use plus the archive paths are checked before
+        // saving, and any problems are surfaced in ONE combined confirm
+        // ("Save the task anyway?" on an edit, "Create the task anyway?" on
+        // a new task) — never a stack of dialogs. The run uses exactly
+        // what the body says (the daemon: task.namespace ?? repo.namespace),
+        // so the check reads the same nsBody the body was built from: a typed
+        // or stored '' is the datastore root — nothing to probe there — and
+        // only a namespace the body omits or nulls inherits the chosen repo's
+        // own. Both checks fail-open: a broken check never blocks a save.
         var repoInfo = REPO_MAP[repository] || {};
-        var effectiveNs = namespace || (repoInfo.namespace || '');
-        verifyThenSave(win, node, repository, effectiveNs, archives, proceed);
+        var effectiveNs = nsBody.send && nsBody.value !== null
+            ? nsBody.value
+            : (repoInfo.namespace || '');
+        verifyThenSave(win, node, repository, effectiveNs, archives, isEdit, proceed);
     }
 
     // Verify the effective namespace via the (user-initiated, one-shot) repo Test
@@ -4801,7 +4808,7 @@
     // Run both checks in parallel, then either save or raise ONE combined confirm
     // covering whichever problems apply. The whole chain is fail-open: if it
     // breaks, the save proceeds (validation must never be what blocks a save).
-    function verifyThenSave(win, node, repository, effectiveNs, archives, proceed) {
+    function verifyThenSave(win, node, repository, effectiveNs, archives, isEditTask, proceed) {
         var btn = win.down('#taskSubmitBtn');
         if (btn) { try { btn.setDisabled(true); } catch (eBtn) { /* non-fatal */ } }
         var reenable = function () {
@@ -4848,7 +4855,10 @@
                 parts.push(t('These paths could not be checked:')
                     + '<div style="margin-top:4px;">' + ulist + '</div>');
             }
-            var msg = parts.join('<br><br>') + '<br><br>' + t('Create the task anyway?');
+            // The question names the operation the dialog is: an edit saves
+            // an existing task; only a new task is created.
+            var msg = parts.join('<br><br>') + '<br><br>'
+                + (isEditTask ? t('Save the task anyway?') : t('Create the task anyway?'));
             try {
                 Ext.Msg.confirm(t('Verify before saving'), msg, function (b) {
                     if (b === 'yes') {
@@ -9011,7 +9021,13 @@
             updateRestoreSummary(win);
             refreshRestore(win);
         }, function (err) {
+            // D-10: the read could not see the task, so the door says so —
+            // the console note alone leaves the operator staring at a source
+            // line that names a task whose repository and namespace were
+            // never read. The sentence stands in for the summary until the
+            // window is closed (the fetch runs once per door).
             ANAS.warn('restore task load failed: ' + ANAS.errText(err));
+            win._taskReadError = ANAS.errText(err);
             updateRestoreSummary(win);
         });
     }
@@ -9050,6 +9066,18 @@
         }
         var p = win._prefill;
         var html;
+        if (win._taskReadError) {
+            // The task read failed: "From task <name>" would read as a
+            // source this door knows, when it knows nothing of it. Say what
+            // failed and what to do instead — never a summary over an empty
+            // form.
+            html = enc(t('Task')) + ' <b>' + enc(win._task) + '</b> '
+                + enc(t('could not be read')) + ' (' + enc(win._taskReadError) + '), '
+                + enc(t('so its repository and namespace are not filled in.')) + ' '
+                + enc(t('Close this window and try again, or pick the source by hand.'));
+            sum.update(html);
+            return;
+        }
         if (p && p.lun) {
             var name = p.lun.name || '';
             var grp = win._group || (p.lun.serial ? 'lun-' + p.lun.serial : '');

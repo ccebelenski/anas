@@ -294,6 +294,40 @@ function panelWin(id) {
     ], { aboveMd: 1, unrepairable: 2 })
     ok('(e2) a mix: both daemon sentences, and the generic restore line for the plain unrepairable block',
       /above-md sentence for 7/.test(amdRot) && /rot sentence for 8/.test(amdRot) && /Unrepairable: \/f.*\./.test(amdRot) && /The job(&#39;|')s PVE notification says what to restore, per file\./.test(amdRot), amdRot)
+
+    // ---- D-27 (cr4.panels2): a bucket value this page does not know renders
+    // as unknown, never as the alarm or the advice of a known value. The panel
+    // and the daemon upgrade independently in a cluster, so the unknown value
+    // standing in here is exactly what a newer daemon on the node sends.
+    const stale = repair([{ block: 3, outcome: 'unrepairable', reasonCode: 'extent-gone-quietly', reason: 'The daemon from tomorrow explains it here.' }], { unrepairable: 1 })
+    ok('D-27: an unknown reason code gets the "this page does not know" line', /This page does not know the result \(extent-gone-quietly\)\. Reload the page to read it\./.test(stale), stale)
+    ok('D-27: ...and no restore pointer rides it', !/Unrepairable:|restore|notification/i.test(stale.replace(/This page does not know the result[^<]*/, '')), stale)
+    ok('D-27: ...and the daemon sentence of an unknown code is not quoted as advice', !/explains it here/.test(stale), stale)
+    const mixedStale = repair([
+      { block: 1, outcome: 'unrepairable', reason: 'two bad blocks in one stripe' },
+      { block: 2, outcome: 'unrepairable', reasonCode: 'extent-gone-quietly', reason: 'x' },
+    ], { unrepairable: 2 })
+    ok('D-27: a KNOWN plain block keeps its restore line beside the stale line',
+      /Unrepairable: \/f.*\./.test(mixedStale) && /This page does not know the result/.test(mixedStale) && /The job(&#39;|')s PVE notification says what to restore, per file\./.test(mixedStale), mixedStale)
+    const staleAmd = repair([{ block: 7, outcome: 'above-md', reasonCode: 'worse-than-rot', reason: 'The daemon\'s own restore sentence.' }], { aboveMd: 1 })
+    ok('D-27: an unknown code on an above-md block quotes nothing and points at no restore',
+      /This page does not know the result/.test(staleAmd) && !/restore sentence/.test(staleAmd) && !/notification/.test(staleAmd) && !/Unrepairable/.test(staleAmd), staleAmd)
+    const staleNe = repair([{ block: 5, outcome: 'not-examined', reasonCode: 'quantum-flip', reason: 'r' }], { notExamined: 1 })
+    ok('D-27: an unknown not-examined code never borrows "nothing was written to them"',
+      !/nothing was written/.test(staleNe) && /This page does not know the result \(quantum-flip\)\. Reload the page to read it\./.test(staleNe), staleNe)
+    const staleNeMix = repair([
+      { block: 5, outcome: 'not-examined', reasonCode: 'run-stopped', reason: 'a gate refused' },
+      { block: 6, outcome: 'not-examined', reasonCode: 'quantum-flip', reason: 'r' },
+    ], { notExamined: 2 })
+    ok('D-27: a KNOWN not-examined block keeps its own sentence and its own count',
+      /1 block\(s\) were not examined, and nothing was written to them: the run stopped before a verdict/.test(staleNeMix) && /This page does not know the result/.test(staleNeMix), staleNeMix)
+    const staleOc = repair([{ block: 6, outcome: 'extent-lost', reasonCode: 'array-rebuilds-rot', reason: 'r' }], { unrepairable: 1 })
+    ok('D-27: an unknown outcome gets the stale line and no generic restore advice',
+      /This page does not know the result/.test(staleOc) && !/Unrepairable/.test(staleOc), staleOc)
+    // The known values keep their arms untouched (control).
+    const knownCsum = repair([{ block: 1, outcome: 'unrepairable', reasonCode: 'csum-unreadable', reason: 'x' }], { unrepairable: 1 })
+    ok('D-27: control: csum-unreadable keeps its own arm and no stale line',
+      /could not be read, so nothing judged them/.test(knownCsum) && !/This page does not know the result/.test(knownCsum), knownCsum)
   }
 
   // ---- (f) scrub-unproven refusals; (g) writtenAt ---------------------------

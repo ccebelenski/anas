@@ -331,6 +331,26 @@
         }
     };
 
+    // A value of a daemon enum this loaded page can render, or null when it
+    // cannot. The panel runs in the browser and the daemon on each node, and
+    // a PVE cluster upgrades the two independently — so a value the page has
+    // never heard of must render as unknown, never as the alarm or the
+    // advice of a known value (cr4.panels2 D-27/P-10). `known` is a map
+    // whose OWN keys are the values the page names; a value the map carries
+    // only through its prototype is not one of them.
+    //
+    // An absent value (undefined, null, '') is null as well: it is not a
+    // value at all, and each caller answers for its own field's optionality
+    // — a required field missing is unknown to the caller, an optional one
+    // keeps its documented default arm.
+    ANAS.knownEnum = function (value, known) {
+        if (value === undefined || value === null || value === '') {
+            return null;
+        }
+        var v = '' + value;
+        return (known && Object.prototype.hasOwnProperty.call(known, v)) ? v : null;
+    };
+
     // Brief success notification: Ext.toast when available, else a msgbox.
     // Body is HTML-encoded by default; use ANAS.toastHtml for deliberate markup.
     ANAS.toast = function (msg) {

@@ -185,6 +185,32 @@
         'write-unconfirmed': true,
         'no-checksum': true
     };
+    // cr4.panels2 D-27: the values of the daemon's block enums this page can
+    // render. The panel runs in the browser and the daemon on each node, and
+    // a PVE cluster upgrades the two independently, so a block carrying a
+    // value outside these lists (a newer daemon) renders as unknown — never
+    // as the alarm or the advice of a known value (ANAS.knownEnum,
+    // 00-core.js). The lists are the shared enum as this release ships it
+    // (packages/shared SelfhealOutcomeKind, SelfhealReasonCode): `bad-blocks-
+    // present` needs no sentence of its own because the generic unrepairable
+    // line IS its arm — the daemon's notification says the per-file detail.
+    var KNOWN_BLOCK_OUTCOMES = {
+        'repaired': true,
+        'unrepairable': true,
+        'above-md': true,
+        'mapping-abort': true,
+        'not-examined': true
+    };
+    var KNOWN_BLOCK_CODES = {
+        'bad-blocks-present': true
+    };
+    KNOWN_BLOCK_CODES[CSUM_UNREADABLE] = true;
+    KNOWN_BLOCK_CODES[ARRAY_REBUILDS_ROT] = true;
+    for (var knec in NOT_EXAMINED_CODES) {
+        if (Object.prototype.hasOwnProperty.call(NOT_EXAMINED_CODES, knec)) {
+            KNOWN_BLOCK_CODES[knec] = true;
+        }
+    }
 
     // Shared schedules helpers (fs-tag chip, pills, poll loop) — ONE copy in
     // 69-schedules-common.js, used by both this view and the Snapshots view.
@@ -1566,6 +1592,50 @@
         }
         var res = job.result;
         var files = res.files || [];
+        // cr4.panels2 D-27: a block whose outcome or reason code this page has
+        // never heard of earns no bucket's alarm and no bucket's advice. The
+        // panel runs in the browser and the daemon on each node, and a PVE
+        // cluster upgrades the two independently — so the honest statement is
+        // that this page is behind. One line per unknown value, naming it
+        // exactly as the daemon sent it.
+        var staleCodes = [];
+        var staleSeen = Object.create(null);
+        var sawStale = false;
+        function noteStale(value) {
+            var v = String(value);
+            if (!Object.prototype.hasOwnProperty.call(staleSeen, v)) {
+                staleSeen[v] = true;
+                staleCodes.push(v);
+            }
+        }
+        function isStaleBlock(blk) {
+            if (!blk) {
+                return true;
+            }
+            var stale = false;
+            // `outcome` is required by the schema: an absent one is as
+            // unknowable as an unknown one. `reasonCode` is optional: an
+            // absent one is just absent (the plain arm), not stale.
+            if (ANAS.knownEnum(blk.outcome, KNOWN_BLOCK_OUTCOMES) === null) {
+                stale = true;
+                if (blk.outcome) {
+                    noteStale(blk.outcome);
+                }
+            }
+            if (blk.reasonCode && ANAS.knownEnum(blk.reasonCode, KNOWN_BLOCK_CODES) === null) {
+                stale = true;
+                noteStale(blk.reasonCode);
+            }
+            return stale;
+        }
+        // Collect every value the page cannot name BEFORE any arm speaks, so a
+        // result whose arms never fire still says the page is behind.
+        for (var sf = 0; sf < files.length; sf++) {
+            var sfb = files[sf].blocks || [];
+            for (var sbi = 0; sbi < sfb.length; sbi++) {
+                isStaleBlock(sfb[sbi]);
+            }
+        }
         if (grid) {
             var store = grid.getStore();
             for (var i = 0; i < files.length; i++) {
@@ -1607,11 +1677,18 @@
                 var plainHere = false;
                 var fb = files[f].blocks || [];
                 for (var b = 0; b < fb.length; b++) {
-                    // Restore advice rides only a block that was EXAMINED and
-                    // proven lost: a not-examined code (`run-stopped`, and
-                    // since cr3.followup every other one) means it never was,
-                    // whatever bucket it arrived in.
-                    if (fb[b].outcome === 'unrepairable' && NOT_EXAMINED_CODES[fb[b].reasonCode] === true) {
+                    // cr4.panels2 D-27: a value this page does not know is
+                    // neither a not-examined code nor a proven loss. It
+                    // claims nothing and earns no advice; it only marks the
+                    // page as behind, and it makes the run's counts too
+                    // opaque for the generic restore line.
+                    if (isStaleBlock(fb[b])) {
+                        sawStale = true;
+                    } else if (fb[b].outcome === 'unrepairable' && NOT_EXAMINED_CODES[fb[b].reasonCode] === true) {
+                        // Restore advice rides only a block that was EXAMINED and
+                        // proven lost: a not-examined code (`run-stopped`, and
+                        // since cr3.followup every other one) means it never was,
+                        // whatever bucket it arrived in.
                         sawRunStopped = true;
                     } else if (fb[b].outcome === 'unrepairable' || fb[b].outcome === 'above-md') {
                         bad.push(fb[b]);
@@ -1638,9 +1715,12 @@
                 }
             }
             // A result without per-block detail keeps the count's advice, as
-            // before — unless a run-stopped block shows the count is not proof.
-            // A file whose restore blocks all carry the daemon's own sentence
-            // (array-rebuilds-rot, above md) is advised by that sentence alone.
+            // before — unless a run-stopped block shows the count is not proof,
+            // or a value this page does not know shows the same (cr4.panels2
+            // D-27: the count could be counting exactly what the page cannot
+            // read). A file whose restore blocks all carry the daemon's own
+            // sentence (array-rebuilds-rot, above md) is advised by that
+            // sentence alone.
             // Review D3: WHICH restore applies is per file (a file restore,
             // or a LUN image restored as a LUN), and only the daemon knows a
             // LUN; its notification says it per file. One result, one advice,
@@ -1649,7 +1729,8 @@
             if (plainFiles.length) {
                 lines.push(enc(t('Unrepairable:') + ' ' + plainFiles.join(', ') + '.'));
                 restoreNote = true;
-            } else if (Number(res.unrepairable || 0) > 0 && !rotReasons.length && !csumFiles.length && !sawRunStopped) {
+            } else if (Number(res.unrepairable || 0) > 0 && !rotReasons.length && !csumFiles.length
+                && !sawRunStopped && !sawStale) {
                 lines.push(enc(t('Unrepairable: the files above.')));
                 restoreNote = true;
             }
@@ -1690,10 +1771,19 @@
             // not be confirmed. It gets its own sentence and leaves the count
             // the "nothing was written" sentence speaks for.
             var unconfirmedWrites = 0;
+            var staleNotExamined = 0;
             for (var n = 0; n < files.length; n++) {
                 var nb = files[n].blocks || [];
                 for (var k = 0; k < nb.length; k++) {
                     if (nb[k].outcome !== 'not-examined') {
+                        continue;
+                    }
+                    // cr4.panels2 D-27: a code this page has never heard of
+                    // claims nothing about its block — least of all that
+                    // nothing was written to it. It leaves the count that
+                    // sentence speaks for, and says the page is behind below.
+                    if (isStaleBlock(nb[k])) {
+                        staleNotExamined += 1;
                         continue;
                     }
                     if (nb[k].reasonCode === WRITE_UNCONFIRMED) {
@@ -1709,7 +1799,7 @@
                     why.push(NOT_EXAMINED_WORDS[code] ? t(NOT_EXAMINED_WORDS[code]) : code);
                 }
             }
-            var unexamined = Number(res.notExamined || 0) - unconfirmedWrites;
+            var unexamined = Number(res.notExamined || 0) - unconfirmedWrites - staleNotExamined;
             if (unexamined > 0) {
                 lines.push(enc(unexamined + ' ' + t('block(s) were not examined, and nothing was written to them')
                     + (why.length ? ': ' + why.join('; ') : '') + '.'));
@@ -1809,6 +1899,12 @@
             lines.push(enc(t('A direct read found') + ' ' + uncounted.join(', ') + ' '
                 + t('inconsistent after the repair, and md\'s check counted no mismatch there.') + ' '
                 + firstStep + ' ' + t('so md counts it, then run the verb its parity mismatch window offers for that band.')));
+        }
+        // cr4.panels2 D-27: what the page CAN say about a value it does not
+        // know — named exactly as the daemon sent it, once each.
+        for (var sc = 0; sc < staleCodes.length; sc++) {
+            lines.push(enc(t('This page does not know the result') + ' (' + staleCodes[sc] + '). '
+                + t('Reload the page to read it.')));
         }
         panel.update(lines.join('<br>'));
     }

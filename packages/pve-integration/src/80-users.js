@@ -180,9 +180,42 @@
         return !!(rec && rec.get('local'));
     }
 
+    // cr4.panels2 (N): the row standing in for a list that could not be read
+    // — it carries the reason and offers no action (70-shares.js's readError
+    // row is the model). Without it the grid keeps the stale rows the failed
+    // reload replaced, with live verbs over accounts the read never confirmed.
+    function readErrorRow(message) {
+        return {
+            name: '',
+            raw: { readError: '' + (message || '') },
+        };
+    }
+
+    function readErrorOf(rec) {
+        var raw = rec ? rec.get('raw') : null;
+        return raw && raw.readError !== undefined ? raw.readError : null;
+    }
+
     // ---- Renderers ---------------------------------------------------------
 
-    function renderGroups(v) {
+    function renderListReadError(failed) {
+        return '<span class="anas-users-read-failed" style="color:var(--anas-warn,#b06a12);">'
+            + enc(t('The list could not be read'))
+            + (failed ? ' (' + enc(failed) + ')' : '') + '. ' + enc(t('Use Reload to read it again.')) + '</span>';
+    }
+
+    function renderUserName(v, metaData, record) {
+        var failed = readErrorOf(record);
+        if (failed !== null) {
+            return renderListReadError(failed);
+        }
+        return enc(v);
+    }
+
+    function renderGroups(v, metaData, record) {
+        if (readErrorOf(record) !== null) {
+            return '';
+        }
         var arr = v || [];
         if (!arr.length) {
             return '<span style="color:#888;">&mdash;</span>';
@@ -190,7 +223,10 @@
         return enc(arr.join(', '));
     }
 
-    function renderMembers(v) {
+    function renderMembers(v, metaData, record) {
+        if (readErrorOf(record) !== null) {
+            return '';
+        }
         var arr = v || [];
         if (!arr.length) {
             return '<span style="color:#888;">' + enc(t('(empty)')) + '</span>';
@@ -199,6 +235,10 @@
     }
 
     function renderGroupName(v, metaData, record) {
+        var failed = readErrorOf(record);
+        if (failed !== null) {
+            return renderListReadError(failed);
+        }
         // identity.1c: a group whose name matches a user with this group as its
         // primary group is that user's PRIVATE group — a pre-existing account
         // ANAS did not create (ANAS users are made with -N, so no phantom
@@ -215,6 +255,9 @@
     }
 
     function renderSmb(v, metaData, record) {
+        if (readErrorOf(record) !== null) {
+            return '';
+        }
         // identity.3 (#68): the passdb holds an entry Samba uses for this
         // account but stored under another name (case) — it can never log in
         // as this user. Say what is stored and how to repair it, in place of
@@ -235,7 +278,10 @@
             + ' style="color:#999;">&#10007;</span>';
     }
 
-    function renderStatus(v) {
+    function renderStatus(v, metaData, record) {
+        if (readErrorOf(record) !== null) {
+            return '';
+        }
         // v === locked
         if (v) {
             return '<span style="color:#c0392b;">' + enc(t('Disabled')) + '</span>';
@@ -243,7 +289,10 @@
         return '<span style="color:#21BF4B;">' + enc(t('Active')) + '</span>';
     }
 
-    function renderSource(v) {
+    function renderSource(v, metaData, record) {
+        if (readErrorOf(record) !== null) {
+            return '';
+        }
         // v === local
         if (v) {
             return '<span class="anas-badge anas-badge-local"'
@@ -296,6 +345,8 @@
             } catch (e2) {
                 ANAS.warn('users store load failed: ' + ANAS.errText(e2));
             }
+            // A read that succeeded ends the unreadable state.
+            grid._readError = null;
             updateUserButtons(grid);
         }, function (err) {
             if (grid.destroyed || grid.destroying) {
@@ -307,6 +358,17 @@
                 // non-fatal
             }
             ANAS.warn('users load failed: ' + ANAS.errText(err));
+            // cr4.panels2 (N): a list that could not be read is never the
+            // stale list it replaced — the could-not-read row takes its
+            // place, and the row verbs stay dead until a read succeeds.
+            grid._readError = ANAS.errText(err);
+            try {
+                grid.getStore().loadData([readErrorRow(grid._readError)]);
+            } catch (e3) {
+                // The row could not be placed either; the flag still keeps
+                // the verbs dead.
+            }
+            updateUserButtons(grid);
         });
     }
 
@@ -334,6 +396,8 @@
             } catch (e2) {
                 ANAS.warn('groups store load failed: ' + ANAS.errText(e2));
             }
+            // A read that succeeded ends the unreadable state.
+            grid._readError = null;
             updateGroupButtons(grid);
         }, function (err) {
             if (grid.destroyed || grid.destroying) {
@@ -345,6 +409,16 @@
                 // non-fatal
             }
             ANAS.warn('groups load failed: ' + ANAS.errText(err));
+            // cr4.panels2 (N): same as the users grid — the could-not-read
+            // row replaces whatever list the last read left, verbs dead.
+            grid._readError = ANAS.errText(err);
+            try {
+                grid.getStore().loadData([readErrorRow(grid._readError)]);
+            } catch (e3) {
+                // The row could not be placed either; the flag still keeps
+                // the verbs dead.
+            }
+            updateGroupButtons(grid);
         });
     }
 
@@ -458,6 +532,16 @@
         if (!grid) {
             return;
         }
+        // cr4.panels2 (N): while the grid holds a row standing in for a list
+        // that could not be read, no row verb is live — even a stale selected
+        // row describes accounts the failed read could not confirm.
+        if (grid._readError) {
+            setDisabled(grid, 'userSmbpw', true);
+            setDisabled(grid, 'userToggle', true);
+            setDisabled(grid, 'userGroups', true);
+            setDisabled(grid, 'userDelete', true);
+            return;
+        }
         var rec = selectedRow(grid);
         var local = isLocal(rec);
         // Every mutating action requires a selected, LOCAL row. Directory users
@@ -495,6 +579,12 @@
 
     function updateGroupButtons(grid) {
         if (!grid) {
+            return;
+        }
+        // cr4.panels2 (N): the groups grid gates the same way.
+        if (grid._readError) {
+            setDisabled(grid, 'groupMembers', true);
+            setDisabled(grid, 'groupDelete', true);
             return;
         }
         var rec = selectedRow(grid);
@@ -1043,8 +1133,12 @@
 
     function diffList(before, after) {
         var i;
-        var beforeMap = {};
-        var afterMap = {};
+        // cr4.panels2 (N): null-prototype maps. On a plain {} the name
+        // `__proto__` — which NAME_RE and groupadd both accept, so the daemon
+        // really can list it — is swallowed on write by Object.prototype's
+        // setter and found truthy on read, and that principal never diffs.
+        var beforeMap = Object.create(null);
+        var afterMap = Object.create(null);
         for (i = 0; i < before.length; i++) {
             beforeMap[before[i]] = 1;
         }
@@ -1429,6 +1523,9 @@
                 'smbEntryMismatch',
                 { name: 'locked', type: 'bool' },
                 { name: 'local', type: 'bool' },
+                // cr4.panels2 (N): carries the readError sentinel of the row
+                // standing in for a list that could not be read.
+                { name: 'raw', type: 'auto' },
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
@@ -1440,6 +1537,8 @@
                 { name: 'gid', type: 'int' },
                 { name: 'members', type: 'auto' },
                 { name: 'local', type: 'bool' },
+                // cr4.panels2 (N): the users store's readError carrier.
+                { name: 'raw', type: 'auto' },
                 // Present only on a user-private group (identity.1c); absent =
                 // a plain group, exactly as an older daemon would send it.
                 'privateGroupOf',
@@ -1472,7 +1571,7 @@
                             text: t('Name'),
                             dataIndex: 'name',
                             width: 160,
-                            renderer: Ext.String.htmlEncode,
+                            renderer: renderUserName,
                         },
                         {
                             text: t('UID'),

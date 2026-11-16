@@ -123,6 +123,19 @@ ok('a running restore renders "Restore running"', iscsi.restoreMarkPill({ state:
 ok('an unverified image renders "Image not verified"', iscsi.restoreMarkPill({ state: 'unverified', detail: '' }).includes('>Image not verified<'))
 ok('an unreadable mark renders "Restore mark unreadable", never nothing', iscsi.restoreMarkPill({ state: 'unreadable', detail: '' }).includes('>Restore mark unreadable<'))
 ok('no mark renders nothing', iscsi.restoreMarkPill(null) === '')
+// --- D-27/P-10 (cr4.panels2): a state this page does not know renders as ----
+// unknown, never as the red "Partial image" of a known value (the panel and
+// the daemon upgrade independently in a cluster).
+{
+  const fut = iscsi.restoreMarkPill({ state: 'extent-gone-quietly', detail: `the daemon from tomorrow says <b>${EVIL}</b>` })
+  ok('an unknown mark state renders a neutral "Unknown state" pill, never "Partial image"',
+    fut.includes('>Unknown state<') && !fut.includes('Partial image') && !fut.includes('#c62828'), fut)
+  ok('...with the daemon\'s detail as its tip, ENCODED',
+    fut.includes('&lt;b&gt;') && fut.includes('&lt;script&gt;') && !fut.includes('<script'), fut)
+  ok('a mark whose state is simply absent renders unknown too',
+    iscsi.restoreMarkPill({ detail: 'x' }).includes('>Unknown state<'))
+  ok('the known states keep their own pills', iscsi.restoreMarkPill({ state: 'interrupted', detail: '' }).includes('>Partial image<'))
+}
 for (const st of ['in-progress', 'interrupted', 'unverified', 'unreadable', EVIL, undefined]) {
   const html = iscsi.restoreMarkPill({ ...health.restoreMarks[1], state: st, detail: EVIL })
   ok(`a hostile sentence in a ${String(st).slice(0, 12)} pill stays text`, !html.includes('<img') && !html.includes('<script'), html)
@@ -168,6 +181,15 @@ ok('a restore running onto a LUN of a disabled target: Enable is disabled', runn
 ok('...and says why', /Enable is refused until the restore ends/.test(running.tooltip), running.tooltip)
 const interrupted = toolbarFor({ iqn: IQN, ownership: 'anas', enabled: false, restoreMark: { state: 'interrupted', detail: 'x' } })
 ok('an interrupted restore: Enable stays available (the daemon asks to confirm)', interrupted.disabled === false && interrupted.tooltip === '', interrupted)
+// D-27/P-10: an unknown mark state gates Enable like in-progress — the page
+// cannot tell what the state allows, so it says to reload and reads the mark
+// again. The daemon stays the authority (its 409 says the same).
+const staleMark = toolbarFor({ iqn: IQN, ownership: 'anas', enabled: false, restoreMark: { state: 'extent-gone-quietly', detail: 'x' } })
+ok('an unknown mark state: Enable is disabled', staleMark.disabled === true, staleMark)
+ok('...and the tip names the state and says to reload the page',
+  staleMark.tooltip === `This restore mark carries a state (${ANAS.enc('extent-gone-quietly')}) this page does not know. Reload the page to read it.`, staleMark.tooltip)
+const staleMarkOn = toolbarFor({ iqn: IQN, ownership: 'anas', enabled: true, restoreMark: { state: 'extent-gone-quietly', detail: 'x' } })
+ok('...and only ENABLE is gated (an enabled target keeps Disable)', staleMarkOn.disabled === false && staleMarkOn.texts.at(-1) === 'Disable', staleMarkOn)
 const plain = toolbarFor({ iqn: IQN, ownership: 'anas', enabled: false, restoreMark: null })
 ok('no mark: Enable available', plain.disabled === false)
 const on = toolbarFor({ iqn: IQN, ownership: 'anas', enabled: true, restoreMark: { state: 'in-progress', detail: 'x' } })
@@ -239,9 +261,10 @@ for (const [name, code] of [['the mark code', block], ['the toolbar gate', toolb
   ok(`${name} is ES5: no template strings, no let/const`, !code.includes('`') && !/\b(?:let|const)\s/.test(code))
   ok(`no ellipsis character in ${name}`, !code.includes('\u2026'))
 }
-for (const label of ['Restore running', 'Partial image', 'Image not verified', 'Restore mark unreadable'])
+for (const label of ['Restore running', 'Partial image', 'Image not verified', 'Restore mark unreadable', 'Unknown state'])
   ok(`"${label}" goes through t()`, block.includes(`t('${label}')`))
 ok('the toolbar\'s reason goes through t()', toolbar.includes('t(\'A whole-image restore is writing a LUN of this target; Enable is refused until the restore ends\')'))
+ok('the unknown-state Enable tip goes through t() (D-27)', toolbar.includes('t(\'This restore mark carries a state\')') && toolbar.includes('t(\'this page does not know. Reload the page to read it.\')'))
 
 if (failed) {
   console.error(`${failed} cr3.lunrestore panel check(s) FAILED`)

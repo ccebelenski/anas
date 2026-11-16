@@ -187,7 +187,12 @@ if (typeof S.showMirrorResult === 'function' && typeof S.showRepairResult === 'f
   S.showRepairResult(r2.win, { status: 'completed', result: { blocks: 1, repaired: 0, unrepairable: 1, aboveMd: 0, mappingAbort: 0, notExamined: 0, files: [{ path: '/a', blocks: [{ block: 1, outcome: 'unrepairable', reasonCode: 'run-stopped', reason: 'stopped' }] }] } })
   ok('an unrepairable count whose blocks are run-stopped carries no restore advice', !/Restore this file from backup/.test(r2.panel.html), r2.panel.html)
   const r3 = panelWin('#repairResult')
-  S.showRepairResult(r3.win, { status: 'completed', result: { blocks: 1, repaired: 0, unrepairable: 1, aboveMd: 0, mappingAbort: 0, notExamined: 0, files: [{ path: '/a', blocks: [{ block: 1, outcome: 'unrepairable', reasonCode: 'both-fail', reason: 'proven lost' }] }] } })
+  // cr4.panels2 D-27 moved this fixture: its code was `both-fail`, which no
+  // enum ever carried, and a value this page does not know now renders as
+  // unknown instead of earning the plain arm. The pin's intent — a KNOWN
+  // proven-lost code keeps its restore advice — is a code the shared enum
+  // ships and the daemon actually sends for a proven loss.
+  S.showRepairResult(r3.win, { status: 'completed', result: { blocks: 1, repaired: 0, unrepairable: 1, aboveMd: 0, mappingAbort: 0, notExamined: 0, files: [{ path: '/a', blocks: [{ block: 1, outcome: 'unrepairable', reasonCode: 'bad-blocks-present', reason: 'proven lost' }] }] } })
   ok('an examined, proven-lost block still carries restore advice', /Unrepairable: \/a\./.test(r3.panel.html) && /The job(&#39;|')s PVE notification says what to restore, per file\./.test(r3.panel.html), r3.panel.html)
 }
 else {

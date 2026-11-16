@@ -822,13 +822,16 @@ const alerts = []
  */
 const polls = []
 
-/** The real autofill opt-out from 00-core.js — every credential dialog
- * references it while building its fields, so the fake must mirror it. */
-const noAutofill = (() => {
+/** The real autofill opt-out and the real known-enum check from 00-core.js —
+ * every credential dialog references the first while building its fields, and
+ * 69-scrubs.js calls the second on every repair result (cr4.panels2 D-27), so
+ * the fake must mirror both. */
+const CORE_REAL = (() => {
   const sandbox = { window: {} }
   vm.runInNewContext(readFileSync(join(SRC, '00-core.js'), 'utf8'), sandbox, { filename: '00-core.js' })
-  return sandbox.window.ANAS.noAutofill
+  return sandbox.window.ANAS
 })()
+const noAutofill = CORE_REAL.noAutofill
 
 /**
  * The REAL ANAS.pve from 10-api.js (pvepool.2) — loaded into a throwaway
@@ -992,6 +995,10 @@ function makeAnas(routes) {
       return dur === '' ? '' : `${dur} ago`
     },
     renderState: s => String(s),
+    // The real 00-core.js helper (cr4.panels2 D-27): 69-scrubs.js reads every
+    // repair block's outcome and reason code through it, so the stub carries
+    // the real one, not a stub that would prove nothing about unknown values.
+    knownEnum: CORE_REAL.knownEnum,
     notifyMode: {
       of(value, dflt) {
         const s = String(value == null ? '' : value).toLowerCase()
@@ -10713,6 +10720,157 @@ async function joinableGid100Checks() {
 }
 
 /**
+ * cr4.panels2 (N): a list that could not be read is never the stale list it
+ * replaced, and never an empty one. A failed /identity/users or
+ * /identity/groups reload puts a could-not-read row in the grid — the
+ * sentence plus the daemon's reason — and the row verbs stay dead until a
+ * read succeeds (70-shares.js's readError row is the model). The second half
+ * belongs to the same door: diffList's plain {} maps swallow a principal
+ * named `__proto__`, so ticking a group the node really lists sends nothing.
+ */
+async function usersUnreadableListChecks() {
+  const USERS_N = [
+    { name: 'Alice', uid: 1000, fullName: 'A', primaryGroup: 'users', groups: ['users'], smbEnabled: true, locked: false, local: true },
+    { name: 'bob', uid: 1001, fullName: null, primaryGroup: 'bob', groups: [], smbEnabled: false, locked: false, local: true },
+  ]
+  const GROUPS_N = [
+    { name: 'smbusers', gid: 1001, members: ['Alice'], local: true },
+    // NAME_RE (:103) accepts `__proto__` and useradd/groupadd accept it, so
+    // the daemon really can list a group by that name.
+    { name: '__proto__', gid: 1002, members: [], local: true },
+  ]
+  const routes = {
+    'GET /identity/users': { data: USERS_N },
+    'GET /identity/groups': { data: GROUPS_N },
+  }
+  const { usersGrid, groupsGrid } = await openUsersView(routes)
+  eq('users (unreadable list): both grids start read',
+    [usersGrid.getStore().getCount(), groupsGrid.getStore().getCount()], [USERS_N.length, GROUPS_N.length])
+
+  // The hazard: a loaded grid with a local row selected, then the read fails.
+  usersGrid.selectRow(0)
+  const live = toolbarState(usersGrid, ['userSmbpw', 'userToggle', 'userGroups', 'userDelete'])
+  ok('users (unreadable list): a selected local row has its verbs live',
+    !live.userSmbpw.disabled && !live.userToggle.disabled && !live.userGroups.disabled && !live.userDelete.disabled,
+    JSON.stringify(live))
+
+  warnings.length = 0
+  routes['GET /identity/users'] = new Error('daemon busy')
+  const reload = findCmp(usersGrid, 'anas-btn-refresh')
+  reload.handler(reload)
+  await settle()
+
+  const uRows = usersGrid.getStore().getRange()
+  ok('users (unreadable list): the failed reload replaces the rows — the stale list is gone',
+    uRows.length === 1 && uRows[0].get('raw') && uRows[0].get('raw').readError === 'daemon busy',
+    JSON.stringify(uRows.map(r => r.get('name'))))
+  const uName = usersGrid.columns.find(c => c.dataIndex === 'name')
+  const uHtml = uName.renderer(uRows[0].get('name'), {}, uRows[0])
+  ok('users (unreadable list): the row says the list could not be read, with the reason',
+    /The list could not be read \(daemon busy\)\./.test(uHtml), uHtml)
+  const dead = toolbarState(usersGrid, ['userSmbpw', 'userToggle', 'userGroups', 'userDelete'])
+  ok('users (unreadable list): every row verb is dead while the list could not be read',
+    dead.userSmbpw.disabled && dead.userToggle.disabled && dead.userGroups.disabled && dead.userDelete.disabled,
+    JSON.stringify(dead))
+  // The could-not-read row states no facts in the other columns.
+  const cellCols = [
+    ['SMB', usersGrid.columns.find(c => c.dataIndex === 'smbEnabled')],
+    ['Status', usersGrid.columns.find(c => c.dataIndex === 'locked')],
+    ['Source', usersGrid.columns.find(c => c.dataIndex === 'local')],
+  ]
+  for (const one of cellCols) {
+    const cellHtml = one[1].renderer(undefined, {}, uRows[0])
+    ok(`users (unreadable list): the ${one[0]} column says nothing on the could-not-read row`,
+      cellHtml === '', cellHtml)
+  }
+  // The grid whose read succeeded keeps its rows and its verbs.
+  groupsGrid.selectRow(0)
+  const gKeep = toolbarState(groupsGrid, ['groupMembers', 'groupDelete'])
+  ok('users (unreadable list): the groups grid (its read succeeded) keeps rows and verbs',
+    groupsGrid.getStore().getCount() === GROUPS_N.length && !gKeep.groupDelete.disabled,
+    JSON.stringify(gKeep))
+
+  // The groups half fails on its own reload (the users Reload reloads both).
+  routes['GET /identity/groups'] = new Error('getent died')
+  groupsGrid.fireEvent('afterrender', groupsGrid)
+  await settle()
+  const gRows = groupsGrid.getStore().getRange()
+  ok('groups (unreadable list): the failed reload replaces the rows too',
+    gRows.length === 1 && gRows[0].get('raw') && gRows[0].get('raw').readError === 'getent died',
+    JSON.stringify(gRows.map(r => r.get('name'))))
+  const gName = groupsGrid.columns.find(c => c.dataIndex === 'name')
+  const gHtml = gName.renderer(gRows[0].get('name'), {}, gRows[0])
+  ok('groups (unreadable list): the row says the list could not be read, with the reason',
+    /The list could not be read \(getent died\)\./.test(gHtml), gHtml)
+  const gDead = toolbarState(groupsGrid, ['groupMembers', 'groupDelete'])
+  ok('groups (unreadable list): both group verbs are dead too',
+    gDead.groupMembers.disabled && gDead.groupDelete.disabled, JSON.stringify(gDead))
+  const gMem = groupsGrid.columns.find(c => c.dataIndex === 'members')
+  const memHtml = gMem.renderer(undefined, {}, gRows[0])
+  ok('groups (unreadable list): the Members column says nothing on the could-not-read row',
+    memHtml === '', memHtml)
+
+  // Until a read succeeds: the users Reload reloads both halves.
+  routes['GET /identity/users'] = { data: USERS_N }
+  routes['GET /identity/groups'] = { data: GROUPS_N }
+  reload.handler(reload)
+  await settle()
+  eq('users (unreadable list): a read that succeeds brings the rows back',
+    [usersGrid.getStore().getCount(), groupsGrid.getStore().getCount()], [USERS_N.length, GROUPS_N.length])
+  usersGrid.selectRow(0)
+  groupsGrid.selectRow(0)
+  const back = toolbarState(usersGrid, ['userDelete'])
+  const gBack = toolbarState(groupsGrid, ['groupDelete'])
+  ok('users (unreadable list): a live local row makes the verbs live again',
+    !back.userDelete.disabled && !gBack.groupDelete.disabled, JSON.stringify([back, gBack]))
+  const aliceRec = usersGrid.getStore().getAt(0)
+  const uHtml2 = uName.renderer(aliceRec.get('name'), {}, aliceRec)
+  ok('users (unreadable list): a read row renders its name, not the sentence',
+    uHtml2 === 'Alice' && !/could not be read/.test(uHtml2), uHtml2)
+  ok('users (unreadable list): the only warnings are the two failed loads',
+    warnings.length === 2, warnings.join(' | '))
+
+  // --- diffList: a principal named `__proto__` diffs like any other name ---
+  created.windows.length = 0
+  usersGrid.selectRow(0) // Alice — stored groups ['users']
+  const gb = findCmp(usersGrid, 'anas-btn-user-groups')
+  gb.handler(gb)
+  await settle()
+  const gw = openWindow()
+  ok('users (__proto__): the Edit Groups door opened', !!gw && !!gw.down('#groups'))
+  gw.down('#groups').setValue(['users', '__proto__'])
+  jobs.length = 0
+  gw.buttonCmps.find(b => b.cls === 'anas-btn-user-groups-submit').handler(null)
+  await settle()
+  const addJob = jobs.find(j => j.method === 'put' && /__proto__/.test(j.path || ''))
+  eq('users (__proto__): ticking the group sends its membership PUT',
+    addJob && [addJob.path, addJob.body], ['/identity/groups/__proto__/members', { add: ['Alice'] }])
+  if (addJob) {
+    validates('users (__proto__): the body parses as UpdateGroupMembersRequest', UpdateGroupMembersRequest, addJob.body)
+  }
+
+  // The reverse leg: a stored `__proto__` that is cleared sends the remove.
+  created.windows.length = 0
+  const routes2 = {
+    'GET /identity/users': { data: [{ ...USERS_N[0], groups: ['users', '__proto__'] }] },
+    'GET /identity/groups': { data: GROUPS_N },
+  }
+  const v2 = await openUsersView(routes2)
+  v2.usersGrid.selectRow(0)
+  const gb2 = findCmp(v2.usersGrid, 'anas-btn-user-groups')
+  gb2.handler(gb2)
+  await settle()
+  const gw2 = openWindow()
+  gw2.down('#groups').setValue(['users'])
+  jobs.length = 0
+  gw2.buttonCmps.find(b => b.cls === 'anas-btn-user-groups-submit').handler(null)
+  await settle()
+  const rmJob = jobs.find(j => j.method === 'put' && /__proto__/.test(j.path || ''))
+  eq('users (__proto__): clearing it sends the remove',
+    rmJob && [rmJob.path, rmJob.body], ['/identity/groups/__proto__/members', { remove: ['Alice'] }])
+}
+
+/**
  * The backup task grid's WEEKLY toggle and its failed-cell tooltip — the two
  * halves of the rclone.3 fix batch that reach back into backup.
  *
@@ -11081,6 +11239,7 @@ warnings.length = 0
 created.windows.length = 0
 await shareUsersChecks()
 await joinableGid100Checks()
+await usersUnreadableListChecks()
 
 // ============================================================================
 //  SMB Self-service (smbsvc.1) — the Previous Versions row: what the dialog

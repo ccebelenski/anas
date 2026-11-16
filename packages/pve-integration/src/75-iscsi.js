@@ -375,6 +375,11 @@
     // finish (a partial image), one whose size was not verified, or a mark that
     // could not be read. The rows say which; the sentence is the daemon's.
 
+    // The states this page can render, ranked most telling first. Its OWN
+    // keys double as the "known to this page" set (ANAS.knownEnum,
+    // cr4.panels2 D-27): a cluster upgrades the panel in the browser and the
+    // daemon on the node independently, so a state outside this list is a
+    // newer daemon's value and renders as unknown, never as a known pill.
     var MARK_RANK = { 'in-progress': 4, interrupted: 3, unverified: 2, unreadable: 1 };
 
     /** The most telling mark row for a target (or one LUN of it), or null. */
@@ -399,15 +404,24 @@
             return '';
         }
         var detail = '' + (m.detail || '');
-        if (m.state === 'in-progress') {
+        // cr4.panels2 D-27: a state this page does not know (or does not
+        // carry at all) renders as unknown — neutral, with the daemon's own
+        // sentence as the tip — never as the red "Partial image" of a state
+        // it does know.
+        var state = ANAS.knownEnum(m.state, MARK_RANK);
+        if (state === null) {
+            return pill('anas-iscsi-restore anas-iscsi-restore-state-unknown', t('Unknown state'), 'var(--anas-muted,gray)', detail);
+        }
+        if (state === 'in-progress') {
             return pill('anas-iscsi-restore anas-iscsi-restore-running', t('Restore running'), 'var(--anas-accent,#3468c0)', detail);
         }
-        if (m.state === 'unreadable') {
+        if (state === 'unreadable') {
             return pill('anas-iscsi-restore anas-iscsi-restore-unknown', t('Restore mark unreadable'), 'var(--anas-warn,#c9820b)', detail);
         }
-        if (m.state === 'unverified') {
+        if (state === 'unverified') {
             return pill('anas-iscsi-restore anas-iscsi-restore-unverified', t('Image not verified'), 'var(--anas-warn,#c9820b)', detail);
         }
+        // 'interrupted' — the only state the ranking still holds.
         return pill('anas-iscsi-restore anas-iscsi-restore-partial', t('Partial image'), 'var(--anas-bad,#c62828)', detail);
     }
 
@@ -902,9 +916,16 @@
         // it ends; the button does not invite it. The daemon stays the
         // authority (its 409 says the same); this only says it first.
         var mark = has ? rec.get('restoreMark') : null;
-        var restoring = has && rec.get('enabled') !== true && !!mark && mark.state === 'in-progress';
+        var markState = mark ? ANAS.knownEnum(mark.state, MARK_RANK) : null;
+        var restoring = has && rec.get('enabled') !== true && markState === 'in-progress';
+        // cr4.panels2 D-27: a mark in a state this page does not know gates
+        // Enable exactly like an in-progress one — the page cannot tell what
+        // that state allows, so it offers no verb and says to reload the page
+        // and read the mark again. Only Enable: a target already enabled
+        // keeps its Disable.
+        var markUnknown = has && rec.get('enabled') !== true && !!mark && markState === null;
         setDisabled(grid, 'iscsiEdit', !mutable);
-        setDisabled(grid, 'iscsiToggle', !mutable || restoring);
+        setDisabled(grid, 'iscsiToggle', !mutable || restoring || markUnknown);
         setDisabled(grid, 'iscsiDelete', !mutable || deleteWhy !== '');
         // Looking at a foreign target's LUNs is READ — always allowed.
         setDisabled(grid, 'iscsiLuns', !has);
@@ -914,7 +935,12 @@
             : '';
         btnSetTip(grid, 'iscsiEdit', foreignTip);
         btnSetTip(grid, 'iscsiToggle', foreign ? foreignTip
-            : (restoring ? t('A whole-image restore is writing a LUN of this target; Enable is refused until the restore ends') : ''));
+            : (restoring
+                ? t('A whole-image restore is writing a LUN of this target; Enable is refused until the restore ends')
+                : (markUnknown
+                    ? t('This restore mark carries a state') + ' (' + ('' + mark.state) + ') '
+                        + t('this page does not know. Reload the page to read it.')
+                    : '')));
         btnSetTip(grid, 'iscsiDelete', foreign ? foreignTip : deleteWhy);
         btnSetTip(grid, 'iscsiLuns', foreign ? t('Read-only: this target is not managed by ANAS') : '');
 

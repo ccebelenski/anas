@@ -121,6 +121,19 @@
         return ANAS.enc(s);
     }
 
+    // D-35: the default ExtJS BoundList renders a row's displayField as RAW
+    // HTML (proven in a browser on PVE 9.2, ExtJS 7.0 — the fact recorded in
+    // 68-backup.js and 75-iscsi.js), so a combo whose rows carry node text —
+    // here the /identity account and group names behind the CIFS Owner and
+    // Group pickers — renders its list through this encoded template, as the
+    // shares, users and cloud panels do. A fresh object per combo: ExtJS
+    // merges listConfig into the list it makes.
+    function encodedList() {
+        return {
+            tpl: '<tpl for="."><div class="x-boundlist-item">{label:htmlEncode}</div></tpl>'
+        };
+    }
+
     function fmtBytes(v) {
         try {
             return ANAS.formatBytes(v);
@@ -2084,6 +2097,7 @@
                     store: ownerStore,
                     valueField: 'id',
                     displayField: 'label',
+                    listConfig: encodedList(),
                     queryMode: 'local',
                     editable: false,
                     emptyText: t('(default — root)'),
@@ -2103,6 +2117,7 @@
                     store: groupStore,
                     valueField: 'id',
                     displayField: 'label',
+                    listConfig: encodedList(),
                     queryMode: 'local',
                     editable: false,
                     emptyText: t('(default — root)'),

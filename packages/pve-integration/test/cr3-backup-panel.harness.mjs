@@ -1909,6 +1909,146 @@ SECTIONS.push(['review2', async () => {
     !state.posts.some(p => p.path === '/backup/repos/test'), JSON.stringify(state.posts))
 }])
 
+// ---- D-9 — the save-time namespace check probes the namespace the RUN will
+//      use, never the repository's own on its say-so. The daemon runs a task
+//      at `task.namespace ?? repo.namespace` (backup-runner.ts): a STORED ''
+//      is the datastore root explicitly and never enters the repo's namespace,
+//      so probing (and warning about) the repo's namespace on a root task is
+//      a check of a namespace the run will not touch. Only a stored-ABSENT
+//      (or cleared-to-null) namespace inherits the repo's. --------------------
+
+SECTIONS.push(['d9-verify-ns', async () => {
+  // Repos fixture: 'pbs-ns' carries a namespace of its own ('repo-ns').
+  const TROOT = { ...TASK, name: 'root-ns-task', repository: 'pbs-ns', namespace: '' }
+  const TABSENT = { ...TASK, name: 'absent-ns-task', repository: 'pbs-ns' }
+  delete TABSENT.namespace
+  const TX = { ...TASK, name: 'x-ns-task', repository: 'pbs-ns', namespace: 'x' }
+  const nsProbes = () => state.posts.filter(p => p.path === '/backup/repos/test').map(p => p.body)
+
+  async function editAndSubmit(task, routes, mutate) {
+    reset(baseRoutes({
+      [`GET /backup/tasks/${task.name}`]: { data: { task: task, revision: 'r9' } },
+      [`PUT /backup/tasks/${task.name}`]: { job: { id: 'jd9' } },
+      ...routes,
+    }))
+    const A = loadPanel()
+    A.backup.openEditTask(VIEW, NODE, task)
+    await settle()
+    if (mutate) { mutate(lastWindow()) }
+    state.posts.length = 0
+    state.confirms.length = 0
+    await submitAndBody(lastWindow())
+  }
+
+  // A task stored at the DATASTORE ROOT on a repository that has a namespace
+  // of its own. The route answers stage 'namespace' (the namespace is missing)
+  // so a wrong probe produces a real warning, not a silent ok.
+  await editAndSubmit(TROOT, { 'POST /backup/repos/test': { data: { stage: 'namespace' } } })
+  ok('D-9: an edit of a stored \'\' task never probes the repository\'s own namespace',
+    !nsProbes().some(b => b && b.namespace === 'repo-ns'), JSON.stringify(nsProbes()))
+  ok('D-9: ...and the datastore root is not probed at all',
+    nsProbes().length === 0, JSON.stringify(nsProbes()))
+  ok('D-9: ...and the root edit carries no warning about a namespace it will not write',
+    !state.confirms.some(c => /does not exist/.test(c.msg || '')), JSON.stringify(state.confirms))
+
+  // Stored ABSENT is different: the run inherits the repo's namespace, so
+  // that is exactly what the check must probe (the intended fallback).
+  await editAndSubmit(TABSENT)
+  ok('D-9: a stored-absent namespace probes the repo\'s own (the run inherits it)',
+    nsProbes().some(b => b && b.namespace === 'repo-ns'), JSON.stringify(nsProbes()))
+
+  // An untouched edit of a stored value probes that value, not the repo's.
+  await editAndSubmit(TX)
+  ok('D-9: an untouched edit probes the stored namespace exactly',
+    nsProbes().some(b => b && b.namespace === 'x')
+      && !nsProbes().some(b => b && b.namespace === 'repo-ns'), JSON.stringify(nsProbes()))
+
+  // A typed value probes what was typed.
+  await editAndSubmit(TX, null, win => win.down('#namespace').setValue('typed-ns'))
+  ok('D-9: a typed namespace probes the typed value',
+    nsProbes().some(b => b && b.namespace === 'typed-ns'), JSON.stringify(nsProbes()))
+
+  // A CLEARED stored namespace is stored as null; the run then inherits the
+  // repo's namespace — so that is what the check probes.
+  await editAndSubmit(TX, null, win => win.down('#namespace').setValue(''))
+  ok('D-9: a cleared namespace probes the repo\'s own (the run inherits it)',
+    nsProbes().some(b => b && b.namespace === 'repo-ns'), JSON.stringify(nsProbes()))
+}])
+
+// ---- D-10 — a restore dialog opened from a task name whose
+//      GET /backup/tasks/<name> FAILED says so on the dialog itself. The
+//      console note alone left the door showing "From task <name>" over an
+//      empty form: a source line claiming a source the read never saw. -----
+
+SECTIONS.push(['d10-degraded-read', async () => {
+  const NAME = 'dead-read-task'
+  const sumHtmlOf = win => ((win.down('#restoreSourceSummary') || {}).html) || ''
+
+  reset(baseRoutes({ [`GET /backup/tasks/${NAME}`]: httpError(500, 'daemon busy') }))
+  let A = loadPanel()
+  let win = A.backup.openRestoreDialog(VIEW, NODE, { task: NAME })
+  await settle()
+  let sum = sumHtmlOf(win)
+  ok('D-10: a failed task read is said on the dialog itself', /could not be read/.test(sum), sum)
+  ok('D-10: ...naming the task and the daemon\'s reason',
+    /dead-read-task/.test(sum) && /daemon busy/.test(sum), sum)
+  ok('D-10: ...and pointing at one thing to do',
+    /Close this window and try again, or pick the source by hand\./.test(sum), sum)
+  ok('D-10: ...and the summary no longer claims "From task"', !/From task/.test(sum), sum)
+
+  // The reason is outside text: encoded, never markup.
+  reset(baseRoutes({ [`GET /backup/tasks/${NAME}`]: httpError(500, '<img src=x onerror=alert(1)>') }))
+  A = loadPanel()
+  win = A.backup.openRestoreDialog(VIEW, NODE, { task: NAME })
+  await settle()
+  sum = sumHtmlOf(win)
+  ok('D-10: the read\'s reason rides the sentence ENCODED',
+    /could not be read/.test(sum) && !/<img/i.test(sum), sum)
+
+  // A read that succeeded still gets the pre-filled source line.
+  const OKT = { ...TASK, name: NAME }
+  reset(baseRoutes({ [`GET /backup/tasks/${NAME}`]: { data: { task: OKT } } }))
+  A = loadPanel()
+  win = A.backup.openRestoreDialog(VIEW, NODE, { task: NAME })
+  await settle()
+  sum = sumHtmlOf(win)
+  ok('D-10: a read that succeeded still gets the "From task" summary',
+    /From task/.test(sum) && /pbs-main/.test(sum) && !/could not be read/.test(sum), sum)
+}])
+
+// ---- N (D-10's sibling) — the combined save-verify confirm asks about the
+//      operation the dialog IS: an EDIT saves, a NEW task is created. -------
+
+SECTIONS.push(['n-confirm-verb', async () => {
+  // An EDIT whose check warns: the question must not say "Create".
+  reset(baseRoutes({
+    [`GET /backup/tasks/${TASK.name}`]: { data: { task: TASK, revision: 'r1' } },
+    'POST /backup/repos/test': { data: { stage: 'namespace' } },
+  }))
+  let A = loadPanel()
+  A.backup.openEditTask(VIEW, NODE, TASK)
+  await settle()
+  state.confirms.length = 0
+  await submitAndBody(lastWindow())
+  const editConfirm = state.confirms.find(c => /anyway\?/.test(c.msg || ''))
+  ok('N-confirm: an edit\'s combined confirm asks "Save the task anyway?"',
+    !!editConfirm && /Save the task anyway\?$/.test(editConfirm.msg), JSON.stringify(editConfirm && editConfirm.msg))
+  ok('N-confirm: ...and never "Create" on an edit',
+    !!editConfirm && !/Create the task anyway/.test(editConfirm.msg), JSON.stringify(editConfirm && editConfirm.msg))
+
+  // A NEW task keeps its own wording.
+  reset(baseRoutes({ 'POST /backup/repos/test': { data: { stage: 'namespace' } } }))
+  A = loadPanel()
+  const wz = await openWizard(A)
+  wz.down('#name').setValue('fresh-verb')
+  wz.down('#namespace').setValue('some-ns')
+  state.confirms.length = 0
+  await submitAndBody(wz)
+  const newConfirm = state.confirms.find(c => /anyway\?/.test(c.msg || ''))
+  ok('N-confirm: a new task\'s confirm still asks "Create the task anyway?"',
+    !!newConfirm && /Create the task anyway\?$/.test(newConfirm.msg), JSON.stringify(newConfirm && newConfirm.msg))
+}])
+
 SECTIONS.push(['repos-read', async () => {
   const routes = baseRoutes({ 'GET /backup/repos': httpError(500, 'registry unreadable') })
   reset(routes)

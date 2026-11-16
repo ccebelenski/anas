@@ -80,6 +80,11 @@ function makeCmp(cfg, win) {
   return {
     itemId: cfg.itemId,
     xtype: cfg.xtype || 'component',
+    // D-35: the bound-list render probe needs the combo's list shape.
+    displayField: cfg.displayField,
+    valueField: cfg.valueField,
+    listConfig: cfg.listConfig,
+    store: cfg.store,
     isField: isField(cfg.xtype),
     readOnly: !!cfg.readOnly,
     disabled: !!cfg.disabled,
@@ -143,12 +148,38 @@ function makeWindow(cfg) {
 const captured = { windows: [], jobs: [], posts: [], alerts: [] }
 // What GET /mounts answers (follow-up (3) sets a list-level tableUnreadable).
 let listResponse = { data: [] }
+// D-35: what GET /identity/users and /identity/groups answer (the CIFS Owner
+// and Group combos fill from these).
+let usersResponse = { data: [] }
+let groupsResponse = { data: [] }
+// The real 00-core encoder, captured by loadUi, so the bound-list render probe
+// encodes exactly as the panel does.
+let REAL_ENC = null
+
+/**
+ * What a combo's drop-down list puts into innerHTML for `rows`. A combo with a
+ * `listConfig.tpl` renders through it (the XTemplate forms the panels use:
+ * `<tpl for=".">`, `{field}`, `{field:htmlEncode}`); one without renders
+ * ExtJS's DEFAULT BoundList item, `{<displayField>}` — RAW (proven in a
+ * browser on PVE 9.2, ExtJS 7.0.0.168 — the fact 68-backup.js:209 and
+ * 75-iscsi.js:196 record, modelled here as in cr3-backup-panel.harness.mjs).
+ */
+function renderBoundList(combo, rows) {
+  const tpl = combo.listConfig && combo.listConfig.tpl
+  const inner = tpl
+    ? String(tpl).replace(/^<tpl for="\.">/, '').replace(/<\/tpl>$/, '')
+    : `<div class="x-boundlist-item">{${combo.displayField}}</div>`
+  return rows.map(row => inner.replace(/\{(\w+)(:htmlEncode)?\}/g,
+    (_m, field, encode) => (encode ? REAL_ENC(row[field]) : String(row[field] == null ? '' : row[field]))))
+    .join('')
+}
 
 function loadUi() {
   const doc = { cookie: '', hidden: false, addEventListener() {}, removeEventListener() {} }
   const win = { document: doc }
   const sandbox00 = { window: {} }
   vm.runInNewContext(readFileSync(join(SRC, '00-core.js'), 'utf8'), sandbox00, { filename: '00-core.js' })
+  REAL_ENC = sandbox00.window.ANAS.enc
   win.ANAS = {
     views: {},
     noAutofill: sandbox00.window.ANAS.noAutofill,
@@ -165,7 +196,8 @@ function loadUi() {
     fmtMode: () => ({ valid: true, symbolic: 'rw-r--r--', gloss: '' }),
     api: {
       get(_node, path) {
-        if (path === '/identity/users' || path === '/identity/groups') { return Promise.resolve({ data: [] }) }
+        if (path === '/identity/users') { return Promise.resolve(usersResponse) }
+        if (path === '/identity/groups') { return Promise.resolve(groupsResponse) }
         if (path.indexOf('/mounts/') === 0) { return Promise.resolve({ data: DETAIL }) }
         if (path === '/mounts') { return Promise.resolve(listResponse) }
         return Promise.resolve({ data: [] })
@@ -527,6 +559,26 @@ async function openEdit(rowData) {
   check(captured.jobs[0] && captured.jobs[0].body.options.domain === 'LINE\u00A0', `review 4 (D3): the line's own domain travels byte for byte (got ${JSON.stringify(captured.jobs[0] && captured.jobs[0].body.options.domain)})`)
   DETAIL.configuredOptions.cifs = savedCo
   DETAIL.credentials = { set: true, username: 'smbuser' }
+}
+
+{
+  // D-35: the CIFS Owner and Group combos fill from /identity/users and
+  // /identity/groups — account and group names from the node's getent — so
+  // their bound lists must render through an encoded template like the
+  // siblings in 70-shares, 80-users and 72-cloud do, not the RAW default.
+  usersResponse = { data: [{ name: '<img src=x onerror=alert(1)>', uid: 2000 }, { name: 'smbuser', uid: 1000 }] }
+  groupsResponse = { data: [{ name: '<img src=x onerror=alert(1)>', gid: 2001 }, { name: 'staff', gid: 100 }] }
+  const w = await openEdit({ ...baseRow })
+  for (const id of ['#cifsUid', '#cifsGid']) {
+    const combo = w.down(id)
+    check(!!combo, `D-35: the CIFS dialog has ${id}`)
+    const rows = (combo && combo.store && combo.store.data) || []
+    check(rows.some(r => /<img/.test(r.label)), `D-35: ${id} holds a hostile account label from the node (got ${JSON.stringify(rows)})`)
+    const html = combo ? renderBoundList(combo, rows) : ''
+    check(!/<img/i.test(html) && /&lt;img/.test(html), `D-35: the ${id} list renders account names ENCODED (got ${html})`)
+  }
+  usersResponse = { data: [] }
+  groupsResponse = { data: [] }
 }
 
 for (const a of captured.alerts) {
