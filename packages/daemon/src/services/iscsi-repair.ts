@@ -72,7 +72,7 @@ import {
 } from './iscsi-mutate.js'
 import { servedElsewhere } from './iscsi-served.js'
 import { attributesFromPersisted, normalizePlugin, targetTpgs } from './iscsi.js'
-import { clearMarkCommand, isFileMark, unreadableFileWay } from './restore-mark.js'
+import { clearMarkCommand, isFileMark, unreadableMarkWay } from './restore-mark.js'
 
 /** One hole, with everything the replay needs, read off the PERSISTED config. */
 export interface IscsiRepairItem {
@@ -364,7 +364,7 @@ function restoreMarkClause(marked: IscsiRepairItem[]): string {
   }
   if (marked.some(b => b.restoreMark === 'unreadable')) {
     // review S4: for an image file, the command that shows it.
-    const see = marked.filter(b => b.restoreMark === 'unreadable' && b.restoreMarkDataset).map(b => unreadableFileWay(b.restoreMarkDataset!, 'Repair')).join('')
+    const see = marked.filter(b => b.restoreMark === 'unreadable' && b.restoreMarkDataset).map(b => unreadableMarkWay(b.restoreMarkDataset!, 'Repair')).join('')
     ways.push(`Repair is refused for a LUN whose restore mark could not be read until it can be read.${see}`)
   }
   if (marked.some(b => b.restoreMark === 'in-progress'))

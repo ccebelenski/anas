@@ -45,7 +45,7 @@ import { readRestoreMarks } from '../iscsi-quarantine.js'
 import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../iscsi-repair.js'
 import { buildIscsiWarnings } from '../iscsi-warnings.js'
 import { buildIscsiTargets } from '../iscsi.js'
-import { ATTR_NOT_INSTALLED, consultsJobRecord, decodeRestoreMark, describeMarkSet, enableMarkVerdict, encodeRestoreMark, GETFATTR, imageRestorePin, JOB_RECORD_ONLY, jobRecordLifetime, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkGetArgs, restoreMarkRefusal, restoreMarksGetArgs, restoreVerdict, SETFATTR, unverifiedMark, writingMark } from '../restore-mark.js'
+import { ATTR_NOT_INSTALLED, consultsJobRecord, decodeRestoreMark, describeMarkSet, enableMarkVerdict, encodeRestoreMark, GETFATTR, imageRestorePin, JOB_RECORD_ONLY, jobRecordLifetime, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkDetail, restoreMarkGetArgs, restoreMarkRefusal, restoreMarksGetArgs, restoreVerdict, SETFATTR, unverifiedMark, writingMark } from '../restore-mark.js'
 import { hexOf, withFileMarks } from './file-mark-fixtures.js'
 import { contextOf, recording, replayLio, targetObjectOf } from './lio-model.js'
 
@@ -912,7 +912,9 @@ describe('cr3.lunrestore review2 (1, defect A) — a run that writes nothing lea
     const node = withMarks(inPlaceMock(), { 'tank/vol1': OLD_MARK }, { unreadable: new Set(['tank/vol1']) })
     const rec = recording(node.executor)
     await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true }), () => {}), (err: Error) => {
-      assert.match(err.message, /^ANAS could not read the restore mark anas:restore on tank\/vol1 \(.*suspended\), so it cannot keep the record an earlier restore may have left there\. The restore is refused until the mark can be read\. Nothing was disabled and nothing was written\.$/)
+      // cr4.lun N: a volume's refusal now names the zfs get that shows the mark
+      // (the row and this door carry the same way).
+      assert.match(err.message, /^ANAS could not read the restore mark anas:restore on tank\/vol1 \(.*suspended\), so it cannot keep the record an earlier restore may have left there\. The restore is refused until the mark can be read\. Nothing was disabled and nothing was written\. To see what ANAS sees, run 'zfs get -Hp -o value,source anas:restore -- tank\/vol1' as root\. When its value column holds the mark, or is '-' \(no mark\), ANAS reads the same and the restore is no longer refused for it\.$/)
       return true
     })
     assert.ok(!disabledBy(rec.calls))
@@ -1110,6 +1112,112 @@ describe('cr3.lunrestore review2 (3, defect C) — an in-place restore onto a FI
       assert.equal(result.targetReEnabled, true)
       assert.ok(enabledBy(rec.calls))
     })
+  })
+})
+
+describe('cr3.lunrestore (cr4 D-6) — a completion line whose count cannot be read leaves the image unverified', () => {
+  const codeOf = (err: Error) => (err as Error & { jobErrorCode?: string }).jobErrorCode
+
+  // Only the two CAPTURED completion shapes count (fixtures/backup/). A line
+  // that puts anything else where the count belongs states a count ANAS could
+  // not read, so it is not the countless old shape and it is not the size:
+  // the image is unverified, the mark stays, the target stays disabled.
+  const UNREADABLE = [
+    'restore image complete (bytes=1048576 duration=1s)', // no comma after the count
+    'restore image complete (bytes=1.0M, duration=1s, speed=1MB/s)', // not a byte integer
+    'restore image complete (bytes=-5, duration=1s, speed=1MB/s)',
+    'restore image complete (xbytes=5, duration=1s, speed=1MB/s)',
+  ]
+
+  for (const line of UNREADABLE) {
+    it(`"${line}": IMAGE_UNVERIFIED, the mark stays, the target stays disabled`, async () => {
+      const node = withMarks(inPlaceMock({ stderr: `${line}    \r`, exitCode: 0, bytesWritten: 0 }))
+      const rec = recording(node.executor)
+      await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true }), () => {}), (err: Error) => {
+        assert.equal(codeOf(err), 'IMAGE_UNVERIFIED')
+        assert.ok(err.message.includes(line), 'the message quotes the line')
+        assert.match(err.message, /states a byte count ANAS could not read/)
+        assert.match(err.message, /stays disabled/)
+        return true
+      })
+      assert.ok(disabledBy(rec.calls))
+      assert.ok(!enabledBy(rec.calls), 'never re-enabled over an image whose count could not be read')
+      assert.equal(JSON.parse(node.marks.get('tank/vol1')!).state, 'unverified')
+    })
+  }
+
+  it('exit 0 after a last progress line of 100% and NO completion line is not complete: the client did not say it finished', async () => {
+    // No captured client ends this way. A rounded percentage is not the
+    // client's completion line and is not ANAS's own count of the bytes.
+    const node = withMarks(inPlaceMock({ stderr: 'progress 100% (512 MiB of 512 MiB in 5.0s)    \r', exitCode: 0, bytesWritten: 0 }))
+    const rec = recording(node.executor)
+    await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true }), () => {}), (err: Error) => {
+      assert.equal(codeOf(err), 'IMAGE_UNVERIFIED')
+      assert.match(err.message, /did not report the restore complete/)
+      return true
+    })
+    assert.ok(!enabledBy(rec.calls), 'never re-enabled without the completion line')
+    assert.equal(JSON.parse(node.marks.get('tank/vol1')!).state, 'unverified')
+  })
+
+  it('the two captured shapes still complete: the old countless line as it is in the fixtures', async () => {
+    // `restore complete (<amount> processed in <t>, average <rate>)` — captured
+    // in img-restore-and-map.txt; it states no byte count, so it completes.
+    const node = withMarks(inPlaceMock({ stderr: 'restore complete (512 MiB processed in 0.6s, average 802.99 MiB/s)    \r', exitCode: 0, bytesWritten: 0 }))
+    const rec = recording(node.executor)
+    const result = await runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true }), () => {})
+    assert.equal(result.complete, true)
+    assert.equal(result.targetReEnabled, true)
+    assert.equal(node.marks.get('tank/vol1'), undefined, 'the mark is removed')
+  })
+
+  it('the new-LUN restore refuses the same way: no LUN is mapped, the new backing carries an unverified mark', async () => {
+    // The second consumer of the completion line. `runNewLunImageRestore`
+    // keeps a mark that says the image was not verified, so nothing treats
+    // it as good, and maps no LUN over it.
+    await withRoot(async (root) => {
+      const rec = recording(mockWith(undefined, { stderr: 'restore image complete (bytes=1.0M, duration=1s, speed=1MB/s)\r', exitCode: 0, bytesWritten: 0 }))
+      await assert.rejects(runNewLunImageRestore(rec.executor, depsFor(rec, root), () => {}), (err: Error) => {
+        assert.equal(codeOf(err), 'IMAGE_UNVERIFIED')
+        assert.match(err.message, /states a byte count ANAS could not read/)
+        return true
+      })
+      const node = replayLio(rec.calls)
+      assert.deepEqual([hasNewvolBackstore(node), isNewvolLun(node)], [true, false], 'kept, unmapped')
+      assert.ok(node.marks.includes('tank/newvol'))
+    })
+  })
+})
+
+describe('cr3.lunrestore (cr4 N) — an unreadable VOLUME row says the read\'s reason and the command', () => {
+  it('a volume: the reason, then the zfs get ANAS itself runs, printed as a shell line', () => {
+    const detail = restoreMarkDetail({
+      state: 'unreadable',
+      source: 'mark',
+      mark: null,
+      what: `LUN 0 ('vmdisk') of ${IQN}`,
+      dataset: 'tank/vol1',
+      read: { state: 'unknown', dataset: 'tank/vol1', reason: 'zfs get exited with code 1' },
+      unreadableDoor: 'enabling the target',
+    })
+    assert.equal(detail, `ANAS could not read the restore mark on tank/vol1 (zfs get exited with code 1), so it cannot tell whether `
+    + `LUN 0 ('vmdisk') of ${IQN} holds a partially restored image. `
+    + `To see what ANAS sees, run 'zfs get -Hp -o value,source anas:restore -- tank/vol1' as root. `
+    + `When its value column holds the mark, or is '-' (no mark), ANAS reads the same and enabling the target is no longer refused for it.`)
+  })
+
+  it('an image FILE: the same shape, the getfattr it always carried (unchanged)', () => {
+    const detail = restoreMarkDetail({
+      state: 'unreadable',
+      source: 'mark',
+      mark: null,
+      what: `LUN 1 ('lun2') of ${IQN}`,
+      dataset: '/tank/images/lun2.raw',
+      read: { state: 'unknown', dataset: '/tank/images/lun2.raw', reason: 'Command timed out after 12000ms' },
+      unreadableDoor: 'enabling the target',
+    })
+    assert.match(detail, /^ANAS could not read the restore mark on \/tank\/images\/lun2\.raw \(Command timed out after 12000ms\), so it cannot tell whether LUN 1 .* holds a partially restored image\./)
+    assert.match(detail, /To see what ANAS sees, run 'LC_ALL=C getfattr --absolute-names -e hex -n trusted\.anas\.restore -- \/tank\/images\/lun2\.raw' as root\./)
   })
 })
 
@@ -1822,7 +1930,9 @@ describe('cr3.lunrestore review2 — an image FILE is emptied when it is opened 
       }
       const rec = recording(base)
       await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), (err: Error) => {
-        assert.match(err.message, /Nothing was written to .*vmdisk2\.raw\. .*vmdisk2\.raw is 0 bytes now, not 536870912: the image file is emptied when it is opened for the restore, so it no longer holds the image it held, and target .* stays disabled\. To restore the image again in place, first set .*vmdisk2\.raw to the image's 536870912 bytes with 'truncate -s 536870912 .*vmdisk2\.raw' \(the in-place restore refuses a file of any other size, and a failed restore can leave the file shorter\); deleting this LUN and restoring the image as a new LUN is the other way out\.$/)
+        // cr4.lun N: a file is not "nothing was written" — its open emptied it.
+        assert.match(err.message, /The client fetched nothing; the image file was emptied when it was opened for the restore\. .*vmdisk2\.raw is 0 bytes now, not the image's 536870912: it no longer holds the image it held, and target .* stays disabled\. To restore the image again in place, first set .*vmdisk2\.raw to the image's 536870912 bytes with 'truncate -s 536870912 .*vmdisk2\.raw' \(the in-place restore refuses a file of any other size, and a failed restore can leave the file shorter\); deleting this LUN and restoring the image as a new LUN is the other way out\.$/)
+        assert.doesNotMatch(err.message, /Nothing was written/)
         assert.equal((err as Error & { jobErrorCode?: string }).jobErrorCode, 'IMAGE_PARTIAL')
         return true
       })
@@ -2287,7 +2397,7 @@ describe('cr3.lunrestore.filemark — the in-place restore onto an image FILE th
       const rec = recording(node.executor)
       await assert.rejects(runImageRestore(rec.executor, inPlaceDeps(rec.executor, { enabled: true, path }), () => {}), (err: Error) => {
         assert.equal(codeOf(err), 'IMAGE_PARTIAL')
-        assert.match(err.message, /is 0 bytes now, not 536870912: the image file is emptied when it is opened for the restore, so it no longer holds the image it held, and target .* stays disabled; it keeps this restore's mark trusted\.anas\.restore\./)
+        assert.match(err.message, /is 0 bytes now, not the image's 536870912: it no longer holds the image it held, and target .* stays disabled; it keeps this restore's mark trusted\.anas\.restore\./)
         return true
       })
       // This run's mark (another start time), not the earlier one put back.

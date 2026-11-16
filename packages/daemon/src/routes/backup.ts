@@ -109,6 +109,7 @@ import {
   runImageRestore,
   runNewLunImageRestore,
   snapshotGroup,
+  unreadableMarkRestoreRefusal,
 } from '../services/backup-restore.js'
 import {
   buildBackupEnv,
@@ -2521,6 +2522,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // under the lock and refuses a mark it cannot read). A read that could not
     // see is not "cannot carry one": only `unsupported` takes the record's words.
     const fileMark = lun.kind === 'zvol' ? null : await readRestoreMark(executor, { path: lun.backingPath })
+    // cr4.lun N: a mark the route cannot read refuses HERE, in the job's own
+    // words, before a confirm is minted for a run that cannot start. The job
+    // reads the mark again under its lock and refuses the same way.
+    if (fileMark?.state === 'unknown') {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'restore-mark-unreadable', message: unreadableMarkRestoreRefusal(lun.backingPath, fileMark.reason) } }
+    }
     const fileUnmarked = fileMark?.state === 'unsupported'
     // cr3.backup (backup-panel second review): the daemon takes no task here —
     // the LUN is named explicitly and signed by serial — but a block task's

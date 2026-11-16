@@ -245,23 +245,78 @@ export function fileMarkRemoveArgs(path: string): string[] {
   return ['-x', FILE_RESTORE_MARK_ATTR, '--', path]
 }
 
+/** A name that needs no quoting in a shell word: letters, digits, `_`, and the punctuation a dataset or path uses. */
+const BARE_NAME_RE = /^[\w./:@-]+$/
+/** A single quote, to escape for a single-quoted shell word. */
+const SINGLE_QUOTE_RE = /'/g
+
+/**
+ * Quote a path or dataset name ANAS prints inside an operator command: bare
+ * when it holds only characters that need no quoting, single-quoted otherwise
+ * (`'` escaped as `'\''`), so a copy-paste of the printed command names the
+ * same object even when the path holds a space (cr4.lun N).
+ */
+export function shellQuote(name: string): string {
+  return BARE_NAME_RE.test(name) ? name : `'${name.replace(SINGLE_QUOTE_RE, '\'\\\'\'')}'`
+}
+
 /** The command that shows an image file's mark exactly as ANAS reads it (review S4). */
 export function fileMarkReadCommand(path: string): string {
-  return `LC_ALL=C ${GETFATTR.slice(GETFATTR.lastIndexOf('/') + 1)} ${fileMarkGetArgs(path).join(' ')}`
+  const args = fileMarkGetArgs(path)
+  return `LC_ALL=C ${GETFATTR.slice(GETFATTR.lastIndexOf('/') + 1)} ${[...args.slice(0, -1), shellQuote(args.at(-1)!)].join(' ')}`
+}
+
+/** The command that shows a volume's mark exactly as ANAS reads it (the argv in {@link restoreMarkGetArgs}). */
+export function volumeMarkReadCommand(dataset: string): string {
+  const args = restoreMarkGetArgs(dataset)
+  return `zfs ${[...args.slice(0, -1), shellQuote(args.at(-1)!)].join(' ')}`
+}
+
+/** The command that shows a mark as ANAS reads it, for a volume or an image file. */
+export function markReadCommand(on: string): string {
+  return isFileMark(on) ? fileMarkReadCommand(on) : volumeMarkReadCommand(on)
 }
 
 /**
- * The way to confirm or fix an image file's mark that could not be read
- * (review S4; operator: a diagnostic gives a path to confirm or fix): the
- * exact command the reader runs, and when the door opens again. `door` is the
- * refused act, lower-case ("enabling the target"). '' for a volume. Starts
- * with a space; ends with its stop.
+ * A command as it is printed inside a sentence, delimited so the whole of it
+ * copies in one piece: single quotes for a command with no quote of its own (every
+ * bare-name command, as always), double quotes when the command carries a
+ * single-quoted name. A name that itself holds a `"` leaves no delimiter that
+ * is not also in the command, so that command is set off by a colon and ends
+ * the clause on its own line (cr4.lun review F3).
+ */
+export function quotedCommand(cmd: string): string {
+  if (!cmd.includes('\''))
+    return `'${cmd}'`
+  if (!cmd.includes('"'))
+    return `"${cmd}"`
+  return `this command:\n${cmd}\n`
+}
+
+/**
+ * The way to confirm or fix a mark that could not be read (review S4;
+ * operator: a diagnostic gives a path to confirm or fix): the exact command
+ * the reader runs, and when the door opens again. `door` is the refused act,
+ * lower-case ("enabling the target"). A volume's command is the `zfs get`
+ * ANAS itself runs; an image file's is its `getfattr` (cr4.lun N). Starts with
+ * a space; ends with its stop.
+ */
+export function unreadableMarkWay(on: string, door: string): string {
+  const cmd = markReadCommand(on)
+  const opening = ` To see what ANAS sees, run ${quotedCommand(cmd)} as root.`
+  if (isFileMark(on)) {
+    return `${opening} When it prints a '${FILE_RESTORE_MARK_ATTR}=0x' line (the mark) `
+      + `or ends with '${NO_SUCH_ATTRIBUTE}' (no mark), ANAS reads the same and ${door} is no longer refused for it.`
+  }
+  return `${opening} When its value column holds the mark, or is '-' (no mark), ANAS reads the same and ${door} is no longer refused for it.`
+}
+
+/**
+ * The way to confirm or fix an image file's mark that could not be read. '' for
+ * a volume (a volume has its own, {@link unreadableMarkWay}).
  */
 export function unreadableFileWay(on: string, door: string): string {
-  if (!isFileMark(on))
-    return ''
-  return ` To see what ANAS sees, run '${fileMarkReadCommand(on)}' as root. When it prints a '${FILE_RESTORE_MARK_ATTR}=0x' line (the mark) `
-    + `or ends with '${NO_SUCH_ATTRIBUTE}' (no mark), ANAS reads the same and ${door} is no longer refused for it.`
+  return isFileMark(on) ? unreadableMarkWay(on, door) : ''
 }
 
 /** The text bytes of a value as the writer's hex (lower-case). */
@@ -512,7 +567,7 @@ export async function putBackRestoreMark(executor: CommandExecutor, on: string, 
 
 /** The one command that clears a mark by hand, on a volume or an image file. */
 export function clearMarkCommand(on: string): string {
-  return isFileMark(on) ? `setfattr -x ${FILE_RESTORE_MARK_ATTR} ${on}` : `zfs inherit ${RESTORE_MARK_PROPERTY} ${on}`
+  return isFileMark(on) ? `setfattr -x ${FILE_RESTORE_MARK_ATTR} ${shellQuote(on)}` : `zfs inherit ${RESTORE_MARK_PROPERTY} ${shellQuote(on)}`
 }
 
 /**
@@ -709,7 +764,7 @@ export function jobRecordLifetime(read?: RestoreMarkRead): string {
  */
 export function fileRestoreAgain(path: string, imageBytes: number | undefined): string {
   const size = imageBytes === undefined ? 'the image\'s exact size' : `the image's ${imageBytes} bytes`
-  return `to restore the image again in place, first set ${path} to ${size} with 'truncate -s ${imageBytes ?? '<bytes>'} ${path}' `
+  return `to restore the image again in place, first set ${path} to ${size} with ${quotedCommand(`truncate -s ${imageBytes ?? '<bytes>'} ${shellQuote(path)}`)} `
     + `(the in-place restore refuses a file of any other size, and a failed restore can leave the file shorter); `
     + `deleting this LUN and restoring the image as a new LUN is the other way out`
 }
@@ -820,10 +875,11 @@ export function restoreMarkDetail(row: { state: IscsiRestoreMarkState, source: '
   const job = row.job ? ` (job ${row.job})` : ''
   switch (row.state) {
     case 'unreadable': {
-      // review S4: an image file's row says what the read returned and how to see it.
-      const file = row.dataset !== null && isFileMark(row.dataset)
-      const said = file && row.read?.state === 'unknown' ? ` (${row.read.reason})` : ''
-      const way = file && row.unreadableDoor ? unreadableFileWay(row.dataset!, row.unreadableDoor) : ''
+      // review S4: the row says what the read returned and how to see it — the
+      // same for a volume's `zfs get` as for an image file's `getfattr`
+      // (cr4.lun N).
+      const said = row.read?.state === 'unknown' ? ` (${row.read.reason})` : ''
+      const way = row.dataset !== null && row.unreadableDoor ? unreadableMarkWay(row.dataset, row.unreadableDoor) : ''
       return `ANAS could not read the restore mark on ${row.dataset}${said}, so it cannot tell whether ${row.what} holds a partially restored image.${way}`
     }
     case 'in-progress':
@@ -864,7 +920,7 @@ export function restoreMarkRefusal(
     return {
       reason: 'restore-mark-unreadable',
       message: `ANAS could not read the restore mark on ${read.dataset} (${read.reason}), so it cannot tell whether ${what} holds a `
-        + `partially restored image. ${action} is refused until the mark can be read.${unreadableFileWay(read.dataset, `${action[0].toLowerCase()}${action.slice(1)}`)}`,
+        + `partially restored image. ${action} is refused until the mark can be read.${unreadableMarkWay(read.dataset, `${action[0].toLowerCase()}${action.slice(1)}`)}`,
     }
   }
   if (jobs.running) {
@@ -1002,7 +1058,7 @@ export function enableMarkVerdict(iqn: string, facts: LunMarkFact[]): EnableMark
       message: `ANAS could not check whether ${unreadable.map(f => `LUN ${f.index} ('${f.name}')`).join(', ')} of ${iqn} `
         + `holds a partially restored image: the restore mark could not be read (${unreadable.map(f => (f.read.state === 'unknown' ? `${f.read.dataset}: ${f.read.reason}` : '')).join('; ')}). `
         + `Enabling is refused until it can be read.`
-        + `${unreadable.map(f => (f.read.state === 'unknown' ? unreadableFileWay(f.read.dataset, 'enabling the target') : '')).join('')}`,
+        + `${unreadable.map(f => (f.read.state === 'unknown' ? unreadableMarkWay(f.read.dataset, 'enabling the target') : '')).join('')}`,
     }
   }
   // review2 D/F1: a running restore onto ANY backing of the target — including

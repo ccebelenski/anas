@@ -22,7 +22,7 @@ import { ensureAhrTargetOrdering } from './ahr-create.js'
 import { classifyPermissionFailure, PBC, pbcPositional, withStateLeftBehind } from './backup-runner.js'
 import { aclNamesRefusal, createLunBackstore, createSparseImage, mapLunIntoTarget, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
 import { normalizePlugin } from './iscsi.js'
-import { capitalize, clearMarkCommand, clearRestoreMark, describeRestoreMark, fileRestoreAgain, isFileMark, jobRecordLifetime, markDataset, markName, markOn as markOnOf, NOT_A_VOLUME, putBackRestoreMark, readRestoreMark, RestoreMarkUnsupportedError, setRestoreMark, unreadableFileWay, unverifiedMark, writingMark } from './restore-mark.js'
+import { capitalize, clearMarkCommand, clearRestoreMark, describeRestoreMark, fileRestoreAgain, isFileMark, jobRecordLifetime, markDataset, markName, markOn as markOnOf, NOT_A_VOLUME, putBackRestoreMark, readRestoreMark, RestoreMarkUnsupportedError, setRestoreMark, unreadableMarkWay, unverifiedMark, writingMark } from './restore-mark.js'
 import { maskSecretValues } from './secret-argv.js'
 
 /**
@@ -195,9 +195,21 @@ const PROGRESS_RE = /^progress\s+(\d+)%\s*\((.*)\)\s*$/
  * fixtures/backup/img-restore-complete-pbc-4.2.0.txt). Matching only the
  * first made every whole-image restore on that client end unverified.
  */
-const COMPLETE_RE = /^restore (?:image )?complete\s*\((.*)\)\s*$/
-/** The exact byte count the second shape carries: `bytes=536870912`. */
-const COMPLETE_BYTES_RE = /(?:^|,\s*)bytes=(\d+)(?:,|$)/
+const COMPLETE_RE = /^restore (image )?complete\s*\((.*)\)\s*$/
+/**
+ * The OLD captured completion shape's inner text (fixtures/backup/, e.g.
+ * img-restore-and-map.txt): `<amount> processed in <t>, average <rate>`. It
+ * states no exact byte count — the amount is display-rounded — and a restore
+ * it reports complete wrote the whole image.
+ */
+const OLD_COMPLETE_INNER_RE = /^\d+(?:\.\d+)? (?:B|KiB|MiB|GiB|TiB|PiB) processed in .+$/
+/**
+ * The 4.2.0 image completion shape's inner text
+ * (fixtures/backup/img-restore-complete-pbc-4.2.0.txt):
+ * `bytes=<N>, duration=<t>, speed=<rate>`. Its byte count is the only one
+ * ANAS reads as exact.
+ */
+const IMAGE_COMPLETE_INNER_RE = /^bytes=(\d+), duration=[^,]+, speed=.+$/
 /** Trailing padding spaces pbc puts on every line. */
 const TRAILING_WS_RE = /\s+$/
 /** The amount processed, at the start of a progress line's parenthesis: `43.939 MiB of 250.001 MiB in 16.1s` (GT-59). */
@@ -211,8 +223,14 @@ export interface RestoreProgress {
   lastLine: string | null
   /** pbc's own `restore complete (…)` line, when it printed one. */
   complete: string | null
-  /** The exact bytes that line states (`bytes=N`, the image shape), when it states them. */
-  completeBytes?: number
+  /**
+   * The byte count the completion line states, or the state of that count:
+   * a number for the 4.2.0 `bytes=N` shape, `'unreadable'` when the line
+   * carries something else where the count belongs (a stated count ANAS
+   * could not read — not the same as stating none), and absent for the older
+   * countless shape. Only the two CAPTURED shapes are read (cr4.lun D-6).
+   */
+  completeBytes?: number | 'unreadable'
   /**
    * A LOWER BOUND on the bytes the last progress line says were processed
    * (`1 MiB of 512 GiB` — review3 3: a `progress 0%` line on a large image
@@ -268,8 +286,14 @@ export function imageBytesWritten(
     return { bytes: descriptorBytes, estimated: false }
   // The line's own count when it states one (the image shape): a count that
   // is not the image's size then fails the size check like a descriptor's.
-  if (exitCode === 0 && progress.complete)
+  // A count the line states but ANAS could not read is unverified, never the
+  // whole image: the number here stands in only so the caller reaches its own
+  // check, which refuses on the state before it looks at this number.
+  if (exitCode === 0 && progress.complete) {
+    if (progress.completeBytes === 'unreadable')
+      return { bytes: imageSize, estimated: false }
     return { bytes: progress.completeBytes ?? imageSize, estimated: false }
+  }
   if (progress.percent !== null) {
     // review3 3: the amount on the line counts too — `progress 0% (1 MiB of
     // 512 GiB in 6.0s)` is 1 MiB written, never 0.
@@ -308,14 +332,32 @@ export function parseRestoreProgress(stderr: string): RestoreProgress {
     const c = line.match(COMPLETE_RE)
     if (c) {
       progress.complete = line
-      const b = c[1].match(COMPLETE_BYTES_RE)
-      if (b && Number.isSafeInteger(Number(b[1])))
-        progress.completeBytes = Number(b[1])
-      else
+      const state = completeBytesState(c[1] !== undefined, c[2])
+      if (state === undefined)
         delete progress.completeBytes
+      else
+        progress.completeBytes = state
     }
   }
   return progress
+}
+
+/**
+ * The byte count a completion line states, or its state: a number for the
+ * 4.2.0 image shape, `'unreadable'` for a completion line that carries
+ * anything else where that count belongs, and `undefined` for the older
+ * countless shape (an amount processed, no exact count). A stated count ANAS
+ * cannot parse proves nothing — it is NOT the countless shape — so the whole
+ * image is never assumed from it (cr4.lun D-6).
+ */
+function completeBytesState(imageShape: boolean, inner: string): number | 'unreadable' | undefined {
+  if (!imageShape)
+    return OLD_COMPLETE_INNER_RE.test(inner) ? undefined : 'unreadable'
+  const m = inner.match(IMAGE_COMPLETE_INNER_RE)
+  if (!m)
+    return 'unreadable'
+  const n = Number(m[1])
+  return Number.isSafeInteger(n) ? n : 'unreadable'
 }
 
 // ---------------------------------------------------------------------------
@@ -463,19 +505,31 @@ export function failedBeforeWriting(stderr: string, signal?: string): boolean {
 
 /**
  * Why an exit-0 stream is not proof of the whole image (review3 6), or null:
- * the descriptor count when it moved and is not the image's size; otherwise
- * the client did not print its `restore complete` line, and ANAS cannot count
- * what the client wrote through its own descriptor (live-proof wave 2).
+ * a completion line whose count ANAS could not read; then the descriptor count
+ * when it moved and is not the image's size; otherwise the client did not
+ * print its `restore complete` line, and ANAS cannot count what the client
+ * wrote through its own descriptor (live-proof wave 2).
  */
-function exitZeroCountGap(descriptorBytes: number, counted: number, imageSize: number, path: string, statedBytes?: number): string | null {
+function exitZeroCountGap(descriptorBytes: number, counted: number, imageSize: number, path: string, progress: RestoreProgress, secret: string): string | null {
+  // A count the line states but ANAS could not read is not "no count" and is
+  // never the image's size: the image is unverified, and the line is quoted so
+  // the operator sees what the client actually printed (cr4.lun D-6).
+  if (progress.completeBytes === 'unreadable')
+    return `its completion line '${maskSecretValues(progress.complete ?? '', [secret])}' states a byte count ANAS could not read`
+  // Complete needs the client's own completion line or ANAS's own count of
+  // the bytes. A last progress line of 100% is neither: the figure is rounded
+  // and the client did not say it finished (cr4.lun review; no captured client
+  // ends that way, so the unproven case fails closed).
+  if (descriptorBytes === 0 && !progress.complete)
+    return 'it did not report the restore complete and ANAS cannot count what it wrote'
   if (counted === imageSize)
     return null
   if (descriptorBytes > 0)
     return `${descriptorBytes} bytes reached ${path}, not the image's ${imageSize}`
   // The completion line's own count (the image shape) that is not the image's
   // size: the client DID report, so the sentence below would be false.
-  if (statedBytes !== undefined)
-    return `its own count is ${statedBytes} bytes, not the image's ${imageSize}`
+  if (progress.completeBytes !== undefined)
+    return `its own count is ${progress.completeBytes} bytes, not the image's ${imageSize}`
   return 'it did not report the restore complete and ANAS cannot count what it wrote'
 }
 
@@ -504,6 +558,18 @@ function unknownAmount(progress: RestoreProgress, where: string, secret: string)
  */
 export function imageRestoreFailure(message: string, code: ImageRestoreFailureCode): Error {
   return Object.assign(new Error(message), { jobErrorCode: code })
+}
+
+/**
+ * The refusal a restore answers when the mark it would have to keep cannot be
+ * read: the route refuses before it mints a confirm and the job refuses under
+ * its lock, in the same words (cr4.lun N). `markOn` is where the mark is (a
+ * volume, or the image file itself), so the way names the right command.
+ */
+export function unreadableMarkRestoreRefusal(markOn: string, reason: string): string {
+  return `ANAS could not read the restore mark ${markName(markOn)} on ${markOn} (${reason}), so it cannot `
+    + `keep the record an earlier restore may have left there. The restore is refused until the mark can be read. `
+    + `Nothing was disabled and nothing was written.${unreadableMarkWay(markOn, 'the restore')}`
 }
 
 /** The classification itself — over the raw stderr, unmasked ({@link explainRestoreFailure}). */
@@ -882,11 +948,8 @@ export async function runImageRestore(
     // that IS read never refuses: restoring again is a way out of it.)
     if (markOn !== null) {
       const read = await readRestoreMark(executor, { path: lun.backingPath })
-      if (read.state === 'unknown') {
-        throw new Error(`ANAS could not read the restore mark ${markName(markOn)} on ${markOn} (${read.reason}), so it cannot `
-          + `keep the record an earlier restore may have left there. The restore is refused until the mark can be read. `
-          + `Nothing was disabled and nothing was written.${unreadableFileWay(markOn, 'the restore')}`)
-      }
+      if (read.state === 'unknown')
+        throw new Error(unreadableMarkRestoreRefusal(markOn, read.reason))
       if (read.state === 'present')
         prior = read
       // cr3.lunrestore.filemark: an image file that cannot carry a mark (no
@@ -924,6 +987,17 @@ export async function runImageRestore(
   // An image file the stream's open emptied although nothing was written.
   let fileEmptied = false
   const nothingWritten = (message: string): Error => fileEmptied ? imageRestoreFailure(message, 'IMAGE_PARTIAL') : new Error(message)
+  /**
+   * The clause before a failed restore's record. A VOLUME is untouched (nothing
+   * was written); an image FILE was emptied when the stream opened it, so it no
+   * longer holds the image it held — the record's next sentence gives its size
+   * (cr4.lun N: a read that could not see that is said as such, never as 0).
+   * Called AFTER {@link restorePriorMark}, which is what re-reads the file and
+   * sets `fileEmptied`.
+   */
+  const wroteNothing = (): string => fileEmptied
+    ? 'The client fetched nothing; the image file was emptied when it was opened for the restore.'
+    : `Nothing was written to ${lun.backingPath}.`
 
   /**
    * Nothing reached the volume: leave its mark as this run found it (review2
@@ -943,8 +1017,8 @@ export async function runImageRestore(
       const size = await readTargetSize(executor, lun)
       if ('error' in size || size.size !== deps.imageSize) {
         fileEmptied = true
-        keepDisabled = `${lun.backingPath} ${'error' in size ? `could not be re-read (${size.error})` : `is ${size.size} bytes now, not ${deps.imageSize}`}: `
-          + `the image file is emptied when it is opened for the restore, so it no longer holds the image it held, and target `
+        keepDisabled = `${lun.backingPath} ${'error' in size ? `could not be re-read (${size.error})` : `is ${size.size} bytes now, not the image's ${deps.imageSize}`}: `
+          + `it no longer holds the image it held, and target `
           + `${target.iqn} stays disabled${markOn !== null ? `; it keeps this restore's mark ${markName(markOn)}` : ''}. `
           + `${capitalize(fileRestoreAgain(lun.backingPath, deps.imageSize))}`
         return ` ${keepDisabled}.`
@@ -1070,9 +1144,11 @@ export async function runImageRestore(
       // back. Every other rejection — a flush that failed after exit 0, a
       // child that died in a way the executor could not report — leaves an
       // unknown amount on the device: the target stays disabled, the mark stays.
+      // (A file is the exception: its open already emptied it, so what it holds
+      // is the empty file, not the image it held — `wroteNothing` says so.)
       if (err instanceof StreamNotStartedError) {
         const kept = await restorePriorMark()
-        throw nothingWritten(`proxmox-backup-client could not be started: ${said}. Nothing was written to ${lun.backingPath}.${kept}`)
+        throw nothingWritten(`proxmox-backup-client could not be started: ${said}. ${wroteNothing()}${kept}`)
       }
       if (err instanceof StreamFlushError) {
         const reason = `the client exited 0, but flushing ${lun.backingPath} to the medium failed (${said})`
@@ -1117,15 +1193,16 @@ export async function runImageRestore(
           + `state: ${wayOut('the image')}. ${detail}`
         throw imageRestoreFailure(partial, 'IMAGE_PARTIAL')
       }
-      // Nothing was written: the volume is as it was, and so is its mark.
+      // Nothing was written: the volume is as it was, and so is its mark. (A
+      // file's open emptied it, which `wroteNothing` says.)
       const kept = await restorePriorMark()
-      throw nothingWritten(`${detail} Nothing was written to ${lun.backingPath}.${kept}`)
+      throw nothingWritten(`${detail} ${wroteNothing()}${kept}`)
     }
 
     // review3 6: an exit 0 whose byte count is not the image's (no `restore
     // complete` line, or a descriptor count that disagrees) is not proof of a
     // complete image: unverified below, never a warning beside a re-enable.
-    const countGap = exitZeroCountGap(r.bytesWritten, bytesWritten, deps.imageSize, lun.backingPath, progress.completeBytes)
+    const countGap = exitZeroCountGap(r.bytesWritten, bytesWritten, deps.imageSize, lun.backingPath, progress, deps.secret)
 
     // ---- Read-back: the disk must still be the same disk -------------------
     updateProgress('verifying the backstore path, unit serial and attributes are unchanged')
@@ -1550,7 +1627,7 @@ export async function runNewLunImageRestore(
         duration = progress.complete
       // review3 6: an exit 0 the byte count does not prove is unverified (below).
       reportedComplete = progress.complete !== null
-      countGap = exitZeroCountGap(r!.bytesWritten, bytesWritten, deps.imageSize, backing.path, progress.completeBytes)
+      countGap = exitZeroCountGap(r!.bytesWritten, bytesWritten, deps.imageSize, backing.path, progress, deps.secret)
 
       if (r!.exitCode !== 0) {
         const detail = explainRestoreFailure(r!.stderr, r!.signal, [deps.secret])

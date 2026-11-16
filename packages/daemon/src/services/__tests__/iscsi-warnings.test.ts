@@ -19,6 +19,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { buildIscsiWarnings, collectIscsiWarnings } from '../iscsi-warnings.js'
+import { restoreMarkDetail } from '../restore-mark.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/iscsi')
@@ -394,6 +395,72 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
       disabledTargets: [{ targetIqn: IQN, tpgTag: 1, lunCount: 1, detail: 'A whole-image restore onto it failed and left it disabled: the image was partially written' }],
     }))
     assert.match(withReason[0].message, /partially written/)
+  })
+
+  // cr4.lun D-7/D-8: the restore-mark cards on a target that is enabled (served
+  // now) and on a disabled one whose Enable would refuse.
+  describe('restore marks that could not be read (cr4.lun D-7/D-8)', () => {
+    const MARK = { v: 1 as const, repo: 'pbs-main', snapshot: 'vm/1/2026-11-14T10:00:00Z', archive: 'drive-scsi0.img', started: '2026-11-14T10:00:00.000Z', state: 'writing' as const }
+    function markRow(o: { state: 'unreadable' | 'interrupted' | 'unverified', what: string, dataset: string, reason?: string, lunIndex?: number }): NonNullable<IscsiHealth['restoreMarks']>[number] {
+      const read = o.state === 'unreadable'
+        ? { state: 'unknown' as const, dataset: o.dataset, reason: o.reason ?? 'zfs get exited with code 1' }
+        : { state: 'present' as const, dataset: o.dataset, raw: JSON.stringify(MARK), mark: MARK }
+      const index = o.lunIndex ?? 0
+      return {
+        backingPath: `/dev/zvol/${o.dataset}`,
+        dataset: o.dataset,
+        backstoreName: `vmdisk${index}`,
+        targetIqn: IQN,
+        tpgTag: 1,
+        lunIndex: index,
+        state: o.state,
+        source: 'mark' as const,
+        mark: o.state === 'unreadable' ? null : MARK,
+        detail: restoreMarkDetail({ state: o.state, source: 'mark', mark: o.state === 'unreadable' ? null : MARK, what: o.what, dataset: o.dataset, read, unreadableDoor: 'enabling the target' }),
+      }
+    }
+
+    it('D-7: an unreadable mark on an ENABLED target is a critical card: served now, the command, then Disable', () => {
+      const w = buildIscsiWarnings(health({
+        restoreMarks: [markRow({ state: 'unreadable', what: `LUN 0 ('vmdisk0') of ${IQN}`, dataset: 'tank/vm1' })],
+      }))
+      const card = w.find(c => /restore state is unknown/.test(c.message))
+      assert.ok(card, 'a card was added for the unreadable mark on an enabled target')
+      assert.equal(card.level, 'critical')
+      assert.equal(card.ref, IQN)
+      assert.match(card.message, /ANAS could not read the restore mark on tank\/vm1 \(zfs get exited with code 1\)/)
+      assert.match(card.message, /Target .* is enabled, so initiators are being served an image whose restore state is unknown\./)
+      assert.match(card.message, /To see what ANAS sees, run 'zfs get -Hp -o value,source anas:restore -- tank\/vm1' as root\./)
+      assert.match(card.message, /Disable the target on the iSCSI screen until the mark can be read\.$/)
+    })
+
+    it('D-8: a disabled target with one interrupted and one unreadable LUN reads as Enable answers: refused until the mark can be read, never a confirm', () => {
+      const w = buildIscsiWarnings(health({
+        disabledTargets: [{ targetIqn: IQN, tpgTag: 1, lunCount: 2 }],
+        restoreMarks: [
+          markRow({ state: 'interrupted', what: `LUN 0 ('vmdisk0') of ${IQN}`, dataset: 'tank/vm1', lunIndex: 0 }),
+          markRow({ state: 'unreadable', what: `LUN 1 ('vmdisk1') of ${IQN}`, dataset: 'tank/vm2', lunIndex: 1 }),
+        ],
+      }))
+      const card = w.find(c => /is disabled/.test(c.message))
+      assert.ok(card)
+      assert.match(card.message, /ANAS could not read the restore mark on tank\/vm2/)
+      assert.match(card.message, /Enable is refused until the mark can be read\./)
+      assert.doesNotMatch(card.message, /asks you to confirm|Restoring the image again is the other way out/)
+    })
+
+    it('D-8: every unreadable LUN is named', () => {
+      const w = buildIscsiWarnings(health({
+        disabledTargets: [{ targetIqn: IQN, tpgTag: 1, lunCount: 2 }],
+        restoreMarks: [
+          markRow({ state: 'unreadable', what: `LUN 0 ('vmdisk0') of ${IQN}`, dataset: 'tank/vm1', lunIndex: 0 }),
+          markRow({ state: 'unreadable', what: `LUN 1 ('vmdisk1') of ${IQN}`, dataset: 'tank/vm2', lunIndex: 1 }),
+        ],
+      }))
+      const card = w.find(c => /is disabled/.test(c.message))
+      assert.match(card?.message ?? '', /LUN 0 \('vmdisk0'\)/)
+      assert.match(card?.message ?? '', /LUN 1 \('vmdisk1'\)/)
+    })
   })
 
   it('foreignChanges are NOT cards — they are informational, not failures', () => {

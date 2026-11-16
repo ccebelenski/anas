@@ -927,7 +927,11 @@ export type IscsiRestoreMarkSource = z.infer<typeof IscsiRestoreMarkSource>
 /** One marked (or unreadable) backing, as the health read found it. */
 export const IscsiRestoreMarkRow = z.object({
   backingPath: z.string(),
-  /** The volume the mark is on; null for an image file (it carries no mark). */
+  /**
+   * The volume the mark is on; null for an image file, whose mark is the
+   * `trusted.anas.restore` extended attribute on the file itself (where the
+   * filesystem it is on supports one).
+   */
   dataset: z.string().nullable(),
   backstoreName: z.string(),
   /** The LUN, when a LUN maps the backstore; absent for an unmapped backstore. */

@@ -168,6 +168,9 @@ describe('cr3 datasets: schedule create over stamped snapshots (H2) and PVE-owne
   it('a create with no stamped snapshot under its target needs no confirm', async () => {
     const res = await create(NIGHTLY)
     assert.equal(res.statusCode, 202, res.body)
+    // The job writes its unit files into the temp directory the teardown
+    // removes: let it finish first.
+    await waitForJob(server, res.json().job.id)
   })
 
   it('L3: the prune leaves this schedule\'s stamped snapshots on an excluded PVE-owned dataset, with a note and a warning outcome', async () => {

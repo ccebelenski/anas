@@ -501,6 +501,25 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
   const imageBody = () => body({ lun: { targetIqn: ANAS_IQN, index: 1 } })
 
   describe('the request shape', () => {
+    // cr4.lun N: a mark the route cannot read refuses the restore HERE, in the
+    // job's own sentence, before a confirm is minted for a run that cannot start.
+    it('the image file\'s restore mark cannot be read: 409 in the job\'s words, no confirm minted, no job', async () => {
+      const { imagePath } = await serveImageLun()
+      const mock = mockOf()
+      mock.prependFixture({ command: GETFATTR, result: { stdout: '', stderr: `getfattr: ${imagePath}: Permission denied\n`, exitCode: 1 } })
+      const res = await restore(imageBody())
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.code, 'CONFLICT')
+      assert.equal(res.body.error!.reason, 'restore-mark-unreadable')
+      const path = imagePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+      assert.match(res.body.error!.message, new RegExp(`^ANAS could not read the restore mark trusted\\.anas\\.restore on ${path} \\(getfattr: ${path}: Permission denied\\), so it cannot keep the record an earlier restore may have left there\\. The restore is refused until the mark can be read\\. Nothing was disabled and nothing was written\\. `))
+      assert.match(res.body.error!.message, /To see what ANAS sees, run 'LC_ALL=C getfattr --absolute-names -e hex -n trusted\.anas\.restore -- /)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined, 'the door refuses before it asks to confirm')
+      const queue = (server as unknown as { jobQueue: JobQueue }).jobQueue
+      assert.deepEqual(queue.list(), [], 'no job was submitted')
+      assertNothingDestructive()
+    })
+
     it('is identity-gated like every other route', async () => {
       await serveAnas()
       const res = await server!.inject({ method: 'POST', url: '/v1/backup/restore', payload: body() })
@@ -2297,7 +2316,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       const r = await repairOverMarkedHole('unreadable')
       const err = (r.json() as { error: { reason: string, message: string } }).error
       assert.equal(err.reason, 'restore-mark')
-      assert.match(err.message, /: ANAS could not read the restore mark on tank\/gone \(cannot get property: pool I\/O is currently suspended\), so it cannot tell whether it holds a partially restored image\. Repair is refused for a LUN whose restore mark could not be read until it can be read\.$/)
+      assert.match(err.message, /: ANAS could not read the restore mark on tank\/gone \(cannot get property: pool I\/O is currently suspended\), so it cannot tell whether it holds a partially restored image\. Repair is refused for a LUN whose restore mark could not be read until it can be read\. To see what ANAS sees, run 'zfs get -Hp -o value,source anas:restore -- tank\/gone' as root\. When its value column holds the mark, or is '-' \(no mark\), ANAS reads the same and Repair is no longer refused for it\.$/)
       assert.doesNotMatch(err.message, /\.\./)
     })
 

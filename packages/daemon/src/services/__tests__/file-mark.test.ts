@@ -24,6 +24,7 @@ import {
   encodeRestoreMark,
   FILE_RESTORE_MARK_ATTR,
   fileMarkGetArgs,
+  fileMarkReadCommand,
   fileMarkRemoveArgs,
   fileMarkSetArgs,
   GETFATTR,
@@ -38,6 +39,9 @@ import {
   RestoreMarkUnsupportedError,
   SETFATTR,
   setRestoreMark,
+  shellQuote,
+  unreadableMarkWay,
+  volumeMarkReadCommand,
 } from '../restore-mark.js'
 import { answerAs, capturedCase, capturedCases, capturedHex, enoent, hexOf, withFileMarks } from './file-mark-fixtures.js'
 
@@ -258,6 +262,26 @@ describe('cr3.lunrestore.filemark — where a mark lives, by the backing path', 
     assert.deepEqual([markName('tank/vol1'), markName('/tank/images/lun0.raw')], ['anas:restore', FILE_RESTORE_MARK_ATTR])
     assert.equal(clearMarkCommand('tank/vol1'), 'zfs inherit anas:restore tank/vol1')
     assert.equal(clearMarkCommand('/tank/images/lun0.raw'), 'setfattr -x trusted.anas.restore /tank/images/lun0.raw')
+  })
+
+  // cr4.lun N: a path or dataset ANAS prints inside an operator command is
+  // quoted with one helper, so a copy-paste names the same object. Bare when it
+  // needs no quoting (the pins above), single-quoted otherwise.
+  it('every path or dataset inside a printed command is shell-quoted: a space or an apostrophe no longer splits it', () => {
+    assert.equal(shellQuote('tank/vol1'), 'tank/vol1')
+    assert.equal(shellQuote('/tank/images/lun0.raw'), '/tank/images/lun0.raw')
+    assert.equal(shellQuote('/mnt/my images/lun0.img'), `'/mnt/my images/lun0.img'`)
+    assert.equal(shellQuote(`/mnt/it's/lun.img`), `'/mnt/it'\\''s/lun.img'`)
+    // The commands an operator copies.
+    assert.equal(clearMarkCommand('/mnt/my images/lun0.img'), `setfattr -x trusted.anas.restore '/mnt/my images/lun0.img'`)
+    assert.equal(clearMarkCommand('tank/my pool'), `zfs inherit anas:restore 'tank/my pool'`)
+    assert.equal(fileMarkReadCommand('/mnt/my images/lun0.img'), `LC_ALL=C getfattr --absolute-names -e hex -n trusted.anas.restore -- '/mnt/my images/lun0.img'`)
+    assert.equal(volumeMarkReadCommand('tank/vol1'), 'zfs get -Hp -o value,source anas:restore -- tank/vol1')
+    assert.equal(volumeMarkReadCommand('tank/my pool'), `zfs get -Hp -o value,source anas:restore -- 'tank/my pool'`)
+    // The way a diagnostic prints it: the whole delimited command copies in
+    // one piece — `"` around a command that carries `'`, `'` otherwise.
+    assert.match(unreadableMarkWay('/mnt/my images/lun0.img', 'enabling the target'), /run "LC_ALL=C getfattr --absolute-names -e hex -n trusted\.anas\.restore -- '\/mnt\/my images\/lun0\.img'" as root\./)
+    assert.match(unreadableMarkWay('/tank/images/lun0.raw', 'enabling the target'), /run 'LC_ALL=C getfattr --absolute-names -e hex -n trusted\.anas\.restore -- \/tank\/images\/lun0\.raw' as root\./)
   })
 
   it('a block device that is not a volume reads unsupported without running anything', async () => {

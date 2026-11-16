@@ -43,6 +43,24 @@ describe('the image completion line of proxmox-backup-client 4.2.0', () => {
     assert.deepEqual(imageBytesWritten(0, p, IMAGE, 0), { bytes: IMAGE, estimated: false })
   })
 
+  it('a completion line carrying a count ANAS cannot read is a state, never "no count" (cr4.lun D-6)', () => {
+    // Only the two CAPTURED shapes count (fixtures/backup/): the countless
+    // old line and the 4.2.0 `bytes=N` line. A line that puts anything else
+    // where the count belongs states a count ANAS could not read, which is
+    // not the same as the old line that states none.
+    for (const inner of [
+      'bytes=1048576 duration=1s', // no comma after the count
+      'bytes=1.0M, duration=1s, speed=1MB/s', // not a byte integer
+      'bytes=-5, duration=1s, speed=1MB/s',
+      'xbytes=5, duration=1s, speed=1MB/s',
+      'bytes=99999999999999999999, duration=1s, speed=1MB/s', // beyond a safe integer
+    ]) {
+      const p = parseRestoreProgress(`restore image complete (${inner})    \r`)
+      assert.equal(p.complete, `restore image complete (${inner})`, inner)
+      assert.equal(p.completeBytes, 'unreadable', inner)
+    }
+  })
+
   it('a line that only resembles it is not a completion', () => {
     for (const line of ['restore image incomplete (bytes=1)', 'xrestore image complete (bytes=1)', 'restore image complete', 'Error: restore image complete (bytes=1)'])
       assert.equal(parseRestoreProgress(`${line}\r`).complete, null, line)

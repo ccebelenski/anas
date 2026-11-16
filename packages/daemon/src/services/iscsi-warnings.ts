@@ -242,7 +242,14 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
       + `(LIO's enable flag is per target, not per LUN).`
     const said = t.detail ? ` ${t.detail}` : ''
     let tail: string
-    if (running) {
+    if (unreadable.length > 0) {
+      // The Enable door refuses an unreadable mark before it looks at any
+      // other state (restore-mark.ts, enableMarkVerdict), so this sentence is
+      // first and names every unreadable LUN (cr4.lun D-8): a partial LUN
+      // beside it does not change what Enable answers.
+      tail = ` ${unreadable.map(m => m.detail).join(' ')} Enable is refused until the mark can be read.${said}`
+    }
+    else if (running) {
       // (a) a restore is running onto it: progress, never an invitation to
       // Enable — and no promise about the end (review2 F1): the restore
       // enables only what it disabled, only over an image it proved.
@@ -270,9 +277,6 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
         + `to initiators: Enable on the iSCSI screen asks you to confirm${marked > 0 ? ` and removes the restore mark${marked === 1 ? '' : 's'}` : ''}.`
         + `${again}${said}`
     }
-    else if (unreadable.length > 0) {
-      tail = ` ${unreadable.map(m => m.detail).join(' ')} Enable is refused until the mark can be read.${said}`
-    }
     else {
       tail = `${said} Enable it from the iSCSI screen when you are ready.`
     }
@@ -281,9 +285,24 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
 
   // cr3.lunrestore: a LUN whose volume carries an interrupted or unverified
   // restore mark on a target that is ENABLED (switched on by hand): initiators
-  // are being served that image now — critical.
+  // are being served that image now — critical. cr4.lun D-7: a mark that could
+  // not be READ is the same severity — serving an image whose restore state is
+  // unknown — and its row carries the command that shows ANAS what the read
+  // returned, for a volume and an image file alike.
   for (const m of marks) {
-    if (!m.targetIqn || disabledIqns.has(m.targetIqn) || (m.state !== 'interrupted' && m.state !== 'unverified'))
+    if (!m.targetIqn || disabledIqns.has(m.targetIqn))
+      continue
+    if (m.state === 'unreadable') {
+      warnings.push({
+        level: 'critical',
+        category: 'iscsi',
+        message: `${m.detail} Target ${m.targetIqn} is enabled, so initiators are being served an image whose restore state is unknown. `
+          + `Disable the target on the iSCSI screen until the mark can be read.`,
+        ref: m.targetIqn,
+      })
+      continue
+    }
+    if (m.state !== 'interrupted' && m.state !== 'unverified')
       continue
     warnings.push({
       level: 'critical',
