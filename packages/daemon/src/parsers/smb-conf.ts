@@ -51,6 +51,11 @@ function trimSamba(s: string): string {
   return s.replace(LEADING_WS_RE, '').replace(TRAILING_WS_RE, '')
 }
 
+/** Trim Samba's whitespace (ASCII only) from the end. */
+function trimEndSamba(s: string): string {
+  return s.replace(TRAILING_WS_RE, '')
+}
+
 /**
  * Samba's line reader keeps a whitespace character only when the character
  * before it is not whitespace: `path = /srv/My  Data` serves `/srv/My Data`,
@@ -250,9 +255,13 @@ export function normalizeKey(name: string): string {
 /**
  * One LOGICAL line as Samba's reader sees it: a comment is one physical line
  * (a trailing backslash does not continue it), while a header or a parameter
- * line runs on through every physical line that ends in a backslash — the
- * backslash dropped, the next line appended — so a line after `path = /x \`
- * is part of the value even when it reads `[next]` or `# not a comment`.
+ * line runs on through every physical line whose last non-blank character is
+ * a backslash — the backslash dropped, the next line appended — so a line
+ * after `path = /x \` is part of the value even when it reads `[next]` or
+ * `# not a comment`. A backslash followed only by blanks before the newline
+ * IS at the line end: `comment = Storage \ ` + `path = /srv/a` is ONE
+ * parameter to Samba (testparm 4.22.11 on a PVE 9 node, cr4.conf D-4; the
+ * same rule the write gate applies in shared/formats/smb-conf.ts).
  */
 interface LogicalLine {
   kind: 'comment' | 'header' | 'param'
@@ -280,8 +289,8 @@ function logicalLines(lines: string[], from: number, to: number): LogicalLine[] 
     }
     let joined = content(lines[i])
     let last = i
-    while (joined.endsWith('\\') && last + 1 < to) {
-      joined = joined.slice(0, -1) + content(lines[last + 1])
+    while (last + 1 < to && trimEndSamba(joined).endsWith('\\')) {
+      joined = trimEndSamba(joined).slice(0, -1) + content(lines[last + 1])
       last++
     }
     const text = trimSamba(collapseSamba(joined))

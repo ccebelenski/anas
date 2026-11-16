@@ -256,6 +256,16 @@ function rec(fields) {
   check('shares: a real 0 renders 0', smb(0) === '0', smb(0))
   check('shares: a real count renders the count', /3/.test(smb(3)), smb(3))
 
+  // cr4.conf fold 6: the daemon's row warnings reach the NFS row as a tag
+  // whose tooltip carries the sentence.
+  const pathCol = nodes.find(n => n.dataIndex === 'path' && typeof n.renderer === 'function')
+  const warned = pathCol.renderer('/srv/nfs/media', {}, rec({
+    pathState: 'exists',
+    raw: { warnings: ['/srv/nfs/media is on lines 3 and 6 of /etc/exports. <merge> & "hand".'] },
+  }))
+  check('shares: a row warning renders as a tag with the sentence in its tooltip', /anas-share-warning/.test(warned) && warned.includes(encode('<merge> & "hand".')), warned)
+  check('shares: a row without warnings carries no warning tag', !/anas-share-warning/.test(pathCol.renderer('/srv/nfs/media', {}, rec({ pathState: 'exists', raw: {} }))))
+
   // cr3.shares (review): a name ANAS cannot address is marked, and offers nothing.
   const nameCol = nodes.find(n => n.dataIndex === 'name' && typeof n.renderer === 'function' && n.text === 'Name')
   const marked = nameCol.renderer(' public', {}, rec({ protocol: 'smb', raw: { unmanagedName: true } }))

@@ -330,6 +330,14 @@ export const NfsExport = z.object({
   pathExists: z.boolean().optional(),
   /** The read-time path check, all four outcomes (cr.35). Absent from an old daemon. */
   pathState: SharePathState.optional(),
+  /**
+   * What a read of /etc/exports noticed beyond the export itself (cr4.conf
+   * D-2): today only that the path is on more than one line, with the line
+   * numbers — the verbs that change or remove a line refuse until one line
+   * is left, and the operator needs the numbers to pick which line to delete.
+   * Absent when the file says nothing worth carrying (one line).
+   */
+  warnings: z.array(z.string()).optional(),
 })
 export type NfsExport = z.infer<typeof NfsExport>
 

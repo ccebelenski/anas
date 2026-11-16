@@ -383,7 +383,20 @@
             html += pathTag('anas-share-unreadable', 'path unreadable',
                 UNREADABLE_TIP, 'var(--anas-muted,gray)');
         }
-        return html;
+        return html + renderRowWarnings(rec);
+    }
+
+    // Row warnings the daemon sends (cr4.conf D-2: an NFS path exported on
+    // more than one line cannot be edited). The sentence rides the tag's
+    // tooltip — the same shape as the path-state tags beside it.
+    function renderRowWarnings(rec) {
+        var raw = rec ? rec.get('raw') : null;
+        var warnings = raw && raw.warnings;
+        if (!warnings || !warnings.length) {
+            return '';
+        }
+        return pathTag('anas-share-warning', 'warning', warnings.join(' '),
+            'var(--anas-warn,#b06a12)');
     }
 
     // Key attributes summary. SMB: read-only/guest/valid-users; NFS: client

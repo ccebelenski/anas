@@ -17,6 +17,7 @@ import {
   getMount,
   hasMount,
   inlineCommentIndex,
+  linesFor,
   mountOptionTokens,
   parseFstab,
   parseFstabDoc,
@@ -422,6 +423,11 @@ describe('surgical edits touch only the targeted line', () => {
     assert.equal(serializeMountLine(entry), 'UUID=xyz /mnt/new ext4 nofail 0 2')
     const removed = removeMount(added, '/mnt/new')
     assert.equal(removed, before) // adding then removing is a no-op on the bytes
+  })
+
+  it('removeMount matches a trailing-slash spelling of the line\'s mountpoint', () => {
+    const text = '/dev/srv1 /mnt/dup/ ext4 defaults 0 0\n/dev/srv2 /mnt/other ext4 ro 0 0\n'
+    assert.equal(removeMount(text, '/mnt/dup'), '/dev/srv2 /mnt/other ext4 ro 0 0\n')
   })
 })
 
@@ -1078,5 +1084,32 @@ describe('cr.52s-e — the direct mount carries only kernel/helper options; the 
     assert.deepEqual(directMountOptionArgs(entryFor('ext4', 'auto,comment=anas')), [])
     // …while the LINE keeps them all.
     assert.equal(mountOptionTokens(entryFor('ext4', 'auto,comment=anas')), 'auto,comment=anas')
+  })
+})
+
+// --- cr4.conf D-21 --------------------------------------------------------------------
+
+describe('linesFor: every line a mountpoint is on (cr4.conf D-21)', () => {
+  it('names every line a duplicated mountpoint sits on', () => {
+    const text = '# a comment\n/dev/srv1 /mnt/dup ext4 defaults 0 0\n/dev/srv2 /mnt/other ext4 nofail 0 0\n/dev/srv3 /mnt/dup ext4 ro 0 0\n'
+    assert.deepEqual(linesFor(text, '/mnt/dup'), [2, 4])
+  })
+
+  it('counts a disabled ANAS line too — the verbs act on it like any entry', () => {
+    const disabled = disableMount('/dev/srv1 /mnt/dup ext4 defaults,nofail 0 0\n', '/mnt/dup')
+    assert.deepEqual(
+      linesFor(`${disabled}/dev/srv2 /mnt/dup ext4 defaults,nofail 0 0\n`, '/mnt/dup'),
+      [1, 2],
+    )
+  })
+
+  it('is empty for a mountpoint the file has no line for', () => {
+    assert.deepEqual(linesFor(loadFixture('fstab-handedited-sample'), '/mnt/nowhere-at-all'), [])
+  })
+
+  it('counts `/mnt/dup` and `/mnt/dup/` as one mountpoint — a trailing slash is noise', () => {
+    const text = '/dev/srv1 /mnt/dup ext4 defaults 0 0\n/dev/srv2 /mnt/dup/ ext4 ro 0 0\n'
+    assert.deepEqual(linesFor(text, '/mnt/dup'), [1, 2])
+    assert.deepEqual(linesFor(text, '/mnt/dup/'), [1, 2])
   })
 })

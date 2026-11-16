@@ -8,7 +8,9 @@ import {
   addExport,
   getExport,
   hasExport,
+  linesFor,
   parseExports,
+  parseExportsByPath,
   parseExportsDoc,
   removeExport,
   replaceExport,
@@ -146,6 +148,26 @@ describe('surgical edits — remove', () => {
     const before = loadFixture()
     assert.equal(removeExport(before, '/not/exported'), before)
   })
+
+  it('matches a trailing-slash spelling of the line\'s path', () => {
+    const text = '/srv/a/ host1(rw)\n/srv/b host2(ro)\n'
+    assert.equal(removeExport(text, '/srv/a'), '/srv/b host2(ro)\n')
+  })
+
+  it('removes EVERY line for the path — a path on several lines is one export', () => {
+    const text = '/srv/a host1(rw)\n/srv/b host2(ro)\n/srv/a/ host3(ro)\n'
+    assert.equal(removeExport(text, '/srv/a'), '/srv/b host2(ro)\n')
+  })
+})
+
+describe('parseExportsByPath — one row per path (cr4.conf D-2)', () => {
+  it('folds the clients of every line for a path, in file order, under the first spelling', () => {
+    const text = '/srv/a host1(rw)\n/srv/b host2(ro)\n/srv/a/ host3(ro)\n'
+    assert.deepEqual(parseExportsByPath(text), [
+      { path: '/srv/a', clients: [{ spec: 'host1', options: ['rw'] }, { spec: 'host3', options: ['ro'] }] },
+      { path: '/srv/b', clients: [{ spec: 'host2', options: ['ro'] }] },
+    ])
+  })
 })
 
 describe('serializeExportLine', () => {
@@ -251,5 +273,41 @@ describe('comments and untouched edits (cr3.shares, review)', () => {
       replaceExport(text, '/srv/a', { path: '/srv/a', clients: [{ spec: 'host9', options: ['ro'] }] }),
       '/srv/a host9(ro) # trailing note\n/srv/b host2(ro)\n',
     )
+  })
+})
+
+// --- cr4.conf D-2 ---------------------------------------------------------------------
+
+describe('linesFor: every line a path is exported on (cr4.conf D-2)', () => {
+  it('names the line each fixture export starts on', () => {
+    const text = loadFixture()
+    const lines = text.split('\n')
+    for (const exp of parseExports(text)) {
+      const at = linesFor(text, exp.path)
+      assert.equal(at.length, 1, exp.path)
+      // The named line is the line `grep -n` finds for the path.
+      assert.ok(lines[at[0] - 1].includes(exp.path), `${exp.path}: ${lines[at[0] - 1]}`)
+    }
+  })
+
+  it('is empty for a path the file does not export', () => {
+    assert.deepEqual(linesFor(loadFixture(), '/srv/nothing-here'), [])
+  })
+
+  it('names both lines when a path is exported twice', () => {
+    const text = '# header\n/srv/dup host1(rw)\n/srv/other host2(ro)\n\n/srv/dup host3(ro)\n'
+    assert.deepEqual(linesFor(text, '/srv/dup'), [2, 5])
+  })
+
+  it('counts a folded continuation entry once, at the line it starts on', () => {
+    const text = '/srv/a host1(rw) \\\n    host2(ro)\n/srv/b host3(ro)\n/srv/a host4(ro)\n'
+    assert.deepEqual(linesFor(text, '/srv/a'), [1, 4])
+    assert.deepEqual(linesFor(text, '/srv/b'), [3])
+  })
+
+  it('counts `/srv/a` and `/srv/a/` as one path — a trailing slash is noise', () => {
+    const text = '/srv/a host1(rw)\n/srv/a/ host2(ro)\n'
+    assert.deepEqual(linesFor(text, '/srv/a'), [1, 2])
+    assert.deepEqual(linesFor(text, '/srv/a/'), [1, 2])
   })
 })

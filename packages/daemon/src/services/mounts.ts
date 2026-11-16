@@ -24,14 +24,15 @@ import { constants as FS_CONSTANTS } from 'node:fs'
 import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { basename, dirname, join, normalize, resolve } from 'node:path'
-import { CIFS_CREDENTIAL_OPTION_KEYS, fstabOptionTokens, MountCifsSec, MountExtraOptions, MountNfsSec, nofailDefeatingOption, normalizeMountTarget } from '@anas/shared'
+import { CIFS_CREDENTIAL_OPTION_KEYS, fstabOptionTokens, MountCifsSec, MountExtraOptions, MountNfsSec, nofailDefeatingOption, normalizeMountTarget, sameConfigPath } from '@anas/shared'
 import { classifyKind, effectiveMountAt, effectiveMounts, isIgnoredMount, optionsReadOnly, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
-import { cifsAuthToken, cifsCredentialTokenScan, getMount, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
+import { cifsAuthToken, cifsCredentialTokenScan, getMount, linesFor, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { PVE_STORAGE_CFG, readPveMountPathsStrict } from '../parsers/pve-storage.js'
 import { zodIssue } from '../validation.js'
 import { ahrLvPath } from './ahr-paths.js'
+import { duplicateKeySentence } from './config-duplicates.js'
 import { readConfig, writeFileAtomic } from './config-writer.js'
 import { liveAtTarget } from './mount-match.js'
 import { execSystemctlShow } from './unit-run-status.js'
@@ -272,6 +273,16 @@ export function buildInventory(
   ahrSpecs: Set<string> = new Set(),
 ): MountSummary[] {
   const rows = buildBaseInventory(findmntText ?? '', fstabText, pveMountPaths ?? new Map(), ahrSpecs)
+  // cr4.conf D-21: a mountpoint on more than one fstab line reads fine but NO
+  // verb can touch it (the first-match editors change one line and leave the
+  // other) — every row for it carries the sentence with the line numbers, the
+  // same the verbs refuse with. The numbers come from the parser's own
+  // `linesFor`, so the count is never a second scan of the file.
+  for (const row of rows) {
+    const lines = linesFor(fstabText, row.mountpoint)
+    if (lines.length > 1)
+      row.warnings = [...(row.warnings ?? []), duplicateKeySentence(row.mountpoint, lines, '/etc/fstab')]
+  }
   // cr3.mounts follow-up (4): an UNREADABLE storage.cfg (`null`, the strict
   // reader's answer) leaves PVE ownership unknown — said on every row that is
   // not already PVE's by its fixed path (/mnt/pve needs no file).
@@ -1157,19 +1168,32 @@ export async function restoreFileBytes(path: string, bytes: Buffer, mode: number
 }
 
 /**
- * Read a credentials file's non-secret metadata; { set:false } if absent.
+ * Read a credentials file's non-secret metadata.
+ *
  * cr3.mounts review 4 (N3): a file mount.cifs would read differently from
  * ANAS is `{ set: true, unknown: true }` — its account is never guessed.
+ *
+ * cr4.conf D-22: the same honesty for every open that failed. `set` answers
+ * the LINE's question — does it carry a `credentials=` option — and the
+ * caller knows that from the entry, never from this read; a read that could
+ * not see the file answers nothing about the account. ENOENT says the named
+ * path is not there (`{ set: true, missing: true }` — the session-mount
+ * fallback to the legacy file name needs that distinction from a real
+ * refusal); every other open failure (a directory, a symlink loop, a
+ * hostile mode) is `{ set: true, unknown: true }`. `{ set: false }` never
+ * leaves this function.
  */
 export async function readCredentialsMeta(
   path: string,
-): Promise<{ set: boolean, username?: string, domain?: string, unknown?: true }> {
+): Promise<{ set: boolean, missing?: true, username?: string, domain?: string, unknown?: true }> {
   let bytes: Buffer
   try {
     bytes = await readFile(path)
   }
-  catch {
-    return { set: false }
+  catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT'
+      ? { set: true, missing: true }
+      : { set: true, unknown: true }
   }
   try {
     return { set: true, ...parseCredentialsMeta(credentialsFileText(path, bytes)) }
@@ -1924,6 +1948,11 @@ export async function buildMountDetail(
   const effective = effectiveMountNode(findmntText, mountpoint)
 
   const detail: MountDetail = { ...row, health, warnings: [] }
+  // cr4.conf D-21: the one-rule-for-both-files warning, the same sentence the
+  // list rows carry and the verbs refuse with, from the parser's own model.
+  const dupLines = linesFor(fstabText, mountpoint)
+  if (dupLines.length > 1)
+    detail.warnings.push(duplicateKeySentence(mountpoint, dupLines, '/etc/fstab'))
   if (capacity)
     detail.capacity = capacity
   if (entry) {
@@ -1960,18 +1989,28 @@ export async function buildMountDetail(
     }
     else if (!entry) {
       fileMeta = await readCredentialsMeta(credsFilePath(opts.credsDir, mountpoint))
-      if (!fileMeta.set)
+      // cr4.conf D-22: the fallback to the legacy file name belongs to
+      // ABSENCE (`missing`) only — a file that exists but could not be
+      // opened is a fact about THAT path, never a hint to look elsewhere.
+      if (fileMeta.missing)
         fileMeta = await readCredentialsMeta(join(opts.credsDir, legacyCredsFileName(mountpoint)))
     }
-    if (fileMeta?.unknown) {
+    // cr4.conf D-22: a line that NAMED a file the read could not see —
+    // uninterpretable (N3), unopenable, or simply absent — carries
+    // credentials with an unknown account; `set: false` stays reserved for
+    // a line that names no file.
+    if (fileMeta?.unknown || (fileMeta?.missing && entry !== undefined)) {
       detail.credentials = { set: true, unknown: true }
     }
     else {
+      // A session mount whose ANAS file names (current and legacy) are both
+      // absent keeps the truthful `set: false` — that absence WAS seen.
+      const open = fileMeta !== undefined && fileMeta.set && !fileMeta.missing
       const account: CifsAccount = entry
-        ? effectiveCifsAccount(entry, fstabText, fileMeta?.set ? fileMeta : null)
+        ? effectiveCifsAccount(entry, fstabText, fileMeta !== undefined && fileMeta.set && !fileMeta.missing ? fileMeta : null)
         : { ...(fileMeta?.username !== undefined ? { username: fileMeta.username } : {}), ...(fileMeta?.domain !== undefined ? { domain: fileMeta.domain } : {}) }
       detail.credentials = {
-        set: (fileMeta?.set ?? false) || hasInlineCredentials(entry),
+        set: open || hasInlineCredentials(entry),
         ...(account.username ? { username: account.username } : {}),
         ...(account.domain ? { domain: account.domain } : {}),
       }
@@ -1990,7 +2029,7 @@ export function fstabLineFor(fstabText: string, mountpoint: string): string | un
   // second splitter that can disagree with it. A legacy `#ANAS ` line is a
   // comment to every other reader of this file, so it is skipped here as before.
   for (const line of parseFstabDoc(fstabText)) {
-    if (line.kind === 'entry' && line.entry.mountpoint === mountpoint && !line.raw.startsWith('#'))
+    if (line.kind === 'entry' && sameConfigPath(line.entry.mountpoint, mountpoint) && !line.raw.startsWith('#'))
       return line.raw
   }
   return undefined
@@ -2778,11 +2817,6 @@ export async function removeMountpointLeafThroughOpenedParent(mountpoint: string
   }
 }
 
-/** Does the fstab already define this mountpoint? */
-export function fstabHasMount(fstabText: string, mountpoint: string): boolean {
-  return parseFstab(fstabText).some(e => e.mountpoint === mountpoint)
-}
-
 /**
  * Story cr.39 (WAVE3-DESIGN §3.3, Mount row): the REVISION of a mount's
  * fstab line — a sha256 of its raw bytes, whichever form it is in (active, the
@@ -2792,6 +2826,6 @@ export function fstabHasMount(fstabText: string, mountpoint: string): boolean {
  * of its old self. Null when the file has no line for the mountpoint.
  */
 export function fstabLineRevision(fstabText: string, mountpoint: string): string | null {
-  const line = parseFstabDoc(fstabText).find(l => l.kind === 'entry' && l.entry.mountpoint === mountpoint)
+  const line = parseFstabDoc(fstabText).find(l => l.kind === 'entry' && sameConfigPath(l.entry.mountpoint, mountpoint))
   return line ? createHash('sha256').update(line.raw).digest('hex') : null
 }

@@ -1,5 +1,5 @@
 import type { CifsCredentialKeyKind, MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
-import { cifsCredentialKeyKind, escapeFstabField, escapeFstabOptionValue, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, unescapeFstabField, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN, X_SYSTEMD_AUTOMOUNT_TOKEN } from '@anas/shared'
+import { cifsCredentialKeyKind, escapeFstabField, escapeFstabOptionValue, MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec, sameConfigPath, unescapeFstabField, X_ANAS_DISABLED_AUTOMOUNT_TOKEN, X_ANAS_DISABLED_KEPT_TOKEN, X_ANAS_DISABLED_TOKEN, X_SYSTEMD_AUTOMOUNT_TOKEN } from '@anas/shared'
 
 /** Recognized enum-value sets, mirrored from the shared schema (never drift). */
 const CIFS_CACHE_VALUES = new Set<string>(MountCifsCache.options)
@@ -167,12 +167,33 @@ export function parseFstab(text: string): MountEntry[] {
 
 /** The entry for `mountpoint`, or undefined if the file has none. */
 export function getMount(text: string, mountpoint: string): MountEntry | undefined {
-  return parseFstab(text).find(e => e.mountpoint === mountpoint)
+  return parseFstab(text).find(e => sameConfigPath(e.mountpoint, mountpoint))
 }
 
 /** Is `mountpoint` present in the file as an entry line? */
 export function hasMount(text: string, mountpoint: string): boolean {
-  return parseFstabDoc(text).some(l => l.kind === 'entry' && l.entry.mountpoint === mountpoint)
+  return parseFstabDoc(text).some(l => l.kind === 'entry' && sameConfigPath(l.entry.mountpoint, mountpoint))
+}
+
+/**
+ * The line numbers (1-based, the number `grep -n` prints) of every entry line
+ * for `mountpoint` — a DISABLED line counts too, because the enable/disable/
+ * remove verbs act on it like any entry. cr4.conf D-21: the verbs that change
+ * or remove a line refuse when this returns more than one number, and the
+ * reads show these same numbers, so the count comes from the file's own
+ * parser and never from a second scan of the text. A trailing-slash spelling
+ * names the same mountpoint (`sameConfigPath`), so `/mnt/x` and `/mnt/x/` are
+ * two lines for one mount.
+ */
+export function linesFor(text: string, mountpoint: string): number[] {
+  const out: number[] = []
+  let line = 0
+  for (const entry of parseFstabDoc(text)) {
+    line++
+    if (entry.kind === 'entry' && sameConfigPath(entry.entry.mountpoint, mountpoint))
+      out.push(line)
+  }
+  return out
 }
 
 /**
@@ -201,7 +222,7 @@ export function addMount(text: string, entry: MountEntry): string {
 export function replaceMount(text: string, mountpoint: string, entry: MountEntry): string {
   const doc = parseFstabDoc(text)
   for (const line of doc) {
-    if (line.kind === 'entry' && line.entry.mountpoint === mountpoint) {
+    if (line.kind === 'entry' && sameConfigPath(line.entry.mountpoint, mountpoint)) {
       const comment = line.trailingComment ? `   ${line.trailingComment}` : ''
       line.raw = line.disabled
         ? disabledSerialization(entry, comment)
@@ -293,7 +314,7 @@ function refreshEntry(line: FstabDocLine & { kind: 'entry' }): void {
 export function addMountOption(text: string, mountpoint: string, token: string): string {
   const doc = parseFstabDoc(text)
   for (const line of doc) {
-    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
+    if (line.kind !== 'entry' || !sameConfigPath(line.entry.mountpoint, mountpoint))
       continue
     const ops = entryOptionsOps(line)
     if (!ops)
@@ -318,7 +339,7 @@ export function addMountOption(text: string, mountpoint: string, token: string):
  */
 export function carriesAutomount(text: string, mountpoint: string): boolean {
   for (const line of parseFstabDoc(text)) {
-    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
+    if (line.kind !== 'entry' || !sameConfigPath(line.entry.mountpoint, mountpoint))
       continue
     const ops = entryOptionsOps(line)
     return ops !== null && ops.opts.split(',').some(t => isLiveAutomountToken(t) || isParkedAutomountToken(t))
@@ -354,7 +375,7 @@ export interface CifsCredentialTokens {
  */
 export function cifsCredentialTokenScan(text: string, mountpoint: string): CifsCredentialTokens | undefined {
   for (const line of parseFstabDoc(text)) {
-    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
+    if (line.kind !== 'entry' || !sameConfigPath(line.entry.mountpoint, mountpoint))
       continue
     const ops = entryOptionsOps(line)
     if (!ops)
@@ -407,7 +428,7 @@ export function carriesInlineSecret(entry: MountEntry): boolean {
 /** Remove ONLY the line for `mountpoint` (active or disabled). No-op if absent. */
 export function removeMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
-  const idx = doc.findIndex(l => l.kind === 'entry' && l.entry.mountpoint === mountpoint)
+  const idx = doc.findIndex(l => l.kind === 'entry' && sameConfigPath(l.entry.mountpoint, mountpoint))
   if (idx !== -1)
     doc.splice(idx, 1)
   return serializeFstabDoc(doc)
@@ -571,7 +592,7 @@ function disabledSerialization(entry: MountEntry, comment: string): string {
 export function disableMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
   for (const line of doc) {
-    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
+    if (line.kind !== 'entry' || !sameConfigPath(line.entry.mountpoint, mountpoint))
       continue
     if (!line.disabled) {
       const tokens = disabledTokens(line.entry)
@@ -620,7 +641,7 @@ export function disableMount(text: string, mountpoint: string): string {
 export function enableMount(text: string, mountpoint: string): string {
   const doc = parseFstabDoc(text)
   for (const line of doc) {
-    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint || !line.disabled)
+    if (line.kind !== 'entry' || !sameConfigPath(line.entry.mountpoint, mountpoint) || !line.disabled)
       continue
     if (line.raw.startsWith(ANAS_MARKER)) {
       line.raw = line.raw.slice(ANAS_MARKER.length)
@@ -640,10 +661,16 @@ export function enableMount(text: string, mountpoint: string): string {
       // Same rule as classifyOptions: any disable token that is not the
       // kept-noauto form is the bare form.
       const hasBare = tokens.some(t => isDisableToken(t) && trimBlanks(t).toLowerCase() !== X_ANAS_DISABLED_KEPT_TOKEN)
-      // Removal matches the TRIMMED token so a hand-spaced token still goes, but
-      // every SURVIVING token keeps its exact bytes — a comma-separated
-      // `defaults, nofail` the operator wrote stays `defaults, nofail`, so the
-      // round trip is byte-identical even with hand spacing.
+      // Removal matches the TRIMMED token so a hand-typed token still goes,
+      // and every SURVIVING token keeps its exact bytes: a line ANAS disabled
+      // itself comes back byte-identical. A blank INSIDE the options field is
+      // a limit of that promise. libmount ends the options field at the first
+      // blank, so a hand-written `defaults, nofail` parses as options
+      // `defaults` with `nofail` shifted into the next field (and a hand
+      // disable token written past the blank is never read as a disable
+      // token at all); a rewrite that then touches the line drops the empty
+      // token the cut leaves behind — measured on the parser,
+      // `defaults, nofail 0 0` comes back `defaults nofail 0 0`.
       rewriteEntryOptions(line, (opts) => {
         const out: string[] = []
         for (const t of opts.split(',').filter(o => o !== '')) {

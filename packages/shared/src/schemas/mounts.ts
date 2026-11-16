@@ -445,6 +445,15 @@ export const MountSummary = z.object({
    * strictly); the panel shows the row hands-off. Absent when the file was read.
    */
   pveOwnershipUnknown: z.boolean().optional(),
+  /**
+   * What a read of /etc/fstab noticed beyond the entry itself (cr4.conf
+   * D-21, additive; MountDetail overrides this key REQUIRED): today only
+   * that the mountpoint is on more than one fstab line, with the line
+   * numbers — the verbs that change or remove a line refuse until one line
+   * is left, and the operator needs the numbers to pick which line to
+   * delete. Absent when the file says nothing worth carrying (one line).
+   */
+  warnings: z.array(z.string()).optional(),
 })
 export type MountSummary = z.infer<typeof MountSummary>
 

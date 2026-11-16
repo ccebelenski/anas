@@ -1,4 +1,5 @@
 import type { NfsClient, NfsExport } from '@anas/shared'
+import { sameConfigPath } from '@anas/shared'
 
 /**
  * Round-trip parser and surgical editor for /etc/exports (see exports(5)).
@@ -123,14 +124,68 @@ export function parseExports(text: string): NfsExport[] {
   return exports
 }
 
+/**
+ * One export per PATH — the API's list and detail shape. /etc/exports allows
+ * the same path on several lines with different clients (that is how two
+ * client sets get different options), so the clients of every line for a path
+ * are carried in file order under the spelling of its first line.
+ */
+export function parseExportsByPath(text: string): NfsExport[] {
+  const out: NfsExport[] = []
+  for (const exp of parseExports(text)) {
+    const row = out.find(e => sameConfigPath(e.path, exp.path))
+    if (row)
+      row.clients.push(...exp.clients)
+    else
+      out.push({ path: exp.path, clients: [...exp.clients] })
+  }
+  return out
+}
+
 /** The export for `path`, or undefined if the file does not export it. */
 export function getExport(text: string, path: string): NfsExport | undefined {
-  return parseExports(text).find(e => e.path === path)
+  return parseExports(text).find(e => sameConfigPath(e.path, path))
 }
 
 /** Is `path` currently exported? */
 export function hasExport(text: string, path: string): boolean {
-  return parseExportsDoc(text).some(l => l.kind === 'export' && l.path === path)
+  return parseExportsDoc(text).some(l => l.kind === 'export' && sameConfigPath(l.path, path))
+}
+
+/** One export line for `path`: the 1-based line it starts on, its clients, and its bytes. */
+export interface ExportOnLine {
+  line: number
+  clients: NfsClient[]
+  raw: string
+}
+
+/**
+ * Every entry that exports `path`, with the line it starts on (1-based, the
+ * number `grep -n` prints), that line's clients and its raw text. A folded
+ * continuation entry counts ONCE, at the line it starts on — that is the line
+ * the operator finds in the file. A trailing-slash spelling names the same
+ * path (`sameConfigPath`), so `/srv/a` and `/srv/a/` are two lines for one
+ * export.
+ */
+export function exportsOnLines(text: string, path: string): ExportOnLine[] {
+  const out: ExportOnLine[] = []
+  let line = 1
+  for (const entry of parseExportsDoc(text)) {
+    if (entry.kind === 'export' && sameConfigPath(entry.path, path))
+      out.push({ line, clients: entry.clients, raw: entry.raw })
+    line += entry.raw.split('\n').length
+  }
+  return out
+}
+
+/**
+ * The line numbers of every entry that exports `path`. cr4.conf D-2: the verbs
+ * that change a line refuse when this returns more than one number, and the
+ * reads show these same numbers, so the count comes from the file's own parser
+ * and never from a second scan of the text.
+ */
+export function linesFor(text: string, path: string): number[] {
+  return exportsOnLines(text, path).map(entry => entry.line)
 }
 
 /**
@@ -156,7 +211,7 @@ export function addExport(text: string, exp: NfsExport): string {
 export function replaceExport(text: string, path: string, exp: NfsExport): string {
   const doc = parseExportsDoc(text)
   for (const line of doc) {
-    if (line.kind === 'export' && line.path === path) {
+    if (line.kind === 'export' && sameConfigPath(line.path, path)) {
       // cr3.shares (review): a client list that is what the entry already
       // says is no edit — the entry keeps its bytes (its continuations and
       // comments included). A real edit writes one line and keeps the
@@ -175,21 +230,27 @@ export function replaceExport(text: string, path: string, exp: NfsExport): strin
   return serializeExportsDoc(doc)
 }
 
-/** Remove ONLY the line for `path`. No-op if `path` is absent. */
+/**
+ * Remove EVERY line for `path`. A path on several lines is one export (the
+ * lines differ only in clients), so the DELETE verb takes all of them; leaving
+ * one behind would keep exporting a path the operator removed. No-op if
+ * `path` is absent.
+ */
 export function removeExport(text: string, path: string): string {
-  const doc = parseExportsDoc(text)
-  const idx = doc.findIndex(l => l.kind === 'export' && l.path === path)
-  if (idx !== -1)
-    doc.splice(idx, 1)
-  return serializeExportsDoc(doc)
+  return serializeExportsDoc(parseExportsDoc(text).filter(l => !(l.kind === 'export' && sameConfigPath(l.path, path))))
+}
+
+/** A client list as /etc/exports spells it (`host(rw,sync)` or a bare host). */
+export function serializeClients(clients: NfsClient[]): string {
+  return clients
+    .map(c => (c.options.length > 0 ? `${c.spec}(${c.options.join(',')})` : c.spec))
+    .join(' ')
 }
 
 /** Serialize one export to a single /etc/exports line. */
 export function serializeExportLine(exp: NfsExport): string {
   const path = WHITESPACE.test(exp.path) ? `"${exp.path}"` : exp.path
-  const clients = exp.clients
-    .map(c => (c.options.length > 0 ? `${c.spec}(${c.options.join(',')})` : c.spec))
-    .join(' ')
+  const clients = serializeClients(exp.clients)
   return clients ? `${path} ${clients}` : path
 }
 

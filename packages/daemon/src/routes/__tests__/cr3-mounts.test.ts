@@ -1036,6 +1036,29 @@ describe('cr3.mounts — remote-mount findings at the route', () => {
       })
     }
 
+    // cr4.conf D-22: the `credentials=` option is the fact that credentials
+    // are SET; the file is only where the account is READ. A file the open
+    // refused — a directory, a symlink loop, a path that is simply not there
+    // — is a read that saw nothing, so the account is UNKNOWN. `set: false`
+    // belongs to a line WITHOUT a `credentials=` option, never to a failed
+    // read (the two N3 cases above already pin the uninterpretable-content
+    // half of this rule; these are the open failures).
+    for (const [name, make] of [
+      ['a path that is a DIRECTORY', async (f: string) => mkdir(f, { recursive: true })],
+      ['a SYMLINK LOOP', async (f: string) => (await import('node:fs/promises')).symlink(f, f)],
+      ['a path that is NOT THERE', async () => {}],
+    ] as const) {
+      it(`D-22: a credentials file that is ${name} reads UNKNOWN in the detail, never set:false`, async () => {
+        const mp = join(base, 'd22')
+        await mkdir(mp)
+        const f = join(dir, 'd22.cred')
+        await make(f)
+        await serve(`//nas/s ${mp} cifs credentials=${f},vers=3.0,nofail 0 0\n`)
+        const det = (await send('GET', `/v1/mounts/${enc(mp)}`)).json().data as MountDetail
+        assert.deepEqual(det.credentials, { set: true, unknown: true })
+      })
+    }
+
     it('N3: a failed fstab write puts a non-UTF-8 credentials file back BYTE for byte', async () => {
       const mp = join(base, 'n3b')
       await mkdir(mp)

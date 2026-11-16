@@ -718,4 +718,75 @@ describe('periodic scrub routes — AHR node-level anas-scrub timer (selfheal.4)
     assert.match(res.json().error.message, /cat \/proc\/mdstat exited 1: cat: \/proc\/mdstat: Permission denied/)
     await bare.close()
   })
+
+  /**
+   * D-26: GET /scrub reads /proc/mdstat TWICE — once inside the AHR topology,
+   * once for the foreign-array diff that names in the note every md array
+   * ANAS's scrub does not cover. The dev-mock topology (md126+md127) with a
+   * foreign `md40` (the ahr.test.ts (c) capture), the SECOND mdstat answer
+   * swappable — good or failed. The fixture is registered FIRST, so both
+   * calls hit this sequence and win over the topology's own registration.
+   */
+  function mdstatDiffServer(diffReadFails: boolean) {
+    const foreign = [
+      'md40 : active raid1 sdy1[1] sdx1[0]',
+      '      1047552 blocks super 1.2 [2/2] [UU]',
+      '',
+      'unused devices: <none>',
+    ].join('\n')
+    const mdstatWithForeign = mockFixtures.ahrMdstat().stdout.replace('unused devices: <none>', foreign)
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: '/usr/bin/cat',
+      args: MDSTAT_CAT_ARGS,
+      results: [
+        { stdout: mdstatWithForeign, stderr: '', exitCode: 0 },
+        diffReadFails
+          ? { stdout: '', stderr: 'cat: /proc/mdstat: Permission denied', exitCode: 1 }
+          : { stdout: mdstatWithForeign, stderr: '', exitCode: 0 },
+      ],
+    })
+    // The topology's own mdstat registration — never consulted (the `results`
+    // sequence above is registered first and wins), present to complete the
+    // topology fixture set.
+    mockAhrTopologyExecutor(executor, { stdout: mdstatWithForeign, stderr: '', exitCode: 0 })
+    executor.addFixture({
+      command: '/usr/sbin/mdadm',
+      args: mdadmDetailExportArgs('/dev/md40'),
+      result: { stdout: 'MD_LEVEL=raid1\nMD_DEVICES=2\nMD_DEVNAME=foreign0\nMD_NAME=otherhost:foreign0\n', stderr: '', exitCode: 0 },
+    })
+    executor.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    // An honest empty ZFS list (a successful read) so the AHR row stands alone.
+    executor.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson([]), stderr: '', exitCode: 0 } })
+    // The phase-2 running check: refused → 'unknown' (cr3), out of the way.
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', '/mnt/anas-ahr/ahr0'], result: { stdout: '', stderr: 'ERROR: not mounted', exitCode: 1 } })
+    return { executor, server: Fastify({ logger: false }) }
+  }
+
+  it('D-26: a readable mdstat diff names the foreign array in the note (no regression)', async () => {
+    const { executor, server: bare } = mdstatDiffServer(false)
+    await bare.register(scrubRoutes, { prefix: '/v1', executor, jobQueue: new JobQueue(), systemdDir: unitDir })
+    const res = await bare.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 200, res.body)
+    const row = ahrRow(res)
+    assert.match(row.note ?? '', /md40 is not an ANAS pool and is not scrubbed by ANAS/)
+    assert.ok(!row.unknown?.includes('mdArrays'), `a diff that ran claims no unknown: ${JSON.stringify(row.unknown)}`)
+    await bare.close()
+  })
+
+  it('D-26: a FAILED mdstat diff read never reads as "no foreign arrays" — the row says it could not be read', async () => {
+    const { executor, server: bare } = mdstatDiffServer(true)
+    await bare.register(scrubRoutes, { prefix: '/v1', executor, jobQueue: new JobQueue(), systemdDir: unitDir })
+    const res = await bare.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 200, res.body)
+    const row = ahrRow(res)
+    // The read that could not run never passes: the row carries the fact and
+    // the note says what could not be seen, with the failed read's own reason.
+    assert.ok(row.unknown?.includes('mdArrays'), `a failed diff read must surface as the mdArrays unknown: ${JSON.stringify(row.unknown)}`)
+    assert.match(row.note ?? '', /the node's md arrays could not be read \(cat: \/proc\/mdstat: Permission denied\), so ANAS cannot say whether an array outside its pools exists/)
+    // And the foreign array is not silently dropped — the note makes no
+    // coverage claim about an mdstat it could not read.
+    assert.doesNotMatch(row.note ?? '', /md40 is not an ANAS pool/)
+    await bare.close()
+  })
 })

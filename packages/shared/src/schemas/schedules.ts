@@ -682,12 +682,14 @@ export const PeriodicScrubState = z.object({
    * failed never reads as absent, idle or "never scrubbed"): `enabled` (the
    * ZFS property, the AHR unit or timer state could not be read — `enabled`
    * then carries no meaning), `lastScrub` (the `zpool status` read failed —
-   * `lastScrub: null` is not "never scrubbed") and `running` (the status
-   * read failed — an absent `running` is not "idle"). Absent or empty: every
-   * fact was read. Optional + additive: an older daemon omits it, an older
-   * panel ignores it.
+   * `lastScrub: null` is not "never scrubbed"), `running` (the status read
+   * failed — an absent `running` is not "idle") and `mdArrays` (AHR rows
+   * only: the node's /proc/mdstat read behind the foreign-array note failed —
+   * whether an md array outside ANAS's pools exists is not known, and the
+   * note says so). Absent or empty: every fact was read. Optional + additive:
+   * an older daemon omits it, an older panel ignores it.
    */
-  unknown: z.array(z.enum(['enabled', 'lastScrub', 'running'])).optional(),
+  unknown: z.array(z.enum(['enabled', 'lastScrub', 'running', 'mdArrays'])).optional(),
 })
 export type PeriodicScrubState = z.infer<typeof PeriodicScrubState>
 

@@ -382,7 +382,15 @@
         if (!mp) {
             return '<span style="color:gray;">&mdash;</span>';
         }
-        return '<span title="' + enc(mp) + '">' + enc(mp) + '</span>';
+        var html = '<span title="' + enc(mp) + '">' + enc(mp) + '</span>';
+        // Row warnings the daemon sends (cr4.conf D-21: a mountpoint on more
+        // than one fstab line no verb may touch). One tag, the sentence in its
+        // tooltip — the row-badge shape this file already uses.
+        var warnings = getf(rec, 'warnings');
+        if (isArray(warnings) && warnings.length) {
+            html += ' ' + tagBadge(t('warning'), 'var(--anas-warn,#b06a12)', warnings.join(' '), false);
+        }
+        return html;
     }
 
     // The ownership badge, alone in its column. PVE / AHR / LOCAL keep the gfx
@@ -550,6 +558,8 @@
             tableUnreadable: m.tableUnreadable === true,
             pveOwnershipUnknown: m.pveOwnershipUnknown === true,
             disabled: m.disabled === true,
+            // cr4.conf D-21: carried verbatim for the Mountpoint cell.
+            warnings: m.warnings,
             raw: m,
         };
         // Materialise the ownership facet so the Managed-by column has a real
@@ -2942,6 +2952,9 @@
                 { name: 'size', type: 'auto' },
                 { name: 'used', type: 'auto' },
                 { name: 'automount', type: 'auto' },
+                // cr4.conf D-21: the row's warnings, rendered on the Mountpoint
+                // cell (additive; absent on an old daemon).
+                { name: 'warnings', type: 'auto' },
                 { name: 'raw', type: 'auto' },
                 // Story iscsi.6: the iSCSI LUN whose image file sits under this
                 // mountpoint. AUTO field — absent on old daemons leaves get()

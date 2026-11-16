@@ -318,8 +318,10 @@
             // always null against a daemon too old to report it).
             running: state.running || null,
             // cr3: the facts whose READ failed this poll ('enabled',
-            // 'lastScrub', 'running') — each renders as unknown, never as off,
-            // never scrubbed or idle. Absent from an older daemon.
+            // 'lastScrub', 'running', and 'mdArrays' on AHR rows — the node's
+            // mdstat behind the foreign-array note could not be read) — each
+            // renders as unknown, never as off, never scrubbed or idle.
+            // Absent from an older daemon.
             unknown: (state.unknown && state.unknown.slice) ? state.unknown.slice() : [],
             // The findings of this pool's NEWEST COMPLETED AHR scrub job, when
             // that job found something (selfheal.3). Null for ZFS, and null for

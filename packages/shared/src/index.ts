@@ -83,7 +83,9 @@ export {
 // daemon (buildSpec, create/test routes) and the UI port both build from,
 // plus its result type.
 export {
+  configPathKey,
   normalizeMountTarget,
+  sameConfigPath,
 } from './mount-target.js'
 
 export type { MountTarget } from './mount-target.js'

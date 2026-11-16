@@ -401,6 +401,17 @@ const baseRow = { mountpoint: '/mnt/share', type: 'cifs', source: '//nas/media',
   check(/UNKNOWN/.test(badge) && !/>ANAS</.test(badge), `(4): Managed by reads UNKNOWN, never ANAS (got ${badge})`)
 }
 
+// ---- cr4.conf fold 6: a row warning rides the Mountpoint cell ----------------------
+
+{
+  const mpCol = gridCfg.columns.find(c => c.dataIndex === 'mountpoint')
+  const warned = mpCol.renderer('/mnt/share', {}, { get: k => (k === 'warnings' ? ['/mnt/share is on lines 1 and 2 of /etc/fstab.'] : undefined) })
+  check(/anas-mount-tag/.test(warned) && warned.includes('/mnt/share is on lines 1 and 2 of /etc/fstab.'), `fold 6: a row warning rides the Mountpoint cell (got ${warned})`)
+  check(/warning/.test(warned), `fold 6: the tag says it is a warning (got ${warned})`)
+  const plain = mpCol.renderer('/mnt/share', {}, { get: () => undefined })
+  check(!/anas-mount-tag/.test(plain), `fold 6: no warning tag without warnings (got ${plain})`)
+}
+
 // ---- review fixes -----------------------------------------------------------------
 
 async function openEdit(rowData) {

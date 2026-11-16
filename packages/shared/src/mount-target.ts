@@ -27,6 +27,26 @@ export interface MountTarget {
   problems: string[]
 }
 
+/** Trailing slashes on a config path; the root `/` keeps its one slash. */
+const CONFIG_PATH_TRAILING_SLASHES_RE = /\/+$/
+
+/**
+ * Do two spellings name the same path? `/mnt/x` and `/mnt/x/` are one
+ * directory, and systemd's fstab generator derives one mount unit from either
+ * (`systemd-escape -p /mnt/x/` is `mnt-x`), so every identity comparison in
+ * /etc/fstab and /etc/exports goes through this one function. Only trailing
+ * slashes are noise: the rest of the spelling is the caller's, and the file is
+ * never rewritten to the compared form.
+ */
+export function sameConfigPath(a: string, b: string): boolean {
+  return configPathKey(a) === configPathKey(b)
+}
+
+/** The comparison key: trailing slashes stripped, except that the root stays `/`. */
+export function configPathKey(path: string): string {
+  return path.replace(CONFIG_PATH_TRAILING_SLASHES_RE, '') || '/'
+}
+
 /** A pasted URL scheme in front of the server (`smb://host`, `cifs://`, `nfs://`). */
 const SERVER_SCHEME_RE = /^(?:smb|cifs|nfs):\/\//i
 /** A leading UNC / Windows path marker (`//host`, `\\host`). */

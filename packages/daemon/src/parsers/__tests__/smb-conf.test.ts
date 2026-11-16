@@ -1673,3 +1673,50 @@ describe('the fold is Samba\'s table: every case pair testparm was asked, both d
     assert.notEqual(smbSectionKey('qș'), smbSectionKey('qȘ'))
   })
 })
+
+// --- cr4.conf D-4 — a backslash followed only by blanks IS a continuation ---
+// The oracle is Samba itself: smb-continuation-blank.testparm records testparm
+// 4.22.11's reading of smb-continuation-blank.conf on a PVE 9 node. The line
+// `comment = Storage \ ` (backslash, then blanks) continues onto the next
+// physical line, so the stanza's own `path` line is folded into the comment
+// and the service Samba builds has no path (testparm prints `available = No`).
+// The write gate (shared/formats/smb-conf.ts) refused such a value all along;
+// the reader must agree with it and with testparm.
+describe('a backslash followed by blanks continues the line (cr4.conf D-4)', () => {
+  const dir = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/samba')
+  const conf = readFileSync(join(dir, 'smb-continuation-blank.conf'), 'utf8')
+  const testparm = readFileSync(join(dir, 'smb-continuation-blank.testparm'), 'utf8')
+
+  it('the continuation-blank fixture round-trips byte-identically', () => {
+    assert.equal(serializeDoc(parseDoc(conf)), conf)
+  })
+
+  it('reads the captured stanza exactly as testparm does (cr4.conf D-4)', () => {
+    assert.deepEqual(parseSmbConf(conf), parseSmbConf(testparm))
+  })
+
+  it('the swallowed path leaves no served share (cr4.conf D-4)', () => {
+    // Samba folded `path = /srv/a` into the comment, so the service has no
+    // path and serves nothing (available = No) — ANAS must not list a share
+    // for it, and must never treat /srv/a as an ANAS-managed share path.
+    assert.deepEqual(parseSmbConf(conf).shares, [])
+    assert.equal(getShare(conf, 'storage'), null)
+    // The stanza still EXISTS (hasShare answers for create's duplicate-name
+    // refusal and for remove) — it is simply not a served path share.
+    assert.equal(hasShare(conf, 'storage'), true)
+  })
+
+  it('the folded value carries the swallowed line (same rule, mid-stanza placement)', () => {
+    // The capture fixed the RULE (testparm 4.22.11); this placement — the
+    // path line standing on its own BEFORE the continued comment — is the
+    // same rule applied where the folded value is observable on a share
+    // that stays served. It is derived, not captured.
+    const text = '[mixed]\n   path = /srv/mixed\n   comment = keep \\ \n   read only = no\n'
+    const share = getShare(text, 'mixed')
+    assert.ok(share)
+    assert.equal(share.comment, 'keep read only = no')
+    // The folded `read only = no` is part of the comment value, never a
+    // parameter of its own — the share keeps Samba's read-only default.
+    assert.equal(share.readOnly, true)
+  })
+})

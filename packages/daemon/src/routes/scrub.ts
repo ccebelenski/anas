@@ -5,7 +5,7 @@ import type { LockClaim } from '../jobs/locks.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { Gate, GuardSpec } from '../safety/guard.js'
 import { AhrScrubToggleRequest, PoolName, ScrubToggleRequest } from '@anas/shared'
-import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
+import { MDSTAT_CAT_ARGS, MDSTAT_PATH, parseMdstat } from '../parsers/mdstat.js'
 import { execZpool, readZpoolNames, zfsUnavailableRefusal } from '../parsers/zpool-list.js'
 import { parseScrubScans } from '../parsers/zpool-status.js'
 import { ahrPoolClaims, guardCheck, guarded, poolClaims, sendRefusal } from '../safety/guard.js'
@@ -265,16 +265,30 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
         return zfsUnreadable(reply, err)
       throw err
     }
-    const [scans, mdstat] = await Promise.all([
+    // D-26: a FAILED diff read is `null` with its reason, never the empty
+    // list — `[]` reads as "the node has no foreign arrays", a confident
+    // statement about an mdstat the read could not see. The rows carry the
+    // `mdArrays` unknown and the note names the failure instead. (An ABSENT
+    // /proc/mdstat can never reach here with AHR rows: cr.33e's ruling makes
+    // it "no md arrays", hence no AHR pools to build rows from.)
+    const [scans, mdRead] = await Promise.all([
       // No ZFS on the node: no status to read (and none would answer).
       zfsUnavailable ? Promise.resolve(new Map()) : zfsScrubScans(),
       // The node's md arrays — diffed against the AHR bands so a foreign array
       // (one ANAS's scrub never covers) is said in the note, never silent.
-      executor.exec(CAT, MDSTAT_CAT_ARGS).then(r => r.exitCode === 0 ? parseMdstat(r.stdout) : []).catch(() => []),
+      executor.exec(CAT, MDSTAT_CAT_ARGS).then(
+        r => r.exitCode === 0
+          ? { arrays: parseMdstat(r.stdout), reason: undefined as string | undefined }
+          : { arrays: null, reason: r.stderr.trim() || `cat ${MDSTAT_PATH} exited ${r.exitCode}` },
+      ).catch((err: unknown) => ({
+        arrays: null,
+        reason: err instanceof Error ? err.message : String(err),
+      })),
     ])
     const ctx = {
       dir: systemdDir,
-      mdKernelNames: mdstat.map(a => a.kernelName),
+      mdKernelNames: mdRead.arrays ? mdRead.arrays.map(a => a.kernelName) : null,
+      ...(mdRead.reason !== undefined ? { mdArraysReason: mdRead.reason } : {}),
       ahrKernelNames: ahr.flatMap(p => p.arrays.map(a => a.kernelName).filter((n): n is string => !!n)),
     }
     const states: PeriodicScrubState[] = [

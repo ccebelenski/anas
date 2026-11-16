@@ -5,10 +5,11 @@ import type { ConfirmStore } from '../safety/confirm.js'
 import type { GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { AccessService } from '../services/access.js'
 import { createHash } from 'node:crypto'
-import { AbsolutePath, CreateNfsExportRequest, EXPORT_PATH_MSG, isExportPath, UpdateNfsExportRequest } from '@anas/shared'
-import { addExport, hasExport, parseExports, parseExportsDoc, removeExport, replaceExport } from '../parsers/exports.js'
+import { AbsolutePath, CreateNfsExportRequest, EXPORT_PATH_MSG, isExportPath, sameConfigPath, UpdateNfsExportRequest } from '@anas/shared'
+import { addExport, exportsOnLines, hasExport, linesFor, parseExportsByPath, parseExportsDoc, removeExport, replaceExport, serializeClients } from '../parsers/exports.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, nfsShareClaim, sendRefusal } from '../safety/guard.js'
 import { createAccessService } from '../services/access.js'
+import { duplicateKeyRefusal, duplicateKeyWarning, EXPORT_DUPLICATE } from '../services/config-duplicates.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import { normalizeMountpointPath } from '../services/mounts.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
@@ -18,6 +19,75 @@ import { shareAccessHandlers } from './share-access.js'
 
 /** `exportfs -ra` re-reads /etc/exports and syncs the kernel export table. */
 const EXPORTFS = '/usr/sbin/exportfs'
+
+/** The file `exportfs -ra` re-reads; it is not an export it can name. */
+const EXPORTS_FILE = '/etc/exports'
+
+/** What ends a path token in an exportfs error line: blanks, a colon, a quote. */
+const EXPORT_ERROR_BOUNDS = /[\s:,"']/
+
+/**
+ * The paths an `exportfs -ra` error line NAMES, read as whole tokens. An
+ * exportfs error quotes the export it choked on as a path (`exportfs: Failed
+ * to stat /testpool/share1: No such file or directory` — node pass capture),
+ * so a path begins at a `/` that starts the line or follows a blank, a colon
+ * or a quote, and ends at the next one. `/etc/exports` is the file being
+ * reloaded, never an export (`exportfs: /etc/exports:3: unknown keyword`). A
+ * line with no path in it (`exportfs: duplicated export entries`) names no
+ * export (cr4.conf D-3a).
+ */
+function pathsInExportError(line: string): string[] {
+  const out: string[] = []
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === '"') {
+      // A quoted path is one token, blanks inside it included.
+      const end = line.indexOf('"', i + 1)
+      const text = end === -1 ? line.slice(i + 1) : line.slice(i + 1, end)
+      if (text.startsWith('/'))
+        out.push(text)
+      i = end === -1 ? line.length : end
+      continue
+    }
+    if (line[i] !== '/')
+      continue
+    const before = i === 0 ? '' : line[i - 1]
+    if (before !== '' && !EXPORT_ERROR_BOUNDS.test(before))
+      continue // a slash inside a word does not begin a path
+    let end = i + 1
+    while (end < line.length && !EXPORT_ERROR_BOUNDS.test(line[end]))
+      end++
+    out.push(line.slice(i, end))
+    i = end - 1
+  }
+  return out.filter(path => !sameConfigPath(path, EXPORTS_FILE))
+}
+
+/**
+ * The honest restore report (cr4.conf D-3b): a hand-edit landed while
+ * `exportfs -ra` ran, the change-detecting restore left the file alone, and
+ * the read-back proves the pre-edit bytes did NOT go back. Says what the read
+ * established — the bytes differ, so the earlier contents were not put back —
+ * then whether the exact line this job wrote is still in the file, by its
+ * bytes and line number. A delete wrote no line, so it reports the lines the
+ * path has now, without claiming they are the job's.
+ */
+function notUndoneSentence(now: string, changedPath: string, written: string): string {
+  const current = exportsOnLines(now, changedPath)
+  const wrote = exportsOnLines(written, changedPath)[0]?.raw ?? null
+  let what: string
+  if (wrote !== null) {
+    const same = current.find(entry => entry.raw === wrote)
+    what = same
+      ? `The line this job wrote is still there: line ${same.line}.`
+      : 'The line this job wrote is no longer there.'
+  }
+  else {
+    what = current.length > 0
+      ? `A line for this path is in /etc/exports: line ${current.map(entry => entry.line).join(' and ')}.`
+      : 'No line for this path is in /etc/exports.'
+  }
+  return `/etc/exports changed while ANAS was reloading it, so ANAS did not put its earlier contents back. ${what} Check the file, then run: exportfs -ra.`
+}
 
 /**
  * NFS export management (Epic 7). Exports are keyed by PATH — one line per path
@@ -62,6 +132,19 @@ export async function nfsExportRoutes(
   const exportNotFound = (path: string): Refusal =>
     ({ status: 404, code: 'NOT_FOUND', message: `Export '${path}' not found` })
 
+  /**
+   * cr4.conf D-2: an edit of a path on more than one line has no single line
+   * to rewrite — the first-match editor would change one line and report
+   * success while the other still exports the path with the old clients.
+   * Refused at the door and again in the job; the reads show the same
+   * sentence. A DELETE is not refused: it removes every line (see
+   * `removeExport`), which is the whole export.
+   */
+  const exportDuplicated = (text: string, path: string): Refusal | null => {
+    const lines = linesFor(text, path)
+    return lines.length > 1 ? duplicateKeyRefusal(path, lines, '/etc/exports', EXPORT_DUPLICATE) : null
+  }
+
   /** sha256 of the export's own line in the file, or null when the line is gone. */
   function exportLineRevision(text: string, path: string): string | null {
     for (const line of parseExportsDoc(text)) {
@@ -97,7 +180,10 @@ export async function nfsExportRoutes(
           return revision
         },
       },
-      gates: [async o => (hasExport(o.text, path) ? null : exportNotFound(path))],
+      gates: [
+        async o => (hasExport(o.text, path) ? null : exportNotFound(path)),
+        async o => exportDuplicated(o.text, path),
+      ],
       // The §4.2 key is the NORMALISED path, so `/tank//x/` cannot slip a
       // second writer past the lock on a spelling of the same export.
       locks: async () => [nfsShareClaim(normalizeMountpointPath(path))],
@@ -110,7 +196,9 @@ export async function nfsExportRoutes(
       // A remove deletes the whole line — nothing survives to bind a revision
       // to (the mounts precedent); the gate re-answers the 404.
       object: nfsExportView(path),
-      gates: [async o => (hasExport(o.text, path) ? null : exportNotFound(path))],
+      gates: [
+        async o => (hasExport(o.text, path) ? null : exportNotFound(path)),
+      ],
       locks: async () => [nfsShareClaim(normalizeMountpointPath(path))],
     }
   }
@@ -144,15 +232,25 @@ export async function nfsExportRoutes(
    * "Rejects the change" is judged against a baseline, not on the exit code
    * alone (node pass R3-D1): `exportfs -ra` exits non-zero for ANY bad line —
    * a stale export whose dataset is gone fails every reload — so the file is
-   * reloaded once before the edit and only an error line the baseline did not
-   * print counts against this change. Errors that predate it are reported and
-   * left alone. When the baseline was clean, any failure counts.
+   * reloaded once before the edit. An error line predates this change only
+   * when the baseline printed it verbatim, it NAMES the export exportfs
+   * choked on, and it does not name the path this job changed; such errors
+   * are reported and left alone (cr4.conf D-3a). A line that names no export
+   * says nothing about WHICH export fails — a baseline that printed the same
+   * path-less text waives nothing — so it counts against the change. When
+   * the baseline was clean, any failure counts.
    *
    * The pre-edit bytes are captured inside the SAME `editConfig` transform and
    * the restore is a second `editConfig` under the same change-detecting lock,
    * so a hand-edit that lands between the write and the reload is left alone.
+   * `restored` is then decided by READING the file back and comparing bytes
+   * (cr4.conf D-3b): the file is either back or it is not, and when it is
+   * not, the job says the bytes differ and reports whether the line it wrote
+   * is still there, instead of reporting a rollback that never happened.
+   * `changedPath` is the path this job's line is about — the waiver test
+   * needs it, and the honest restore report reads it back.
    */
-  async function editExportsWithReload(transform: (current: string) => string, progress: (message: string) => void): Promise<void> {
+  async function editExportsWithReload(transform: (current: string) => string, progress: (message: string) => void, changedPath: string): Promise<void> {
     progress('Checking the current NFS exports (exportfs -ra)')
     const baseline = await runExportfs()
     let before: string | null = null
@@ -167,8 +265,18 @@ export async function nfsExportRoutes(
     if (after.ok)
       return
     const known = new Set(baseline.ok ? [] : baseline.errors)
-    const fresh = after.errors.filter(line => !known.has(line))
-    if (!baseline.ok && fresh.length === 0) {
+    // Every real exportfs error quotes the export it choked on as a path (the
+    // pathsInExportError capture above). A line with no path in it names no
+    // export, so it cannot be judged to predate anything. The changed path is
+    // compared as a whole token, so an error on `/srv/nfs/backups` is not an
+    // error on `/srv/nfs/backup`.
+    const namedPaths = (line: string): string[] => pathsInExportError(line)
+    const namesExport = (line: string): boolean => namedPaths(line).length > 0
+    const namesChangedPath = (line: string): boolean => namedPaths(line).some(path => sameConfigPath(path, changedPath))
+    const predatesChange = (line: string): boolean =>
+      known.has(line) && namesExport(line) && !namesChangedPath(line)
+    const against = after.errors.filter(line => !predatesChange(line))
+    if (!baseline.ok && after.errors.length > 0 && against.length === 0) {
       progress(`exportfs -ra reports errors that predate this change and were left as they are: ${after.message}`)
       return
     }
@@ -181,7 +289,12 @@ export async function nfsExportRoutes(
       let restored = false
       try {
         await editConfig(exportsPath, current => (current === writtenBytes ? previous : current))
-        restored = true
+        // cr4.conf D-3b: believe the bytes, not the call — the read-back is
+        // what decides whether the file is back.
+        const now = await readConfig(exportsPath)
+        restored = now === previous
+        if (!restored)
+          progress(notUndoneSentence(now, changedPath, writtenBytes))
       }
       catch (restoreErr) {
         progress(`Could not restore /etc/exports after the failed reload — the rejected change is still in the file: ${why(restoreErr)}`)
@@ -190,23 +303,31 @@ export async function nfsExportRoutes(
         // A failed `exportfs -ra` may have applied part of the bad file to the
         // kernel's export table; reload the restored file so the kernel
         // matches it again. Best-effort: the error below is what the job reports.
+        // A non-zero exit with no stderr names no export, so it says its note
+        // too (cr4.conf D-3a).
         const again = await runExportfs().catch(() => null)
-        if (again && !again.ok && (baseline.ok || again.errors.some(line => !known.has(line))))
+        if (again && !again.ok && (again.errors.length === 0 || again.errors.some(line => !predatesChange(line))))
           progress(`/etc/exports was restored, but reloading it failed — the kernel's export table may not match the file: ${again.message}`)
       }
     }
-    throw new Error(fresh.length > 0 ? fresh.join('\n') : after.message)
+    throw new Error(against.length > 0 ? against.join('\n') : after.message)
   }
 
   // --- GET /shares/nfs — list ALL exports --------------------------------
   server.get('/shares/nfs', async () => {
     // Check each export's path at read time: missing = a stale line, not
     // answering = a hung mount under it (cr.35, through the executor).
-    const parsed = parseExports(await readConfig(exportsPath))
+    const text = await readConfig(exportsPath)
+    // cr4.conf D-2: one row per path, carrying the clients of every line for
+    // it — /etc/exports allows the same path on several lines for different
+    // clients. A path on more than one line cannot be edited, so its row says
+    // so with the line numbers.
+    const parsed = parseExportsByPath(text)
     const probes = await probeSharePaths(executor, parsed.map(e => e.path))
     const exports = parsed.map(exp => ({
       ...exp,
       ...sharePathFields(probes.get(exp.path)!),
+      ...duplicateKeyWarning(exp.path, linesFor(text, exp.path), '/etc/exports', EXPORT_DUPLICATE),
     }))
     return { data: exports }
   })
@@ -220,12 +341,20 @@ export async function nfsExportRoutes(
     }
     const path = pathParsed.data
 
-    const exp = parseExports(await readConfig(exportsPath)).find(e => e.path === path)
+    const text = await readConfig(exportsPath)
+    const exp = parseExportsByPath(text).find(e => sameConfigPath(e.path, path))
     if (!exp) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Export '${path}' not found` } }
     }
-    return { data: { ...exp, ...sharePathFields(await probeSharePath(executor, exp.path)) } }
+    return {
+      data: {
+        ...exp,
+        ...sharePathFields(await probeSharePath(executor, exp.path)),
+        // cr4.conf D-2: the same line-number warning the list carries.
+        ...duplicateKeyWarning(path, linesFor(text, path), '/etc/exports', EXPORT_DUPLICATE),
+      },
+    }
   })
 
   // --- POST /shares/nfs — create an export -------------------------------
@@ -288,7 +417,7 @@ export async function nfsExportRoutes(
           if (hasExport(current, exp.path))
             throw new GuardRefusalError(exportExists(exp.path))
           return addExport(current, exp)
-        }, updateProgress)
+        }, updateProgress, exp.path)
         return { created: exp.path }
       }),
       { locks: pre.locks },
@@ -375,8 +504,13 @@ export async function nfsExportRoutes(
           // with the 404 sentence and the file keeps its bytes.
           if (!hasExport(current, path))
             throw new GuardRefusalError(exportNotFound(path))
+          // cr4.conf D-2: two lines for the path appeared since the reverify
+          // read — the same refusal, the file keeps its bytes.
+          const dup = exportDuplicated(current, path)
+          if (dup)
+            throw new GuardRefusalError(dup)
           return replaceExport(current, path, exp)
-        }, updateProgress)
+        }, updateProgress, path)
         return { updated: path }
       }),
       { locks: pre.locks },
@@ -409,6 +543,9 @@ export async function nfsExportRoutes(
 
     // Removing an export is a live change: connected clients lose access on the
     // next `exportfs -ra`. Gate it behind a confirmation code (Principle 14).
+    // The confirm names every line the delete removes, with that line's
+    // clients: a path on several lines is one export and the delete takes all
+    // of them.
     if (!guardConfirm(confirmStore, request, reply, spec, pre, {
       validated: { path },
       address: ['path'],
@@ -416,6 +553,7 @@ export async function nfsExportRoutes(
       warnings: [
         `Export '${path}' will be removed from /etc/exports and unexported immediately.`,
         `Any clients currently mounting '${path}' will lose access on the next access.`,
+        ...exportsOnLines(pre.object.text, path).map(entry => `Line ${entry.line}: ${serializeClients(entry.clients) || 'no clients'}`),
       ],
     })) {
       return reply
@@ -426,14 +564,18 @@ export async function nfsExportRoutes(
       { ...identity, params: { path } },
       guarded(spec, pre, async (_exp, { updateProgress }) => {
         updateProgress(`Removing NFS export ${path}`)
+        let removedLines = 0
         await editExportsWithReload((current) => {
           // Last-moment backstop: gone since the reverify read — refuse with
           // the 404 sentence, the file keeps its bytes.
           if (!hasExport(current, path))
             throw new GuardRefusalError(exportNotFound(path))
+          // cr4.conf D-2: every line for the path goes — the lines differ only
+          // in clients, and one left behind would keep exporting the path.
+          removedLines = exportsOnLines(current, path).length
           return removeExport(current, path)
-        }, updateProgress)
-        return { removed: path }
+        }, updateProgress, path)
+        return { removed: path, lines: removedLines }
       }),
       { locks: pre.locks },
     )

@@ -3,7 +3,7 @@ import type { FastifyBaseLogger } from 'fastify'
 import type { MockExecutor } from '../../executor/mock.js'
 import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -91,6 +91,42 @@ describe('fs browse route (Epic 16.9)', () => {
     assert.equal(res.data!.exists, false)
     assert.equal(res.data!.type, 'missing')
     assert.deepEqual(res.data!.dirs, [])
+  })
+
+  it('a path under a FILE is missing — ENOTDIR is an absence every tool reads (cr4.conf D-1)', async () => {
+    const f = join(dir, 'plain-file')
+    await writeFile(f, 'x')
+    const res = await browse(server!, join(f, 'child'))
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.data!.exists, false)
+    assert.equal(res.data!.type, 'missing')
+  })
+
+  it('a stat that could not run answers 503 UNAVAILABLE, never a confident missing (cr4.conf D-1)', async () => {
+    // The probe's T6 shape: an inside-the-share child whose stat fails EACCES
+    // (production: an NFS export with root squash, a FUSE mount). A read that
+    // could not see never says gone — the old catch read every stat failure
+    // as exists=false type=missing.
+    const locked = join(dir, 'dark')
+    await mkdir(locked)
+    await chmod(locked, 0o000)
+    const target = join(locked, 'inner')
+    // Running as root defeats permission bits — then stat sees fine and there
+    // is nothing to pin (the same accommodation as the fail-open test below).
+    const blind = await stat(target).then(() => false, () => true)
+    try {
+      const res = await browse(server!, target)
+      if (!blind) {
+        assert.equal(res.statusCode, 200)
+        return
+      }
+      assert.equal(res.statusCode, 503, JSON.stringify(res))
+      assert.equal(res.error!.code, 'UNAVAILABLE')
+      assert.equal(res.error!.message, `${target} could not be read (EACCES).`)
+    }
+    finally {
+      await chmod(locked, 0o755)
+    }
   })
 
   it('400s on a relative path', async () => {

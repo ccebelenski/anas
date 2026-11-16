@@ -287,6 +287,39 @@ describe('nfs export routes', () => {
       assert.equal(job.status, 'completed')
       assert.ok((await readFile(exportsPath, 'utf8')).includes('/srv/nfs/fine'), 'the change stays applied')
     })
+
+    // cr4.conf D-3(a): the R3-D1 waiver needs the error line to NAME an export
+    // (a path exportfs choked on). A line that names no export — "duplicated
+    // export entries" carries no path at all — says nothing about WHICH export
+    // fails, so it counts against this change even when the baseline printed
+    // the very same text. Before this rule one path-less baseline line waived
+    // every identical error and a failed change read as done.
+    it('a reload error that names no export counts against the change even when the baseline printed it (cr4.conf D-3)', async () => {
+      const before = await readFile(exportsPath, 'utf8')
+      const mock = (server! as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      let exportfsCalls = 0
+      mock.exec = async (command: string, args: string[]) => {
+        if (command === '/usr/sbin/exportfs') {
+          exportfsCalls++
+          // EVERY call — baseline included — fails with the same path-less line.
+          return { stdout: '', stderr: 'exportfs: duplicated export entries\n', exitCode: 1 }
+        }
+        return orig(command, args)
+      }
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/shares/nfs',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ path: '/srv/nfs/unnamed', clients: [{ spec: '*', options: ['rw', 'sync'] }] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed', 'the path-less line is not waived by a baseline that printed it')
+      assert.match(job.error!.message, /duplicated export entries/)
+      assert.equal(await readFile(exportsPath, 'utf8'), before, 'the rejected change was rolled back')
+      assert.equal(exportfsCalls, 3, 'baseline, the failing reload, and a reload of the restored file')
+    })
   })
 
   // --- PUT update --------------------------------------------------------
@@ -315,6 +348,105 @@ describe('nfs export routes', () => {
         else
           assert.equal(afterLines[i], beforeLines[i])
       }
+    })
+
+    // cr4.conf D-3(b): `restored` was the hope that the second editConfig
+    // wrote, not a read of the bytes. A hand-edit landing between the write
+    // and the reload makes the restore leave the file alone — the change is
+    // STILL in the file. The job then says that plainly, with the line,
+    // instead of rolling back a file it never rolled back.
+    it('a hand-edit during the reload leaves the change standing and the job says it was not undone (cr4.conf D-3)', async () => {
+      const mock = (server! as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      let exportfsCalls = 0
+      mock.exec = async (command: string, args: string[]) => {
+        if (command === '/usr/sbin/exportfs') {
+          exportfsCalls++
+          if (exportfsCalls === 1)
+            return { stdout: '', stderr: '', exitCode: 0 }
+          if (exportfsCalls === 2) {
+            // The admin edits the file after ANAS wrote its line.
+            await writeFile(exportsPath, `${await readFile(exportsPath, 'utf8')}# admin hand edit\n`)
+            return { stdout: '', stderr: '/srv/nfs/backups: bad option\n', exitCode: 1 }
+          }
+          return { stdout: '', stderr: '', exitCode: 0 }
+        }
+        return orig(command, args)
+      }
+      const res = await server!.inject({
+        method: 'PUT',
+        url: `/v1/shares/nfs/${enc('/srv/nfs/backups')}`,
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ clients: [{ spec: '10.0.0.0/8', options: ['ro', 'sync'] }] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /\/srv\/nfs\/backups: bad option/, 'the fresh error names the changed path')
+      const after = await readFile(exportsPath, 'utf8')
+      assert.ok(after.includes('/srv/nfs/backups 10.0.0.0/8(ro,sync)'), 'the change is still in the file')
+      assert.ok(after.includes('# admin hand edit'), 'the hand edit survives')
+      // The progress line says what the read established: the bytes differ,
+      // and the exact line the job wrote is still there, at its number.
+      assert.match(job.progress ?? '', /\/etc\/exports changed while ANAS was reloading it, so ANAS did not put its earlier contents back\./)
+      assert.match(job.progress ?? '', /The line this job wrote is still there: line 4\./)
+      // Nothing was restored, so the reload of the restored file never runs.
+      assert.equal(exportfsCalls, 2, 'baseline and the failing reload only')
+    })
+
+    // cr4.conf D-3(a): the waiver compares the path exportfs names as a WHOLE
+    // token. `/srv/nfs/media/files` has `/srv/nfs/media` as a prefix, so the
+    // old raw substring test counted the other export's error as this
+    // change's and rolled a good change back.
+    it('an error on an export whose path has the changed path as a prefix does not count (cr4.conf D-3)', async () => {
+      const mock = (server! as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      const stale = 'exportfs: Failed to stat /srv/nfs/media/files: No such file or directory'
+      mock.exec = async (command: string, args: string[]) =>
+        (command === '/usr/sbin/exportfs'
+          ? { stdout: '', stderr: `${stale}\n`, exitCode: 1 }
+          : orig(command, args))
+      const res = await server!.inject({
+        method: 'PUT',
+        url: `/v1/shares/nfs/${enc('/srv/nfs/media')}`,
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ clients: [{ spec: '10.0.0.0/8', options: ['rw'] }] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', job.progress ?? '')
+      assert.ok((await readFile(exportsPath, 'utf8')).includes('/srv/nfs/media 10.0.0.0/8(rw)'), 'the good change stays')
+    })
+
+    it('a hand-edit that also removes the job\'s line is reported as gone (cr4.conf D-3)', async () => {
+      const mock = (server! as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      let exportfsCalls = 0
+      mock.exec = async (command: string, args: string[]) => {
+        if (command === '/usr/sbin/exportfs') {
+          exportfsCalls++
+          if (exportfsCalls === 1)
+            return { stdout: '', stderr: '', exitCode: 0 }
+          if (exportfsCalls === 2) {
+            const text = await readFile(exportsPath, 'utf8')
+            await writeFile(exportsPath, text.split('\n').filter(line => !line.startsWith('/srv/nfs/media ')).join('\n'))
+            return { stdout: '', stderr: '/srv/nfs/media: bad option\n', exitCode: 1 }
+          }
+          return { stdout: '', stderr: '', exitCode: 0 }
+        }
+        return orig(command, args)
+      }
+      const res = await server!.inject({
+        method: 'PUT',
+        url: `/v1/shares/nfs/${enc('/srv/nfs/media')}`,
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ clients: [{ spec: '10.0.0.0/8', options: ['rw'] }] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.progress ?? '', /The line this job wrote is no longer there\./)
+      assert.doesNotMatch(job.progress ?? '', /is still there/)
     })
 
     it('returns 404 for a path that is not exported', async () => {

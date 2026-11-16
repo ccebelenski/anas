@@ -1,0 +1,15 @@
+# What Samba reads from smb-continuation-blank.conf (cr4.conf D-4,
+# 2026-11-15, Samba 4.22.11 on a PVE 9 node):
+#   testparm -s smb-continuation-blank.conf
+# The two parameter lines below are what testparm printed for the stanza;
+# their order and tab indentation follow the house style of the other
+# captures here and were not themselves captured. The global section
+# testparm echoes above the stanzas (the node's own defaults) is not part
+# of this capture and is not reproduced.
+#
+# The `path` line is gone as its own parameter: Samba folded it into
+# `comment`, and a service left without `path` is marked unavailable —
+# `available = No` is Samba's own verdict, printed in the stanza.
+[storage]
+	comment = Storage path = /srv/a
+	available = No

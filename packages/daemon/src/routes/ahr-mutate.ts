@@ -9,7 +9,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { lstat } from 'node:fs/promises'
 import { dirname, join, relative, resolve as resolvePath } from 'node:path'
-import { AhrCreateRequest, AhrMirrorReconcileRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, AhrScrubJobDetail, isComposableDisk, PoolName } from '@anas/shared'
+import { AhrCreateRequest, AhrMirrorReconcileRequest, AhrMountpointRequest, AhrParityRewriteRequest, AhrRepairRequest, AhrScrubJobDetail, configPathKey, isComposableDisk, PoolName } from '@anas/shared'
 import { currentLane } from '../executor/deadline.js'
 import { parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
 import { hasMount, parseFstab } from '../parsers/fstab.js'
@@ -45,8 +45,6 @@ import { requireIdentity } from './identity.js'
 const FINDMNT = '/usr/bin/findmnt'
 const REALPATH = '/usr/bin/realpath'
 const VGS = '/usr/sbin/vgs'
-
-const TRAILING_SLASHES_RE = /\/+$/
 
 /**
  * The fields each short AHR verb's confirm leaves out of its signature (story
@@ -753,7 +751,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // refusal gate (cr.52r doc ruling — ONE 409, reason system-mount-target).
     let mountpoint: string | undefined
     if (req.mountpoint !== undefined) {
-      mountpoint = req.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
+      mountpoint = configPathKey(req.mountpoint)
     }
 
     const spec = createSpec({ name: req.name, tier: req.tier, disks: req.disks, mountpoint })
@@ -824,7 +822,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // Request-only (about the value typed): normalised here; /mnt/pve and /
     // answer through the move's shared refusal gate (cr.52r doc ruling — ONE
     // 409, reason system-mount-target, PVE-territory sentence for /mnt/pve).
-    const mp = parsed.data.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
+    const mp = configPathKey(parsed.data.mountpoint)
 
     // Story cr.38 (§2.3 "mountpoint": every gate was request-time only, and
     // there was no system-pool gate). One gate list at both doors: not

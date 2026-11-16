@@ -32,6 +32,7 @@ import type { PveStorageRef } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from './findmnt.js'
 import { readFile } from 'node:fs/promises'
+import { configPathKey } from '@anas/shared'
 import { parseFindmntTable, readFindmntTable, zfsLiveDatasetMounts } from './findmnt.js'
 
 /** Default location of the PVE storage config on a Proxmox host. */
@@ -83,9 +84,6 @@ const KEY_VALUE_RE = /^(\S+)\s(.*)$/
 /** Trailing carriage return (CRLF files) — stripped, indentation preserved. */
 const TRAILING_CR_RE = /\r$/
 
-/** One or more trailing slashes on a path (normalised away before comparison). */
-const TRAILING_SLASH_RE = /\/+$/
-
 /** The pool ROOT is the segment before the first '/' (e.g. `tank/data` → `tank`). */
 function poolRoot(dataset: string): string {
   return dataset.split('/')[0]
@@ -96,11 +94,6 @@ function splitContent(content: string | undefined): string[] {
   return content
     ? content.split(',').map(c => c.trim()).filter(Boolean)
     : []
-}
-
-/** Strip trailing slashes from an absolute path (but keep the root `/` itself). */
-function stripTrailingSlash(path: string): string {
-  return path.replace(TRAILING_SLASH_RE, '') || '/'
 }
 
 /**
@@ -132,13 +125,13 @@ function isUnder(path: string, mp: string): boolean {
 export function pathOnZfsFilesystem(path: string, nodes: FindmntNode[] | null): boolean | null {
   if (nodes === null)
     return null
-  const target = stripTrailingSlash(path)
+  const target = configPathKey(path)
   let bestLen = -1
   let zfs = false
   for (const n of nodes) {
     if (!n.target)
       continue
-    const t = stripTrailingSlash(n.target)
+    const t = configPathKey(n.target)
     if (!isUnder(target, t))
       continue
     if (t.length > bestLen) {
@@ -168,13 +161,13 @@ export function pathOnZfsFilesystem(path: string, nodes: FindmntNode[] | null): 
 export function servingZfsDataset(path: string, nodes: FindmntNode[] | null): string | null {
   if (nodes === null)
     return null
-  const target = stripTrailingSlash(path)
+  const target = configPathKey(path)
   let bestLen = -1
   let source: string | null = null
   for (const n of nodes) {
     if (!n.target)
       continue
-    const t = stripTrailingSlash(n.target)
+    const t = configPathKey(n.target)
     if (!isUnder(target, t))
       continue
     if (t.length > bestLen) {
@@ -223,13 +216,13 @@ export function matchMountpoint(
   // which can only tighten the gates this feeds.
   if (pathOnZfsFilesystem(path, nodes) === false)
     return null
-  const target = stripTrailingSlash(path)
+  const target = configPathKey(path)
   let best: ZfsMountpoint | null = null
   let bestLen = -1
   for (const mp of mountpoints) {
     if (!mp.mountpoint)
       continue
-    const canonical = stripTrailingSlash(mp.mountpoint)
+    const canonical = configPathKey(mp.mountpoint)
     if (isUnder(target, canonical) && canonical.length > bestLen) {
       best = mp
       bestLen = canonical.length
@@ -655,7 +648,7 @@ export function parsePveMountPaths(text: string, liveDatasetMounts?: ReadonlyMap
 
   const claim = (path: string, id: string): void => {
     if (path.startsWith('/'))
-      byPath.set(stripTrailingSlash(path), id)
+      byPath.set(configPathKey(path), id)
   }
   // A zfspool without its own `mountpoint` claims `/<pool dataset>`, and every
   // zfspool's dataset claims its LIVE mountpoint too when one is known
@@ -669,7 +662,7 @@ export function parsePveMountPaths(text: string, liveDatasetMounts?: ReadonlyMap
       // would otherwise claim the whole filesystem and every restore target on
       // the node would answer 409 PVE_MANAGED "inside '/'". The root FS is not
       // storage territory; the config default `/<dataset>` still claims.
-      for (const live of liveDatasetMounts?.get(stripTrailingSlash(current.pool)) ?? []) {
+      for (const live of liveDatasetMounts?.get(configPathKey(current.pool)) ?? []) {
         if (live !== '/')
           claim(live, current.id)
       }

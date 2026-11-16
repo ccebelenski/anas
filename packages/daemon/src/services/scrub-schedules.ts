@@ -195,9 +195,14 @@ export interface AhrScrubContext {
   /**
    * Kernel names (`md127`) of EVERY md array on the node (from /proc/mdstat)
    * and of the AHR bands — the difference is the arrays ANAS does not scrub,
-   * which the state's `note` names rather than hides.
+   * which the state's `note` names rather than hides. `mdKernelNames: null`
+   * says the mdstat read FAILED this poll (D-26): the diff could not be made,
+   * so the row carries the `mdArrays` unknown and the note says whether a
+   * foreign array exists is not known — never "no foreign arrays".
    */
-  mdKernelNames?: string[]
+  mdKernelNames?: string[] | null
+  /** Why the mdstat read failed (with `mdKernelNames: null`) — named in the note. */
+  mdArraysReason?: string
   ahrKernelNames?: string[]
 }
 
@@ -267,11 +272,14 @@ export function ahrScrubNote(
 
 /**
  * The md arrays in `/proc/mdstat` that are NOT one of the AHR bands — the ones
- * this node's scrub never covers. An unreadable mdstat yields none (fail-open:
- * the filter's absence costs the note, never a false claim).
+ * this node's scrub never covers. A null/absent list yields none HERE — the
+ * diff says nothing about arrays it could not see. The honesty is the
+ * caller's (D-26): a FAILED mdstat read must reach the state as `null` with
+ * `mdArraysReason`, so the row carries the `mdArrays` unknown and the note
+ * names the failure — never as "no foreign arrays".
  */
 export function foreignMdArrays(
-  mdKernelNames: string[] | undefined,
+  mdKernelNames: string[] | null | undefined,
   ahrKernelNames: string[] | undefined,
 ): string[] {
   if (!mdKernelNames?.length)
@@ -315,6 +323,13 @@ export async function readAhrScrubState(
   const enabledUnknown = read.state === 'unreadable' || (timerOn === null && read.state === 'ok')
   const enabled = !enabledUnknown && timerEnabled && (schedule?.pools.includes(pool) ?? false)
   const foreign = ctx ? foreignMdArrays(ctx.mdKernelNames, ctx.ahrKernelNames) : []
+  // D-26: the mdstat read behind the foreign-array diff FAILED (null). The
+  // note says so and the row carries the `mdArrays` unknown — an array
+  // outside ANAS's pools is then neither named nor silently absent.
+  const mdArraysUnreadable = ctx !== undefined && ctx.mdKernelNames === null
+  const mdArraysNote = mdArraysUnreadable && ctx
+    ? `the node's md arrays could not be read${ctx.mdArraysReason ? ` (${ctx.mdArraysReason})` : ''}, so ANAS cannot say whether an array outside its pools exists`
+    : undefined
   // The LEGACY state (review F1/F4): no ANAS units exist and mdadm's mdcheck is
   // what runs. Reported as the mechanism it IS — never as ANAS's timer sitting
   // disabled, and never adopted onto ANAS's timer at daemon start.
@@ -323,10 +338,12 @@ export async function readAhrScrubState(
     ahrScrubNote(mdcheckOn, foreign, timerEnabled),
     ...(read.state === 'unreadable' ? [`the anas-scrub unit could not be read: ${read.reason}`] : []),
     ...(mdcheckRead === null ? ['whether mdcheck is on could not be read'] : []),
+    ...(mdArraysNote ? [mdArraysNote] : []),
   ]
   const unknown: NonNullable<PeriodicScrubState['unknown']> = [
     ...(enabledUnknown ? ['enabled' as const] : []),
     ...(running === 'unknown' ? ['running' as const] : []),
+    ...(mdArraysUnreadable ? ['mdArrays' as const] : []),
   ]
   return {
     target: { kind: 'ahr', pool },

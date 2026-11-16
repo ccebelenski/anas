@@ -4,8 +4,8 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { CreateMountRequest } from '@anas/shared'
-import { entryFromRequest, fstabHasMount, fstabLineFor } from '../../services/mounts.js'
-import { addMount, addMountOption, disableMount, enableMount, getMount, parseFstab, removeMount } from '../fstab.js'
+import { entryFromRequest, fstabLineFor } from '../../services/mounts.js'
+import { addMount, addMountOption, disableMount, enableMount, getMount, hasMount, parseFstab, removeMount } from '../fstab.js'
 
 /**
  * cr3.mounts M3 — the fstab reader splits fields exactly where libmount does.
@@ -47,7 +47,7 @@ describe('cr3.mounts M3 — fstab fields split as libmount splits them', () => {
     assert.equal(back.fstype, 'nfs4')
     // The hand-written `/mnt/media` line is still its own, untouched mount.
     assert.equal(getMount(written, '/mnt/media')?.spec, 'nas:/real')
-    assert.equal(fstabHasMount(written, req.mountpoint), true, 'the create collision gate sees the line')
+    assert.equal(hasMount(written, req.mountpoint), true, 'the create collision gate sees the line')
     assert.equal(removeMount(written, req.mountpoint), before, 'Remove takes exactly that line out')
     assert.equal(fstabLineFor(written, req.mountpoint), written.split('\n')[2])
   })
@@ -60,7 +60,7 @@ describe('cr3.mounts M3 — fstab fields split as libmount splits them', () => {
     assert.ok(back, 'the CIFS line is read back')
     assert.equal(back.spec, '//nas/共有　写真')
     assert.equal(back.fstype, 'cifs')
-    assert.equal(fstabHasMount(written, '/mnt/photos'), true)
+    assert.equal(hasMount(written, '/mnt/photos'), true)
   })
 
   it('a CRLF line keeps its CR through the byte-surgical option writers', () => {

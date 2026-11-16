@@ -6,7 +6,7 @@ import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, readlinkSync } from 'node:fs'
-import fsp, { mkdir, mkdtemp, readFile, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
+import fsp, { chmod, mkdir, mkdtemp, readFile, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -246,6 +246,45 @@ describe('cr.52 — one shared mountTargetRefusal at every mountpoint door', () 
       assert.equal(res.statusCode, 202, res.body)
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    })
+
+    it('an UNLISTABLE existing directory confirms too — a failed read is not empty (cr4.conf D-24)', async () => {
+      // The empty-mountpoint read could not run (EACCES on a mode-000 dir),
+      // which the old code read as an empty folder: no confirm, straight to
+      // the job. A folder nobody could list may well hold data, and mounting
+      // over it hides it exactly like a visibly non-empty one — so it asks
+      // for the same confirmation, and the sentence names the failed read
+      // with its error code.
+      server = createServer({ mock: true, logger: false })
+      const mp = join(dir, 'unlistable')
+      await mkdir(mp)
+      await writeFile(join(mp, 'x.txt'), 'stay')
+      await chmod(mp, 0o000)
+      try {
+        const first = await create(mp)
+        assert.equal(first.statusCode, 409, first.body)
+        const body = first.json() as { error: { code: string, message: string, warnings: string[] } }
+        assert.equal(body.error.code, 'CONFIRMATION_REQUIRED', first.body)
+        assert.match(body.error.message, /could not be listed \(EACCES\)/)
+        assert.match(body.error.message, /mountpoint must be an empty directory/)
+        // cr4.conf fold 5: the sentence ends with what the operator can run.
+        assert.match(body.error.message, /Run ls -la .* as root to see what is in it before you confirm\.$/)
+        assert.match(body.error.warnings[0], /could not be listed/)
+        assert.match(body.error.warnings[0], /hide whatever is inside it until unmounted/)
+        const res = await server.inject({
+          method: 'POST',
+          url: '/v1/mounts',
+          headers: { ...JSON_HEADERS, 'x-anas-confirm': first.headers['x-anas-confirm-code'] as string },
+          payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/export', mountpoint: mp, persistent: false, mountNow: false }),
+        })
+        assert.equal(res.statusCode, 202, res.body)
+        const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+        assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      }
+      finally {
+        // The temp tree must be removable again.
+        await chmod(mp, 0o700)
+      }
     })
   })
 

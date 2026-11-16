@@ -12,11 +12,12 @@ import { join, resolve as resolvePath } from 'node:path'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { classifyKind, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
-import { addMount, ANAS_MARKER, carriesAutomount, carriesInlineSecret, cifsCredentialTokenScan, directMountOptionArgs, disableMount, enableMount, getMount, hasMount, isCifs, isNfs, parseFstabDoc, removeMount, replaceMount, serializeMountLine } from '../parsers/fstab.js'
+import { addMount, ANAS_MARKER, carriesAutomount, carriesInlineSecret, cifsCredentialTokenScan, directMountOptionArgs, disableMount, enableMount, getMount, hasMount, isCifs, isNfs, linesFor, parseFstabDoc, removeMount, replaceMount, serializeMountLine } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG, readPveMountPathsStrict, readPveTerritoryClaims, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
 import { ahrMountBase } from '../services/ahr-paths.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders, runFuser, toolNotFound } from '../services/busy-diagnosis.js'
+import { duplicateKeyRefusal } from '../services/config-duplicates.js'
 import { editConfig, readConfig, writeFileAtomic } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { describeLive, liveAtTarget, specMatchesLive } from '../services/mount-match.js'
@@ -38,7 +39,6 @@ import {
   effectiveCifsAccount,
   entryFromRequest,
   formatCredentials,
-  fstabHasMount,
   fstabLineRevision,
   InvalidExtraOptionsError,
   isRemoteKind,
@@ -636,12 +636,31 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       gates.push(stateGate(o => !!o.entry, { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${mp}' is not in /etc/fstab — nothing to disable` }))
     if (verb === 'unmount')
       gates.push(stateGate(o => o.mounted, { status: 404, code: 'NOT_FOUND', message: `Mount '${mp}' is not currently mounted` }))
+    // cr4.conf D-21 (the one rule /etc/exports follows as D-2): a verb that
+    // changes or removes a line refuses when the mountpoint is on more than
+    // one — the first-match editors rewrite or delete ONE line and report
+    // success while the other line still mounts it at boot. Refused at the
+    // door, before any confirm is minted, and asked again in the job's last-
+    // moment transform; create, mount and unmount touch no line.
+    if (verb === 'update' || verb === 'enable' || verb === 'disable' || verb === 'remove')
+      gates.push(async o => duplicateFstabLines(o.fstabText, mp))
     // cr3.mounts H2: an edit RE-MOUNTS (`remountEntry` unmounts first, or
     // mounts over an unmounted target), so it takes the LUN gate the other
     // unmounting verbs take — the same hard 409, route and job.
     if (verb === 'unmount' || verb === 'disable' || verb === 'remove' || verb === 'update')
       gates.push(lunGate(verbing))
     return gates
+  }
+
+  /**
+   * cr4.conf D-21: the refusal for a mountpoint on more than one /etc/fstab
+   * line (the number comes from the fstab parser itself), or null when it is
+   * on one line or none. One rule with /etc/exports (D-2) — see
+   * services/config-duplicates.ts.
+   */
+  function duplicateFstabLines(text: string, mp: string): Refusal | null {
+    const lines = linesFor(text, mp)
+    return lines.length > 1 ? duplicateKeyRefusal(mp, lines, '/etc/fstab') : null
   }
 
   /**
@@ -778,7 +797,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
             ? { status: 400, code: 'VALIDATION_ERROR', message: `Mountpoint '${s.mountpoint}' is a ZFS dataset mountpoint` }
             : null
         },
-        async s => fstabHasMount(s.fstabText, s.mountpoint)
+        async s => hasMount(s.fstabText, s.mountpoint)
           ? { status: 409, code: 'CONFLICT', message: `Mount '${s.mountpoint}' is already in /etc/fstab` }
           : null,
       ],
@@ -937,8 +956,19 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     // writes (the bound identity) and the WHOLE validated request — a replay
     // after the line changed is 409 IDENTITY_MISMATCH, a changed body is 409
     // CONFIRM_SCOPE_CHANGED naming the field.
-    const contents = await dirContents(req.mountpoint)
-    if (contents !== null && contents.length > 0) {
+    const listing = await dirContents(req.mountpoint)
+    if (listing.state === 'unreadable' || (listing.state === 'listed' && listing.names.length > 0)) {
+      // cr4.conf D-24: an unlistable folder asks for the SAME confirmation as
+      // a visibly non-empty one — the failed read says nothing about what is
+      // inside, and mounting over the folder hides it either way. The
+      // sentence names the failed read and its error code, and ends with the
+      // command that shows the operator what is in the folder.
+      const found = listing.state === 'unreadable'
+        ? `'${req.mountpoint}' could not be listed (${listing.code})`
+        : `'${req.mountpoint}' is not empty`
+      const hiding = listing.state === 'unreadable'
+        ? 'whatever is inside it'
+        : `the ${listing.names.length} item(s) already there`
       if (!guardConfirm(confirmStore, request, reply, spec, pre, {
         validated: {
           type: req.type,
@@ -961,9 +991,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           ...(req.credentials ? { credentialFields: Object.keys(req.credentials).sort() } : {}),
         },
         address: ['mountpoint'],
-        message: `'${req.mountpoint}' is not empty — a mountpoint must be an empty directory (§2 Mounts), so confirming will hide the ${contents.length} item(s) already there`,
+        message: `${found} — a mountpoint must be an empty directory (§2 Mounts), so confirming will hide ${hiding}. Run ls -la ${req.mountpoint} as root to see what is in it before you confirm.`,
         warnings: [
-          `'${req.mountpoint}' is not empty — the mount will hide its current contents until unmounted.`,
+          listing.state === 'unreadable'
+            ? `${found} — the mount will hide whatever is inside it until unmounted.`
+            : `'${req.mountpoint}' is not empty — the mount will hide its current contents until unmounted.`,
         ],
       })) {
         return reply
@@ -1326,6 +1358,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           await editConfig(fstabPath, (current) => {
             if (!hasMount(current, mp))
               throw new Error(`Mount '${mp}' is not in /etc/fstab`)
+            // cr4.conf D-21 last-moment backstop: a second line appeared since
+            // the gate read — refuse, the file keeps its bytes.
+            const dup = duplicateFstabLines(current, mp)
+            if (dup)
+              throw new GuardRefusalError(dup)
             return replaceMount(current, mp, merged)
           })
         }
@@ -1432,7 +1469,14 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         { ...identity, params: { mountpoint: mp } },
         guarded(spec, pre, async (_o, { updateProgress }) => {
           updateProgress(`Enabling ${mp} in /etc/fstab`)
-          await editConfig(fstabPath, current => enableMount(current, mp))
+          await editConfig(fstabPath, (current) => {
+            // cr4.conf D-21 last-moment backstop: two lines for the mountpoint
+            // appeared since the gate read — refuse, the file keeps its bytes.
+            const dup = duplicateFstabLines(current, mp)
+            if (dup)
+              throw new GuardRefusalError(dup)
+            return enableMount(current, mp)
+          })
           updateProgress('Reloading systemd (daemon-reload)')
           await daemonReload(executor)
           return { enabled: mp }
@@ -1500,6 +1544,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           updateProgress(`Disabling ${mp} in /etc/fstab`)
           let automount = false
           await editConfig(fstabPath, (current) => {
+            // cr4.conf D-21 last-moment backstop: two lines for the mountpoint
+            // appeared since the gate read — refuse, the file keeps its bytes.
+            const dup = duplicateFstabLines(current, mp)
+            if (dup)
+              throw new GuardRefusalError(dup)
             automount = carriesAutomount(current, mp) // the line BEFORE the change
             return disableMount(current, mp)
           })
@@ -1596,6 +1645,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           updateProgress('Removing /etc/fstab entry')
           let automount = false
           await editConfig(fstabPath, (current) => {
+            // cr4.conf D-21 last-moment backstop: two lines for the mountpoint
+            // appeared since the gate read — refuse, the file keeps its bytes.
+            const dup = duplicateFstabLines(current, mp)
+            if (dup)
+              throw new GuardRefusalError(dup)
             automount = carriesAutomount(current, mp) // the line BEFORE the change
             return removeMount(current, mp)
           })
@@ -2062,16 +2116,24 @@ async function listHolders(executor: CommandExecutor, mountpoint: string, procRo
   return { state: 'listed', holders: holders.map(h => ({ pid: String(h.pid), command: h.command })) }
 }
 
-/** Directory contents, or null when the path does not exist. */
-async function dirContents(path: string): Promise<string[] | null> {
+/**
+ * Directory listing for the empty-mountpoint check: the names, `missing`
+ * when the path does not exist (the create will mkdir it), or `unreadable`
+ * with the errno when the folder is there but the LISTING FAILED
+ * (cr4.conf D-24). A failed read never reads as empty — a folder nobody
+ * could list may hold data, and the confirm has to say exactly that.
+ */
+async function dirContents(path: string): Promise<
+  { state: 'listed', names: string[] } | { state: 'missing' } | { state: 'unreadable', code: string }
+> {
   try {
-    return await readdir(path)
+    return { state: 'listed', names: await readdir(path) }
   }
   catch (err) {
     const code = (err as NodeJS.ErrnoException).code
     if (code === 'ENOENT')
-      return null
-    return [] // exists but unreadable — treat as empty (don't block on EACCES)
+      return { state: 'missing' }
+    return { state: 'unreadable', code: code ?? 'unknown' }
   }
 }
 

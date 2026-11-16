@@ -232,11 +232,26 @@ export async function fsRoutes(server: FastifyInstance, opts: FsRouteOptions) {
         type = 'other'
       }
     }
-    catch {
-      // ENOENT (and any stat failure — a dangling symlink, permission) reads as
-      // "nothing usable here". exists=false, no listing.
-      const result: FsBrowseResult = { path, exists: false, type: 'missing', dirs: [] }
-      return { data: result }
+    catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        // The read SAW an absence: the path is not there, or a parent is a
+        // plain file (every tool's answer). A dangling symlink lands here
+        // too — stat follows it to nothing. exists=false, no listing.
+        const result: FsBrowseResult = { path, exists: false, type: 'missing', dirs: [] }
+        return { data: result }
+      }
+      // Every OTHER stat failure (EACCES under root squash, ELOOP, EIO) is a
+      // read that could not run: it never says gone (cr4.conf D-1). 503
+      // UNAVAILABLE naming the path and the code, the way the not-answering
+      // gate above answers, plus the one log line.
+      request.log.warn(`fs.browse: ${path} could not be read (${code ?? 'unknown'})`)
+      return reply.status(503).send({
+        error: {
+          code: 'UNAVAILABLE',
+          message: `${path} could not be read (${code ?? 'unknown'}).`,
+        },
+      })
     }
 
     const result: FsBrowseResult = { path, exists: true, type, dirs: [] }
