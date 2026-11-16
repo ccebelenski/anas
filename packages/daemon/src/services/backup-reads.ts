@@ -294,15 +294,23 @@ export function parseSnapshotList(stdout: string, refused: string[] = []): Backu
     return null
   const out: BackupSnapshot[] = []
   const items = parsed as RawSnapshot[]
+  // cr4 (P-5 class): a row ANAS cannot read is COUNTED, never dropped in
+  // silence — a wholly malformed array must not read as an honestly empty
+  // listing.
+  let dropped = 0
   for (let index = 0; index < items.length; index++) {
     const item = items[index]
-    if (!item || typeof item !== 'object')
+    if (!item || typeof item !== 'object') {
+      dropped++
       continue
+    }
     const backupType = asString(item['backup-type'])
     const backupId = asString(item['backup-id'])
     const backupTime = asInt(item['backup-time'])
-    if (!backupType || !backupId || backupTime === undefined)
+    if (!backupType || !backupId || backupTime === undefined) {
+      dropped++
       continue
+    }
     const refusal = rowIdentityRefusal('snapshot', index, backupType, backupId)
     if (refusal) {
       refused.push(refusal)
@@ -335,6 +343,17 @@ export function parseSnapshotList(stdout: string, refused: string[] = []): Backu
     if (typeof item.protected === 'boolean')
       snapshot.protected = item.protected
     out.push(snapshot)
+  }
+  // EVERY row unreadable is a fault, not an empty listing: the caller gets
+  // the failure verdict it would get for a payload that is not a list at all.
+  if (dropped > 0 && dropped === items.length) {
+    refused.push(`every one of the ${items.length} snapshot row(s) PBS returned is missing a usable `
+      + 'backup-type, backup-id or backup-time, so this listing cannot be read')
+    return null
+  }
+  if (dropped > 0) {
+    refused.push(`PBS returned ${dropped} of ${items.length} snapshot row(s) without a usable `
+      + 'backup-type, backup-id or backup-time; ANAS left them out')
   }
   // Newest first. Sorted on an array we own (never `toSorted` — the codebase
   // targets the older idiom).
@@ -475,7 +494,9 @@ export async function listSnapshots(
     return {
       ok: false,
       verdict: 'error',
-      detail: 'proxmox-backup-client exited 0 but did not return the expected JSON snapshot list',
+      // cr4: a list whose every row was unreadable says that, not the generic
+      // "not the expected JSON".
+      detail: refused.at(-1) ?? 'proxmox-backup-client exited 0 but did not return the expected JSON snapshot list',
     }
   }
   return { ok: true, data: snapshots, ...(refused.length ? { warnings: refused } : {}) }

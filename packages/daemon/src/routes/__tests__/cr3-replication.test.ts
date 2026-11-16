@@ -76,6 +76,8 @@ interface World {
   present: Set<string>
   /** full snapshot → hold tags. */
   holds: Map<string, Set<string>>
+  /** `zfs holds` fails (cr4): a read that could not see is unknown, never "no holds". */
+  holdsFail?: boolean
   pipelineResult?: PipelineResult
   /** This node's `zpool list -j` answer (default: tank and backup). */
   zpoolList?: ExecResult
@@ -124,6 +126,8 @@ function fakeExecutor(world: World, log: string[]): CommandExecutor {
     }
     if (cmd === ZFS && args[0] === 'holds') {
       const ops = args.slice(args.indexOf('--') + 1)
+      if (world.holdsFail)
+        return { stdout: '', stderr: 'cannot open \'tank/data@anas-backup-nightly-1794618000\': permission denied', exitCode: 1 }
       return ok(ops.flatMap(s => Array.from(world.holds.get(s) ?? [], t => `${s}\t${t}\tMon Jul 13 10:00 2026`)).join('\n'))
     }
     if (cmd === ZFS && args[0] === 'hold') {
@@ -518,6 +522,16 @@ describe('review of cr3 — a backup or cloud TRANSIENT never carries the chain\
     assert.equal(r.error, undefined, r.error?.message)
     assert.deepEqual(holdsOf(world), before)
     assert.match((r.result as { note?: string }).note ?? '', /sent from it only while the source still has it — it is not held there, so the run that took it may destroy it first, and the run then sends from '@S3'/)
+  })
+
+  it('a FAILED holds read says the holds could not be read and gives the command (cr4)', async () => {
+    const world = transientWorld(true)
+    world.holdsFail = true
+    const r = await run(world, { target: { pool: 'backup', dataset: 'data' } })
+    assert.equal(r.error, undefined, r.error?.message)
+    const note = (r.result as { note?: string }).note ?? ''
+    assert.match(note, /The holds on 'tank\/data@anas-backup-nightly-1794618000' could not be read, so ANAS cannot say whether it is protected; check with: zfs holds tank\/data@anas-backup-nightly-1794618000/)
+    assert.doesNotMatch(note, /it is not held there/)
   })
 
   it('with nothing named and the target\'s newest snapshot a transient the source still has, nothing is sent and the holds stay (the next send starts from it)', async () => {

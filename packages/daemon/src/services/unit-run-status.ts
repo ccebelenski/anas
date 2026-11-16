@@ -463,6 +463,15 @@ export interface UnitRunStatus extends LastRun {
   runActive: boolean
   /** The `systemctl show` snapshot it was derived from (kinds layer exit codes etc. on it). */
   serviceProps: Record<string, string>
+  /**
+   * One of the two `systemctl show` reads could not answer (cr4 D-25). A
+   * failed SERVICE read leaves no live record; a failed TIMER read leaves the
+   * journal's older result line standing as the last run (the newer-trigger
+   * guard needs `LastTriggerUSec`) and `nextRunAt` null because it was not
+   * seen. Either way the row's run status cannot be trusted, and the kinds
+   * render it unreadable from this one flag.
+   */
+  statusUnreadable: boolean
 }
 
 /** How a kind hands its units to {@link deriveUnitRunStatus}. */
@@ -509,5 +518,8 @@ export async function deriveUnitRunStatus(
     nextRunAt: parseSystemdTimestamp(timerProps.NextElapseUSecRealtime),
     runActive: isRunActive(serviceProps),
     serviceProps,
+    // cr4 (D-25): BOTH reads decide whether the row means anything — a failed
+    // timer read silently promotes an older journal line to "the last run".
+    statusUnreadable: showReadFailed(serviceProps) || showReadFailed(timerProps),
   }
 }

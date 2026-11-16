@@ -343,3 +343,54 @@ describe('unit run status — a unit\'s journal starts at its unit file\'s birth
     }
   })
 })
+
+/**
+ * cr4 (D-25): a `systemctl show` that could not answer marks the whole row
+ * unreadable. The TIMER read is the one that mattered silently: without
+ * `LastTriggerUSec` the newer-trigger guard cannot run, so the journal's OLDER
+ * result line stood as the last run, with a blank next run and nothing saying
+ * the read failed.
+ */
+describe('unit run status — a failed systemctl show is reported (D-25)', () => {
+  const showFailed = { stdout: '', stderr: 'Failed to get properties: Transport endpoint is not connected', exitCode: 1 }
+
+  function failingMock(which: 'service' | 'timer'): MockExecutor {
+    const mock = unitMock({
+      service: { ...REBOOTED },
+      nextRaw: 'Sun 2026-11-15 02:00:00 UTC',
+      lastTrigger: 'Sat 2026-11-14 02:00:00 UTC',
+      journal: SUCCESS_LINE,
+    })
+    // The unitMock fixtures are exact; a later exact fixture for the failing
+    // read wins only when it is added for the same argv. Clear and re-register.
+    mock.clearFixtures()
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['show', SERVICE, '-p', SERVICE_STATUS_PROPS],
+      result: which === 'service' ? showFailed : ok(blob(REBOOTED)),
+    })
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['show', TIMER, '-p', TIMER_STATUS_PROPS],
+      result: which === 'timer' ? showFailed : ok(`NextElapseUSecRealtime=Sun 2026-11-15 02:00:00 UTC\nLastTriggerUSec=Sat 2026-11-14 02:00:00 UTC\n`),
+    })
+    mock.addFixture({ command: JOURNALCTL, args: ['-u', SERVICE, '-n', '200', '-o', 'short-iso', '--no-pager'], result: ok(SUCCESS_LINE) })
+    return mock
+  }
+
+  it('a failed TIMER read marks the row unreadable — the journal\'s older line is not "the last run" said plainly', async () => {
+    const st = await derive(failingMock('timer'))
+    assert.equal(st.statusUnreadable, true)
+    assert.equal(st.nextRunAt, null)
+  })
+
+  it('a failed SERVICE read marks the row unreadable (the behaviour this generalises)', async () => {
+    const st = await derive(failingMock('service'))
+    assert.equal(st.statusUnreadable, true)
+  })
+
+  it('both reads answering leaves the row readable', async () => {
+    const st = await derive(unitMock({ service: { ...REBOOTED }, nextRaw: 'Sun 2026-11-15 02:00:00 UTC', lastTrigger: 'Sat 2026-11-14 02:00:00 UTC', journal: SUCCESS_LINE }))
+    assert.equal(st.statusUnreadable, false)
+  })
+})

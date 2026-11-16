@@ -14,7 +14,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GuardPass, GuardReads, GuardSpec, ObjectView, Refusal } from '../safety/guard.js'
 import type { RcloneConfigPaths, RcloneConfigRead } from '../services/rclone-config.js'
-import type { UnitTaskObject } from '../services/task-units.js'
+import type { TaskUnitRead, UnitTaskObject } from '../services/task-units.js'
 import { access, constants } from 'node:fs/promises'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
@@ -59,6 +59,7 @@ import {
   readRecentJournal,
   readRunActive,
   readTask,
+  readTaskChecked,
   readUnitTexts,
   removeTaskUnits,
   runningDirectJobFields,
@@ -77,7 +78,7 @@ import { carriesViewMarker, normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rclo
 import { testRemote } from '../services/rclone-probe.js'
 import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
 import { readSourceGuardFacts } from '../services/source-guard.js'
-import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
+import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight, unreadableTaskUnitRefusal } from '../services/task-units.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
 
@@ -1096,19 +1097,28 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     }
   }
 
-  /** A create's object is the name SLOT: existence is a gate, re-run in the job under the name key. */
-  function cloudTaskCreateSpec(name: string): GuardSpec<{ existing: CloudSyncTask | null }> {
+  /**
+   * A create's object is the name SLOT: existence is a gate, re-run in the job
+   * under the name key. cr4 (D-20): the read is three-valued — a unit file
+   * that is THERE and could not be read refuses the create (409, naming the
+   * file) instead of passing as absent and being overwritten.
+   */
+  function cloudTaskCreateSpec(name: string): GuardSpec<{ existing: TaskUnitRead<CloudSyncTask> }> {
     return {
       operation: 'cloud.task.create',
       object: {
         what: `Cloud sync task '${name}'`,
-        read: async () => ({ existing: await readTask(systemdDir, name) }),
+        read: async () => ({ existing: await readTaskChecked(systemdDir, name) }),
         id: async () => ({ task: name }),
         unbound: () => `Could not read cloud sync tasks — refusing`,
       },
-      gates: [async o => (o.existing
-        ? { status: 409, code: 'CONFLICT', message: `Cloud sync task '${name}' already exists` }
-        : null)],
+      gates: [async (o) => {
+        if (o.existing.state === 'unreadable')
+          return unreadableTaskUnitRefusal(CLOUD_UNIT_KIND, name, o.existing)
+        return o.existing.state === 'task'
+          ? { status: 409, code: 'CONFLICT', message: `Cloud sync task '${name}' already exists` }
+          : null
+      }],
       locks: async () => [taskClaim('cloud', name, 'exclusive')],
     }
   }
@@ -1131,8 +1141,8 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       // is skipped by the list AND by a parsed-object read, which would answer
       // 404 on exactly the unit the operator needs to remove — this read makes
       // it deletable. The UPDATE spec above stays bound to the parsed object:
-      // an edit cannot be bound to bytes that do not parse — 404 not-found is
-      // right there.
+      // an edit cannot be bound to bytes that do not parse — cr4 (D-20), that
+      // read answers 503 naming the file, never a 404 saying it is not there.
       object: {
         what: `Cloud sync task '${name}'`,
         read: () => readUnitStoreEntry(readUnitTexts, systemdDir, name),

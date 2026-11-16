@@ -32,9 +32,10 @@ import type { TargetObject } from '../services/iscsi-guard.js'
 import type { BackingRefusal, ResolvedAhrPool, ResolvedBacking } from '../services/iscsi-mutate.js'
 import type { IscsiPaths, IscsiReadContext } from '../services/iscsi.js'
 import type { SourceClaims } from '../services/source-claims.js'
-import type { UnitTaskObject } from '../services/task-units.js'
+import type { TaskUnitRead, UnitTaskObject } from '../services/task-units.js'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
   BackupBrowseRequest,
@@ -97,6 +98,7 @@ import {
   parentDirectory,
   probePathKind,
   readSelectionFacts,
+  refusedHardlinkSentence,
   restoreTerritoryRefusal,
   runFileRestore,
   writeTestDirectory,
@@ -137,6 +139,7 @@ import {
   readRecentJournal,
   readRunActive,
   readTask,
+  readTaskChecked,
   readUnitTexts,
   removeTaskUnits,
   runningDirectJobFields,
@@ -160,7 +163,7 @@ import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNest
 import { FILE_RESTORE_MARK_ATTR, jobRecordLifetime, readRestoreMark, restoreEndSentence, restoreJobsOf } from '../services/restore-mark.js'
 import { datasetSourceClaims, pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
 import { notThereClause, readSourceGuardFacts, unmountedMountFor, unreadableFactsRefusal } from '../services/source-guard.js'
-import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight } from '../services/task-units.js'
+import { activeRunDeleteRefusal, readUnitStoreEntry, readUnitTaskObject, runStateUnreadableRefusal, serviceUnitRevision, taskRunInFlight, unreadableTaskUnitRefusal } from '../services/task-units.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -661,13 +664,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // Refuse (409) while a backup TASK still references this repository.
       // Distinct code from the CAS 'CONFLICT': the UI reload-and-retries CAS
       // conflicts, but a referenced-repo refusal must show its message.
-      const referencing = (await readAllTasks(systemdDir)).filter(t => t.repository === name)
-      if (referencing.length) {
+      const refs = await repoReferencingTasks(name)
+      if ('unreadable' in refs) {
+        reply.code(503)
+        return { error: { code: 'UNAVAILABLE', message: refs.unreadable } }
+      }
+      if (refs.referencing.length) {
         reply.code(409)
         return {
           error: {
             code: 'IN_USE',
-            message: `Repository '${name}' is still used by backup task(s): ${referencing.map(t => t.name).join(', ')} — remove them first`,
+            message: `Repository '${name}' is still used by backup task(s): ${refs.referencing.join(', ')} — remove them first`,
           },
         }
       }
@@ -678,12 +685,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         async () => {
           // cr.41: the IN_USE refusal is re-run in the job — a task created
           // after the route's check must not be stranded on a removed repo.
-          const referencing = (await readAllTasks(systemdDir)).filter(t => t.repository === name)
-          if (referencing.length) {
+          const refs = await repoReferencingTasks(name)
+          if ('unreadable' in refs)
+            throw new GuardRefusalError({ status: 503, code: 'UNAVAILABLE', message: refs.unreadable })
+          if (refs.referencing.length) {
             throw new GuardRefusalError({
               status: 409,
               code: 'IN_USE',
-              message: `Repository '${name}' is still used by backup task(s): ${referencing.map(t => t.name).join(', ')} — remove them first`,
+              message: `Repository '${name}' is still used by backup task(s): ${refs.referencing.join(', ')} — remove them first`,
             })
           }
           const written = await writeBackupRepos(paths, expectedVersion, current.repos.filter(r => r.name !== name))
@@ -695,6 +704,25 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { job }
     },
   )
+
+  /**
+   * cr4 (P-5): the tasks that reference repository `name`, read over the
+   * CHECKED store. The skipping reader drops a unit that is there and cannot
+   * be read or parsed, so a task the operator still has would be invisible and
+   * the removal would strand it. One such unit refuses the removal: ANAS
+   * cannot tell whether it uses the repository.
+   */
+  async function repoReferencingTasks(name: string): Promise<{ referencing: string[] } | { unreadable: string }> {
+    const checked = await readAllTasksChecked(systemdDir)
+    if (checked.unreadable.length) {
+      const first = checked.unreadable[0]!
+      return {
+        unreadable: `Task unit ${join(systemdDir, serviceUnitName(first.name))} could not be read, `
+          + `so ANAS cannot tell whether it uses repository '${name}'. Fix or remove that file, then try again.`,
+      }
+    }
+    return { referencing: checked.tasks.filter(t => t.repository === name).map(t => t.name) }
+  }
 
   // --- POST /backup/repos/test — staged diagnosis ---------------------------
   server.post('/backup/repos/test', async (request, reply) => {
@@ -1342,19 +1370,28 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     }
   }
 
-  /** A create's object is the name SLOT: existence is a gate, re-run in the job under the name key. */
-  function backupTaskCreateSpec(name: string): GuardSpec<{ existing: BackupTask | null }> {
+  /**
+   * A create's object is the name SLOT: existence is a gate, re-run in the job
+   * under the name key. cr4 (D-20): the read is three-valued — a unit file
+   * that is THERE and could not be read refuses the create (409, naming the
+   * file) instead of passing as absent and being overwritten.
+   */
+  function backupTaskCreateSpec(name: string): GuardSpec<{ existing: TaskUnitRead<BackupTask> }> {
     return {
       operation: 'backup.task.create',
       object: {
         what: `Backup task '${name}'`,
-        read: async () => ({ existing: await readTask(systemdDir, name) }),
+        read: async () => ({ existing: await readTaskChecked(systemdDir, name) }),
         id: async () => ({ task: name }),
         unbound: () => `Could not read backup tasks — refusing`,
       },
-      gates: [async o => (o.existing
-        ? { status: 409, code: 'CONFLICT', message: `Backup task '${name}' already exists` }
-        : null)],
+      gates: [async (o) => {
+        if (o.existing.state === 'unreadable')
+          return unreadableTaskUnitRefusal(BACKUP_UNIT_KIND, name, o.existing)
+        return o.existing.state === 'task'
+          ? { status: 409, code: 'CONFLICT', message: `Backup task '${name}' already exists` }
+          : null
+      }],
       locks: async () => [taskClaim('backup', name, 'exclusive')],
     }
   }
@@ -1377,8 +1414,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // is skipped by the list AND by a parsed-object read, which would answer
       // 404 on exactly the unit the operator needs to remove — this read makes
       // it deletable. The UPDATE spec above stays bound to the parsed object:
-      // an edit cannot be bound to bytes that do not parse — 404 not-found is
-      // right there.
+      // an edit cannot be bound to bytes that do not parse — cr4 (D-20), that
+      // read answers 503 naming the file, never a 404 saying it is not there.
       object: {
         what: `Backup task '${name}'`,
         read: () => readUnitStoreEntry(readUnitTexts, systemdDir, name),
@@ -3379,6 +3416,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // in-place trigger), file sizes read (the exact space figure).
     const selectionGate: Gate<RestoreDestination> = async (o) => {
       const facts = await o.selection()
+      // cr4 (P-6): every picked hardlink was left out because the server named
+      // a link target ANAS will not pass to the client. With no selection left,
+      // the restore would mean the WHOLE archive - not what was asked. Refuse
+      // with the same sentences the job result carries otherwise.
+      if (!facts.selections.length && facts.refusedHardlinks.length) {
+        return {
+          status: 409,
+          code: 'CONFLICT',
+          message: `${facts.refusedHardlinks.map(h => refusedHardlinkSentence(h.selection, h.target)).join(' ')} Nothing was restored.`,
+        }
+      }
       if (!facts.unknown.length)
         return null
       return {

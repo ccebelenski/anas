@@ -796,6 +796,64 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     )
   })
 
+  // --- cr4 P-6: the server's hardlink target passes the archive-path gate -----
+
+  it('a hardlink whose link target is not an archive path leaves the group out and the job result says so (P-6)', async () => {
+    const stats = [
+      statBlock('/alpha.txt', 23, 'file', '644', '-rw-r--r--'),
+      statBlock('/hard-b.txt -> "a/../../etc/cron.d/evil"', 0, 'symlink', '0', 'L---------'),
+    ].join('\n\n')
+    seedHappyPath({ stats, selections: ['/alpha.txt'] })
+
+    const res = await post(body({ selections: ['/alpha.txt', '/hard-b.txt'] }))
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+    assert.equal(job.status, 'completed')
+    const result = job.result as BackupFilesRestoreResult
+    // The group is out; the other selection restored.
+    assert.deepEqual(result.selections, ['/alpha.txt'])
+    assert.deepEqual(result.addedForHardlinks, [])
+    const warning = result.warnings.find(w => /hardlink/.test(w))
+    assert.ok(warning, `expected the hardlink sentence, got ${JSON.stringify(result.warnings)}`)
+    assert.match(warning, /Entry \/hard-b\.txt is a hardlink whose link target \(a\/\.\.\/\.\.\/etc\/cron\.d\/evil\) is not a path ANAS will pass to the backup client, so its hardlink group was not restored\. Restore the whole archive to recover it\./)
+    // The crafted server path never became a --pattern.
+    const call = mockOf(server).calls.find(c => c.command === PBC && c.args[0] === 'restore')!
+    assert.deepEqual(call.args.filter((a, i) => call.args[i - 1] === '--pattern'), ['/alpha.txt'])
+  })
+
+  it('control characters in the link target never reach the job text (P-6)', async () => {
+    const stats = [
+      statBlock('/alpha.txt', 23, 'file', '644', '-rw-r--r--'),
+      statBlock('/hard-b.txt -> "a/b\tfake-line"', 0, 'symlink', '0', 'L---------'),
+    ].join('\n\n')
+    seedHappyPath({ stats, selections: ['/alpha.txt'] })
+
+    const res = await post(body({ selections: ['/alpha.txt', '/hard-b.txt'] }))
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+    assert.equal(job.status, 'completed')
+    const result = job.result as BackupFilesRestoreResult
+    const warning = result.warnings.find(w => /hardlink/.test(w))
+    assert.ok(warning, `expected the hardlink sentence, got ${JSON.stringify(result.warnings)}`)
+    // eslint-disable-next-line no-control-regex
+    assert.equal(/[\x00-\x1F\x7F]/.test(warning), false, JSON.stringify(warning))
+    assert.match(warning, /a\/b fake-line/)
+  })
+
+  it('a restore whose every selection was such a hardlink is refused, never widened to the whole archive (P-6)', async () => {
+    seedHappyPath({
+      stats: statBlock('/hard-b.txt -> "a/../../etc/cron.d/evil"', 0, 'symlink', '0', 'L---------'),
+      selections: ['/hard-b.txt'],
+    })
+    const res = await post(body({ selections: ['/hard-b.txt'] }))
+    assert.equal(res.statusCode, 409, res.body)
+    const bodyJson = res.json() as { error: { code: string, message: string } }
+    assert.equal(bodyJson.error.code, 'CONFLICT')
+    assert.match(bodyJson.error.message, /Entry \/hard-b\.txt is a hardlink whose link target \(a\/\.\.\/\.\.\/etc\/cron\.d\/evil\) is not a path ANAS will pass to the backup client/)
+    assert.match(bodyJson.error.message, /Nothing was restored\.$/)
+    assert.equal(restoreRan(), false)
+  })
+
   // --- Verification ---------------------------------------------------------
 
   it('a silent no-match completes WITH WARNINGS and names what is missing (GT-24)', async () => {

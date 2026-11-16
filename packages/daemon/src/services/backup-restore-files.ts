@@ -11,12 +11,13 @@ import type { BackupReadDeps } from './backup-reads.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'node:fs'
 import { open, unlink } from 'node:fs/promises'
-import { isPathWithin, restorePatternsFor } from '@anas/shared'
+import { ArchivePath, isPathWithin, restorePatternsFor } from '@anas/shared'
 import { readPveMountPathsStrict } from '../parsers/pve-storage.js'
 import { isHardlinkStat, statArchivePaths } from './backup-catalog.js'
 import { classifyBackupReadVerdict } from './backup-reads.js'
 import { buildBackupEnv, PBC, pbcPositional } from './backup-runner.js'
 import { ownershipRefusal, pveManagedRefusal } from './pve-footprint.js'
+import { singleLine } from './replication-notify.js'
 import { maskSecretValues } from './secret-argv.js'
 
 /**
@@ -1069,6 +1070,13 @@ export interface SelectionFacts {
   exactBytes: number | null
   /** Non-fatal notes (a stat pass that could not run at all). */
   warnings: string[]
+  /**
+   * Hardlink selections left OUT of the restore (cr4 P-6): the server's own
+   * `stat` named a link target that is not an archive path ANAS will pass to
+   * the backup client, so the group cannot be completed and restoring one name
+   * of it alone fails the whole job. Named so a caller can say which.
+   */
+  refusedHardlinks: { selection: string, target: string }[]
 }
 
 /**
@@ -1092,6 +1100,10 @@ export interface SelectionFacts {
  *
  * An ABSOLUTE target is kept as-is: it is archive-absolute already, and leaving
  * that branch in costs nothing if a future client version emits it.
+ *
+ * The result is the SERVER's text, not a validated path. A caller must run it
+ * through `ArchivePath` before it becomes a `--pattern` (cr4 P-6, in
+ * {@link readSelectionFacts}); this helper does not.
  */
 export function hardlinkPrimaryPath(_selection: string, target: string): string | null {
   if (!target)
@@ -1100,6 +1112,18 @@ export function hardlinkPrimaryPath(_selection: string, target: string): string 
     return target.replace(TRAILING_SLASHES_RE, '') || '/'
   const rooted = `/${target.replace(TRAILING_SLASHES_RE, '')}`
   return rooted === '/' ? null : rooted
+}
+
+/**
+ * The sentence for a hardlink selection the restore leaves out (cr4 P-6): the
+ * entry, what its link target is, and the one way to recover it. Both values
+ * are server text, so both are flattened to one line before they are written
+ * into a job result.
+ */
+export function refusedHardlinkSentence(selection: string, target: string): string {
+  return `Entry ${singleLine(selection)} is a hardlink whose link target (${singleLine(target)}) is not `
+    + 'a path ANAS will pass to the backup client, so its hardlink group was not restored. '
+    + 'Restore the whole archive to recover it.'
 }
 
 /**
@@ -1129,6 +1153,7 @@ export async function readSelectionFacts(
     unknown: [],
     exactBytes: null,
     warnings: [],
+    refusedHardlinks: [],
   }
 
   const out = await statArchivePaths(executor, deps, selections)
@@ -1159,6 +1184,17 @@ export async function readSelectionFacts(
     }
     if (isHardlinkStat(stat)) {
       const primary = hardlinkPrimaryPath(selection, stat.target ?? '')
+      // cr4 (P-6): the server's own listing is not a trusted path source. It
+      // rides into the client's `--pattern` list verbatim, so it passes the
+      // same gate an operator selection does; one that fails leaves the whole
+      // hardlink group out (restoring one name alone fails the whole job) and
+      // the job result says which entry and why.
+      if (primary && !ArchivePath.safeParse(primary).success) {
+        facts.refusedHardlinks.push({ selection, target: stat.target ?? '' })
+        facts.selections = facts.selections.filter(s => s !== selection)
+        facts.warnings.push(refusedHardlinkSentence(selection, stat.target ?? ''))
+        continue
+      }
       if (primary && !seen.has(primary)) {
         seen.add(primary)
         facts.selections.push(primary)

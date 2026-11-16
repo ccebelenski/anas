@@ -53,11 +53,12 @@ const REALPATH_TIMEOUT_S = '5'
  *     somebody mounted by hand and then unmounted is indistinguishable from a
  *     path that was always a plain directory — nothing on the system records
  *     the intent. An absent path is the caller's own existence check.
- *   - FAIL OPEN on the mount table. An unreadable mount table (or an
- *     unreadable fstab) means the guard cannot see the system, and a guard
- *     that cannot see must not claim a mount is missing: it passes, exactly as
- *     every other derivation in this daemon fails open rather than blocking on
- *     its own blindness.
+ *   - NOT fail-open on the mount table or the fstab. An unreadable mount
+ *     table (or an unreadable fstab) means the guard cannot see the system,
+ *     and a missing fact may only tighten: `guardSourcePath` answers
+ *     `unreadableFactsRefusal` and the path is refused rather than read as
+ *     "nothing is missing". `unmountedMountFor` on its own names no mount it
+ *     could not see — every gate calls the refusal first.
  *   - NOT fail-open on the ZFS facts (ident.4 review). An unmounted dataset's
  *     mountpoint is an ordinary empty directory on its mounted parent, so
  *     without `zfs list` a path below a live ZFS mount cannot be told apart
@@ -89,8 +90,9 @@ export interface SourceGuardFacts {
    */
   realpaths: Map<string, string>
   /**
-   * The mount table could not be read. While true the guard passes everything
-   * — it has no evidence that anything is missing (fail open).
+   * The mount table could not be read. {@link unmountedMountFor} names no
+   * mount it could not see, and {@link guardSourcePath} refuses the path
+   * through {@link unreadableFactsRefusal} (a missing fact may only tighten).
    */
   mountTableUnavailable: boolean
   /**

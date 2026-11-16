@@ -23,7 +23,6 @@ import {
   parseHelperResult,
   readOnce,
   readUnitJournal,
-  showReadFailed,
   showUnitProps,
   showUnitPropsStrict,
   TRIGGER_SLACK_MS,
@@ -236,19 +235,108 @@ function errorWord(err: unknown): string {
   return (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err))
 }
 
-/** One task by name, or null if its service file is absent/invalid. */
+/**
+ * One task read by name (cr4 D-20): the task, ABSENT (only when the file is
+ * not there — ENOENT/ENOTDIR), or there and unreadable with the file's path
+ * and the reason. Missing, unreadable and unparseable are three different
+ * facts: a caller that treats the last two as absent overwrites a unit it
+ * promised not to, or says "not found" about a file the operator can see.
+ */
+export type TaskUnitRead<T>
+  = | { state: 'task', task: T }
+    | { state: 'absent' }
+    | { state: 'unreadable', path: string, reason: string }
+
+/** One task by name, three-valued: the task, absent, or there and unreadable. */
 export async function readTaskUnit<T>(
   kind: TaskUnitKind,
   dir: string,
   name: string,
   schema: ZodType<T>,
-): Promise<T | null> {
+): Promise<TaskUnitRead<T>> {
+  const path = join(dir, serviceUnitName(kind, name))
+  let content: string
   try {
-    return parseTaskUnit(kind, await readFile(join(dir, serviceUnitName(kind, name)), 'utf-8'), schema)
+    content = await readFile(path, 'utf-8')
   }
-  catch {
-    return null
+  catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR')
+      return { state: 'absent' }
+    return { state: 'unreadable', path, reason: errorWord(err) }
   }
+  const task = parseTaskUnit(kind, content, schema)
+  if (task)
+    return { state: 'task', task }
+  return { state: 'unreadable', path, reason: `no valid ${kind.marker.replace(MARKER_EQUALS_RE, '')} JSON` }
+}
+
+/**
+ * The fact every door says about a unit file that is there and could not be
+ * read (cr4 D-20): where it is, and why it could not be read.
+ */
+export function unitFileUnreadableFact(
+  kind: TaskUnitKind,
+  name: string,
+  read: { path: string, reason: string },
+): string {
+  return `A unit file for ${kind.label} task '${name}' already exists at ${read.path} and could not be read (${read.reason}).`
+}
+
+/**
+ * The CREATE gate's refusal over that fact: ANAS will not overwrite a unit it
+ * could not read, so the 409 says so and names the file to fix or remove.
+ */
+export function unreadableTaskUnitRefusal(
+  kind: TaskUnitKind,
+  name: string,
+  read: { path: string, reason: string },
+): Refusal {
+  return {
+    status: 409,
+    code: 'CONFLICT',
+    message: `${unitFileUnreadableFact(kind, name, read)} ANAS will not overwrite it. Fix or remove that file, then try again.`,
+  }
+}
+
+/** A single-task read's 503 sentence over the same fact. */
+export function unreadableTaskUnitMessage(
+  kind: TaskUnitKind,
+  name: string,
+  read: { path: string, reason: string },
+): string {
+  return `${unitFileUnreadableFact(kind, name, read)} Fix or remove that file, then try again.`
+}
+
+/**
+ * A single-task read that found a unit file it could not read (cr4 D-20). The
+ * server's error handler answers it 503 UNAVAILABLE with this sentence, so a
+ * door that reads one task never answers the 404 "not found" a failed read
+ * would fake. A job that reads it fails with the same sentence.
+ */
+export class TaskUnitUnreadableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'TaskUnitUnreadableError'
+  }
+}
+
+/**
+ * {@link readTaskUnit} for a caller that must have the task or nothing: the
+ * task, null when ABSENT, and a THROWN {@link TaskUnitUnreadableError} when the
+ * file is there and could not be read. Never the collapsed null — a caller
+ * cannot mistake an unreadable unit for a missing one.
+ */
+export async function readTaskUnitOrThrow<T>(
+  kind: TaskUnitKind,
+  dir: string,
+  name: string,
+  schema: ZodType<T>,
+): Promise<T | null> {
+  const read = await readTaskUnit(kind, dir, name, schema)
+  if (read.state === 'unreadable')
+    throw new TaskUnitUnreadableError(unreadableTaskUnitMessage(kind, name, read))
+  return read.state === 'task' ? read.task : null
 }
 
 /**
@@ -455,9 +543,11 @@ export interface UnitTaskObject<T> {
 /**
  * Read a unit-store task or schedule's guard object: the parsed payload and
  * the `.service` text it was stored in, in ONE read pair (the revision hashes
- * the text this read already carried). Null when the unit is absent OR
- * unparseable — the guard's read answers null exactly when {@link readTask}
- * would, so a task the store cannot read is as good as gone.
+ * the text this read already carried). Null when the unit is ABSENT. A unit
+ * that is there and cannot be read or parsed does not answer null: cr4
+ * (D-20), `readPayload` throws `TaskUnitUnreadableError`, which the guard's
+ * door leaves to the server's 503 with the file named — an unreadable unit is
+ * a fact about the store, never "gone".
  */
 export async function readUnitTaskObject<T>(
   readPayload: (dir: string, name: string) => Promise<T | null>,
@@ -928,7 +1018,7 @@ export async function deriveTaskStatus(
   // ONE journal read per row, shared by the derivation's rungs and the
   // last-success lookup below (whichever needs it first pays for it).
   const readJournal = readOnce(() => readRecentJournal(kind, executor, task.name))
-  const { lastRunResult, lastRunAt, lastRunNote, nextRunAt, runActive, serviceProps } = await deriveUnitRunStatus(executor, {
+  const { lastRunResult, lastRunAt, lastRunNote, nextRunAt, runActive, statusUnreadable } = await deriveUnitRunStatus(executor, {
     serviceUnit: serviceUnitName(kind, task.name),
     timerUnit: timerUnitName(kind, task.name),
     enabled: task.enabled,
@@ -959,7 +1049,7 @@ export async function deriveTaskStatus(
     lastSuccessAt,
     runActive,
     ...(lastRunNote ? { lastRunNote } : {}),
-    ...(showReadFailed(serviceProps) ? { statusUnreadable: true as const } : {}),
+    ...(statusUnreadable ? { statusUnreadable: true as const } : {}),
   }
 }
 

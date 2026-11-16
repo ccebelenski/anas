@@ -2,7 +2,7 @@ import type { BackupArchiveConsistency, BackupExpandedArchive, BackupPruneResult
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { BackupTrigger, CadenceGateDecision } from './backup-cadence.js'
-import type { RunActiveState, SuperviseRunOptions, TaskUnitKind, UnreadableTaskUnit } from './task-units.js'
+import type { RunActiveState, SuperviseRunOptions, TaskUnitKind, TaskUnitRead, UnreadableTaskUnit } from './task-units.js'
 import type { TaskHelperResult } from './unit-run-status.js'
 import { BACKUP_SKIP_EXIT_CODE, BackupTask as BackupTaskSchema } from '@anas/shared'
 import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.js'
@@ -33,6 +33,7 @@ import {
   readRecentJournal as readRecentJournalGeneric,
   readRunActive as readRunActiveGeneric,
   readTaskUnit,
+  readTaskUnitOrThrow,
   readUnitTexts as readUnitTextsGeneric,
   removeTaskUnits as removeTaskUnitsGeneric,
   runningDirectJobFields as runningDirectJobFieldsGeneric,
@@ -286,8 +287,18 @@ export async function readAllTasksChecked(dir: string): Promise<{ tasks: BackupT
   return readAllTaskUnitsChecked(BACKUP_UNIT_KIND, dir, BackupTaskSchema)
 }
 
-/** One task by name, or null if its service file is absent/invalid. */
+/**
+ * One task by name: the task, or null when its service file is ABSENT
+ * (cr4 D-20). A file that is there and cannot be read throws
+ * `TaskUnitUnreadableError` instead — never null, which a caller would take
+ * for "no task" and act on.
+ */
 export async function readTask(dir: string, name: string): Promise<BackupTask | null> {
+  return readTaskUnitOrThrow(BACKUP_UNIT_KIND, dir, name, BackupTaskSchema)
+}
+
+/** {@link readTask}, three-valued: the task, absent, or there and unreadable. */
+export async function readTaskChecked(dir: string, name: string): Promise<TaskUnitRead<BackupTask>> {
   return readTaskUnit(BACKUP_UNIT_KIND, dir, name, BackupTaskSchema)
 }
 

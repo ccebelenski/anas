@@ -291,8 +291,12 @@ export interface Transport {
 }
 
 /**
- * The transport bound to an executor + config. All remote reads fail open
- * (empty/false) so a probe failure never masquerades as data.
+ * The transport bound to an executor + config. Reads do NOT all fail open, and
+ * a caller must know which shape it holds: `remotePoolNames` and
+ * `remotePoolExists` answer `{ ok: false, error }` on a failed listing (the
+ * caller refuses), while `listPeers`, `remoteSnapshotNames` and
+ * `remoteHeldTags` answer an empty list and `remoteDatasetExists` answers
+ * false — an empty answer a caller cannot tell from "there are none".
  */
 export function createTransport(executor: CommandExecutor, config: TransportConfig): Transport {
   async function sshExec(resolved: ResolvedLocation, cmd: string[]): Promise<ExecResult> {

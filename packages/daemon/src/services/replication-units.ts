@@ -16,7 +16,7 @@ import { isTransientRunSnapshot } from './snapshot-naming.js'
 // is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
 // hand-copy and its last private leftovers (third pass).
 import { listServiceUnitsChecked, markerRegex, quoteExecArg, readUnitFile, refuseControlChars, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
-import { deriveUnitRunStatus, newestHelperResult, readOnce, readUnitJournal, showReadFailed, toSystemdRunResult, TRIGGER_SLACK_MS } from './unit-run-status.js'
+import { deriveUnitRunStatus, newestHelperResult, readOnce, readUnitJournal, toSystemdRunResult, TRIGGER_SLACK_MS } from './unit-run-status.js'
 
 /**
  * Recurring replication TASKS (Epic 5.5.3) — the systemd units ARE the store.
@@ -663,7 +663,7 @@ export async function deriveTaskStatus(
     ...(run.lastRunNote ? { lastRunNote: run.lastRunNote } : {}),
     // cr3.followup: a `systemctl show` that could not answer is a failed
     // read, never the `unknown` result it derives to.
-    ...(showReadFailed(run.serviceProps) ? { statusUnreadable: true as const } : {}),
+    ...(run.statusUnreadable ? { statusUnreadable: true as const } : {}),
     ...(targetDrift ? { targetDrift } : {}),
   }
 }

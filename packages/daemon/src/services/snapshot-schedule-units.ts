@@ -16,7 +16,7 @@ import {
   systemdTimersStampDir,
   unlinkQuiet,
 } from './systemd-unit-store.js'
-import { deriveUnitRunStatus, readUnitJournal, showReadFailed, toSystemdRunResult } from './unit-run-status.js'
+import { deriveUnitRunStatus, readUnitJournal, toSystemdRunResult } from './unit-run-status.js'
 
 /**
  * Snapshot SCHEDULES (Epic 17.3/17.4/17.5) — the systemd units ARE the store,
@@ -596,7 +596,7 @@ async function computeStatus(
       ...(run.lastRunNote ? { lastRunNote: run.lastRunNote } : {}),
       // cr3.followup: a `systemctl show` that could not answer is a failed
       // read, never the `unknown` result it derives to.
-      ...(showReadFailed(run.serviceProps) ? { statusUnreadable: true as const } : {}),
+      ...(run.statusUnreadable ? { statusUnreadable: true as const } : {}),
     },
     lastRunExitCode,
   }

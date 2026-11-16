@@ -1,7 +1,7 @@
 import type { BackupRepo } from '@anas/shared'
 import type { BackupReposPaths } from '../backup-repos.js'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -139,6 +139,48 @@ describe('backup repos — per-repo secret files (0600 root-only)', () => {
     await removeRepoSecret(credsDir, 'pbs-main')
     assert.equal(await repoSecretSet(credsDir, 'pbs-main'), false)
     assert.equal(await readRepoSecret(credsDir, 'pbs-main'), null)
+  })
+
+  it('a chmod that fails on the secret FILE fails the write and removes the file (cr4)', async () => {
+    await assert.rejects(
+      writeRepoSecret(credsDir, 'pbs-main', 'super-secret-value', {
+        chmod: async (path) => {
+          if (path.endsWith('.secret'))
+            throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+        },
+      }),
+      /the secret file .*backup-repo-pbs-main\.secret could not be made root-only \(EPERM\); it was removed, so the secret was not saved\. Fix the permissions on .*, then try again\./,
+    )
+    // Nothing holding the secret is left behind.
+    assert.deepEqual(await readdir(credsDir), [])
+    assert.equal(await readRepoSecret(credsDir, 'pbs-main'), null)
+  })
+
+  it('a chmod that fails on the secret DIRECTORY fails before any secret is written (cr4)', async () => {
+    await assert.rejects(
+      writeRepoSecret(credsDir, 'pbs-main', 'super-secret-value', {
+        chmod: async () => {
+          throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+        },
+      }),
+      /the secret directory .* could not be made root-only \(EACCES\), so the secret was not saved\. Fix the permissions on .*, then try again\./,
+    )
+    assert.deepEqual(await readdir(credsDir), [])
+  })
+
+  it('a file chmod that fails AND a removal that fails says the file is still there (cr4)', async () => {
+    await assert.rejects(
+      writeRepoSecret(credsDir, 'pbs-main', 'super-secret-value', {
+        chmod: async (path) => {
+          if (path.endsWith('.secret'))
+            throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+        },
+        rm: async () => {
+          throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+        },
+      }),
+      /could not be made root-only \(EPERM\) and could not be removed; delete .* by hand\./,
+    )
   })
 
   it('removeRepoSecret on a missing file is a no-op (best-effort)', async () => {

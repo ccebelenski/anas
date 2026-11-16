@@ -146,6 +146,39 @@ describe('backup restore reads — snapshot list parsing (real fixtures)', () =>
     assert.equal(parseSnapshotList('{"a":1}'), null)
   })
 
+  it('counts a row it could not read and says so, never an honest empty list (cr4)', () => {
+    const refused: string[] = []
+    const parsed = parseSnapshotList(JSON.stringify([
+      { 'backup-id': 'x', 'backup-type': 'host' },
+      null,
+      'row',
+      { 'backup-id': 'y', 'backup-time': 100, 'backup-type': 'host', 'files': [] },
+    ]), refused)
+    assert.ok(parsed)
+    assert.equal(parsed.length, 1)
+    assert.equal(parsed[0]!.backupId, 'y')
+    assert.equal(refused.length, 1)
+    assert.match(refused[0]!, /PBS returned 3 of 4 snapshot row\(s\) without a usable backup-type, backup-id or backup-time; ANAS left them out/)
+  })
+
+  it('a wholly unreadable array is a failure verdict, not an empty listing (cr4)', () => {
+    const refused: string[] = []
+    const parsed = parseSnapshotList(JSON.stringify([
+      { 'backup-id': 'x' },
+      { 'backup-time': 100 },
+      null,
+    ]), refused)
+    assert.equal(parsed, null)
+    assert.equal(refused.length, 1)
+    assert.match(refused[0]!, /every one of the 3 snapshot row\(s\) PBS returned is missing a usable backup-type, backup-id or backup-time, so this listing cannot be read/)
+  })
+
+  it('an honestly empty array is still an empty list with no warning (GT-5 stands)', () => {
+    const refused: string[] = []
+    assert.deepEqual(parseSnapshotList('[]', refused), [])
+    assert.deepEqual(refused, [])
+  })
+
   it('an element missing its identity parts is skipped, not guessed at', () => {
     const parsed = parseSnapshotList(JSON.stringify([
       { 'backup-id': 'x', 'backup-type': 'host' },
@@ -339,6 +372,34 @@ describe('backup restore reads — the runners', () => {
     const out = await listSnapshots(exec, { repo: makeRepo(), secret: 'x' })
     assert.equal(out.ok, false)
     assert.equal(out.ok === false && out.verdict, 'error')
+  })
+
+  it('a listing whose every row is unreadable is an error verdict naming that (cr4)', async () => {
+    const exec = new MockExecutor()
+    exec.addFixture({ command: PBC, result: { stdout: JSON.stringify([{ 'backup-id': 'x' }, null]), stderr: '', exitCode: 0 } })
+    const out = await listSnapshots(exec, { repo: makeRepo(), secret: 'x' })
+    assert.equal(out.ok, false)
+    assert.ok(out.ok === false && out.verdict === 'error')
+    assert.match(out.ok === false ? out.detail : '', /every one of the 2 snapshot row\(s\) PBS returned is missing a usable/)
+  })
+
+  it('a partly unreadable listing warns with the count and returns the readable rows (cr4)', async () => {
+    const exec = new MockExecutor()
+    exec.addFixture({
+      command: PBC,
+      result: {
+        stdout: JSON.stringify([
+          { 'backup-id': 'x', 'backup-type': 'host', 'backup-time': 100, 'files': [] },
+          { 'backup-id': 'y' },
+        ]),
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    const out = await listSnapshots(exec, { repo: makeRepo(), secret: 'x' })
+    assert.ok(out.ok)
+    assert.equal(out.data.length, 1)
+    assert.match(out.warnings?.join(' ') ?? '', /PBS returned 1 of 2 snapshot row\(s\)/)
   })
 
   it('listGroups parses the real group listing', async () => {

@@ -7,6 +7,7 @@ import type {
   SuperviseRunOptions,
   TaskRunResult,
   TaskUnitKind,
+  TaskUnitRead,
 } from './task-units.js'
 import type { TaskHelperResult } from './unit-run-status.js'
 import { BACKUP_SKIP_EXIT_CODE, CloudSyncTask as CloudSyncTaskSchema } from '@anas/shared'
@@ -34,6 +35,7 @@ import {
   readRecentJournal as readRecentJournalGeneric,
   readRunActive as readRunActiveGeneric,
   readTaskUnit,
+  readTaskUnitOrThrow,
   readUnitTexts as readUnitTextsGeneric,
   removeTaskUnits as removeTaskUnitsGeneric,
   runningDirectJobFields as runningDirectJobFieldsGeneric,
@@ -200,8 +202,18 @@ export async function readAllTasks(dir: string): Promise<CloudSyncTask[]> {
   return readAllTaskUnits(CLOUD_UNIT_KIND, dir, CloudSyncTaskSchema)
 }
 
-/** One task by name, or null if its service file is absent/invalid. */
+/**
+ * One task by name: the task, or null when its service file is ABSENT
+ * (cr4 D-20). A file that is there and cannot be read throws
+ * `TaskUnitUnreadableError` instead — never null, which a caller would take
+ * for "no task" and act on.
+ */
 export async function readTask(dir: string, name: string): Promise<CloudSyncTask | null> {
+  return readTaskUnitOrThrow(CLOUD_UNIT_KIND, dir, name, CloudSyncTaskSchema)
+}
+
+/** {@link readTask}, three-valued: the task, absent, or there and unreadable. */
+export async function readTaskChecked(dir: string, name: string): Promise<TaskUnitRead<CloudSyncTask>> {
   return readTaskUnit(CLOUD_UNIT_KIND, dir, name, CloudSyncTaskSchema)
 }
 

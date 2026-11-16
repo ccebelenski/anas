@@ -58,6 +58,7 @@ import { defaultRcloneConfigPaths, RCLONE, rcloneBaseArgs } from './services/rcl
 import { defaultRemotesPaths } from './services/replication-remotes.js'
 import { createTransport, defaultMembersFile } from './services/replication-transport.js'
 import { imageRestorePin } from './services/restore-mark.js'
+import { TaskUnitUnreadableError } from './services/task-units.js'
 
 /** Methods that change state — the cr.26 JSON-only rule applies to these. */
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'DELETE', 'PATCH'])
@@ -248,6 +249,16 @@ export function createServer(opts?: ServerOptions) {
     // error's name, so this file needs no import from the route that throws.
     if (isUnreadableListError(error)) {
       request.log.warn(`${error.name} on ${request.method} ${request.url}: ${error.message}`)
+      return reply.code(503).send({
+        error: { code: 'UNAVAILABLE', message: error.message },
+      })
+    }
+    // cr4 (D-20): a single-task read that found a unit file it could not read
+    // throws TaskUnitUnreadableError (services/task-units.ts). The route must
+    // answer the same fact the create gate's 409 states — never the 404 "not
+    // found" a failed read would fake.
+    if (error instanceof TaskUnitUnreadableError) {
+      request.log.warn(`task unit unreadable on ${request.method} ${request.url}: ${error.message}`)
       return reply.code(503).send({
         error: { code: 'UNAVAILABLE', message: error.message },
       })

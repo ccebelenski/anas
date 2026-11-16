@@ -152,20 +152,63 @@ export function repoSecretPath(dir: string, name: string): string {
   return join(dir, repoSecretFileName(name))
 }
 
+/** Test seam for the secret write's permission calls (cr4). */
+export interface SecretWriteSeams {
+  chmod?: (path: string, mode: number) => Promise<void>
+  rm?: (path: string) => Promise<void>
+}
+
+function errnoWord(err: unknown): string {
+  return (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err))
+}
+
 /**
  * Write a repo's secret atomically: ensure `dir` (0700 root), write the secret
  * file 0600. The secret never touches argv/logs. The file holds ONLY the raw
  * secret bytes (no key=value framing) — it is read back verbatim into
  * `PBS_PASSWORD`.
+ *
+ * cr4: a `chmod` that fails is a FAILED write, with the path and the error —
+ * the secret is root-only (EPICS §2) or it is not stored. `mkdir`'s mode is
+ * masked by the umask and a pre-existing target can be looser than 0600, so
+ * these calls are the guarantee; swallowing them could leave the secret
+ * readable by others. A file whose chmod failed is removed before the throw.
  */
-export async function writeRepoSecret(dir: string, name: string, secret: string): Promise<string> {
+export async function writeRepoSecret(
+  dir: string,
+  name: string,
+  secret: string,
+  seams: SecretWriteSeams = {},
+): Promise<string> {
+  const chmodPath = seams.chmod ?? ((path: string, mode: number) => chmod(path, mode))
+  const remove = seams.rm ?? ((path: string) => rm(path, { force: true }))
   await mkdir(dir, { recursive: true, mode: 0o700 })
-  await chmod(dir, 0o700).catch(() => {})
+  try {
+    await chmodPath(dir, 0o700)
+  }
+  catch (err) {
+    throw new Error(`the secret directory ${dir} could not be made root-only (${errnoWord(err)}), `
+      + `so the secret was not saved. Fix the permissions on ${dir}, then try again.`)
+  }
   const path = repoSecretPath(dir, name)
   await writeFileAtomic(path, secret, { mode: 0o600 })
   // Secrets are root-only (EPICS §2) — force 0600 even onto a pre-existing
   // looser-mode target.
-  await chmod(path, 0o600).catch(() => {})
+  try {
+    await chmodPath(path, 0o600)
+  }
+  catch (err) {
+    const code = errnoWord(err)
+    try {
+      await remove(path)
+    }
+    catch {
+      throw new Error(`the secret file ${path} could not be made root-only (${code}) and could not be `
+        + `removed; delete ${path} by hand.`)
+    }
+    throw new Error(`the secret file ${path} could not be made root-only (${code}); it was removed, `
+      + `so the secret was not saved. Fix the permissions on ${dir}, then try again.`)
+  }
   return path
 }
 

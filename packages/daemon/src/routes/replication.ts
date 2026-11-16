@@ -745,11 +745,20 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
               // that took it may destroy it first, and the next run then
               // sends from '@S' (ZFS accepts that while the target is
               // unmodified since its newest snapshot).
-              const pinned = await readLocalHoldsChecked(executor, [`${source}@${d.keepHoldsOn}`]).catch(() => null)
-              const isHeld = pinned?.get(`${source}@${d.keepHoldsOn}`)?.includes(holdTag) === true
-              note = isHeld
-                ? `The target's newest snapshot is '@${d.keepHoldsOn}', a backup or cloud run's snapshot the source still has: nothing was sent, the holds were left as they are, and the next new snapshot is sent from it`
-                : `The target's newest snapshot is '@${d.keepHoldsOn}', a backup or cloud run's snapshot the source still has: nothing was sent and the holds were left as they are; the next new snapshot is sent from it only while the source still has it — it is not held there, so the run that took it may destroy it first, and the run then sends from '@${snapName}'`
+              // cr4: `readLocalHoldsChecked` never rejects (it answers null on
+              // a failed read), so there is no `.catch` — and null is NOT "not
+              // held": a read that could not see must not say the source may
+              // lose the snapshot, nor that it may not.
+              const pinnedSnap = `${source}@${d.keepHoldsOn}`
+              const pinned = await readLocalHoldsChecked(executor, [pinnedSnap])
+              const isHeld = pinned?.get(pinnedSnap)?.includes(holdTag) === true
+              const lead = `The target's newest snapshot is '@${d.keepHoldsOn}', a backup or cloud run's snapshot the source still has: nothing was sent and the holds were left as they are`
+              if (pinned === null)
+                note = `${lead}. The holds on '${pinnedSnap}' could not be read, so ANAS cannot say whether it is protected; check with: zfs holds ${pinnedSnap}`
+              else if (isHeld)
+                note = `${lead}, and the next new snapshot is sent from it`
+              else
+                note = `${lead}; the next new snapshot is sent from it only while the source still has it — it is not held there, so the run that took it may destroy it first, and the run then sends from '@${snapName}'`
             }
             else if (d.newerCommon === undefined) {
               try {
