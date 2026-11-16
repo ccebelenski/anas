@@ -43,12 +43,34 @@
     //   submitText — Save button text (default 'Save')
     //   submitCls  — Save button cls (test hook / styling)
     //   load(basicForm, done) — async preload; call done() on success or
-    //                           done(errMsg) to show a load error.
+    //                           done(errMsg) to show a load error. While the
+    //                           preload is outstanding Save is disabled and
+    //                           the submit handler refuses (cr4, P-4): the
+    //                           fields hold nothing that was read, and a
+    //                           change-diff against an empty snapshot would
+    //                           PUT defaults the pool never had.
     //   submit(basicForm, win) — invoked when Save is clicked and the form is
     //                            valid; caller runs the mutation and closes win.
     // Defined once (guarded) so multiple property-edit files can share it.
+    function setSaveDisabled(win, off) {
+        // The loaded flag is the gate that decides; the button state is the
+        // operator's cue. Guarded: a stub window without the button down yet
+        // simply keeps the flag.
+        try {
+            var sb = win.down('#editSaveBtn');
+            if (sb && typeof sb.setDisabled === 'function') {
+                sb.setDisabled(!!off);
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
     if (!ANAS.editWindow) {
         ANAS.editWindow = function (cfg) {
+            // cr4 (P-4): the preload's answer is what turns Save on. No read,
+            // no submit — for every window that shares this shape.
+            var loaded = !cfg.load;
             var win = Ext.create('Ext.window.Window', {
                 cls: cfg.cls,
                 title: ANAS.t(cfg.title),
@@ -74,8 +96,15 @@
                     {
                         text: ANAS.t(cfg.submitText || 'Save'),
                         cls: cfg.submitCls,
+                        itemId: 'editSaveBtn',
                         handler: function () {
                             if (win.destroyed || win.destroying) {
+                                return;
+                            }
+                            // cr4 (P-4): the second gate behind the disabled
+                            // button — while the read is outstanding (or after
+                            // it failed) nothing submits.
+                            if (!loaded) {
                                 return;
                             }
                             var panel = win.down('#form');
@@ -100,6 +129,8 @@
 
             if (cfg.load) {
                 var panel = win.down('#form');
+                // cr4 (P-4): Save opens off; the fields hold nothing read yet.
+                setSaveDisabled(win, true);
                 try {
                     win.setLoading(true);
                 } catch (e) {
@@ -121,7 +152,12 @@
                             ANAS.warn(errMsg);
                         }
                         win.close();
+                        return;
                     }
+                    // cr4 (P-4): the read answered with the pool's own values;
+                    // the change-diff now compares against what was read.
+                    loaded = true;
+                    setSaveDisabled(win, false);
                 });
             }
 

@@ -1423,10 +1423,22 @@
                     break;
                 }
             }
+            // cr4 (D-33): hold Save shut while the list is in flight, exactly
+            // as the location picker does (#39) — right now the picker holds
+            // nothing that was read, and an unreadable answer keeps Save shut
+            // by name below.
+            var token = ANAS.editGuard.block(win, 'zfsDatasets', t('The datasets are loading.'));
             loadDatasetOptions(node, pool, summary).then(function (res) {
                 if (win.destroyed || win.destroying) {
                     return;
                 }
+                // cr4 fold (the task dialog's probe C3, same shape): a pool
+                // switch can leave this read superseded. Its late answer
+                // changes nothing — not the gate, not the rows, not the value.
+                if (!ANAS.editGuard.latest(win, 'zfsDatasets', token)) {
+                    return;
+                }
+                ANAS.editGuard.unblock(win, 'zfsDatasets', token);
                 var opts = res.opts;
                 // cr3: remembered for the save, which refuses a ZFS target
                 // or an exclude list picked from a list that was never read.
@@ -1435,6 +1447,16 @@
                 zfsDsStore.loadData(opts);
                 var fld = win.down('#zfsDataset');
                 if (fld) {
+                    // An answered read clears a failed one's mark (the task
+                    // dialog's probe C2 shape): without this a recovered dialog
+                    // fails its own form and Save is a silent no-op.
+                    try {
+                        if (typeof fld.clearInvalid === 'function') {
+                            fld.clearInvalid();
+                        }
+                    } catch (eClear) {
+                        // nothing to clear
+                    }
                     var want = preselectRel !== undefined ? preselectRel
                         : (opts.length ? opts[0].rel : '');
                     fld.setValue(want);

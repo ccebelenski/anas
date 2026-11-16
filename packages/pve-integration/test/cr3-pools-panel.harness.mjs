@@ -347,7 +347,8 @@ function tileDots(html) {
 // Open the real composer over a stub window; returns a driver. `disks` is the
 // GET /disks answer; `jobs` decides each confirmAndRun's outcome in order
 // ('complete' | 'fail' | 'lost'); every request body is recorded.
-async function composer({ mode = 'create', disks, poolName = 'tank', jobs = [], topology = { vdevGroups: [] } }) {
+async function composer({ mode = 'create', disks, poolName = 'tank', jobs = [], topology = { vdevGroups: [] },
+  disksFail = false, topologyFail = false }) {
   const els = {}
   for (const s of ['#anasc-mount', '#anasc-poolname', '#anasc-role', '#anasc-type', '#anasc-addvdev',
     '#anasc-avail', '#anasc-availcount', '#anasc-racks', '#anasc-summary', '#anasc-advisor']) {
@@ -355,9 +356,14 @@ async function composer({ mode = 'create', disks, poolName = 'tank', jobs = [], 
   }
   els['#anasc-role'].value = 'data'
   els['#anasc-type'].value = 'stripe'
+  // cr4 (D-17): the Retry control exists only when the rendered Available
+  // pane actually carries its marker (the fake DOM mirrors the real one).
+  const retryEl = fakeEl('#anasc-retry-disks')
   const root = {
     querySelector: s => els[s] || null,
-    querySelectorAll: s => (s === '.anas-composer-disk' ? [fakeEl('card')] : []),
+    querySelectorAll: s => (s === '.anas-composer-disk' ? [fakeEl('card')]
+      : s === '[data-retry-disks]' ? (els['#anasc-avail'].innerHTML.includes('data-retry-disks') ? [retryEl] : [])
+        : []),
   }
   let winCfg = null
   const createBtn = { disabled: true, setDisabled(v) { this.disabled = v } }
@@ -376,20 +382,32 @@ async function composer({ mode = 'create', disks, poolName = 'tank', jobs = [], 
   let currentDisks = disks
   const confirms = []
   const toasts = []
+  const alerts = []
+  // cr4 (D-15, D-17): a rejected read as a per-path state, flippable after
+  // open (the D-17 Retry test opens with /disks rejecting and answers it).
+  let failDisks = !!disksFail
+  let failTopo = !!topologyFail
+  const gets = []
   const Ext = {
     String: { htmlEncode },
     create: (_c, cfg) => { winCfg = cfg; return win },
     on() {}, un() {},
     toast: m => toasts.push(m),
-    Msg: { alert() {}, confirm: (title, msg, cb) => confirms.push({ title, msg, cb }) },
+    Msg: { alert: (_title, m) => { alerts.push(m) }, confirm: (title, msg, cb) => confirms.push({ title, msg, cb }) },
   }
   const held = []
   const grid = { itemId: 'poolsGrid' }
   const { ANAS } = loadPanels(['38-pool-composer.js'], { Ext })
   ANAS.api = {
     get(_n, path) {
-      if (path === '/disks') { return Promise.resolve({ data: currentDisks }) }
-      if (path.startsWith('/pools/')) { return Promise.resolve({ data: topology }) }
+      if (path === '/disks') {
+        gets.push(path)
+        return failDisks ? Promise.reject(new Error('socket hang up')) : Promise.resolve({ data: currentDisks })
+      }
+      if (path.startsWith('/pools/')) {
+        gets.push(path)
+        return failTopo ? Promise.reject(new Error('socket hang up')) : Promise.resolve({ data: topology })
+      }
       return Promise.reject(new Error(path))
     },
   }
@@ -410,7 +428,10 @@ async function composer({ mode = 'create', disks, poolName = 'tank', jobs = [], 
   await settle(); await settle(); await settle()
   return {
     ANAS, els, createBtn, win, requests, reloads, winCfg, confirms, toasts, held, grid,
+    gets, alerts, retryEl,
+    diskGets: () => gets.filter(p => p === '/disks').length,
     setDisks(d) { currentDisks = d },
+    setReadFailures(o) { if (o && 'disks' in o) { failDisks = !!o.disks }; if (o && 'topology' in o) { failTopo = !!o.topology } },
     type(sel, v) { els[sel].value = v; els[sel].fire('input') },
     addVdev(role, type) {
       els['#anasc-role'].value = role
@@ -640,6 +661,65 @@ const DISK = (id, extra = {}) => ({ id, status: 'available', size: 1e12, rotatio
   eq('review(4): kind — unknown rotational is the neutral disk', k({ rotational: null }), 'disk')
 }
 
+// --- cr4.panels1 D-15: EXPAND with a failed pool-detail read ------------------
+// A rejected GET /pools/:name rendered "No vdevs yet" with Commit live: the
+// probe staged a stripe on the unread pool and POSTed /pools/tank/vdevs. The
+// unread layout says so in place of the bays and Commit stays off.
+{
+  const c = await composer({ mode: 'expand', disks: [DISK('d1')], topologyFail: true })
+  const racks = c.racks()
+  ok('D-15: the bays are replaced by the could-not-be-read sentence with the reason',
+    racks.includes('current layout could not be read') && racks.includes('socket hang up')
+      && racks.includes('Close this window and open it again'), racks.slice(0, 300))
+  ok('D-15: a failed layout read never says "No vdevs yet"', !/No vdevs yet/.test(racks), racks.slice(0, 300))
+  ok('D-15: Commit is disabled while the layout is unread', c.createBtn.disabled === true)
+  c.addVdev('data', 'stripe')
+  c.drop('d1', 'v1')
+  ok('D-15: staging cannot re-enable Commit on the unread layout', c.createBtn.disabled === true)
+  c.commit()
+  await settle(); await settle(); await settle()
+  eq('D-15: Commit sends nothing while the layout is unread', c.requests, [])
+  ok('D-15: the refused Commit names the unread layout',
+    c.alerts.some(m => m.includes('current layout could not be read')), JSON.stringify(c.alerts))
+  ok('D-15: the summary blocks on the unread layout',
+    c.summary().includes('current layout could not be read') && /Blocking/.test(c.summary()),
+    c.summary().slice(0, 400))
+  // Control: the read answered with an empty layout — that is "No vdevs yet".
+  const e = await composer({ mode: 'expand', disks: [DISK('d1')], topology: { vdevGroups: [] } })
+  ok('D-15 control: an answered empty layout still says "No vdevs yet"',
+    /No vdevs yet/.test(e.racks()) && !/could not be read/.test(e.racks()), e.racks())
+}
+
+// --- cr4.panels1 D-17: a failed GET /disks is said, with a Retry --------------
+// The rejected read rendered "No available disks found" byte-identical to the
+// real empty answer (probe E1 vs control E4); the only trace was a console
+// warning, and the free count said zero.
+{
+  const c = await composer({ mode: 'create', disks: [DISK('d1')], disksFail: true })
+  ok('D-17: the picker says the disk list could not be read, with the reason',
+    c.avail().includes('The disk list could not be read') && c.avail().includes('socket hang up'),
+    c.avail().slice(0, 300))
+  ok('D-17: the pane carries a Retry', c.avail().includes('data-retry-disks'), c.avail().slice(0, 300))
+  ok('D-17: the free count is unknown, never zero',
+    c.els['#anasc-availcount'].textContent === '— free', c.els['#anasc-availcount'].textContent)
+  const before = c.diskGets()
+  c.setReadFailures({ disks: false })
+  c.setDisks([DISK('d1')])
+  c.retryEl.fire('click')
+  await settle(); await settle(); await settle()
+  ok('D-17: Retry re-reads /disks', c.diskGets() > before, `before ${before}, after ${c.diskGets()}`)
+  ok('D-17: a successful retry renders the disk',
+    c.avail().includes('d1') && !c.avail().includes('could not be read'), c.avail().slice(0, 300))
+  ok('D-17: the free count is a number again after the success',
+    c.els['#anasc-availcount'].textContent === '1 free', c.els['#anasc-availcount'].textContent)
+  // Control: the read answered with an empty inventory — that is the real
+  // "No available disks found".
+  const r = await composer({ mode: 'create', disks: [] })
+  ok('D-17 control: a real empty inventory still says "No available disks found"',
+    r.avail().includes('No available disks found') && !r.avail().includes('could not be read')
+      && !r.avail().includes('data-retry-disks'), r.avail())
+}
+
 // =============================================================================
 // EXPAND / REPLACE (35-pool-attach.js)
 // =============================================================================
@@ -724,6 +804,29 @@ const POOL = (extra = {}) => ({ name: 'tank', state: 'ONLINE', scanRunning: fals
     ok(`L12: trimSupported ${v} — Trim not offered, and said`, b.trim.disabled && /could not be read/.test(b.trim.tip), b.trim.tip)
     ok(`L12: upgradeAvailable ${v} — Upgrade not offered, and said`, b.upgrade.disabled && /could not be read/.test(b.upgrade.tip), b.upgrade.tip)
   }
+}
+
+// --- cr4.panels1 D-18: a health the read did not answer is unknown --------------
+// A selected pool whose `state` was missing took the Scrub tooltip "pool is
+// not ONLINE" — the panel stated as fact what it had not seen. The unread
+// health now gets the sentence shape the adjacent unread scan state uses.
+{
+  const { ANAS } = loadPanels(['30-pools.js', '36-pool-export.js', '37-pool-destroy.js'])
+  const up = row => { const g = poolsGrid(row); ANAS.pools.updateButtons(g); return g.btns }
+  for (const v of [null, undefined]) {
+    const b = up(POOL({ state: v }))
+    ok(`D-18: state ${v} — Scrub not offered, and said as unread`,
+      b.scrub.disabled && b.scrub.tip === 'The pool health could not be read; reload to try again', b.scrub.tip)
+    ok(`D-18: state ${v} — the panel never calls unread health "not ONLINE"`,
+      !/not ONLINE/.test(b.scrub.tip), b.scrub.tip)
+  }
+  // Controls: the read answered — a read non-ONLINE state keeps the health
+  // reason, ONLINE with no scan offers Scrub.
+  const d = up(POOL({ state: 'DEGRADED' }))
+  ok('D-18 control: an answered non-ONLINE state keeps the health reason',
+    d.scrub.disabled && d.scrub.tip.includes('pool is not ONLINE'), d.scrub.tip)
+  const o = up(POOL())
+  ok('D-18 control: ONLINE with no scan offers Scrub, no tooltip', !o.scrub.disabled && o.scrub.tip === '')
 }
 
 // --- cr3 sweep: the shared Mount column never says "not mounted" by default -----
@@ -940,6 +1043,61 @@ const POOL = (extra = {}) => ({ name: 'tank', state: 'ONLINE', scanRunning: fals
     const out = c && c.renderer ? String(c.renderer(null)) : String(null)
     ok(`review(4): an absent SMART ${n} reads a dash, not 0 or "null"`, out.includes('&mdash;') && !out.includes('null'), out)
   }
+}
+
+// --- cr4.panels1 D-19: only statuses the daemon defines read as themselves -------
+// A record with no `status` fell into renderUsageBase's `default:` and read
+// "In use" (the review captured `"status":{ "html": "In use" }` on the
+// unfixed panel). A use that was not read says so; the shared DiskUsageStatus
+// values render as themselves, `other` included.
+//
+// cr4 fold: the default branch serves two DIFFERENT cases and used to say the
+// membership read failed at both. Only the daemon's own `unknown` status means
+// that; a value this page does not know (a newer daemon) is named as such,
+// since nothing established that the read failed.
+{
+  const stores = []
+  const Ext = {
+    String: { htmlEncode },
+    create: (cls, cfg) => { if (cls === 'Ext.data.Store') { stores.push(cfg); return cfg } return { show() {}, close() {}, down: () => null } },
+    on() {}, un() {}, Msg: { alert() {} },
+  }
+  const { ANAS } = loadPanels(['40-disks.js'], { Ext })
+  ANAS.api = { get: () => Promise.resolve({ data: { attributes: [] } }) }
+  const cfg = ANAS.views.disks.factory('n')
+  const usage = cfg.items[0].columns.find(c => c.dataIndex === 'status').renderer
+  const cell = data => usage(data.status, {}, rec(data))
+  // Meaning changed by the fold: a record with no status no longer claims the
+  // membership read failed (nothing established that); it says its status is
+  // unknown ('?' for the absent value) and points at the reload.
+  ok('D-19: a record with no status says its status is unknown, never "In use"',
+    /Unknown status \(\?\)\. Reload the page\./.test(cell({ id: 'sda' }))
+      && !cell({ id: 'sda' }).includes('In use'),
+    cell({ id: 'sda' }))
+  ok('D-19: a value this panel does not know is NAMED, and never claims the membership read failed',
+    /Unknown status \(raid_member\)\. Reload the page\./.test(cell({ id: 'sda', status: 'raid_member' }))
+      && !cell({ id: 'sda', status: 'raid_member' }).includes('pool membership could not be read')
+      && !cell({ id: 'sda', status: 'raid_member' }).includes('In use'),
+    cell({ id: 'sda', status: 'raid_member' }))
+  ok('D-19: an unknown value with markup in it is encoded once',
+    !/<img/.test(cell({ id: 'sda', status: '<img src=x onerror=alert(1)>' }))
+      && /&lt;img/.test(cell({ id: 'sda', status: '<img src=x onerror=alert(1)>' })),
+    cell({ id: 'sda', status: '<img src=x onerror=alert(1)>' }))
+  // Controls: the daemon-defined values (shared DiskUsageStatus) still render
+  // as themselves.
+  ok('D-19 control: available', cell({ id: 'sda', status: 'available' }).includes('Available'))
+  ok('D-19 control: other with partitions still reads Partitioned',
+    cell({ id: 'sda', status: 'other', partitions: [{ n: 1 }] }).includes('Partitioned'))
+  ok('D-19 control: other with no partitions still reads In use',
+    cell({ id: 'sda', status: 'other' }).includes('In use'))
+  const sys = cell({ id: 'sda', status: 'system', poolName: 'tank' })
+  ok('D-19 control: system with a pool names it', sys.includes('System') && sys.includes('tank'), sys)
+  ok('D-19 control: the daemon\'s own unknown status keeps the membership sentence',
+    cell({ id: 'sda', status: 'unknown' }).includes('pool membership could not be read')
+      && !cell({ id: 'sda', status: 'unknown' }).includes('Unknown status'))
+  ok('D-19 control: ahr_member renders pool / array',
+    cell({ id: 'sda', status: 'ahr_member', poolName: 'hyb', ahrArray: 'array0' }).includes('hyb / array0'))
+  ok('D-19 control: ceph_osd', cell({ id: 'sda', status: 'ceph_osd' }).includes('Ceph OSD'))
 }
 
 // --- review (5): every file in the fence parses as ES5 ---------------------------
@@ -1197,6 +1355,134 @@ const POOL = (extra = {}) => ({ name: 'tank', state: 'ONLINE', scanRunning: fals
   ok('zfsUnavailable: AHR pools still render', html.includes('anas-dash-pool-ahr'))
   const only = D.dash.renderPoolsComposite(dashView({ pools: [], ahrPools: [], zfsUnavailable: SENT }, null))
   ok('zfsUnavailable: with no AHR pools the statement replaces "No pools."', only.includes('ZFS is not available') && !only.includes('No pools.'))
+}
+
+// --- cr4.panels1 D-16: a rejected GET /pools is said in the grid ----------------
+// The reject left the grid at its default empty text — the same face as the
+// real "No pools" answer — with only a modal saying anything. Now the grid
+// itself says the read failed, with the reason, and no earlier rows stand
+// (the import scan's pattern). Create and Import stay offered: the composer
+// reads its own disk list and the import window runs its own scan, so
+// neither depends on this list (both handlers checked).
+{
+  const view = { emptyText: '', refresh() {} }
+  const Ext = { String: { htmlEncode }, create: (cls, cfg) => cfg, on() {}, un() {}, Msg: { alert() {} } }
+  const { ANAS } = loadPanels(['30-pools.js', '32-pool-create.js', '33-pool-import.js'], { Ext })
+  const alerts = []
+  ANAS.alertMsg = (_title, m) => { alerts.push(m) }
+  const g = poolsGrid(null)
+  const btns = {
+    createPool: { disabled: false, tip: '', setDisabled(v) { this.disabled = !!v }, setTooltip(v) { this.tip = v } },
+    importPool: { disabled: false, tip: '', setDisabled(v) { this.disabled = !!v }, setTooltip(v) { this.tip = v } },
+  }
+  const down = g.down
+  g.down = q => btns[q.replace('#', '')] || down(q)
+  g.setLoading = () => {}
+  let cleared = 0
+  g.getStore = () => ({ loadData(rows) { if (rows.length === 0) { cleared++ } } })
+  g.getView = () => view
+  ANAS.api = { get: () => Promise.reject(new Error('socket hang up')) }
+  ANAS.pools.reload(g, 'n')
+  await settle(); await settle()
+  ok('D-16: the grid says the pool list could not be read, with the reason',
+    view.emptyText.includes('The pool list could not be read') && view.emptyText.includes('socket hang up'), view.emptyText)
+  ok('D-16: a failed read never reads as the answered-empty grid',
+    !view.emptyText.includes('No pools'), view.emptyText)
+  ok('D-16: the failed read leaves no earlier rows standing', cleared === 1, `cleared ${cleared}`)
+  ok('D-16: the alert still carries the reason',
+    alerts.length === 1 && alerts[0].includes('socket hang up'), JSON.stringify(alerts))
+  ok('D-16: Create and Import stay offered after the failed read',
+    !btns.createPool.disabled && !btns.importPool.disabled, JSON.stringify([btns.createPool, btns.importPool]))
+  // Control: the read answers with no pools — that is the real "No pools".
+  ANAS.api = { get: () => Promise.resolve({ data: [] }) }
+  ANAS.pools.reload(g, 'n')
+  await settle(); await settle()
+  ok('D-16 control: an answered empty list says "No pools"',
+    view.emptyText.includes('No pools') && !view.emptyText.includes('could not be read'), view.emptyText)
+}
+
+// --- cr4.panels1 P-4: Save lives only after the properties read answers ---------
+// The Edit Pool dialog snapshots the pool's properties as `original` and PUTs
+// only the diff. While the window's GET /pools/:name was still pending, the
+// snapshot was {} and the fields held nothing, so pressing Save diffed empty
+// fields against nothing and PUT the all-off defaults — the window mask was
+// the only thing preventing it. Save now opens disabled, the submit handler
+// refuses until the read answers, and a successful read opens it. The gate
+// sits in the shared ANAS.editWindow shape, which the dataset and share
+// property dialogs reuse.
+{
+  const values = {}
+  const set = []
+  const jobs = []
+  const toasts = []
+  const alerts = []
+  let closed = false
+  const form = {
+    isValid: () => true,
+    setValues(v) { set.push(v); Object.assign(values, v) },
+    findField: n => ({ getValue: () => values[n] }),
+  }
+  const sb = { disabled: false, setDisabled(v) { this.disabled = !!v } }
+  let winCfg = null
+  const win = {
+    destroyed: false, destroying: false,
+    show() {}, setLoading() {}, close() { closed = true },
+    down: q => (q === '#form' ? { getForm: () => form } : q === '#editSaveBtn' ? sb : null),
+  }
+  const Ext = {
+    String: { htmlEncode },
+    create: (cls, cfg) => { if (cls === 'Ext.window.Window') { winCfg = cfg } return win },
+    on() {}, un() {}, Msg: { alert(_t, m) { alerts.push(m) } },
+  }
+  const { ANAS } = loadPanels(['30-pools.js', '31-pool-props.js'], { Ext })
+  ANAS.alertMsg = (_t, m) => { alerts.push(m) }
+  ANAS.runJob = o => { jobs.push(o) }
+  ANAS.toast = m => { toasts.push(m) }
+  let resolveGet = null
+  ANAS.api = { get: () => new Promise(res => { resolveGet = res }) }
+  ANAS.pools.actions.find(a => a.itemId === 'modifyProps').handler('n', {}, 'tank')
+  const pressSave = () => winCfg.buttons[1].handler()
+  await settle()
+  ok('P-4: Save opens disabled while the properties read is outstanding', sb.disabled === true, JSON.stringify(sb))
+  pressSave()
+  ok('P-4: a Save press while the read is outstanding sends nothing',
+    jobs.length === 0 && toasts.length === 0 && !closed,
+    JSON.stringify({ jobs: jobs.map(j => j.body), toasts: toasts.length, closed }))
+  resolveGet({ data: { properties: { ashift: 12, autoexpand: true, autoreplace: false, autotrim: true, failmode: 'continue' } } })
+  await settle(); await settle()
+  ok('P-4: the answered read opens Save', sb.disabled === false, JSON.stringify(sb))
+  eq('P-4: the read put the pool\'s own values in the form', set[0],
+    { ashift: 12, autoexpand: true, autoreplace: false, autotrim: true, failmode: 'continue' })
+  values.autoexpand = false
+  pressSave()
+  ok('P-4: after the read, one changed value PUTs exactly that change',
+    jobs.length === 1 && jobs[0].method === 'put' && JSON.stringify(jobs[0].body) === '{"properties":{"autoexpand":"off"}}',
+    JSON.stringify(jobs.map(j => j.body)))
+  // A failed read closes the window with its sentence (cr3 behavior) and Save
+  // never opens.
+  const jobs2 = []
+  const alerts2 = []
+  let closed2 = false
+  const sb2 = { disabled: false, setDisabled(v) { this.disabled = !!v } }
+  const win2 = {
+    destroyed: false, destroying: false,
+    show() {}, setLoading() {}, close() { closed2 = true },
+    down: q => (q === '#form' ? { getForm: () => ({ isValid: () => true, setValues() {}, findField: () => ({ getValue: () => undefined }) }) } : q === '#editSaveBtn' ? sb2 : null),
+  }
+  const Ext2 = {
+    String: { htmlEncode },
+    create: () => win2,
+    on() {}, un() {}, Msg: { alert(_t, m) { alerts2.push(m) } },
+  }
+  const { ANAS: A2 } = loadPanels(['30-pools.js', '31-pool-props.js'], { Ext: Ext2 })
+  A2.alertMsg = (_t, m) => { alerts2.push(m) }
+  A2.runJob = o => { jobs2.push(o) }
+  A2.api = { get: () => Promise.reject(new Error('socket hang up')) }
+  A2.pools.actions.find(a => a.itemId === 'modifyProps').handler('n', {}, 'tank')
+  await settle(); await settle()
+  ok('P-4: a failed read closes the window with Save still disabled and nothing sent',
+    closed2 === true && sb2.disabled === true && jobs2.length === 0 && alerts2.some(m => m.includes('socket hang up')),
+    JSON.stringify({ closed2, disabled: sb2.disabled, jobs: jobs2.length, alerts: alerts2 }))
 }
 
 // =============================================================================

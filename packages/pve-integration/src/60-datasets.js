@@ -535,6 +535,11 @@
 
     // ---- Load --------------------------------------------------------------
 
+    // The tree's ORDINARY empty-state text — what an answered read with no
+    // pools says. One string, shared by the view's config and the reload, so a
+    // failed read's sentence can never linger over an answered one.
+    var DATASETS_EMPTY_TEXT = 'No datasets found';
+
     function poolNames(tree) {
         var names = [];
         try {
@@ -601,6 +606,10 @@
             if (tree.destroyed || tree.destroying) {
                 return;
             }
+            // cr4 fold: an ANSWERED read replaces a previous failure's
+            // sentence — a node that answered with no pools says there are
+            // none, not that the list could not be read.
+            setTreeEmptyText(tree, t(DATASETS_EMPTY_TEXT));
             var pools = (res && res.data) || [];
             var calls = [];
             for (var i = 0; i < pools.length; i++) {
@@ -772,9 +781,40 @@
             } catch (e) {
                 // non-fatal
             }
-            ANAS.warn('pools load failed: ' + ANAS.errText(err));
-            ANAS.alertMsg('Error', t('Failed to load pools') + ': ' + ANAS.errText(err));
+            var why = ANAS.errText(err);
+            ANAS.warn('pools load failed: ' + why);
+            // cr4 fold (the pool grid's D-16 rule, at the datasets tree): a
+            // rejected read never stands as an empty tree OR as the rows a
+            // previous read left behind — they are no longer known current.
+            // The failure is said in place of the rows, and the toolbar acts
+            // on what is on screen, which is now nothing.
+            setTreeEmptyText(tree, t('The pool list could not be read') + ' (' + why + ').');
+            try {
+                tree.setRootNode({ expanded: true, children: [] });
+            } catch (eClear) {
+                // non-fatal — the empty text still says it
+            }
+            try {
+                updateButtons(tree);
+            } catch (eBtn) {
+                // non-fatal
+            }
+            ANAS.alertMsg('Error', t('Failed to load pools') + ': ' + why);
         });
+    }
+
+    // The pool grid's empty-text helper (30-pools.js, cr4 D-16) is the ONE
+    // implementation: it encodes the text and takes whichever setter the view
+    // offers. Guarded, because this file must render even beside an older
+    // build that does not provide it; the alert below still says the failure.
+    function setTreeEmptyText(tree, text) {
+        try {
+            if (ANAS.pools && typeof ANAS.pools.setGridEmptyText === 'function') {
+                ANAS.pools.setGridEmptyText(tree, text);
+            }
+        } catch (e) {
+            // cosmetic only — the alert carries the failure
+        }
     }
 
     // A pool whose dataset list could not be read (cr3): one info row under it
@@ -4319,7 +4359,7 @@
                 rootVisible: false,
                 store: store,
                 selModel: { mode: 'SINGLE' },
-                emptyText: t('No datasets found'),
+                emptyText: t(DATASETS_EMPTY_TEXT),
                 columns: [
                     {
                         xtype: 'treecolumn',

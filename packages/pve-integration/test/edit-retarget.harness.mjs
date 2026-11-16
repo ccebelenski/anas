@@ -53,6 +53,12 @@ const state = {
   confirmAnswer: 'yes',
   /** Paths whose promise is held open until release() is called. */
   hold: null,
+  /**
+   * path → { release } for MANY reads held open at once. `hold` holds one read;
+   * the superseded-read race (probe C3) needs the first pool's read and the
+   * second pool's read in flight together.
+   */
+  holds: {},
   /** Every ANAS.pollJob a flow started: { jobId, opts } (cr.64b2-ii pin jobs). */
   polls: [],
   /** The job the fake pollJob hands to onComplete/onFailed (null = no poll). */
@@ -68,6 +74,7 @@ function reset() {
   state.confirms = []
   state.confirmAnswer = 'yes'
   state.hold = null
+  state.holds = {}
   state.polls = []
   state.job = null
 }
@@ -125,13 +132,38 @@ function makeComponent(cfg, registry) {
   c.setTooltip = (v) => { c.tooltip = v }
   c.setEmptyText = (v) => { c.emptyText = v }
   c.setEditable = (v) => { c.editable = v }
+  // Real ExtJS field validity: a marked field FAILS the form's isValid() until
+  // clearInvalid() is called (that is what 60-datasets.js's own clearInvalid
+  // calls presume). Only a DISABLED field is skipped — ExtJS validates hidden
+  // ones, which is why the dialogs disable as well as hide.
+  c.invalid = false
+  c.markInvalid = (msg) => { c.invalidText = msg; c.invalid = true }
+  c.clearInvalid = () => { c.invalidText = null; c.invalid = false }
+  // The plan line of the Replicate Once dialog is a plain component Ext renders
+  // via update()/addCls()/removeCls() (cr4, D-32).
+  c.update = (h) => { c.html = h }
+  c.addCls = (v) => { c.addedCls = (c.addedCls || []).concat([v]) }
+  c.removeCls = (v) => { c.addedCls = (c.addedCls || []).filter(x => x !== v) }
   c.setLoading = () => {}
   c.expand = () => { c.collapsed = false }
   c.collapse = () => { c.collapsed = true }
   c.removeAll = () => { c._children = [] }
   c.add = items => [].concat(items).forEach(i => c._children.push(makeComponent(i, registry)))
   c.getStore = () => c.store
-  c.getForm = () => ({ isValid: () => true })
+  c._registry = registry
+  // The form's validity is every registered field's: a marked (and not
+  // disabled) field makes the form invalid, exactly as Ext.form.Basic does.
+  c.getForm = () => ({
+    isValid: () => {
+      const reg = c._registry || {}
+      const keys = Object.keys(reg)
+      for (let i = 0; i < keys.length; i++) {
+        const f = reg[keys[i]]
+        if (f && f.invalid === true && !f.disabled) { return false }
+      }
+      return true
+    },
+  })
   c.getSelection = () => c._selection || []
   c.down = sel => byItemId(c, String(sel).replace('#', ''))
   c.destroyed = false
@@ -218,7 +250,25 @@ function apiAnswer(table, path) {
   if (state.hold && state.hold.path === path) {
     return new Promise((resolve) => { state.hold.release = () => resolve(value) })
   }
+  if (state.holds && state.holds[path]) {
+    const slot = state.holds[path]
+    return new Promise((resolve) => { slot.release = () => resolve(value) })
+  }
   return Promise.resolve(value)
+}
+
+/** Hold a path's next read open (many paths at once — the superseded-read race). */
+function holdPath(path) {
+  state.holds[path] = {}
+}
+
+/** Answer the read held on `path` (does nothing if none is held). */
+function releasePath(path) {
+  const slot = state.holds[path]
+  if (slot && slot.release) {
+    slot.release()
+    delete state.holds[path]
+  }
 }
 
 function loadUi() {
@@ -467,6 +517,134 @@ const TASK = {
   eq('Save opens once the picker has resolved', win.down('#submit').disabled, false)
 }
 
+// --- 4b. cr4 (D-33): the same shut for the source-dataset read -------------------
+// The location picker's async window was closed (#39); the source-dataset read
+// beside it was not, so a Save inside that window POSTed/PUTed a task whose
+// source combo held nothing that had been read.
+{
+  reset()
+  state.get = baseGets()
+  state.hold = { path: '/pools/tank/datasets' }
+  const grid = fakeGrid()
+  ANAS.replication.openTaskDialog('n1', grid, TASK)
+  await settle()
+  const win = lastWindow
+  eq('Save is disabled while the source datasets are in flight', win.down('#submit').disabled, true)
+  pressSave(win)
+  eq('a Save inside that window sends NOTHING', state.requests.length, 0)
+  ok('the refusal says the list is loading', /loading/i.test(alertMsg()), alertMsg())
+  state.hold.release()
+  state.hold = null
+  await settle()
+  eq('Save opens once the datasets have answered', win.down('#submit').disabled, false)
+  eq('the guard note is gone once they answered', win.down('#guardNote').hidden, true)
+}
+
+// --- 4c. cr4 (D-31): a FAILED source-dataset read is said, and Save refuses ------
+// The old reject still offered "(pool root)" to every non-PVE pool and Create
+// posted `dataset: ''` — a source chosen from a list that was never read. Now
+// the listing offers NONE, marks the field with the daemon's reason, and the
+// save refuses by name (#40's unreadable rule, applied to the task dialog).
+{
+  reset()
+  state.get = baseGets({
+    '/pools/tank/datasets': () => Promise.reject(
+      new Error('503 UNAVAILABLE: the datasets of pool tank could not be read')),
+  })
+  const win = await openTask(TASK)
+  const fld = win.down('#sourceDataset')
+  ok('the field says the listing could not be read, with the reason',
+    /The datasets of this pool could not be read/.test(String(fld.invalidText || ''))
+    && /503 UNAVAILABLE/.test(String(fld.invalidText || '')),
+    String(fld.invalidText))
+  eq('a read that failed offers no "(pool root)"', fld.getStore().rows().length, 0)
+  eq('the marked field leaves the dialog form invalid', win.down('#form').getForm().isValid(), false)
+  pressSave(win)
+  eq('Create sends NOTHING', state.requests.length, 0)
+  // Meaning changed by the harness's real-validity model: a marked field now
+  // fails the form, so the form gate refuses SILENTLY (the D-31 named refusal
+  // in submitTask is the backstop behind it, not the gate that fires first).
+  eq('the form gate refuses without an alert', state.alerts.length, 0)
+  // Unmark the field the way a recovered read would: the named refusal still
+  // stands behind it and still refuses by name.
+  fld.clearInvalid()
+  pressSave(win)
+  eq('with the field unmarked the named backstop still sends NOTHING', state.requests.length, 0)
+  ok('the refusal names the pool and the reason',
+    /tank/.test(alertMsg()) && /could not be read/.test(alertMsg()), alertMsg())
+  // Control: the answered listing opens the dialog normally (test 5 saves).
+  reset()
+  state.get = baseGets()
+  const ok2 = await openTask(TASK)
+  ok('control: an answered listing leaves the field unmarked',
+    !ok2.down('#sourceDataset').invalidText, String(ok2.down('#sourceDataset').invalidText))
+}
+
+// --- 4d. cr4 fold (probe C3): a SUPERSEDED read's late answer changes NOTHING ---
+// Two source-dataset reads in flight at once: the dialog opens on tank, the
+// operator switches to backup before tank answers, then tank answers. That
+// answer must not open Save (the backup read is still out — D-33), must not put
+// tank's rows or dataset under backup's name (D-31), and must not clear the
+// guard the newer read owns.
+{
+  reset()
+  state.get = baseGets()
+  holdPath('/pools/tank/datasets')
+  holdPath('/pools/backup/datasets')
+  const grid = fakeGrid()
+  ANAS.replication.openTaskDialog('n1', grid, TASK)
+  await settle()
+  const win = lastWindow
+  eq('4d: the first (tank) listing is in flight — Save is shut', win.down('#submit').disabled, true)
+  win.down('#sourcePool').setValue('backup')
+  await settle()
+  eq('4d: the pool moved while tank was out — Save is still shut', win.down('#submit').disabled, true)
+
+  releasePath('/pools/tank/datasets')
+  await settle()
+  eq('4d: the superseded tank answer does NOT open the gate', win.down('#submit').disabled, true)
+  eq('4d: nor leave tank\'s dataset under backup\'s name',
+    win.down('#sourceDataset').getValue() !== 'media', true)
+  eq('4d: nor tank\'s rows in the listing',
+    JSON.stringify(win.down('#sourceDataset').getStore().rows().map(r => r.rel)), '[]')
+
+  releasePath('/pools/backup/datasets')
+  await settle()
+  eq('4d: the CURRENT backup answer opens the gate', win.down('#submit').disabled, false)
+  eq('4d: and the listing is backup\'s',
+    JSON.stringify(win.down('#sourceDataset').getStore().rows().map(r => r.rel)), '[""]')
+  eq('4d: with the pool root selected', win.down('#sourceDataset').getValue(), '')
+  eq('4d: no stale unreadable flag survived the race', win.anasSrcDatasetsUnreadable, null)
+}
+
+// --- 4e. cr4 fold (probe C2): an answered read CLEARS a failed read's mark ------
+// The failed listing marks the field; the operator switches to a pool that can
+// answer. The mark must go, or the form fails and Save is a silent no-op on a
+// dialog that looks healthy.
+{
+  reset()
+  state.get = baseGets({
+    '/pools/tank/datasets': () => Promise.reject(
+      new Error('503 UNAVAILABLE: the datasets of pool tank could not be read')),
+  })
+  const win = await openTask(TASK)
+  const fld = win.down('#sourceDataset')
+  eq('4e: the failed read marked the field', fld.invalid, true)
+  win.down('#sourcePool').setValue('backup')
+  await settle()
+  eq('4e: the new read cleared the stale mark', fld.invalid, false)
+  eq('4e: so the form is valid again', win.down('#form').getForm().isValid(), true)
+  eq('4e: the stale unreadable flag is gone', win.anasSrcDatasetsUnreadable, null)
+  eq('4e: the new listing is on offer', fld.getStore().rows().length, 1)
+  eq('4e: Save is open', win.down('#submit').disabled, false)
+  // Control: the dialog really saves now, naming the pool the listing answered.
+  win.down('#schedule').setValue('weekly')
+  pressSave(win)
+  eq('4e: the recovered dialog sends its save', state.requests.length, 1)
+  eq('4e: against the pool that answered', (state.requests[0] || { body: { source: {} } }).body.source.pool, 'backup')
+  eq('4e: and no alert', state.alerts.length, 0)
+}
+
 // --- 5. An unchanged edit saves — with no retarget flag -------------------------
 {
   reset()
@@ -530,6 +708,268 @@ const TASK = {
   eq('and the same for the target', win.down('#targetPool').getValue(), 'tank')
   eq('Save is open', win.down('#submit').disabled, false)
   eq('no guard note', win.down('#guardNote').hidden, true)
+}
+
+// --- 7b. cr4 (D-32): a failed POOLS read is said, not rendered as absence -------
+// loadPools used to swallow its error and hand the callers `[]` — which both
+// dialog entries then told the operator as "No pool is available for
+// replication." Now the list resolves EMPTY CARRYING the reason (`unreadable`,
+// the 69-snapshots.js shape) and each entry says which of the two facts it
+// saw; only a list that ANSWERED empty may toast. Task dialog first: its
+// create path reaches the same loadPools through the exported openTaskDialog.
+{
+  reset()
+  state.get = baseGets({
+    '/pools': () => Promise.reject(new Error('502 BAD GATEWAY: anasd is not answering')),
+  })
+  lastWindow = null
+  await openTask(null)
+  eq('a failed pools read opens no create dialog', lastWindow, null)
+  eq('the create does not toast "no pool" after a failed read', state.toasts.length, 0)
+  ok('the create alerts with the reason',
+    state.alerts.length === 1 && /The pools could not be read/.test(alertMsg())
+    && /502 BAD GATEWAY/.test(alertMsg()), JSON.stringify(state.alerts))
+
+  // Control: a create against an ANSWERED-empty list still says so, plainly.
+  reset()
+  state.get = baseGets({ '/pools': { data: [] } })
+  lastWindow = null
+  await openTask(null)
+  eq('an answered-empty pool list still toasts on create', state.toasts.length, 1)
+  ok('and still with the plain true sentence',
+    /No pool is available for replication/.test(state.toasts[0] || ''), state.toasts[0])
+  eq('no alert for a read that answered', state.alerts.length, 0)
+}
+
+// --- 7c. cr4 (D-32): the same failed POOLS read at the once dialog ----------------
+// openReplicateOnce is exported beside loadOnceSnapshots so this is provable
+// from the real entry point.
+{
+  reset()
+  state.get = baseGets({
+    '/pools': () => Promise.reject(new Error('502 BAD GATEWAY: anasd is not answering')),
+  })
+  lastWindow = null
+  ANAS.replication.openReplicateOnce('n1', fakeGrid())
+  await settle()
+  eq('a failed pools read opens no once dialog', lastWindow, null)
+  eq('a read that failed claims no absence', state.toasts.length, 0)
+  ok('it alerts with the reason',
+    state.alerts.length === 1 && /The pools could not be read/.test(alertMsg())
+    && /502 BAD GATEWAY/.test(alertMsg()), JSON.stringify(state.alerts))
+
+  // Control: an ANSWERED-empty list still toasts the plain sentence.
+  reset()
+  state.get = baseGets({ '/pools': { data: [] } })
+  lastWindow = null
+  ANAS.replication.openReplicateOnce('n1', fakeGrid())
+  await settle()
+  eq('an answered-empty pool list still toasts at the once dialog', state.toasts.length, 1)
+  ok('and with the plain true sentence there too',
+    /No pool is available for replication/.test(state.toasts[0] || ''), state.toasts[0])
+  eq('no alert for a read that answered', state.alerts.length, 0)
+  eq('and still no dialog', lastWindow, null)
+}
+
+// --- 7d. cr4 (D-32): the once dialog after a FAILED SNAPSHOT read -----------------
+// The snapshot combo used to keep '(loading snapshots…)' forever. The field
+// now says what could not be read, with the reason, and what Replicate does
+// instead — and pressing Replicate keeps that promise: the POST names no
+// snapshot, so the daemon sends the newest when the run starts.
+{
+  reset()
+  state.get = baseGets({
+    '/pools/tank/datasets//snapshots': () => Promise.reject(
+      new Error('503 UNAVAILABLE: the snapshots of dataset tank could not be read')),
+  })
+  state.post = {
+    '/pools/tank/datasets//replicate/plan':
+      { data: { mode: 'incremental', estimatedBytes: 20480, baseSnapshot: 'snapA' } },
+  }
+  lastWindow = null
+  ANAS.replication.openReplicateOnce('n1', fakeGrid())
+  await settle()
+  const win = lastWindow
+  ok('the once dialog opens (its pools answered)', !!win && !!win.down('#snapshot'))
+  const snapFld = win.down('#snapshot')
+  const shown = String(snapFld.emptyText || '')
+  ok('the field says the snapshot list could not be read',
+    /The snapshot list could not be read/.test(shown), shown)
+  ok('that sentence carries the reason from the daemon', /503 UNAVAILABLE/.test(shown), shown)
+  ok('and says what Replicate sends instead',
+    /Replicate sends the newest snapshot/.test(shown), shown)
+  ok('nothing on the field pretends the read is still pending',
+    !/\(loading snapshots/.test(shown), shown)
+  eq('the failed read offers no snapshot rows', snapFld.getStore().rows().length, 0)
+
+  // The promise the sentence makes: press Replicate.
+  const submit = win.down('#onceSubmit')
+  eq('Replicate is open (the plan computed)', submit.disabled, false)
+  submit.handler(submit)
+  eq('one run went out', state.requests.length, 1)
+  const sent = state.requests[0] || { path: '', body: {} }
+  eq('as the replicate POST', sent.path, '/pools/tank/datasets//replicate')
+  ok('naming no snapshot: the daemon sends the newest',
+    sent.body.snapshot === undefined && sent.body.snapshotFirst === undefined,
+    JSON.stringify(sent.body))
+}
+
+// --- 7e. Control: an answered snapshot list is unchanged --------------------------
+{
+  reset()
+  state.get = baseGets({
+    '/pools/tank/datasets//snapshots': { data: [{ snapshotName: 'snapB', created: 1730000000 }] },
+  })
+  state.post = {
+    '/pools/tank/datasets//replicate/plan':
+      { data: { mode: 'incremental', estimatedBytes: 1024, baseSnapshot: 'snapB' } },
+  }
+  lastWindow = null
+  ANAS.replication.openReplicateOnce('n1', fakeGrid())
+  await settle()
+  const win = lastWindow
+  const snapFld = win.down('#snapshot')
+  eq('control: the answered list preselects the newest',
+    snapFld.getValue(), ANAS.replication.NEWEST_SNAPSHOT)
+  ok('control: the field carries no unreadable notice',
+    !/could not be read/.test(String(snapFld.emptyText || '')), String(snapFld.emptyText))
+  eq('control: the field is not marked invalid', snapFld.invalidText, undefined)
+  const submit = win.down('#onceSubmit')
+  submit.handler(submit)
+  eq('control: one run went out', state.requests.length, 1)
+  ok('control: still naming no snapshot', state.requests[0].body.snapshot === undefined,
+    JSON.stringify(state.requests[0].body))
+}
+
+// --- 7f. cr4 fold: a FAILED snapshot read's sentence does not outlive the read --
+// The failure sentence was set on the field and never replaced. Switch to a
+// dataset whose read ANSWERS EMPTY: the old sentence would stand as fact for a
+// read that did not fail, and "(loading snapshots…)" would pretend to wait.
+{
+  reset()
+  state.get = baseGets({
+    '/pools/tank/datasets//snapshots': () => Promise.reject(
+      new Error('503 UNAVAILABLE: the snapshots of dataset tank could not be read')),
+    '/pools/backup/datasets//snapshots': { data: [] },
+  })
+  lastWindow = null
+  ANAS.replication.openReplicateOnce('n1', fakeGrid())
+  await settle()
+  const win = lastWindow
+  const snapFld = win.down('#snapshot')
+  ok('7f: the failed read said so first', /could not be read/.test(String(snapFld.emptyText || '')),
+    String(snapFld.emptyText))
+  win.down('#srcPool').setValue('backup')
+  await settle()
+  const shown = String(snapFld.emptyText || '')
+  ok('7f: the answered read drops the failure sentence', !/could not be read/.test(shown), shown)
+  ok('7f: and does not pretend the read is still in flight', !/\(loading snapshots/.test(shown), shown)
+  ok('7f: it says the dataset has nothing to send',
+    /no snapshot to replicate/.test(shown), shown)
+  eq('7f: with no rows to pick', snapFld.getStore().rows().length, 0)
+}
+
+// --- 7g. cr4 fold: an answered non-empty list restores the ordinary text --------
+{
+  reset()
+  state.get = baseGets({
+    '/pools/tank/datasets//snapshots': () => Promise.reject(
+      new Error('503 UNAVAILABLE: the snapshots of dataset tank could not be read')),
+    '/pools/backup/datasets//snapshots': { data: [{ snapshotName: 'snapC', created: 1730000000 }] },
+  })
+  lastWindow = null
+  ANAS.replication.openReplicateOnce('n1', fakeGrid())
+  await settle()
+  const win = lastWindow
+  const snapFld = win.down('#snapshot')
+  win.down('#srcPool').setValue('backup')
+  await settle()
+  const shown = String(snapFld.emptyText || '')
+  ok('7g: the answered list drops the failure sentence', !/could not be read/.test(shown), shown)
+  ok('7g: the field is back to its ordinary placeholder', /\(loading snapshots/.test(shown), shown)
+  eq('7g: and the newest is preselected', snapFld.getValue(), ANAS.replication.NEWEST_SNAPSHOT)
+}
+
+// --- 7h. cr4 fold: THIS node's pool list failing at the location picker --------
+// loadLocationPools' local branch ignored the `unreadable` marker D-32 added,
+// so a failed GET /pools rendered as an ordinary empty dropdown. It takes the
+// free-text shape a failed far side takes, with the reason in view.
+{
+  reset()
+  state.get = baseGets({
+    '/replication/locations': { data: { peers: ['nas2'], remotes: [] } },
+    '/replication/peers/nas2/pools': { data: ['backup'] },
+  })
+  lastWindow = null
+  ANAS.replication.openReplicateOnce('n1', fakeGrid())
+  await settle()
+  const win = lastWindow
+  const combo = win.down('#targetPool')
+  win.down('#targetLocation').setValue('peer:nas2')
+  await settle()
+  eq('7h: the peer\'s pools load into the combo',
+    combo.getStore().rows().map(r => r.name).join(','), 'backup')
+
+  // THIS node's pool list now fails.
+  state.get['/pools'] = () => Promise.reject(new Error('502 BAD GATEWAY: anasd is not answering'))
+  win.down('#targetLocation').setValue('local')
+  await settle()
+  const shown = String(combo.emptyText || '')
+  ok('7h: the failure is NOT rendered as an ordinary empty dropdown',
+    /this node's pools could not be read/.test(shown), shown)
+  ok('7h: it does not claim a reach that happened', !/could not reach/.test(shown), shown)
+  ok('7h: the reason is said once, in view',
+    state.toasts.some(m => /The pools could not be read/.test(m) && /502 BAD GATEWAY/.test(m)),
+    JSON.stringify(state.toasts))
+  eq('7h: the combo takes free-text entry', combo.editable, true)
+}
+
+// --- 7i. cr4 fold: the once dialog refuses a source from an unread listing -----
+// loadDatasetOptions dropped the `unreadable` marker, so the once dialog's
+// source combo offered "(pool root)" from a listing that could not be read.
+// It now offers none, says why in the field, and the save refuses by name.
+{
+  reset()
+  state.get = baseGets({
+    '/pools/tank/datasets': () => Promise.reject(
+      new Error('503 UNAVAILABLE: the datasets of pool tank could not be read')),
+    '/pools/tank/datasets//snapshots': { data: [] },
+  })
+  state.post = {
+    '/pools/tank/datasets//replicate/plan':
+      { data: { mode: 'incremental', estimatedBytes: 20480, baseSnapshot: 'snapA' } },
+  }
+  lastWindow = null
+  ANAS.replication.openReplicateOnce('n1', fakeGrid())
+  await settle()
+  const win = lastWindow
+  const fld = win.down('#srcDataset')
+  ok('7i: the field says the listing could not be read, with the reason',
+    /The datasets of this pool could not be read/.test(String(fld.invalidText || ''))
+    && /503 UNAVAILABLE/.test(String(fld.invalidText || '')), String(fld.invalidText))
+  eq('7i: a read that failed offers no "(pool root)"', fld.getStore().rows().length, 0)
+  eq('7i: the field is marked invalid', fld.invalid, true)
+  const submit = win.down('#onceSubmit')
+  submit.handler(submit)
+  eq('7i: Replicate sends NOTHING', state.requests.length, 0)
+  eq('7i: the form gate refuses silently', state.alerts.length, 0)
+  fld.clearInvalid()
+  submit.handler(submit)
+  eq('7i: the named backstop still sends NOTHING', state.requests.length, 0)
+  ok('7i: naming the pool and the reason',
+    /tank/.test(alertMsg()) && /could not be read/.test(alertMsg()), alertMsg())
+
+  // Control: an answered listing offers its rows and leaves the field unmarked.
+  reset()
+  state.get = baseGets()
+  lastWindow = null
+  ANAS.replication.openReplicateOnce('n1', fakeGrid())
+  await settle()
+  const ok2 = lastWindow
+  eq('control: an answered listing offers the pool root and its datasets',
+    ok2.down('#srcDataset').getStore().rows().map(r => r.rel).join(','), ',media')
+  ok('control: and leaves the field unmarked',
+    !ok2.down('#srcDataset').invalid, String(ok2.down('#srcDataset').invalidText))
 }
 
 // =============================================================================
@@ -638,6 +1078,29 @@ function schedGets(extra) {
   eq('a new schedule defaults to a kind that exists', win.down('#targetKind').getValue(), 'zfs')
   eq('Save is open', win.down('#submit').disabled, false)
   eq('no guard note', win.down('#guardNote').hidden, true)
+}
+
+// --- 12b. cr4 (D-33): the schedule dialog's dataset read is shut too -------------
+// A failed read was already refused by name (win.anasDatasetsUnreadable); the
+// in-flight window beside it was open: Save POSTed a schedule whose dataset and
+// exclude list had never been displayed. Same rule as test 4b, same guard.
+{
+  reset()
+  state.get = schedGets()
+  state.hold = { path: '/pools/tank/datasets' }
+  const grid = fakeGrid()
+  ANAS.schedules.openDialog('n1', grid, null)
+  await settle()
+  const win = lastWindow
+  eq('Save is disabled while the datasets are in flight', win.down('#submit').disabled, true)
+  ok('the guard note says the read is outstanding', /loading/i.test(noteHtml(win)), noteHtml(win))
+  pressSave(win)
+  eq('a Save inside that window sends NOTHING', state.requests.length, 0)
+  state.hold.release()
+  state.hold = null
+  await settle()
+  eq('Save opens once the datasets have answered', win.down('#submit').disabled, false)
+  eq('no guard note after the answer', win.down('#guardNote').hidden, true)
 }
 
 // =============================================================================

@@ -282,6 +282,69 @@ const unavailable = (msg) => {
   ok('the save refuses a ZFS target picked from an unread dataset list', /if \(win\.anasDatasetsUnreadable\) \{\s*ANAS\.alertMsg\('Cannot save'/.test(snapSrc2))
 }
 
+// ---- cr4 fold: a rejected /pools read is SAID in the tree, never an empty one --
+// The pool grid's D-16 rule, at the datasets tree: a failed pool read used to
+// only alert, leaving whatever rows the previous read put there standing as if
+// they were current (or an ordinary empty tree if there were none). The tree
+// now says the read failed, with the reason, and carries no rows; an answered
+// read puts the ordinary text back.
+{
+  const DS = loadUi(['00-core.js', '10-api.js', '30-pools.js', '60-datasets.js'])
+  DS.warn = () => {}
+  const alerts = []
+  DS.alertMsg = (title, msg) => alerts.push({ title, msg })
+  let mode = 'answer'
+  DS.api.get = (_node, path) => {
+    if (path === '/pools') {
+      if (mode === 'fail') {
+        return Promise.reject(unavailable('502 BAD GATEWAY: anasd is not answering'))
+      }
+      return Promise.resolve(mode === 'answer' ? { data: [{ name: 'tank', size: 100 }] } : { data: [] })
+    }
+    return Promise.resolve({ data: [] })
+  }
+  const view = {
+    emptyText: 'No datasets found',
+    setEmptyText(t) { view.emptyText = t },
+  }
+  const built = []
+  const tree = {
+    setLoading() {},
+    getRootNode: () => null,
+    getSelection: () => [],
+    setRootNode(r) { built.push(r) },
+    down: () => null,
+    getView: () => view,
+  }
+  // A first, ANSWERED read puts a pool row on screen...
+  DS.datasets.reload(tree, 'n1')
+  for (let i = 0; i < 5; i++) await tick()
+  const first = built[built.length - 1] || {}
+  ok('fold6: the answered read puts the pool on screen',
+    (first.children || []).length === 1, JSON.stringify(first))
+
+  // ...then the next read is rejected.
+  mode = 'fail'
+  DS.datasets.reload(tree, 'n1')
+  for (let i = 0; i < 5; i++) await tick()
+  ok('fold6: the tree says the pool list could not be read, with the reason',
+    /The pool list could not be read/.test(String(view.emptyText))
+    && /502 BAD GATEWAY/.test(String(view.emptyText)), String(view.emptyText))
+  ok('fold6: ...and the rows the previous read left are not standing as current',
+    built.length >= 2 && (built[built.length - 1].children || []).length === 0,
+    JSON.stringify(built[built.length - 1]))
+  ok('fold6: ...and the alert still carries the reason',
+    alerts.length === 1 && /502 BAD GATEWAY/.test(alerts[0].msg), JSON.stringify(alerts))
+
+  // Recovery: an answered (empty) read restores the ordinary text.
+  mode = 'empty'
+  DS.datasets.reload(tree, 'n1')
+  for (let i = 0; i < 5; i++) await tick()
+  ok('fold6: an answered read puts the ordinary empty text back',
+    /No datasets found/.test(String(view.emptyText))
+    && !/could not be read/.test(String(view.emptyText)), String(view.emptyText))
+}
+
 // ---- 60-datasets.js: the toolbar tooltip setter encodes --------------------
 const dsSrc = readFileSync(join(SRC, '60-datasets.js'), 'utf8')
 ok('60-datasets.js setTip encodes the tooltip', /var tipHtml = text \? enc\(text\) : undefined;/.test(dsSrc))

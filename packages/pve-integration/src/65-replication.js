@@ -148,6 +148,13 @@
     // cannot appear in a snapshot name, so this never collides with one.
     var NEWEST_SNAPSHOT = '/newest';
 
+    // The Replicate Once snapshot combo's ORDINARY placeholder: shown while a
+    // read is out (and after a list that answered — the field has rows by
+    // then). A read's own verdict replaces it: the failure sentence, or the
+    // dataset-has-none sentence. One string, so the failure sentence can never
+    // linger where the ordinary text belongs. ASCII dots only.
+    var SNAP_LOADING_TEXT = '(loading snapshots...)';
+
     // A backup or cloud run's transient snapshot — the daemon's own predicate
     // (`isTransientRunSnapshot`, services/snapshot-naming.ts: the prefixes
     // `anas-backup-` and `anas-cloud-`). Such a snapshot is destroyed by the
@@ -679,6 +686,10 @@
     ANAS.replication.renderPlan = renderPlan;
     // Review of cr3: exposed for cr3-replication.harness.mjs.
     ANAS.replication.loadOnceSnapshots = loadOnceSnapshots;
+    // cr4 (D-32): the once dialog's entry point beside it — what a failed
+    // pools read SAYS (alert with the reason, not a "no pool" toast) is only
+    // provable from here.
+    ANAS.replication.openReplicateOnce = openReplicateOnce;
     ANAS.replication.fetchPlan = fetchPlan;
     ANAS.replication.NEWEST_SNAPSHOT = NEWEST_SNAPSHOT;
     // rrep.3: the row builder, the Source -> Target cell, the Enable/Disable
@@ -741,23 +752,29 @@
     // omitted — skew tightens, never loosens.
 
     // Resolve to the pool summaries (every pool, PVE's included); never rejects.
+    // cr4 (D-32): "no pools" and "the pools could not be read" are two
+    // different facts. A read that failed resolves to an EMPTY list CARRYING
+    // the reason (`unreadable`, the 69-snapshots.js shape) — the callers say
+    // which of the two they saw instead of rendering the failure as absence.
     function loadPools(node) {
         return ANAS.api.get(node, '/pools').then(function (res) {
             return (res && res.data) || [];
         }, function (err) {
             ANAS.warn('replication pools load failed: ' + ANAS.errText(err));
-            return [];
+            var list = [];
+            list.unreadable = ANAS.errText(err) || t('unknown error');
+            return list;
         });
     }
 
-    // Resolve to a list of { rel, label } dataset options for a pool: the pool
-    // root '(pool root)' first, then each ANAS-managed dataset's relative path —
+    // Resolve to { opts, rows, unreadable? } for a pool: the pool root
+    // '(pool root)' first, then each ANAS-managed dataset's relative path —
     // owned rows (any kind) are omitted, siblings stay. `poolSummary` carries
-    // the pool's pveStorages for the skew fallback. Never rejects.
+    // the pool's pveStorages for the skew fallback. Never rejects. cr4 fold:
+    // the WHOLE answer rides through — dropping it to `opts` also dropped the
+    // could-not-be-read marker the callers now act on.
     function loadDatasetOptions(node, pool, poolSummary) {
-        return loadDatasetListing(node, pool, poolSummary).then(function (res) {
-            return res.opts;
-        });
+        return loadDatasetListing(node, pool, poolSummary);
     }
 
     // The same listing, read once, as { opts, rows }: `opts` as above; `rows`
@@ -834,18 +851,15 @@
             },
             function (err) {
                 ANAS.warn('replication datasets load failed for ' + pool + ': ' + ANAS.errText(err));
-                // A PVE pool offers NOTHING on failure: its root is owned
-                // (a `pve` verdict on the summary, or pveStorages on any
-                // daemon), so surfacing "(pool root)" would hand the operator
-                // a target the daemon refuses. Tighten on failure, never loosen.
-                var rootOwned = false;
-                try {
-                    rootOwned = ANAS.pve.isOwned(poolSummary, poolSummary, false);
-                } catch (eFail) {
-                    // a malformed summary cannot be classified — the old
-                    // behaviour (offer the root) stands; the daemon refuses
-                }
-                return { opts: rootOwned ? [] : rootOpt, rows: [] };
+                // cr4 (D-31): the schedule dialog's rule (#40's `unreadable`
+                // listing): a listing that could not be read offers NONE and
+                // carries the reason, so the dialog can say so in the field
+                // and the save can refuse by name. "(pool root)" standing
+                // here — the old shape for every non-PVE pool — was a target
+                // chosen from a list the dialog never read. A pool whose root
+                // is PVE's offered nothing on failure already; this tightens
+                // the rest to the same face: none, with the reason.
+                return { opts: [], rows: [], unreadable: ANAS.errText(err) || t('unknown error') };
             }
         );
     }
@@ -950,12 +964,26 @@
     }
 
     // Resolve the target-pool candidates for a location. Local → ANAS pools;
-    // peer/remote → that location's pools endpoint. Never rejects; on an error
-    // or empty list the caller falls back to free-text entry.
-    //   → { names:[...], freeText:bool }
+    // peer/remote → that location's pools endpoint. Never rejects; on an error,
+    // an unreadable list, or an empty list the caller falls back to free-text
+    // entry — saying which of the three it saw.
+    //   → { names:[...], freeText:bool, error?, hint? }
     function loadLocationPools(node, loc) {
         if (!loc || loc.kind === 'local' || !loc.name) {
             return loadPools(node).then(function (pools) {
+                // cr4 fold: this node's pool list can fail too. D-32 gave
+                // loadPools an `unreadable` marker and the two dialog entries
+                // use it; this caller ignored it, so a failed read rendered as
+                // an ordinary empty dropdown. It takes the same free-text
+                // shape a failed far side takes, with the reason.
+                if (pools.unreadable) {
+                    return {
+                        names: [],
+                        freeText: true,
+                        error: t('The pools could not be read') + ': ' + pools.unreadable + '.',
+                        hint: LOC_HINT_UNREADABLE,
+                    };
+                }
                 var names = [];
                 for (var i = 0; i < pools.length; i++) {
                     names.push(pools[i].name);
@@ -977,10 +1005,13 @@
         });
     }
 
-    // Two different facts, two hints (repl.r2): the location answered and
-    // lists no pools; or it did not answer at all.
+    // Three different facts, three hints (repl.r2): the location answered and
+    // lists no pools; it did not answer at all; or — for THIS node — it
+    // answered but its pool list could not be read (cr4 fold: never said as
+    // "could not reach", which the read did not establish).
     var LOC_HINT = t('this location lists no pools — enter the pool name');
     var LOC_HINT_FAILED = t('could not reach this location — enter the pool name');
+    var LOC_HINT_UNREADABLE = t('this node\'s pools could not be read — enter the pool name');
 
     // setEmptyText is version-dependent on ExtJS combos; guard it so a missing
     // method can never abort the surrounding repopulation logic.
@@ -1020,9 +1051,14 @@
         }
         setEmpty(combo, t('(loading pools…)'));
         // Hold Save while the list is in flight — the combo is empty right now.
-        ANAS.editGuard.block(win, 'targetPool', t('Loading target pools…'));
+        var poolToken = ANAS.editGuard.block(win, 'targetPool', t('Loading target pools...'));
         return loadLocationPools(node, loc).then(function (r) {
             if (win.destroyed || win.destroying) {
+                return;
+            }
+            // A location switch can leave this read superseded: its late
+            // answer must not repopulate the combo under the newer location.
+            if (!ANAS.editGuard.latest(win, 'targetPool', poolToken)) {
                 return;
             }
             try {
@@ -1040,7 +1076,7 @@
                     // Editable free-text: the operator names a pool we can't list.
                     combo.forceSelection = false;
                     combo.setEditable(true);
-                    setEmpty(combo, r.error ? LOC_HINT_FAILED : LOC_HINT);
+                    setEmpty(combo, r.hint || (r.error ? LOC_HINT_FAILED : LOC_HINT));
                     if (r.error) {
                         // Said once, in view, when the location is picked — the
                         // placeholder is too short to carry the reason.
@@ -1060,7 +1096,7 @@
                         + t('is not in this location\'s pool list any more. Saving now would '
                             + 'replicate somewhere else — pick a target deliberately, or cancel.'));
                 } else {
-                    ANAS.editGuard.unblock(win, 'targetPool');
+                    ANAS.editGuard.unblock(win, 'targetPool', poolToken);
                 }
             } catch (e) {
                 ANAS.warn('replication pool combo repopulate failed: ' + ANAS.errText(e));
@@ -1085,7 +1121,7 @@
         if (!combo) {
             return;
         }
-        ANAS.editGuard.block(win, 'location', t('Loading target locations…'));
+        var locToken = ANAS.editGuard.block(win, 'location', t('Loading target locations...'));
         var apply = function () {
             applyLocationToPoolCombo(win, node, selectedLocation(win));
             if (opts.onAfterApply) {
@@ -1099,6 +1135,10 @@
         }
         loadLocations(node).then(function (locs) {
             if (win.destroyed || win.destroying) {
+                return;
+            }
+            // The same rule at this read: a superseded answer touches nothing.
+            if (!ANAS.editGuard.latest(win, 'location', locToken)) {
                 return;
             }
             try {
@@ -1134,11 +1174,11 @@
                             + 'replicate somewhere else — re-register it, pick another '
                             + 'location deliberately, or cancel.'));
                 } else {
-                    ANAS.editGuard.unblock(win, 'location');
+                    ANAS.editGuard.unblock(win, 'location', locToken);
                 }
             } catch (e) {
                 ANAS.warn('replication location load failed: ' + ANAS.errText(e));
-                ANAS.editGuard.unblock(win, 'location');
+                ANAS.editGuard.unblock(win, 'location', locToken);
             }
         });
     }
@@ -2082,8 +2122,16 @@
             // Nothing to point a NEW task at. An EDIT still opens: the task
             // already has its endpoints, and the dialog's job is then to say the
             // pool list is missing — not to disappear (mirrors 69-snapshots.js).
+            // cr4 (D-32): and only a list that ANSWERED empty says that — an
+            // unreadable one alerts with its reason instead (the once dialog's
+            // rule, at the same read).
             if (!names.length && !isEdit) {
-                ANAS.toast(t('No pool is available for replication.'));
+                if (pools.unreadable) {
+                    ANAS.alertMsg('Cannot load targets', t('The pools could not be read') + ': '
+                        + pools.unreadable + '. ' + t('Try again.'));
+                } else {
+                    ANAS.toast(t('No pool is available for replication.'));
+                }
                 return;
             }
             buildTaskWindow(node, grid, isEdit, task, src, tgt, names, pools);
@@ -2325,18 +2373,53 @@
                     break;
                 }
             }
+            // cr4 (D-33): hold Save shut while the source list is in flight,
+            // exactly as the location picker does (#39) — the picker holds
+            // nothing that was read until the listing answers.
+            var token = ANAS.editGuard.block(win, 'sourceDatasets', t('The source datasets are loading.'));
             loadDatasetListing(node, pool, summary).then(function (res) {
                 if (win.destroyed || win.destroying) {
                     return;
                 }
+                // cr4 fold (probe C3): the operator may have switched the pool
+                // while THIS read was out. Its late answer changes nothing —
+                // not the gate (the newer read still owns it), not the rows,
+                // not the value under the newer pool's name.
+                if (!ANAS.editGuard.latest(win, 'sourceDatasets', token)) {
+                    return;
+                }
+                ANAS.editGuard.unblock(win, 'sourceDatasets', token);
                 var opts = res.opts;
+                // cr4 (D-31): remembered for the save, which refuses a source
+                // dataset or exclude list chosen from a listing that was
+                // never read — and said in the field, as the schedule dialog
+                // does (#40).
+                win.anasSrcDatasetsUnreadable = res.unreadable || null;
                 excluder.setRows(res.rows);
                 srcDsStore.loadData(opts);
                 var fld = win.down('#sourceDataset');
                 if (fld) {
+                    // cr4 fold (probe C2): an answered read clears the mark a
+                    // failed one left, or a recovered dialog fails its own form
+                    // and Save is a silent no-op (the 60-datasets.js pattern).
+                    try {
+                        if (typeof fld.clearInvalid === 'function') {
+                            fld.clearInvalid();
+                        }
+                    } catch (eClear) {
+                        // nothing to clear
+                    }
                     var want = preselectRel !== undefined ? preselectRel
                         : (opts.length ? opts[0].rel : '');
                     fld.setValue(want);
+                    if (res.unreadable) {
+                        try {
+                            // markInvalid renders HTML in its tip: encoded.
+                            fld.markInvalid(enc(t('The datasets of this pool could not be read') + ': ' + res.unreadable));
+                        } catch (eMark) {
+                            // the save still refuses
+                        }
+                    }
                 }
                 refreshExclude();
             });
@@ -2490,6 +2573,15 @@
         var targetPool = valOf(win, '#targetPool');
         if (!sourcePool || !targetPool) {
             ANAS.alertMsg('Invalid input', t('Select a source and target pool.'));
+            return;
+        }
+        // cr4 (D-31): a source dataset picked from a listing that could not
+        // be read is not a choice — refuse by name, as the schedule dialog
+        // does (#40).
+        if (win.anasSrcDatasetsUnreadable) {
+            ANAS.alertMsg('Cannot save', t('The datasets of pool') + ' ' + sourcePool + ' '
+                + t('could not be read, so neither the dataset nor what to exclude can be chosen') + ': '
+                + win.anasSrcDatasetsUnreadable + '. ' + t('Close the dialog and try again.'));
             return;
         }
         var schedule = ('' + (valOf(win, '#schedule') || '')).trim();
@@ -3044,10 +3136,17 @@
             return;
         }
         store.loadData([]);
+        // cr4 fold: a NEW read is out. Whatever the field said — the previous
+        // dataset's failure sentence, or that the previous one had none —
+        // described a dataset that is no longer the picked source.
+        setEmpty(snapFld, t(SNAP_LOADING_TEXT));
         ANAS.api.get(node, datasetPathRel(srcPool, srcRel, 'snapshots')).then(function (res) {
             if (win.destroyed || win.destroying) {
                 return;
             }
+            // cr4 (D-32): the list answered — the field's unreadable notice,
+            // and the newest-snapshot promise standing behind it, are void.
+            win.anasSnapsUnreadable = null;
             // Review of cr3: the list is the daemon's own order (newest first;
             // no re-sort by the creation CLOCK here), backup and cloud run
             // transients are never offered (the daemon refuses one by name —
@@ -3071,6 +3170,13 @@
                 data.unshift({ snapshotName: NEWEST_SNAPSHOT, label: t('(the newest snapshot when the run starts)') });
             }
             store.loadData(data);
+            // cr4 fold: the read ANSWERED, so the field carries the answered
+            // fact — the ordinary placeholder when there is something to pick,
+            // and otherwise that this dataset has nothing to send. The failure
+            // sentence, and a "(loading)" that pretends to wait on a read that
+            // already answered, are both gone.
+            setEmpty(snapFld, data.length ? t(SNAP_LOADING_TEXT)
+                : t('This dataset has no snapshot to replicate.'));
             if (data.length && !valOf(win, '#snapshotFirst')) {
                 snapFld.setValue(NEWEST_SNAPSHOT);
             }
@@ -3079,7 +3185,20 @@
             if (win.destroyed || win.destroying) {
                 return;
             }
-            ANAS.warn('replicate snapshot list failed: ' + ANAS.errText(err));
+            var reason = ANAS.errText(err);
+            ANAS.warn('replicate snapshot list failed: ' + reason);
+            // cr4 (D-32): the combo kept its '(loading snapshots…)'
+            // placeholder forever after this — a read that could not see
+            // pretended to still be waiting. The field now says what could
+            // not be read, with the reason, and what Replicate does instead:
+            // sends the newest (the daemon's own pick when the run starts;
+            // submitOnce honours the flag below). The empty text renders as
+            // HTML, so the reason is encoded; no markInvalid — the field is
+            // not blocking anything here, and an invalid mark would take the
+            // form down with it.
+            win.anasSnapsUnreadable = reason || t('unknown error');
+            setEmpty(snapFld, t('The snapshot list could not be read') + ' ('
+                + enc(win.anasSnapsUnreadable) + '). ' + t('Replicate sends the newest snapshot.'));
             fetchPlan(win, node);
         });
     }
@@ -3091,7 +3210,17 @@
                 names.push(pools[i].name);
             }
             if (!names.length) {
-                ANAS.toast(t('No pool is available for replication.'));
+                // cr4 (D-32): a read that could not see gets no verdict. An
+                // unreadable pool list is not a node without pools — it alerts
+                // with the reason (the 69-snapshots.js 'Cannot load targets'
+                // voice); only a list that ANSWERED empty may say no pool is
+                // available.
+                if (pools.unreadable) {
+                    ANAS.alertMsg('Cannot load targets', t('The pools could not be read') + ': '
+                        + pools.unreadable + '. ' + t('Try again.'));
+                } else {
+                    ANAS.toast(t('No pool is available for replication.'));
+                }
                 return;
             }
             buildOnceWindow(node, grid, names, pools);
@@ -3186,7 +3315,7 @@
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
-                            emptyText: t('(loading snapshots…)'),
+                            emptyText: t(SNAP_LOADING_TEXT),
                         },
                         {
                             xtype: 'checkboxfield',
@@ -3262,14 +3391,36 @@
                     break;
                 }
             }
-            loadDatasetOptions(node, pool, summary).then(function (opts) {
+            loadDatasetOptions(node, pool, summary).then(function (res) {
                 if (win.destroyed || win.destroying) {
                     return;
                 }
+                var opts = res.opts;
+                // cr4 fold: the once dialog's source listing carries the same
+                // fact the task dialog acts on (D-31): a read that could not
+                // see offers none, the field says why, and the save refuses by
+                // name below. The pool root standing here after a failed read
+                // was a source chosen from a list the dialog never read.
+                win.anasSrcDatasetsUnreadable = res.unreadable || null;
                 srcDsStore.loadData(opts);
                 var fld = win.down('#srcDataset');
                 if (fld) {
+                    try {
+                        if (typeof fld.clearInvalid === 'function') {
+                            fld.clearInvalid();
+                        }
+                    } catch (eClear) {
+                        // nothing to clear
+                    }
                     fld.setValue(opts.length ? opts[0].rel : '');
+                    if (res.unreadable) {
+                        try {
+                            // markInvalid renders HTML in its tip: encoded.
+                            fld.markInvalid(enc(t('The datasets of this pool could not be read') + ': ' + res.unreadable));
+                        } catch (eMark) {
+                            // the save still refuses
+                        }
+                    }
                 }
                 seedTargetDefault();
                 loadOnceSnapshots(win, node);
@@ -3322,13 +3473,29 @@
             ANAS.alertMsg('Invalid input', t('Select a source and target pool.'));
             return;
         }
+        // cr4 fold (the task dialog's D-31 refusal, at this dialog): a source
+        // picked from a listing that could not be read is not a choice.
+        if (win.anasSrcDatasetsUnreadable) {
+            ANAS.alertMsg('Cannot save', t('The datasets of pool') + ' ' + srcPool + ' '
+                + t('could not be read, so the source dataset cannot be chosen') + ': '
+                + win.anasSrcDatasetsUnreadable + '. ' + t('Close the dialog and try again.'));
+            return;
+        }
         var targetDs = ('' + (valOf(win, '#targetDataset') || '')).replace(/^\/+|\/+$/g, '');
         var snapFirst = !!valOf(win, '#snapshotFirst');
         var snap = snapFirst ? '' : valOf(win, '#snapshot');
         if (!snapFirst && !snap) {
-            ANAS.alertMsg('Invalid input',
-                t('Choose a snapshot, or check "Snapshot now and replicate".'));
-            return;
+            if (win.anasSnapsUnreadable) {
+                // cr4 (D-32): the field told the operator Replicate sends the
+                // newest snapshot — keep that promise. Omitting the name is
+                // exactly the NEWEST_SNAPSHOT path: the daemon picks the
+                // newest non-transient snapshot when the run starts.
+                snap = NEWEST_SNAPSHOT;
+            } else {
+                ANAS.alertMsg('Invalid input',
+                    t('Choose a snapshot, or check "Snapshot now and replicate".'));
+                return;
+            }
         }
 
         var body = { target: { pool: targetPool } };

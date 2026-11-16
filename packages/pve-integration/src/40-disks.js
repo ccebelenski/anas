@@ -409,16 +409,28 @@
                 return t('System');
             case 'ceph_osd':
                 return t('Ceph OSD');
-            case 'unknown':
-                // cr3 daemon contract: membership could not be read.
-                return '<span style="color:' + COLOR_UNKNOWN + ';">'
-                    + enc(t('Unknown: pool membership could not be read')) + '</span>';
             case 'other':
-            default:
                 if (d.partitions && d.partitions.length) {
                     return t('Partitioned');
                 }
                 return t('In use');
+            case 'unknown':
+                // cr3 daemon contract: the daemon emits `unknown` only when
+                // the membership read failed, so the cause is established and
+                // said. ONLY this value carries that sentence (cr4 fold).
+                return '<span style="color:' + COLOR_UNKNOWN + ';">'
+                    + enc(t('Unknown: pool membership could not be read')) + '</span>';
+            default:
+                // A status this page does not know — a value a newer daemon
+                // defines, or a record with none. Nothing here established
+                // that the membership read failed, so that sentence would
+                // state a cause the read never gave. Name the value ('?' when
+                // the record carries none, the file's mark for an unread
+                // value); the reload is the way to a page that knows it.
+                var rawStatus = (d.status === undefined || d.status === null || d.status === '')
+                    ? '?' : '' + d.status;
+                return '<span style="color:' + COLOR_UNKNOWN + ';">'
+                    + enc(t('Unknown status') + ' (' + rawStatus + '). ' + t('Reload the page.')) + '</span>';
         }
     }
 

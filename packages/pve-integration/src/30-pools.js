@@ -846,10 +846,19 @@
                 return;
             }
             grid.setLoading(false);
-            ANAS.warn('pools load failed: ' + ANAS.errText(err));
+            var why = ANAS.errText(err);
+            // cr4 (D-16): a rejected read never stands as an empty grid. Like
+            // the import scan (33-pool-import.js), the failure is said in
+            // place of the rows, and no earlier rows stay standing as if they
+            // were current. Create and Import stay offered: the composer
+            // reads GET /disks for itself and the import window runs its own
+            // scan — neither depends on this list.
+            setGridEmptyText(grid, ANAS.t('The pool list could not be read') + ' (' + why + ').');
+            grid.getStore().loadData([]);
+            ANAS.warn('pools load failed: ' + why);
             try {
                 ANAS.alertMsg('Error',
-                    ANAS.t('Failed to load pools') + ': ' + ANAS.errText(err));
+                    ANAS.t('Failed to load pools') + ': ' + why);
             } catch (e) {
                 // non-fatal
             }
@@ -899,10 +908,19 @@
                 scrubBtn.setDisabled(true);
                 btnSetText(scrubBtn, 'Start Scrub');
                 btnSetTip(scrubBtn, '');
+            } else if (has && (rec.get('state') === null || rec.get('state') === undefined)) {
+                // cr4 (D-18): a health the read did not answer is UNKNOWN —
+                // the panel never calls it "not ONLINE". Same shape as the
+                // unread scan state above: neither verb is offered, and the
+                // tooltip says what could not be read.
+                scrubBtn.setDisabled(true);
+                btnSetText(scrubBtn, 'Start Scrub');
+                btnSetTip(scrubBtn, ANAS.t('The pool health could not be read; reload to try again'));
             } else {
                 // Start Scrub only on a healthy (ONLINE) pool — parallel with the
                 // AHR Expand/Scrub gate: scrubbing a degraded/faulted pool piles
-                // load on already-vulnerable data; fix the fault first.
+                // load on already-vulnerable data; fix the fault first. A state
+                // that was read and is not ONLINE keeps its own reason.
                 var online = has && rec.get('state') === 'ONLINE';
                 scrubBtn.setDisabled(!online);
                 btnSetText(scrubBtn, 'Start Scrub');

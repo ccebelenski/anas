@@ -257,6 +257,11 @@
             diskById: {},       // id -> disk
             vdevs: [],          // staged/new vdevs (draft)
             existing: [],       // read-only vdevs (expand mode)
+            // cr4 (D-15, D-17): why a read failed, or null when the read
+            // answered. An unread layout and an unread disk list are states,
+            // never "no vdevs" / "no disks".
+            existingError: null, // reason GET /pools/:name failed (expand)
+            disksError: null,    // reason GET /disks failed
             assigned: {},       // diskId -> vdevId
             seq: 0,
             win: null,
@@ -358,6 +363,15 @@
             || (POOL_NAME_RE.test(name) && name.length <= POOL_NAME_MAX);
         if (!nameOk) {
             blocking.push(t('Enter a valid pool name (letter first; letters, digits, - _; at most 255).'));
+        }
+
+        // cr4 (D-15): an expand commits against the pool's CURRENT layout. When
+        // that read failed, nothing can be committed — the add might duplicate
+        // or contradict what is really on the pool. The block stays until a
+        // read answers (a success clears state.existingError).
+        if (state.mode === 'expand' && state.existingError) {
+            blocking.push(t('The pool\'s current layout could not be read') + ' (' + state.existingError + '). '
+                + t('Close this window and open it again.'));
         }
 
         var hasCompleteData = false;
@@ -721,6 +735,23 @@
         if (!listEl) {
             return;
         }
+        if (state.disksError) {
+            // cr4 (D-17): a rejected GET /disks is said, never rendered as
+            // "No available disks found" — that answer belongs to a read that
+            // actually answered empty. The free count is unknown, not zero.
+            listEl.innerHTML = '<div style="font-size:12px;text-align:center;padding:20px 0">'
+                + '<div style="color:var(--anas-danger);margin-bottom:10px">'
+                + enc(t('The disk list could not be read') + ' (' + state.disksError + ').') + '</div>'
+                + '<button type="button" data-retry-disks'
+                + ' style="border:1px solid var(--anas-card-edge);background:var(--anas-slot);'
+                + 'color:var(--anas-ink);cursor:pointer;font:inherit;font-size:12px;font-weight:600;'
+                + 'padding:4px 14px;border-radius:8px">'
+                + enc(t('Retry')) + '</button></div>';
+            if (countEl) {
+                countEl.textContent = '— ' + t('free');
+            }
+            return;
+        }
         var html = '';
         var free = 0;
         for (var i = 0; i < state.disks.length; i++) {
@@ -741,6 +772,20 @@
     function renderRacks(state) {
         var racksEl = state.root.querySelector('#anasc-racks');
         if (!racksEl) {
+            return;
+        }
+        if (state.existingError) {
+            // cr4 (D-15): a layout the panel could not read is said in place of
+            // the bays — "No vdevs yet" is the answer to a read that answered
+            // with an empty pool, and Commit is blocked (validate) until a read
+            // succeeds.
+            racksEl.innerHTML = '<div style="min-height:60px;font-size:12px;text-align:center;'
+                + 'border:1.5px dashed var(--anas-danger);border-radius:11px;padding:20px 8px;'
+                + 'color:var(--anas-danger);background:color-mix(in srgb,var(--anas-danger) 12%,transparent)">'
+                + '<span style="display:block;font-size:13px;font-weight:600;margin-bottom:2px">'
+                + enc(t('The pool\'s current layout could not be read') + ' (' + state.existingError + ').')
+                + '</span>'
+                + enc(t('Close this window and open it again.')) + '</div>';
             return;
         }
         var html = '';
@@ -962,6 +1007,24 @@
                     refresh(state);
                 });
             })(sels[s]);
+        }
+        // Retry after a failed GET /disks (cr4, D-17): re-read the inventory;
+        // on success the list and the free count render from the fresh answer.
+        var retries = root.querySelectorAll('[data-retry-disks]');
+        var r;
+        for (r = 0; r < retries.length; r++) {
+            (function (btn) {
+                btn.addEventListener('click', function () {
+                    loadAvailableDisks(state, function () {
+                        // The window may have closed while the retry was in
+                        // flight (same guard as the window's own afterLoad).
+                        if (state.win && (state.win.destroyed || state.win.destroying)) {
+                            return;
+                        }
+                        refresh(state);
+                    });
+                });
+            })(retries[r]);
         }
     }
 
@@ -1460,6 +1523,14 @@
     function commit(state) {
         try {
             var expand = state.mode === 'expand';
+            // cr4 (D-15): the button is already disabled by validate while the
+            // layout is unread; this is the second gate — a commit against a
+            // layout the panel never read is refused here too.
+            if (expand && state.existingError) {
+                Ext.Msg.alert(t('Add vdevs'), t('The pool\'s current layout could not be read') + ' ('
+                    + state.existingError + '). ' + t('Close this window and open it again.'));
+                return;
+            }
             var run = function () {
                 if (expand) {
                     commitExpand(state);
@@ -1506,11 +1577,15 @@
                 }
             }
             state.disks = avail;
+            state.disksError = null;
             if (done) {
                 done(null);
             }
         }, function (err) {
             ANAS.warn('composer disk load failed: ' + ANAS.errText(err));
+            // cr4 (D-17): the list is unread, not empty — renderAvail says so
+            // with a Retry; a later success clears the flag.
+            state.disksError = ANAS.errText(err);
             if (done) {
                 done(err);
             }
@@ -1529,11 +1604,16 @@
                     state.existing.push({ role: groups[g].role, vdev: vdevs[v] });
                 }
             }
+            state.existingError = null;
             if (done) {
                 done(null);
             }
         }, function (err) {
             ANAS.warn('composer topology load failed: ' + ANAS.errText(err));
+            // cr4 (D-15): an unread layout is not an empty pool. The reason
+            // rides the state: renderRacks says it in place of the bays and
+            // validate blocks Commit until a read answers.
+            state.existingError = ANAS.errText(err);
             if (done) {
                 done(err);
             }

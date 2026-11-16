@@ -1092,6 +1092,16 @@
     // mirrors it onto the #submit button and the #guardNote component (noteCfg
     // is that component's config); block/unblock update the map and re-run
     // refresh().
+    //
+    // A guarded LOAD also takes a token: block() bumps the key's counter on the
+    // window and returns it. Two reads of the same key can be in flight at once
+    // (the operator switches the pool before the first listing answers); the
+    // late answer of the SUPERSEDED read must change nothing — not open the
+    // gate the newer read still owns, and not put its rows or value on screen
+    // under the newer pool's name. latest(win, key, token) says whether the
+    // caller still owns the key, and unblock(win, key, token) refuses a token
+    // that no longer does. A block used as a plain on/off gate passes no token
+    // and is never superseded.
     ANAS.editGuard = {
         reason: function (win) {
             var blocks = win._saveBlocks || {};
@@ -1125,10 +1135,26 @@
         },
         block: function (win, key, reason) {
             win._saveBlocks = win._saveBlocks || {};
+            win._saveSeq = win._saveSeq || {};
+            win._saveSeq[key] = (win._saveSeq[key] || 0) + 1;
             win._saveBlocks[key] = reason;
             ANAS.editGuard.refresh(win);
+            return win._saveSeq[key];
         },
-        unblock: function (win, key) {
+        // Is `token` still the latest block taken on win+key? A caller that
+        // passed no token is asking about no load, so it is always current.
+        // The counter only grows (unblock leaves it), so a token from an
+        // earlier cycle can never match a later block by number.
+        latest: function (win, key, token) {
+            if (token === undefined || token === null || !win || !win._saveSeq) {
+                return true;
+            }
+            return win._saveSeq[key] === token;
+        },
+        unblock: function (win, key, token) {
+            if (!ANAS.editGuard.latest(win, key, token)) {
+                return;
+            }
             if (win._saveBlocks) {
                 delete win._saveBlocks[key];
             }
