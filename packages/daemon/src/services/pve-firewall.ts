@@ -8,10 +8,12 @@
  * ANAS screen. So ANAS looks, and says one line.
  *
  * It says it and nothing more. PVE territory is read-only and hands-off
- * (§2 standing ruling, story 3.25/18): `/etc/pve/firewall/*.fw` is parsed,
- * NEVER written, and no "fix it for me" button will ever exist here — a
- * firewall rule is the one thing on a Proxmox node that is unambiguously the
- * administrator's, and ANAS adding one silently would be indefensible.
+ * (§2 standing ruling, story 3.25/18): `/etc/pve/firewall/cluster.fw` and the
+ * node's own `/etc/pve/local/host.fw` (PVE's symlink to
+ * `/etc/pve/nodes/<node>/host.fw`) are parsed, NEVER written, and no "fix it
+ * for me" button will ever exist here — a firewall rule is the one thing on a
+ * Proxmox node that is unambiguously the administrator's, and ANAS adding one
+ * silently would be indefensible.
  *
  * FAIL-OPEN in both directions, and asymmetrically so:
  *
@@ -47,6 +49,15 @@ export const PVE_FIREWALL = '/usr/sbin/pve-firewall'
 
 /** Where PVE keeps its firewall config (pmxcfs; cluster-wide). */
 export const PVE_FIREWALL_DIR = '/etc/pve/firewall'
+
+/**
+ * Where PVE keeps this node's OWN firewall config. Captured on a PVE 9 node:
+ * a host rule created with `pvesh create /nodes/<node>/firewall/rules` lands in
+ * `/etc/pve/nodes/<node>/host.fw`, NOT in `/etc/pve/firewall/` (which held no
+ * file). `/etc/pve/local` is PVE's own symlink to the node's directory, so it
+ * is the stable name to read rather than reconstructing the node name.
+ */
+export const PVE_HOST_FIREWALL_DIR = '/etc/pve/local'
 
 /** The iSCSI well-known port. */
 export const ISCSI_PORT = 3260
@@ -183,6 +194,11 @@ export function parseFirewallStatus(stdout: string): boolean | null {
 export interface PveFirewallOptions {
   /** `/etc/pve/firewall` override — the tests point it at a temp dir. */
   firewallDir?: string
+  /**
+   * The NODE's own firewall directory override (`/etc/pve/local` by default;
+   * `host.fw` lives here, not in `firewallDir`). Tests point it at a temp dir.
+   */
+  hostFirewallDir?: string
 }
 
 /** Read one `.fw` file; null when it is not there or cannot be read. */
@@ -197,7 +213,9 @@ async function readFw(dir: string, name: string): Promise<string | null> {
 
 /**
  * The advisory for this node. Reads `pve-firewall status` and, when the
- * firewall is on, `cluster.fw` + `host.fw` for a rule admitting 3260/tcp.
+ * firewall is on, `cluster.fw` (cluster-wide) plus the node's own `host.fw`
+ * (from `hostFirewallDir`, `/etc/pve/local` by default) for a rule admitting
+ * 3260/tcp.
  *
  * `cluster.fw`'s `[OPTIONS] enable:` is consulted only as a FALLBACK for the
  * status command (a node where `pve-firewall` is not installed at all has no
@@ -215,6 +233,7 @@ export async function readPveFirewallAdvisory(
   ports: number[] = [ISCSI_PORT],
 ): Promise<IscsiFirewallAdvisory> {
   const dir = opts.firewallDir ?? PVE_FIREWALL_DIR
+  const hostDir = opts.hostFirewallDir ?? PVE_HOST_FIREWALL_DIR
   let enabled: boolean | null = null
   try {
     const r = await executor.exec(PVE_FIREWALL, ['status'])
@@ -232,7 +251,9 @@ export async function readPveFirewallAdvisory(
   if (enabled !== true)
     return { enabled, admits3260: null, advisory: null }
 
-  const hostText = await readFw(dir, 'host.fw')
+  // The node's own rules are in `/etc/pve/local/host.fw` (a symlink to
+  // `/etc/pve/nodes/<node>/host.fw`), NOT in the cluster-wide directory.
+  const hostText = await readFw(hostDir, 'host.fw')
   if (clusterText === null && hostText === null) {
     // Enabled, but nothing readable to judge the rules by. Say nothing —
     // "I could not read your rules" is not "you have no rule".

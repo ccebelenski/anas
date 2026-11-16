@@ -378,6 +378,34 @@ describe('computeIscsiHealth — the restore hole (GT-20/GT-21)', () => {
     assert.equal(health.interfacesUnknown, true)
   })
 
+  it('cr4: a node with NO targets does not run `ip addr`, and is not "interfaces unknown"', async () => {
+    // RED before: the empty read returned nodeAddresses null and health read
+    // that as "the addresses could not be read" — a failed read that was never
+    // made. The read is genuinely not needed with no targets, so say nothing.
+    const dir = await mkdtemp(join(tmpdir(), 'anas-iscsi-notargets-'))
+    let ipCalls = 0
+    const exec: CommandExecutor = {
+      async exec(command: string): Promise<ExecResult> {
+        if (command === '/usr/bin/ip')
+          ipCalls++
+        return { stdout: '', stderr: '', exitCode: 1 }
+      },
+      async pipeline(): Promise<PipelineResult> {
+        return { leftExitCode: 1, rightExitCode: 1, leftStderr: '', rightStderr: '', stdout: '' }
+      },
+      async execToStream(): Promise<ExecStreamResult> {
+        return { stderr: '', exitCode: 1, bytesWritten: 0 }
+      },
+    }
+    const ctx = await readIscsiContext(exec, { configfsRoot: join(dir, 'target'), saveconfigPath: join(dir, 'saveconfig.json') })
+    const health = computeIscsiHealth(ctx, await buildIscsiTargets(ctx))
+    assert.equal(ipCalls, 0, 'ip addr must not run with nothing to compare against')
+    assert.equal(ctx.nodeAddresses, null)
+    assert.equal(ctx.nodeAddressesUnread, undefined, 'a read that was not made is not a failed read')
+    assert.equal(health.interfacesUnknown, false)
+    await rm(dir, { recursive: true, force: true })
+  })
+
   it('reports portals and a LUN that exist live but were never persisted', async () => {
     // The three-portal capture as the PERSISTED side against the one-portal
     // live tree: two portals in the file are not live, and the live config has

@@ -38,6 +38,7 @@ import type { OwnershipInputs, OwnershipLun } from './iscsi-ownership.js'
 import type { StatDevice } from './iscsi-served.js'
 import type { StubVerdict } from './iscsi-stub.js'
 import { stat } from 'node:fs/promises'
+import { join } from 'node:path'
 import { anasTargetName } from '@anas/shared'
 import { LIO_SAVECONFIG_PATH, readLioSaveconfigState, storageObjectsByName } from '../parsers/lio-saveconfig.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpointsFull } from '../parsers/pve-storage.js'
@@ -135,11 +136,19 @@ export interface IscsiReadContext {
   persistedUnreadable?: string | null
   inputs: OwnershipInputs
   /**
-   * Addresses this node's interfaces currently carry. NULL means "could not be
-   * read" — which is NOT the same as "none", and is why a portal's
-   * `carriedByInterface` is nullable (GT-24 says LIO will never tell us).
+   * Addresses this node's interfaces currently carry. `null` means "not
+   * available" — either the read FAILED ({@link nodeAddressesUnread}) or it was
+   * NEVER MADE because the node has no targets (there is nothing to compare
+   * against). It is never "none": that is why a portal's `carriedByInterface`
+   * is nullable (GT-24 says LIO will never tell us).
    */
   nodeAddresses: Set<string> | null
+  /**
+   * cr4: the address read was ATTEMPTED and FAILED (`nodeAddresses` is then
+   * null). Absent/false when it read, or when it was not made because the node
+   * has no targets — a read that was never made is not a read that failed.
+   */
+  nodeAddressesUnread?: boolean
   /**
    * Every backing path either source names, probed ONCE during the gather:
    * does it resolve, and (for a file) how big is it? The builder reads this map
@@ -165,6 +174,13 @@ export interface IscsiReadContext {
    * candidate.
    */
   stubs: Map<string, IscsiLunStubFacts>
+  /**
+   * cr4 (D-11): where the two configuration sources were read. Named in the
+   * `backing-unreadable` sentence so the operator has a grounded path. Absent
+   * on a hand-built context (a test): the sentence omits them.
+   */
+  configfsRoot?: string
+  saveconfigPath?: string
 }
 
 /** A stub verdict with the facts it was reached from — the `stubLuns[]` row. */
@@ -360,6 +376,8 @@ export async function readIscsiContext(
     backing: new Map(),
     mounts: new Map(),
     stubs: new Map(),
+    configfsRoot: paths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
+    saveconfigPath: paths.saveconfigPath ?? LIO_SAVECONFIG_PATH,
   }
 
   const hasTargets = live.targets.length > 0 || (persisted?.targets.length ?? 0) > 0
@@ -425,8 +443,12 @@ export async function readIscsiContext(
       )
     }
     catch {
-      // Fail-open: without AHR topology a file on an AHR pool reads as foreign,
-      // which is a hands-off badge, not a broken screen.
+      // The AHR topology could not be read. A file LUN that matched no ZFS
+      // dataset could still be on an AHR pool ANAS manages, so its owner is
+      // UNKNOWN — never a positive "foreign" (cr4, D-11). The target stays
+      // ANAS's (the F2 rule keeps Repair and the screens working) and the
+      // sentence says the owner could not be read.
+      inputs.ahrUnreadable = true
     }
   }
 
@@ -446,9 +468,13 @@ export async function readIscsiContext(
     persistedUnreadable,
     inputs,
     nodeAddresses,
+    // cr4: on this path the read WAS made; a null here means it failed.
+    ...(nodeAddresses === null ? { nodeAddressesUnread: true } : {}),
     backing,
     mounts,
     stubs: new Map(),
+    configfsRoot: paths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
+    saveconfigPath: paths.saveconfigPath ?? LIO_SAVECONFIG_PATH,
   }
 }
 
@@ -555,6 +581,12 @@ interface TpgBuild {
   luns: IscsiLun[]
   /** A live ACL of this TPG whose session could not be read (cr3). */
   sessionsUnknown: boolean
+  /**
+   * The live configfs TPG when it exists — kept so the ownership sentence can
+   * name a LUN's configfs directory only when that directory was actually read
+   * (cr4, D-11).
+   */
+  liveTpg?: ConfigfsTpg
 }
 
 /** The live and persisted halves of one target, and the backstores both name. */
@@ -756,6 +788,7 @@ function buildTpg(
     sessions,
     luns,
     sessionsUnknown: unreadableAcls.length > 0,
+    ...(liveTpg === undefined ? {} : { liveTpg }),
   }
 }
 
@@ -815,12 +848,20 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
     // ANAS's own target hands-off at the exact moment it needs managing. Every
     // TPG's LUNs count: a guest disk mapped in a second TPG is still a guest
     // disk.
-    const ownershipLuns: OwnershipLun[] = allLuns.map(l => ({
-      name: l.name,
-      backingPath: l.backingPath,
-      backingExists: l.backingExists,
+    const configfsRoot = ctx.configfsRoot ?? CONFIGFS_TARGET_ROOT
+    const ownershipLuns: OwnershipLun[] = builds.flatMap(b => b.luns.map((l) => {
+      // Name the configfs LUN directory only when it was actually read (the
+      // LUN is live in that TPG) — never a path invented for a target that is
+      // not there (cr4, D-11).
+      const live = b.liveTpg?.luns.some(x => x.index === l.index) ?? false
+      return {
+        name: l.name,
+        backingPath: l.backingPath,
+        backingExists: l.backingExists,
+        ...(live ? { configfsPath: join(configfsRoot, 'iscsi', iqn, `tpgt_${b.tag}`, 'lun', `lun_${l.index}`) } : {}),
+      }
     }))
-    const ownership = deriveOwnership(iqn, ownershipLuns, ctx.inputs)
+    const ownership = deriveOwnership(iqn, ownershipLuns, ctx.inputs, { saveconfigPath: ctx.saveconfigPath })
 
     const allPortals = builds.flatMap(b => b.portals)
     // cr3: a target directory that could not be listed hides ACLs, sessions

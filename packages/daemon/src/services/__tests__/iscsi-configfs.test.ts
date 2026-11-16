@@ -355,3 +355,29 @@ describe('lunHoldingDevice — the busy-diagnosis seam (GT-41)', () => {
     assert.equal(await lunHoldingDevice('/gtiscsi/image', { root, blockRoot }), null)
   })
 })
+
+describe('cr4 — an `IQN.`-named target directory is read like any target', () => {
+  // iSCSI names are case-INSENSITIVE, so a directory named `IQN.…` is a target.
+  // RED before: `readTargets` compared `iqn.`/`eui.`/`naa.` case-sensitively and
+  // skipped the entry, so the target vanished and its LUNs read as holes.
+  it('reads a target whose name begins with an upper-case IQN.', async () => {
+    const manifest = loadFixture('configfs-live.manifest')
+      .replaceAll('iqn.2026-08.dev.anas.gtiscsi:target1', 'IQN.2026-08.dev.anas.gtiscsi:target1')
+    const dir = await mkdtemp(join(tmpdir(), 'anas-configfs-iqn-'))
+    const root = join(dir, 'target')
+    await materializeConfigfsManifest(manifest, root)
+    const blockRoot = join(dir, 'block')
+    await mkdir(join(blockRoot, 'zd16'), { recursive: true })
+    await writeFile(join(blockRoot, 'zd16', 'size'), '4194304\n')
+    try {
+      const state = await readConfigfs({ root, blockRoot })
+      assert.equal(state.targets.length, 1)
+      // The name is preserved exactly as the kernel shows it.
+      assert.equal(state.targets[0].iqn, 'IQN.2026-08.dev.anas.gtiscsi:target1')
+      assert.equal(state.targets[0].tpgs[0].luns.length, 2)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})

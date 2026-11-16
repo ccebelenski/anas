@@ -39,6 +39,10 @@ const REAL_STATUS_DISABLED = readFileSync(
   join(__dirname, '../../fixtures/iscsi/pve-firewall-status-disabled.txt'),
   'utf-8',
 )
+const REAL_HOST_FW_DISABLED = readFileSync(
+  join(__dirname, '../../fixtures/iscsi/host-fw-disabled-rule.txt'),
+  'utf-8',
+)
 
 describe('pve-firewall — parsing', () => {
   describe('parseFirewallStatus', () => {
@@ -141,12 +145,15 @@ describe('pve-firewall — parsing', () => {
 
 describe('pve-firewall — readPveFirewallAdvisory (the four states)', () => {
   let dir: string
+  let hostDir: string
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-fw-'))
+    hostDir = await mkdtemp(join(tmpdir(), 'anas-fw-host-'))
   })
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true })
+    await rm(hostDir, { recursive: true, force: true })
   })
 
   function execStatus(stdout: string, exitCode = 0): MockExecutor {
@@ -155,14 +162,20 @@ describe('pve-firewall — readPveFirewallAdvisory (the four states)', () => {
     return exec
   }
 
+  // Both directories are always pointed at temp dirs so no test ever reads the
+  // workstation's real `/etc/pve/firewall` or `/etc/pve/local`.
+  function opts() {
+    return { firewallDir: dir, hostFirewallDir: hostDir }
+  }
+
   it('DISABLED (the real stunt-node capture) → no advisory', async () => {
-    const r = await readPveFirewallAdvisory(execStatus(REAL_STATUS_DISABLED), { firewallDir: dir })
+    const r = await readPveFirewallAdvisory(execStatus(REAL_STATUS_DISABLED), opts())
     assert.deepEqual(r, { enabled: false, admits3260: null, advisory: null })
   })
 
   it('ENABLED + a rule that admits 3260/tcp → no advisory', async () => {
     await writeFile(join(dir, 'cluster.fw'), '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -p tcp -dport 3260\n')
-    const r = await readPveFirewallAdvisory(execStatus('Status: enabled/running\n'), { firewallDir: dir })
+    const r = await readPveFirewallAdvisory(execStatus('Status: enabled/running\n'), opts())
     assert.equal(r.enabled, true)
     assert.equal(r.admits3260, true)
     assert.equal(r.advisory, null)
@@ -170,7 +183,7 @@ describe('pve-firewall — readPveFirewallAdvisory (the four states)', () => {
 
   it('ENABLED + NO rule admitting 3260/tcp → the one-line advisory', async () => {
     await writeFile(join(dir, 'cluster.fw'), '[OPTIONS]\nenable: 1\n\n[RULES]\nIN ACCEPT -p tcp -dport 8006\n')
-    const r = await readPveFirewallAdvisory(execStatus('Status: enabled/running\n'), { firewallDir: dir })
+    const r = await readPveFirewallAdvisory(execStatus('Status: enabled/running\n'), opts())
     assert.equal(r.enabled, true)
     assert.equal(r.admits3260, false)
     assert.match(r.advisory ?? '', /firewall is enabled and no rule admits 3260\/tcp/)
@@ -179,23 +192,39 @@ describe('pve-firewall — readPveFirewallAdvisory (the four states)', () => {
     assert.match(r.advisory ?? '', /ANAS never edits firewall rules/)
   })
 
-  it('a HOST rule counts as well as a cluster one', async () => {
+  it('a HOST rule counts as well as a cluster one — read from the node directory', async () => {
     await writeFile(join(dir, 'cluster.fw'), '[OPTIONS]\nenable: 1\n\n[RULES]\nIN DROP\n')
-    await writeFile(join(dir, 'host.fw'), '[RULES]\nIN ACCEPT -p tcp -dport 3200:3300\n')
-    const r = await readPveFirewallAdvisory(execStatus('Status: enabled/running\n'), { firewallDir: dir })
+    // Captured on a PVE 9 node: the node's own rule lives in host.fw in the
+    // node's directory (here the hostDir temp dir, standing in for
+    // `/etc/pve/local`), NOT beside cluster.fw.
+    await writeFile(join(hostDir, 'host.fw'), '[RULES]\nIN ACCEPT -p tcp -dport 3200:3300\n')
+    const r = await readPveFirewallAdvisory(execStatus('Status: enabled/running\n'), opts())
     assert.equal(r.admits3260, true)
     assert.equal(r.advisory, null)
   })
 
+  it('the REAL node capture of a DISABLED host rule does not admit 3260/tcp', async () => {
+    // Real capture from a PVE 9 node: a rule made with `enable 0` is written to
+    // the node's host.fw as `|IN ACCEPT -p tcp -dport 3260 # probe` — the
+    // leading pipe is PVE's "disabled" marker and the rule admits nothing. If
+    // the parser counted it, a firewall that is dropping 3260 would read as
+    // allowing it.
+    await writeFile(join(hostDir, 'host.fw'), REAL_HOST_FW_DISABLED)
+    const r = await readPveFirewallAdvisory(execStatus('Status: enabled/running\n'), opts())
+    assert.equal(r.enabled, true)
+    assert.equal(r.admits3260, false)
+    assert.match(r.advisory ?? '', /no rule admits 3260\/tcp/)
+  })
+
   it('UNREADABLE status (no pve-firewall at all) → no advisory, ever', async () => {
     // No fixture ⇒ the mock returns exit 127, "command not found".
-    const r = await readPveFirewallAdvisory(new MockExecutor(), { firewallDir: dir })
+    const r = await readPveFirewallAdvisory(new MockExecutor(), opts())
     assert.deepEqual(r, { enabled: null, admits3260: null, advisory: null })
   })
 
   it('falls back to cluster.fw [OPTIONS] enable when the command could not run', async () => {
     await writeFile(join(dir, 'cluster.fw'), '[OPTIONS]\nenable: 1\n\n[RULES]\nIN DROP\n')
-    const r = await readPveFirewallAdvisory(new MockExecutor(), { firewallDir: dir })
+    const r = await readPveFirewallAdvisory(new MockExecutor(), opts())
     assert.equal(r.enabled, true)
     assert.equal(r.admits3260, false)
     assert.ok(r.advisory)
@@ -204,14 +233,14 @@ describe('pve-firewall — readPveFirewallAdvisory (the four states)', () => {
   it('ENABLED but the RULES are unreadable → silence, not a false accusation', async () => {
     // Enabled per the command, and no readable .fw file at all: "I could not
     // read your rules" is NOT evidence that a rule is missing.
-    const r = await readPveFirewallAdvisory(execStatus('Status: enabled/running\n'), { firewallDir: dir })
+    const r = await readPveFirewallAdvisory(execStatus('Status: enabled/running\n'), opts())
     assert.deepEqual(r, { enabled: true, admits3260: null, advisory: null })
   })
 
   it('never executes anything but `pve-firewall status` — it is a READER', async () => {
     const exec = execStatus('Status: enabled/running\n')
     await writeFile(join(dir, 'cluster.fw'), '[OPTIONS]\nenable: 1\n\n[RULES]\nIN DROP\n')
-    await readPveFirewallAdvisory(exec, { firewallDir: dir })
+    await readPveFirewallAdvisory(exec, opts())
     assert.deepEqual(exec.calls, [{ command: PVE_FIREWALL, args: ['status'] }])
   })
 })

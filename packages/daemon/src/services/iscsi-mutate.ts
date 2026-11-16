@@ -189,8 +189,18 @@ export function withIscsiLock<T>(fn: () => Promise<T>): Promise<T> {
  * or a comma) before the parameter name is what makes the token a parameter,
  * and nothing ANAS legitimately passes (`wwn=`, `size=`, `write_back=`,
  * `emulate_write_cache=`, `file_or_dev=`, `storage_object=`) can match it.
+ *
+ * cr4 (D-13): the flag can carry one or two dashes (`--password=…`) and the
+ * secret can follow as a SEPARATE token (`--password <secret>`), so the
+ * parameter may be followed by `=`, whitespace or the end of the token. Both
+ * forms are refused on the flag alone — the guard never needs to look at the
+ * value, and the refusal names only the flag.
  */
-const SECRET_ARG_RE = /(?:^|[\s,])(password|password_mutual|mutual_password)=/i
+// The capture group is read by `assertSecretArgShape` (secret-argv.ts), which
+// passes this pattern in and names the matched flag in its refusal; eslint
+// cannot see that use across the module boundary.
+// eslint-disable-next-line regexp/no-unused-capturing-group
+const SECRET_ARG_RE = /(?:^|[\s,])-{0,2}(password|password_mutual|mutual_password)(?:=|\s|$)/i
 
 /**
  * Throw if any targetcli argv token would leak a CHAP secret.
@@ -205,6 +215,32 @@ export function assertNoSecretArgs(args: string[]): void {
   assertSecretArgShape(args, SECRET_ARG_RE)
 }
 
+/**
+ * cr4 (D-13): render argv for an error message WITHOUT echoing a secret-bearing
+ * token's value. `SECRET_ARG_RE` finds a flag (`password=` / `--password=…` /
+ * `--password`); the value after the flag's `=` is replaced with `<secret>`, and
+ * for the two-token `--password <secret>` form the following token is masked
+ * too. `assertNoSecretArgs` refuses such argv before it ever runs, so this is
+ * the backstop that keeps a secret out of the job result and journald even if a
+ * future caller bypasses the guard.
+ */
+function redactSecretArgs(args: string[]): string[] {
+  const out = [...args]
+  for (let i = 0; i < out.length; i++) {
+    const token = out[i]!
+    if (!SECRET_ARG_RE.test(token))
+      continue
+    const eq = token.indexOf('=')
+    if (eq >= 0) {
+      out[i] = `${token.slice(0, eq)}=<secret>`
+    }
+    else if (i + 1 < out.length) {
+      out[i + 1] = '<secret>'
+    }
+  }
+  return out
+}
+
 /** A targetcli invocation that exited non-zero. */
 export class TargetcliError extends Error {
   constructor(
@@ -216,7 +252,10 @@ export class TargetcliError extends Error {
       .map(l => l.trim())
       .filter(l => l.length > 0)
       .join('; ')
-    super(`targetcli ${args.join(' ')} failed: ${detail}`)
+    // cr4 (D-13): the argv is rendered with any secret-bearing token masked —
+    // a failed job's result and its journald line must never carry a CHAP
+    // secret, whatever went wrong.
+    super(`targetcli ${redactSecretArgs(args).join(' ')} failed: ${detail}`)
     this.name = 'TargetcliError'
   }
 }
@@ -249,12 +288,21 @@ export async function runTargetcli(executor: CommandExecutor, args: string[]): P
  */
 const CONFIGSHELL_UNSAFE_RE = /[\s"']/
 
-/** A token that would not survive targetcli's re-parse as ONE token (cr3, ISCSI-L10). */
+/**
+ * A token that would not survive targetcli's re-parse as ONE token (cr3,
+ * ISCSI-L10).
+ *
+ * cr4 (D-13): the message names the argument's POSITION and, when the token is
+ * a parameter, its flag name — never the token itself. A token that fails this
+ * check may carry a secret (`--password=<secret>` is precisely such a token),
+ * and the refusal must not become the leak.
+ */
 export class TargetcliArgError extends Error {
-  constructor(readonly token: string) {
-    super(`Refusing to run targetcli with '${token}': targetcli re-joins its arguments with spaces and parses the `
-      + `line again, so a value containing a space, a quote or a second '=' would be read as something else. `
-      + `Nothing was run.`)
+  constructor(readonly position: number, readonly flagName: string | null) {
+    super(`Refusing to run targetcli: argument ${position + 1}`
+      + `${flagName === null ? '' : ` ('${flagName}')`} would not survive targetcli's re-parse — targetcli `
+      + `re-joins its arguments with spaces and parses the line again, so a value containing a space, a quote `
+      + `or a second '=' would be read as something else. Nothing was run.`)
     this.name = 'TargetcliArgError'
   }
 }
@@ -269,10 +317,37 @@ export class TargetcliArgError extends Error {
  * the one place every one of them passes.
  */
 export function assertConfigshellArgs(args: string[]): void {
-  for (const token of args) {
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]!
     if (!configshellSafe(token))
-      throw new TargetcliArgError(token)
+      throw new TargetcliArgError(i, safeFlagName(token))
   }
+}
+
+/** A `--flag…` / `-flag…` token: capture the flag name after the dash(es). */
+const DASHED_FLAG_RE = /^-{1,2}([a-z]\w*)/i
+
+/** A clean parameter name, so a value before an `=` is never mistaken for one. */
+const BARE_FLAG_NAME_RE = /^[a-z]\w*$/i
+
+/**
+ * The PARAMETER NAME of a token, when it has one, for an error message that
+ * must not echo the token (cr4, D-13). A dashed flag (`--password…`) or a
+ * `name=` keyword yields that name; a positional token (an address, a path)
+ * yields null. Only a clean `[a-z]\w*` name is returned, so a value that
+ * happens to sit before a `=` is never mistaken for a flag.
+ */
+function safeFlagName(token: string): string | null {
+  const dashed = DASHED_FLAG_RE.exec(token)
+  if (dashed)
+    return dashed[1]!
+  const eq = token.indexOf('=')
+  if (eq > 0) {
+    const name = token.slice(0, eq)
+    if (BARE_FLAG_NAME_RE.test(name))
+      return name
+  }
+  return null
 }
 
 /**
@@ -520,6 +595,18 @@ export function assertInstalled(ctx: IscsiReadContext): IscsiRefusal | null {
 }
 
 /**
+ * Name a LUN in a refusal message — `LUN 0 of <iqn> (backstore 'x', /path)`.
+ *
+ * cr4 (D-11): a LUN whose backing path could not be read has NO path. Printing
+ * `(backstore 'x', )` reads as an empty path; name only the backstore in that
+ * case.
+ */
+function namedLun(h: { lunIndex: number, targetIqn: string, backstoreName: string, backingPath: string }): string {
+  const where = h.backingPath.length > 0 ? `, ${h.backingPath}` : ''
+  return `LUN ${h.lunIndex} of ${h.targetIqn} (backstore '${h.backstoreName}'${where})`
+}
+
+/**
  * cr3 (ISCSI-L7, operator ruling 2026-11-14 "best practice prevails"): the one
  * sentence for restore holes in targets ANAS does NOT manage. They keep the
  * node degraded — a save is node-wide and would erase their saved LUNs — but
@@ -529,7 +616,7 @@ export function assertInstalled(ctx: IscsiReadContext): IscsiRefusal | null {
  * on the node, hence the maintenance window.
  */
 export function foreignHolesSentence(holes: Pick<IscsiMissingLun, 'targetIqn' | 'lunIndex' | 'backstoreName' | 'backingPath'>[]): string {
-  const named = holes.map(h => `LUN ${h.lunIndex} of ${h.targetIqn} (backstore '${h.backstoreName}', ${h.backingPath})`).join('; ')
+  const named = holes.map(namedLun).join('; ')
   const one = holes.length === 1
   return `${named} ${one ? 'is' : 'are'} missing from ${one ? 'a target' : 'targets'} ANAS does not manage. ANAS never `
     + `writes to a target it does not own, so Repair leaves ${one ? 'it' : 'them'} alone. Restore ${one ? 'it' : 'them'} by hand: `
@@ -604,9 +691,7 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
   // ANAS never touches it, which is precisely why it no longer degrades.)
   const ownedStubs = health.stubLuns.filter(s => s.ownership === 'anas' && s.zeroSized)
   if (ownedStubs.length > 0) {
-    const stubs = ownedStubs
-      .map(l => `LUN ${l.lunIndex} of ${l.targetIqn} (backstore '${l.backstoreName}', ${l.backingPath})`)
-      .join('; ')
+    const stubs = ownedStubs.map(namedLun).join('; ')
     return {
       reason: 'stub-backing',
       message: `The live iSCSI configuration is serving ${ownedStubs.length} `
@@ -633,7 +718,7 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
   const ownHoles = health.missingLuns.filter(l => l.targetOwnership !== 'foreign' && handsOffOf(l.targetIqn) === null)
   const handsOffClause = notRepairable.length === 0
     ? ''
-    : ` ${notRepairable.map(l => `LUN ${l.lunIndex} of ${l.targetIqn} (backstore '${l.backstoreName}', ${l.backingPath})`).join('; ')} `
+    : ` ${notRepairable.map(namedLun).join('; ')} `
       + `${notRepairable.length === 1 ? 'is' : 'are'} missing too, and Repair does not write to ${notRepairable.length === 1 ? 'that target' : 'those targets'}: `
       + `${[...new Set(notRepairable.map(l => handsOffOf(l.targetIqn)!.message))].join(' ')}`
   if (ownHoles.length === 0 && (foreignHoles.length > 0 || notRepairable.length > 0)) {
@@ -643,9 +728,7 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
         + `${foreignHoles.length > 0 ? ` ${foreignHolesSentence(foreignHoles)}` : ''}${handsOffClause}`,
     }
   }
-  const missing = ownHoles
-    .map(l => `LUN ${l.lunIndex} of ${l.targetIqn} (backstore '${l.backstoreName}', ${l.backingPath})`)
-    .join('; ')
+  const missing = ownHoles.map(namedLun).join('; ')
   const foreignClause = foreignHoles.length > 0 ? ` Besides: ${foreignHolesSentence(foreignHoles)}` : ''
   return {
     reason: 'degraded-restore',
@@ -923,24 +1006,84 @@ export async function updateIscsiTarget(
       // create after it fails — a rollback undoes only what this operation
       // did. If the put-back fails too, the target may listen on no portal:
       // the sentence says so and names the command that restores it.
+      //
+      // cr4 (D-12): the portals this edit ALREADY created must be undone too.
+      // A second `portals create` that LIO refuses used to leave the first
+      // address live and unsaved while the job said "nothing else was changed".
+      // Undo them (reverse order), then put the wildcard back, then state
+      // exactly what was undone — or, when an undo fails, which portal is
+      // still listening and the command that removes it.
       if (wildcardFirst.length === 0)
         throw err
       const base = err instanceof Error ? err.message : String(err)
+      const created = toAdd.slice(0, portalsAdded)
+      const undone: string[] = []
+      const stillListening: string[] = []
+      // Undo in REVERSE order (the last one created comes down first).
+      for (let i = created.length - 1; i >= 0; i--) {
+        const p = created[i]!
+        try {
+          await runTargetcli(executor, [`${tpg}/portals`, 'delete', p.address, String(p.port)])
+          undone.push(`${p.address}:${p.port}`)
+        }
+        catch {
+          stillListening.push(`targetcli ${tpg}/portals delete ${p.address} ${p.port}`)
+        }
+      }
+      const restored: string[] = []
       const failedUndo: string[] = []
       for (const p of wildcardFirst) {
         try {
           await runTargetcli(executor, [`${tpg}/portals`, 'create', p.address, String(p.port)])
+          restored.push(`${p.address}:${p.port}`)
         }
         catch {
           failedUndo.push(`targetcli ${tpg}/portals create ${p.address} ${p.port}`)
         }
       }
+
+      // Say what the wildcard(s) came to: all back, none back (the target may
+      // now listen on nothing), or some back — never claim "NO portal" when one
+      // was restored.
+      let wildcardClause: string
       if (failedUndo.length === 0) {
-        throw new Error(`${base} The wildcard portal${wildcardFirst.length === 1 ? '' : 's'} this edit had removed `
-          + `(${wildcardFirst.map(p => `${p.address}:${p.port}`).join(', ')}) ${wildcardFirst.length === 1 ? 'was' : 'were'} put back; nothing else was changed.`)
+        wildcardClause = `The wildcard portal${restored.length === 1 ? '' : 's'} this edit had removed `
+          + `(${restored.join(', ')}) ${restored.length === 1 ? 'was' : 'were'} put back.`
       }
-      throw new Error(`${base} The wildcard portal this edit had removed could not be put back either, so target '${iqn}' `
-        + `may now listen on NO portal. Restore it with: ${failedUndo.join('; ')} (the saved configuration still has it, so the next boot restores it too).`)
+      else if (restored.length === 0) {
+        // What the target listens on now depends on whether a portal this edit
+        // created is still there: "NO portal" is said only when none is.
+        const many = failedUndo.length > 1
+        const listens = stillListening.length > 0
+          ? `so target '${iqn}' now listens only on what this edit created and could not remove`
+          : `so target '${iqn}' may now listen on NO portal`
+        wildcardClause = `The wildcard portal${many ? 's' : ''} this edit had removed could not be put back, ${listens}. `
+          + `Restore ${many ? 'them' : 'it'} with: ${failedUndo.join('; ')} `
+          + `(the saved configuration still has ${many ? 'them' : 'it'}, so the next boot restores ${many ? 'them' : 'it'} too).`
+      }
+      else {
+        wildcardClause = `The wildcard portal${restored.length === 1 ? '' : 's'} this edit had removed `
+          + `(${restored.join(', ')}) ${restored.length === 1 ? 'was' : 'were'} put back, but the rest could not be: `
+          + `restore ${failedUndo.length === 1 ? 'it' : 'them'} with: ${failedUndo.join('; ')} `
+          + `(the saved configuration still has them, so the next boot restores them too).`
+      }
+      // State exactly what happened to the portals this run created: removed
+      // again, still listening (named with the command that removes each), or
+      // nothing was created at all.
+      let createdClause: string
+      if (stillListening.length > 0) {
+        createdClause = `The portal${created.length === 1 ? '' : 's'} this edit had created could not all be removed again: `
+          + `${stillListening.join('; ')} ${stillListening.length === 1 ? 'is' : 'are'} still listening and not saved.`
+      }
+      else if (created.length > 0) {
+        createdClause = `The portal${created.length === 1 ? '' : 's'} this edit had created (${undone.join(', ')}) `
+          + `${created.length === 1 ? 'was' : 'were'} removed again.`
+      }
+      else {
+        createdClause = ''
+      }
+      const nothingElse = created.length === 0 && failedUndo.length === 0 ? ' Nothing else was changed.' : ''
+      throw new Error(`${base} ${createdClause}${createdClause === '' ? '' : ' '}${wildcardClause}${nothingElse}`)
     }
     for (const p of removeAfter)
       await remove(p)

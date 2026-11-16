@@ -291,7 +291,12 @@ export function computeIscsiHealth(
       {
         const persistedLuns = persistedTpg?.luns ?? []
         const liveLunCount = tpg.luns.filter(l => l.present).length
-        if (target.present && persistedLuns.length > 0 && liveLunCount === 0) {
+        // cr4: a configfs directory that could not be listed makes the live LUN
+        // list UNKNOWN, not empty — the same suppression the hole report above
+        // applies (`configfsUnreadable` carries the sentence). Reporting
+        // "serving nothing" from a failed read invents a card.
+        const lunListUnreadable = (target.configfsUnreadable ?? []).length > 0
+        if (!lunListUnreadable && target.present && persistedLuns.length > 0 && liveLunCount === 0) {
           targetsServingNothing.push({
             targetIqn: target.iqn,
             tpgTag: tpg.tpgTag,
@@ -474,7 +479,10 @@ export function computeIscsiHealth(
     // a wrong-mount-only report holds data and is never acted on.
     degraded: missingLuns.length > 0 || stubLuns.some(s => s.ownership === 'anas' && s.zeroSized) || !!ctx.persistedUnreadable
       || liveUnreadable.length > 0,
-    interfacesUnknown: ctx.nodeAddresses === null,
+    // cr4: only a read that was ATTEMPTED and FAILED is "unknown". A node with
+    // no targets never makes the read, so `nodeAddresses` is null there too —
+    // that is "not needed", not "could not be read".
+    interfacesUnknown: ctx.nodeAddressesUnread === true,
     ...(ctx.persistedUnreadable ? { saveconfigUnreadable: ctx.persistedUnreadable } : {}),
     ...(liveUnreadable.length > 0 ? { configfsUnreadable: liveUnreadable } : {}),
     checkedAt: now.toISOString(),

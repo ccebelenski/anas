@@ -629,3 +629,108 @@ describe('cr3 (review) — the served serials say when they could not be read', 
     assert.ok('serials' in strict && strict.serials.size === 0, JSON.stringify(strict))
   })
 })
+
+describe('cr4 D-11 — a LUN whose backing path could not be read (the probe-2 C3 shape)', () => {
+  // A persisted-only target (a restore that did not bring it up) whose only LUN
+  // names a backstore the saved config does not carry: neither source can name
+  // a backing path, so `backingPath` is ''. RED before: ownership foreign /
+  // backing-not-anas-storage with the sentence "backed by , which is not on
+  // storage ANAS manages", and an empty path printed in the health message.
+  function ctx(): IscsiReadContext {
+    return {
+      live: { present: true, backstores: [], targets: [] },
+      persisted: {
+        storageObjects: [],
+        targets: [{
+          iqn: ANAS_T1,
+          fabric: 'iscsi',
+          tpgs: [{
+            tag: 1,
+            enable: true,
+            authentication: false,
+            generateNodeAcls: false,
+            demoModeDiscovery: false,
+            tpgCredentialsSet: false,
+            portals: [],
+            luns: [{ index: 0, storageObject: '/backstores/block/not_in_storage_objects', backstoreName: 'not_in_storage_objects', plugin: 'block' }],
+            acls: [],
+          }],
+        }],
+      } as unknown as IscsiReadContext['persisted'],
+      inputs: { pveStorages: new Map(), zfsMountpoints: [] },
+      nodeAddresses: null,
+      backing: new Map(),
+      mounts: new Map(),
+      stubs: new Map(),
+      saveconfigPath: '/etc/rtslib-fb-target/saveconfig.json',
+      configfsRoot: '/sys/kernel/config/target',
+    }
+  }
+
+  it('the target is hands-off with the backing-unreadable reason, and the sentence claims nothing about ownership', async () => {
+    const targets = await buildIscsiTargets(ctx())
+    assert.equal(targets[0].ownership, 'foreign')
+    assert.equal(targets[0].ownershipReason, 'backing-unreadable')
+    const detail = targets[0].ownershipDetail
+    assert.match(detail, /could not be read from the kernel target configuration/)
+    assert.match(detail, /saveconfig\.json/)
+    assert.match(detail, /Refresh this screen/)
+    assert.doesNotMatch(detail, /is not on storage ANAS manages/)
+    assert.doesNotMatch(detail, /backed by ,/)
+    // The LUN carries no pool/dataset invented from an empty path.
+    assert.equal(targets[0].luns[0].pool, undefined)
+    assert.equal(targets[0].luns[0].dataset, undefined)
+  })
+
+  it('the restore-hole message no longer prints an empty path', async () => {
+    const c = ctx()
+    const targets = await buildIscsiTargets(c)
+    const refusal = assertSaveable(c, targets)
+    assert.ok(refusal)
+    assert.doesNotMatch(refusal.message ?? '', /backstore 'not_in_storage_objects', \)/)
+    assert.doesNotMatch(refusal.message ?? '', /backed by ,/)
+  })
+})
+
+describe('cr4 — a target whose LUN directory could not be listed is not "serving nothing"', () => {
+  // The hole report next to it is suppressed by `configfsUnreadable` (the LUN
+  // list is unknown, not empty). The serving-nothing report must be suppressed
+  // the same way: a failed read is not evidence of an empty disk list.
+  function ctx(): IscsiReadContext {
+    return {
+      live: {
+        present: true,
+        backstores: [],
+        targets: [{ iqn: ANAS_IQN, tpgs: [liveTpg(1, [])], unreadable: [`/sys/kernel/config/target/iscsi/${ANAS_IQN}/tpgt_1/lun`] }],
+      },
+      persisted: {
+        storageObjects: [so('b0', '/tank/b0.raw')],
+        targets: [{ iqn: ANAS_IQN, fabric: 'iscsi', tpgs: [persistedTpg(1, [{ index: 0, name: 'b0' }])] }],
+      } as unknown as IscsiReadContext['persisted'],
+      inputs: { pveStorages: new Map(), zfsMountpoints: [] },
+      nodeAddresses: null,
+      backing: new Map(),
+      mounts: new Map(),
+      stubs: new Map(),
+    }
+  }
+
+  it('the serving-nothing report is suppressed, and the LUN list is reported unread', async () => {
+    const targets = await buildIscsiTargets(ctx())
+    const health = computeIscsiHealth(ctx(), targets)
+    assert.deepEqual(health.targetsServingNothing, [])
+    // The unreadable list is said, not turned into a fact about LUNs.
+    assert.ok((health.configfsUnreadable ?? []).length > 0)
+    assert.equal(health.missingLuns.length, 0)
+  })
+
+  it('a genuinely empty live LUN list (configfs read fine) still reports serving nothing', async () => {
+    // The counterpart: with no unreadable dir, the same live/persisted shape IS
+    // the GT-21 restore-with-no-LUNs state and must be reported.
+    const c = ctx()
+    delete (c.live.targets[0] as { unreadable?: string[] }).unreadable
+    const targets = await buildIscsiTargets(c)
+    const health = computeIscsiHealth(c, targets)
+    assert.equal(health.targetsServingNothing.length, 1)
+  })
+})

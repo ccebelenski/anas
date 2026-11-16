@@ -263,11 +263,22 @@ export type IscsiOwnership = z.infer<typeof IscsiOwnership>
  * - `backing-pve-storage`     — a LUN's backing object is on a PVE-managed pool/dataset.
  * - `backing-pve-guest-disk`  — a LUN's backing object is a PVE guest volume (`vm-N-disk-M`).
  * - `backing-not-anas-storage` — a LUN's backing object is on storage ANAS does not manage.
+ * - `backing-unreadable`      — a LUN's backing path could not be read from the
+ *                               kernel target configuration, or the AHR topology
+ *                               that could vouch for a file LUN could not be
+ *                               read. The owner is UNKNOWN. A LUN with no
+ *                               readable path at all is hands-off; a file that
+ *                               merely could not be placed stays ANAS's (the
+ *                               F2 rule). Either way nothing is claimed about
+ *                               whose storage it is.
  *
- * The last three are the ONLY reasons that make a target foreign, and that is
- * the rule of story `iscsi.5`: **the ANAS IQN convention is authoritative for
- * `anas`, and only a backing that POSITIVELY resolves onto PVE-managed or
- * non-ANAS storage takes a target away.** An absence proves nothing about
+ * The ownership-POSITIVE reasons (`backing-pve-storage`, `backing-pve-guest-disk`,
+ * `backing-not-anas-storage`) are the ONLY positive ones that make a target
+ * foreign, and that is the rule of story `iscsi.5`: **the ANAS IQN convention
+ * is authoritative for `anas`, and only a backing that POSITIVELY resolves onto
+ * PVE-managed or non-ANAS storage takes a target away.** `backing-unreadable` is
+ * hands-off only where the read itself failed (an empty path), which is safe
+ * without being a claim. An absence proves nothing about
  * ownership — a pool that is not imported yet, an image on a mount that has not
  * come up, a target that has no LUNs at all are all ANAS's problem to fix, and
  * handing them a hands-off badge would take away the tools at exactly the moment
@@ -281,6 +292,7 @@ export const IscsiOwnershipReason = z.enum([
   'backing-pve-storage',
   'backing-pve-guest-disk',
   'backing-not-anas-storage',
+  'backing-unreadable',
 ])
 export type IscsiOwnershipReason = z.infer<typeof IscsiOwnershipReason>
 

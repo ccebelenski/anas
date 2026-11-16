@@ -770,7 +770,11 @@ async function readTargets(root: string, nodeSink: string[]): Promise<ConfigfsTa
   for (const entry of (await listDir(iscsiDir, nodeSink)).sort()) {
     // `iscsi/` also holds `discovery_auth/`, `lio_version`, `cpus_allowed_list`.
     // A target directory is exactly one whose name is an iSCSI node name.
-    if (!(entry.startsWith('iqn.') || entry.startsWith('eui.') || entry.startsWith('naa.')))
+    // iSCSI names are case-INSENSITIVE, so an `IQN.…`/`EUI.…`/`NAA.…` directory
+    // is a target too — comparing case-sensitively hid it, and its LUNs then
+    // read as restore holes of a target that was right there (cr4).
+    const lower = entry.toLowerCase()
+    if (!(lower.startsWith('iqn.') || lower.startsWith('eui.') || lower.startsWith('naa.')))
       continue
     const targetDir = join(iscsiDir, entry)
     const tpgs: ConfigfsTpg[] = []

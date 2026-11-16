@@ -446,6 +446,84 @@ describe('the unresolved backing tier (iscsi.5 / F2)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// cr4 D-11 — a backing path that could not be READ is unknown, never a
+// positive "foreign" (the reviewer's probe-2 C3 shape)
+// ---------------------------------------------------------------------------
+
+describe('D-11 — an unreadable backing is unknown, said as unknown', () => {
+  const anas = anasIqn('vmstore', { nodeName: 'nas.example.com', date: new Date(Date.UTC(2026, 7, 25)) })
+
+  it('classifyBacking: an empty path is NOT a positive foreign verdict', () => {
+    // RED before: kind foreign with no marker, so deriveOwnership declared the
+    // target "not on storage ANAS manages" with an empty path in the sentence.
+    const c = classifyBacking('', inputs())
+    assert.equal(c.backingUnreadable, 'path')
+    assert.notEqual(c.pveOwnership?.kind, 'guest-volume')
+  })
+
+  it('deriveOwnership: an empty backing is hands-off with its own reason, and claims nothing about ownership', () => {
+    const tag = deriveOwnership(anas, [
+      { name: 'not_in_storage_objects', backingPath: '' },
+    ], inputs())
+    assert.equal(tag.ownership, 'foreign')
+    assert.equal(tag.reason, 'backing-unreadable')
+    assert.match(tag.detail, /could not be read from the kernel target configuration/)
+    // The ONE thing to do, and never the old empty-path claim.
+    assert.match(tag.detail, /Refresh this screen/)
+    assert.doesNotMatch(tag.detail, /is not on storage ANAS manages/)
+    assert.doesNotMatch(tag.detail, /backed by ,/)
+  })
+
+  it('deriveOwnership: the sentence names the configfs path that was read when the LUN is live', () => {
+    const configfsPath = '/sys/kernel/config/target/iscsi/iqn.2026-08.com.example.nas.anas:vmstore/tpgt_1/lun/lun_0'
+    const tag = deriveOwnership(anas, [
+      { name: 'b0', backingPath: '', configfsPath },
+    ], inputs())
+    assert.equal(tag.reason, 'backing-unreadable')
+    assert.ok(tag.detail.includes(configfsPath), tag.detail)
+  })
+
+  it('deriveOwnership: the sentence names the saved configuration instead when the target is not live', () => {
+    const tag = deriveOwnership(anas, [
+      { name: 'b0', backingPath: '' },
+    ], inputs(), { saveconfigPath: '/etc/rtslib-fb-target/saveconfig.json' })
+    assert.equal(tag.reason, 'backing-unreadable')
+    assert.match(tag.detail, /\/etc\/rtslib-fb-target\/saveconfig\.json/)
+  })
+
+  it('classifyBacking: a file matching no dataset with the AHR topology unreadable is unknown', () => {
+    // RED before: a file on an AHR pool whose topology could not be read was a
+    // positive "foreign", taking ANAS's own target hands-off with a wrong claim.
+    const c = classifyBacking('/mnt/ahr1/vmdisk.raw', inputs({ ahrUnreadable: true }))
+    assert.equal(c.backingUnreadable, 'ahr')
+  })
+
+  it('deriveOwnership: the AHR-unreadable case says the topology could not be read, and the target stays ANAS\'s', () => {
+    // The F2 rule: an unreadable topology must not remove the repair tools, so
+    // the target stays `anas` (unlike the empty-path case, which is hands-off).
+    const tag = deriveOwnership(anas, [
+      { name: 'vmdisk', backingPath: '/mnt/ahr1/vmdisk.raw' },
+    ], inputs({ ahrUnreadable: true }))
+    assert.equal(tag.ownership, 'anas')
+    assert.equal(tag.reason, 'backing-unreadable')
+    assert.match(tag.detail, /AHR pool topology could not be read/)
+    assert.doesNotMatch(tag.detail, /is not on storage ANAS manages/)
+    // It is not claimed absent either.
+    assert.doesNotMatch(tag.detail, /resolve onto no storage/)
+  })
+
+  it('an AHR mountpoint that DOES hold the file is still ANAS\'s — unreadable vs read', () => {
+    // The counterpart: when the topology was read and names the pool, the file
+    // is ordinary ANAS storage (no regression from the unreadable fix).
+    const tag = deriveOwnership(anas, [
+      { name: 'vmdisk', backingPath: '/mnt/ahr1/vmdisk.raw' },
+    ], inputs({ ahrMountpoints: new Map([['ahr1', '/mnt/ahr1']]) }))
+    assert.equal(tag.ownership, 'anas')
+    assert.equal(tag.reason, 'anas-managed')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Story pvepool.1 — the footprint fixture set, answered per DATASET
 // ---------------------------------------------------------------------------
 

@@ -37,6 +37,12 @@ Two more real captures, both plain stdout, nothing written to the node:
 | `lsblk-zd-tran.json` | `lsblk -J -o NAME,TYPE,KNAME,SERIAL,SIZE,TRAN` | REAL capture. Three `zd*` entries reported as `"type": "disk"` — the GT-43 inventory hazard, now the fixture for the `parsers/lsblk.ts` filter. **The node's own initiator was logged OUT for this capture** (the wave-1 live proof left it that way and it was deliberately not logged back in), so no `tran: "iscsi"` row appears here; the iSCSI-transport rows with their real serials are in `anasd-v1-disks.json` from the `iscsi.1` run. |
 | `pve-firewall-status-disabled.txt` | `pve-firewall status` | REAL capture, exit 0. The node's firewall was never enabled (GT open question 5), so this is the DISABLED half of the advisory only. `/etc/pve/firewall/` was an empty directory — no `cluster.fw`, no `host.fw`. The ENABLED cases (rule present / rule absent) could not be captured read-only and are driven from `.fw` files written into a temp dir by `services/__tests__/pve-firewall.test.ts`, which labels them as such; **they owe a live proof in `iscsi.7`**. |
 
+## Added for `cr4.iscsi` (D-14, 2026-11-15)
+
+| File | What it is | Provenance |
+|---|---|---|
+| `host-fw-disabled-rule.txt` | A node's own `host.fw`, three lines: `[RULES]`, a blank line, and `\|IN ACCEPT -p tcp -dport 3260 # probe` | REAL capture from a PVE 9 node. A rule made with `pvesh create /nodes/<node>/firewall/rules --type in --action ACCEPT --dport 3260 --proto tcp --enable 0 --comment probe` lands in `/etc/pve/nodes/<node>/host.fw` — NOT in `/etc/pve/firewall/` (which held no file). The leading `\|` is PVE's DISABLED marker. `services/pve-firewall.ts` reads the node's file via `/etc/pve/local/host.fw`. |
+
 | File | What it is | Provenance |
 |---|---|---|
 | `package-versions.txt` | `dpkg-query -W` + `pveversion` + `uname -r` + `zfs --version` | real capture |

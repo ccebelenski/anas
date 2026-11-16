@@ -89,6 +89,22 @@ export interface BackingClassification {
    * UNKNOWN: never "not PVE's", never "foreign".
    */
   ownershipUnknown?: boolean
+  /**
+   * cr4 (D-11): the classification is unknown because a READ failed, not
+   * because the storage is somebody else's.
+   *
+   * - `path` — the LUN's backing path could not be read from the kernel target
+   *            configuration at all (`devPath` is empty). The target is
+   *            hands-off (the safe side): a LUN whose backing cannot even be
+   *            named is not one ANAS should act on.
+   * - `ahr`  — the path resolves onto no ZFS dataset and the AHR pool topology
+   *            that could hold it could not be read. The target stays ANAS's
+   *            (the F2 rule keeps Repair available), the owner unknown.
+   *
+   * Either way it is never a positive "foreign" verdict, and the sentence says
+   * what could not be read rather than claiming whose storage it is.
+   */
+  backingUnreadable?: 'path' | 'ahr'
 }
 
 /** The system facts ownership is derived from; both are already read elsewhere. */
@@ -117,6 +133,14 @@ export interface OwnershipInputs {
    * before, which can only tighten, never loosen.
    */
   findmntNodes?: FindmntNode[] | null
+  /**
+   * cr4 (D-11): the AHR pool topology read FAILED (it was attempted because a
+   * file LUN resolved onto no ZFS dataset, and `readAhrPools` threw). A file
+   * that matched neither a ZFS dataset nor an AHR mountpoint is then UNKNOWN —
+   * it could be on an AHR pool ANAS manages, so it is never a positive
+   * "foreign". Absent/false = the topology was not needed, or it read.
+   */
+  ahrUnreadable?: boolean
   /** AHR pool mountpoints (`name -> mountpoint`); an AHR pool's only block kind is a file. */
   ahrMountpoints?: Map<string, string>
   /**
@@ -218,6 +242,12 @@ export function classifyBacking(
     pveOwnership: null,
     pveGuestVolume: false,
   }
+  // cr4 (D-11): no path at all is not an absence — it is a read that did not
+  // see. The LUN's backing path could not be read from the kernel target
+  // configuration (neither source named a backstore `dev`/`udev_path`), so the
+  // owner is UNKNOWN, never a positive `foreign`.
+  if (devPath.length === 0)
+    return { ...unmatched, kind: 'foreign', backingUnreadable: 'path' }
   if (!devPath.startsWith('/'))
     return unmatched
 
@@ -289,6 +319,15 @@ export function classifyBacking(
   if (inputs.zfsMountpointsUnreadable)
     return { ...unmatched, kind: 'unresolved', ownershipUnknown: true }
 
+  // cr4 (D-11): the file matched neither a ZFS dataset nor an AHR mountpoint
+  // because the AHR topology read FAILED. It could be on an AHR pool ANAS
+  // manages, so the owner is unknown — never a positive `foreign`. This does
+  // NOT set `ownershipUnknown`: that flag refuses Repair, and the F2 rule is
+  // that an unreadable topology must keep the repair tools available. The
+  // verdict is carried by `backingUnreadable` instead.
+  if (inputs.ahrUnreadable)
+    return { ...unmatched, backingUnreadable: 'ahr' }
+
   return unmatched
 }
 
@@ -304,6 +343,47 @@ export interface OwnershipLun {
    * (see {@link classifyBacking}); `null`/omitted means "not checked".
    */
   backingExists?: boolean | null
+  /**
+   * cr4 (D-11): the LUN's own configfs directory, when it is live in the kernel
+   * target tree. Named in the sentence when its backing path could not be read,
+   * so the operator has a grounded path to look at.
+   */
+  configfsPath?: string
+}
+
+/**
+ * The sentence for a LUN whose backing path could not be read (cr4, D-11).
+ *
+ * Nothing is claimed about whose storage it is — only that the read did not
+ * see, where it looked, and the one thing to do. The configfs LUN directory is
+ * named when the LUN is live; otherwise the saved configuration that was read
+ * is named instead, because there is no configfs path for a target that is not
+ * there.
+ */
+function backingUnreadableDetail(lun: OwnershipLun, saveconfigPath: string | undefined): string {
+  if (lun.configfsPath) {
+    return `The backing path of LUN '${lun.name}' could not be read from the kernel target configuration: `
+      + `the configfs path ${lun.configfsPath} was read and names no backstore with a device path, `
+      + `so ANAS cannot tell whose storage it is. Refresh this screen to read it again.`
+  }
+  if (saveconfigPath) {
+    return `The backing path of LUN '${lun.name}' could not be read from the kernel target configuration: `
+      + `the LUN is not in the running configuration (configfs), and the saved configuration (${saveconfigPath}) names no `
+      + `storage object for its backstore, so ANAS cannot tell whose storage it is. `
+      + `Refresh this screen to read it again.`
+  }
+  return `The backing path of LUN '${lun.name}' could not be read from the kernel target configuration, `
+    + `so ANAS cannot tell whose storage it is. Refresh this screen to read it again.`
+}
+
+/**
+ * The sentence for a file LUN that matched no ZFS dataset because the AHR pool
+ * topology could not be read (cr4, D-11). Unknown, said as unknown.
+ */
+function ahrUnreadableDetail(lun: OwnershipLun): string {
+  return `The backing path of LUN '${lun.name}' (${lun.backingPath}) resolves onto no ZFS dataset, and `
+    + `this node's AHR pool topology could not be read, so ANAS cannot tell whose storage it is. `
+    + `Refresh this screen to read it again.`
 }
 
 /**
@@ -336,6 +416,11 @@ export function deriveOwnership(
   iqn: string,
   luns: OwnershipLun[],
   inputs: OwnershipInputs,
+  /**
+   * cr4 (D-11): where the saved configuration was read, named in the
+   * `backing-unreadable` sentence for a LUN that is not live in configfs.
+   */
+  paths: { saveconfigPath?: string } = {},
 ): IscsiOwnershipTag {
   if (!isAnasIqn(iqn)) {
     return {
@@ -354,8 +439,19 @@ export function deriveOwnership(
   }
 
   const unresolved: OwnershipLun[] = []
+  const unknownTopology: OwnershipLun[] = []
   for (const lun of luns) {
     const c = classifyBacking(lun.backingPath, inputs, lun.backingExists)
+    // cr4 (D-11): a LUN with NO backing path at all was not read. The owner is
+    // unknown, so the target is hands-off (the safe side), and the sentence
+    // says what could not be read — never whose storage it is.
+    if (c.backingUnreadable === 'path') {
+      return {
+        ownership: 'foreign',
+        reason: 'backing-unreadable',
+        detail: backingUnreadableDetail(lun, paths.saveconfigPath),
+      }
+    }
     // cr3 ISCSI-H1: an image FILE that is not there (or is a placeholder, which
     // the read layer hands over as `backingExists: false`) says nothing about
     // whose storage it is on. Its dataset was inferred from whatever filesystem
@@ -366,15 +462,24 @@ export function deriveOwnership(
     // quarantine and the degraded mark. So an absent file is an absence, full
     // stop: it can never take the target away. A `/dev/...` path is different —
     // a zvol path NAMES its dataset, which is a fact about the name and stays.
+    if (lun.backingExists === false && isFilePath(lun.backingPath)) {
+      if (c.kind === 'unresolved' || c.pveOwnership !== null)
+        unresolved.push(lun)
+      continue
+    }
+    // cr4 (D-11): a file that matched no ZFS dataset BECAUSE the AHR topology
+    // could not be read is unknown, not foreign. The file may be on an AHR pool
+    // ANAS manages, so the target stays ANAS's (the F2 rule: an unreadable
+    // topology must not remove the repair tools) and the sentence says the
+    // owner could not be read.
+    if (c.backingUnreadable === 'ahr') {
+      unknownTopology.push(lun)
+      continue
+    }
     // cr3: a file whose dataset could not be judged (the mountpoint table was
     // unreadable) — the same answer as an absence: it never takes the target.
     if (c.ownershipUnknown) {
       unresolved.push(lun)
-      continue
-    }
-    if (lun.backingExists === false && isFilePath(lun.backingPath)) {
-      if (c.kind === 'unresolved' || c.pveOwnership !== null)
-        unresolved.push(lun)
       continue
     }
     if (c.pveGuestVolume) {
@@ -413,6 +518,22 @@ export function deriveOwnership(
       detail: `IQN follows the ANAS naming convention; ${unresolved.length} of ${luns.length} LUN${luns.length === 1 ? '' : 's'} `
         + `resolve${unresolved.length === 1 ? 's' : ''} onto no storage on this node right now — ${named}. `
         + `An absent backing is a hole to repair, not a change of ownership.`,
+    }
+  }
+
+  // cr4 (D-11): the AHR topology could not be read, so an unmatched file LUN's
+  // owner is unknown. The target stays ANAS's (so Repair and the screens keep
+  // working), and the sentence says the owner could not be read — it does not
+  // claim the backing is foreign, nor that it resolves onto nothing.
+  if (unknownTopology.length > 0) {
+    return {
+      ownership: 'anas',
+      reason: 'backing-unreadable',
+      detail: unknownTopology.length === 1
+        ? ahrUnreadableDetail(unknownTopology[0]!)
+        : `The backing paths of ${unknownTopology.length} LUNs (${unknownTopology.map(l => l.name).join(', ')}) `
+          + `resolve onto no ZFS dataset, and this node's AHR pool topology could not be read, so ANAS cannot tell `
+          + `whose storage they are on. Refresh this screen to read it again.`,
     }
   }
 

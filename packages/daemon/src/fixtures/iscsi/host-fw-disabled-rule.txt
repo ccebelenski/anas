@@ -1,0 +1,3 @@
+[RULES]
+
+|IN ACCEPT -p tcp -dport 3260 # probe

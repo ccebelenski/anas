@@ -42,10 +42,12 @@ export interface IscsiRouteOptions extends IscsiPaths {
   jobQueue?: Pick<JobQueue, 'findRunning' | 'findEndedRuns' | 'findLastCompleted'>
   /** `/etc/pve/firewall` override (story iscsi.6) — read-only, tests only. */
   firewallDir?: string
+  /** The node's own `/etc/pve/local` override — `host.fw` lives here. Tests only. */
+  hostFirewallDir?: string
 }
 
 export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptions) {
-  const { executor, firewallDir, jobQueue, ...paths } = opts
+  const { executor, firewallDir, hostFirewallDir, jobQueue, ...paths } = opts
 
   // --- GET /iscsi/targets --------------------------------------------------
   server.get('/iscsi/targets', async () => {
@@ -129,7 +131,12 @@ export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptio
     // will `ss`. Read-only, fail-open, and NEVER a rule ANAS writes: the advisory
     // points at PVE. Absent (not null-filled) when there is nothing to say.
     // cr3 (ISCSI-L11): every port this target's portals listen on, not 3260 alone.
-    const firewall = await readPveFirewallAdvisory(executor, firewallDir === undefined ? {} : { firewallDir }, targetTpgs(target).flatMap(t => t.portals.map(p => p.port)))
+    const firewallOpts: { firewallDir?: string, hostFirewallDir?: string } = {}
+    if (firewallDir !== undefined)
+      firewallOpts.firewallDir = firewallDir
+    if (hostFirewallDir !== undefined)
+      firewallOpts.hostFirewallDir = hostFirewallDir
+    const firewall = await readPveFirewallAdvisory(executor, firewallOpts, targetTpgs(target).flatMap(t => t.portals.map(p => p.port)))
     return { data: { ...target, firewall } }
   })
 }

@@ -201,16 +201,16 @@ describe('ISCSI-L11 — the firewall advisory asks about the ports the portals l
   it('a portal on 3261 behind a firewall that admits only 3260 is advised', async () => {
     // RED before: advisory null — only 3260 was ever checked.
     await writeFile(join(dir, 'host.fw'), '[RULES]\nIN ACCEPT -p tcp -dport 3260\n')
-    const fw = await readPveFirewallAdvisory(enabled(), { firewallDir: dir }, [3261])
+    const fw = await readPveFirewallAdvisory(enabled(), { firewallDir: dir, hostFirewallDir: dir }, [3261])
     assert.equal(fw.admits3260, true)
     assert.match(fw.advisory ?? '', /no rule admits 3261\/tcp/)
   })
 
   it('every port admitted: no advisory; the default is 3260 alone, as before', async () => {
     await writeFile(join(dir, 'host.fw'), '[RULES]\nIN ACCEPT -p tcp -dport 3260:3261\n')
-    assert.equal((await readPveFirewallAdvisory(enabled(), { firewallDir: dir }, [3260, 3261])).advisory, null)
+    assert.equal((await readPveFirewallAdvisory(enabled(), { firewallDir: dir, hostFirewallDir: dir }, [3260, 3261])).advisory, null)
     await writeFile(join(dir, 'host.fw'), '[RULES]\nIN ACCEPT -p tcp -dport 22\n')
-    assert.match((await readPveFirewallAdvisory(enabled(), { firewallDir: dir })).advisory ?? '', /no rule admits 3260\/tcp/)
+    assert.match((await readPveFirewallAdvisory(enabled(), { firewallDir: dir, hostFirewallDir: dir })).advisory ?? '', /no rule admits 3260\/tcp/)
   })
 })
 
@@ -265,6 +265,48 @@ describe('ISCSI-L13 — an edit creates the new portals before it removes the ol
       `targetcli /iscsi/${IQN}/tpg1/portals create 192.0.2.30 3262`,
       `targetcli /iscsi/${IQN}/tpg1/portals delete 192.0.2.10 3261`,
     ])
+  })
+
+  it('(cr4 D-12) a create that fails after an earlier one SUCCEEDED undoes the created portal and says so', async () => {
+    // RED before: the first address stayed live and unsaved, and the job said
+    // "nothing else was changed".
+    const t = { ...target(), portals: [{ address: '0.0.0.0', port: 3260, family: 'inet' as const, carriedByInterface: null }] }
+    const failing = new MockExecutor()
+    failing.addFixture({ command: TARGETCLI, argsMatch: a => a[1] === 'create' && a[2] === '192.0.2.30', result: { stdout: '', stderr: 'Could not create NetworkPortal in configFS', exitCode: 1 } })
+    failing.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+    await assert.rejects(
+      () => updateIscsiTarget({ executor: failing }, t, { portals: [{ address: '192.0.2.20', port: 3260 }, { address: '192.0.2.30', port: 3260 }] }),
+      /The portal this edit had created \(192\.0\.2\.20:3260\) was removed again\. The wildcard portal this edit had removed \(0\.0\.0\.0:3260\) was put back\./,
+    )
+    assert.deepEqual(argv(failing), [
+      `targetcli /iscsi/${IQN}/tpg1/portals delete 0.0.0.0 3260`,
+      `targetcli /iscsi/${IQN}/tpg1/portals create 192.0.2.20 3260`,
+      `targetcli /iscsi/${IQN}/tpg1/portals create 192.0.2.30 3260`,
+      // The one this run created is deleted again, then the wildcard returns.
+      `targetcli /iscsi/${IQN}/tpg1/portals delete 192.0.2.20 3260`,
+      `targetcli /iscsi/${IQN}/tpg1/portals create 0.0.0.0 3260`,
+    ])
+  })
+
+  it('(cr4 D-12) an undo that fails names the portal still listening and the command that removes it', async () => {
+    const t = { ...target(), portals: [{ address: '0.0.0.0', port: 3260, family: 'inet' as const, carriedByInterface: null }] }
+    const failing = new MockExecutor()
+    // The second create fails, and the undo of the first (the delete) fails too.
+    failing.addFixture({ command: TARGETCLI, argsMatch: a => a[1] === 'create' && a[2] === '192.0.2.30', result: { stdout: '', stderr: 'refused', exitCode: 1 } })
+    failing.addFixture({ command: TARGETCLI, argsMatch: a => a[1] === 'delete' && a[2] === '192.0.2.20', result: { stdout: '', stderr: 'busy', exitCode: 1 } })
+    failing.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+    let message = ''
+    try {
+      await updateIscsiTarget({ executor: failing }, t, { portals: [{ address: '192.0.2.20', port: 3260 }, { address: '192.0.2.30', port: 3260 }] })
+    }
+    catch (err) {
+      message = err instanceof Error ? err.message : String(err)
+    }
+    assert.match(message, /could not all be removed again/)
+    assert.match(message, /is still listening and not saved/)
+    // The command that removes it is named, with the address in it.
+    assert.match(message, new RegExp(`targetcli /iscsi/${IQN.replaceAll('.', '\\.')}/tpg1/portals delete 192\\.0\\.2\\.20 3260`))
+    assert.doesNotMatch(message, /Nothing else was changed/)
   })
 })
 

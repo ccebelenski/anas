@@ -17,6 +17,7 @@ import {
   aclAuthPath,
   addIscsiLun,
   applyAclCredentials,
+  assertConfigshellArgs,
   assertNoSecretArgs,
   assertSaveable,
   attributeTokens,
@@ -199,6 +200,88 @@ describe('runTargetcli — one command per invocation, real exit code (GT-5)', (
       SecretOnArgvError,
     )
     assert.equal(mock.calls.length, 0, 'nothing was executed')
+  })
+
+  it('cr4 D-13: the `--flag=value` and `--flag value` forms are refused too, and never echo the secret', () => {
+    // RED before: `--password=<secret>` fell through to the configshell guard,
+    // whose error interpolated the whole token — the secret in the job result.
+    const shapes: string[][] = [
+      [`--password=${SECRET}`],
+      [`--password_mutual=${MUTUAL}`],
+      [`--mutual_password=${MUTUAL}`],
+      ['--password', SECRET],
+      ['/iscsi/x', '--password', SECRET],
+      ['/iscsi/x', `--mutual_password=${MUTUAL}`],
+    ]
+    for (const args of shapes) {
+      let thrown: unknown
+      try {
+        assertNoSecretArgs(args)
+      }
+      catch (err) {
+        thrown = err
+      }
+      assert.ok(thrown instanceof SecretOnArgvError, `${JSON.stringify(args)} was not refused`)
+      const message = (thrown as Error).message
+      assert.ok(!message.includes(SECRET) && !message.includes(MUTUAL), message)
+      // It names the flag, not the token.
+      assert.match(message, /'(password|password_mutual|mutual_password)='/, message)
+    }
+    // The `--flag value` form is caught at the runTargetcli boundary, before
+    // targetcli ever starts.
+    return assert.rejects(
+      () => runTargetcli(okExecutor(), ['/iscsi/x', '--password', SECRET]),
+      (err: unknown) => {
+        assert.ok(err instanceof SecretOnArgvError)
+        assert.ok(!(err as Error).message.includes(SECRET), (err as Error).message)
+        return true
+      },
+    )
+  })
+})
+
+describe('cr4 D-13 — the targetcli error classes never echo a token', () => {
+  it('TargetcliArgError names the position and the flag, never the token', () => {
+    // `--password=<secret>` is a token the re-parse guard refuses; its message
+    // must not carry the secret it found.
+    let message = ''
+    try {
+      assertConfigshellArgs(['/iscsi/x', `--password=${SECRET}`])
+    }
+    catch (err) {
+      message = (err as Error).message
+    }
+    assert.match(message, /argument 2/)
+    assert.match(message, /'password'/)
+    assert.ok(!message.includes(SECRET), message)
+    assert.ok(!message.includes(`--password=${SECRET}`), message)
+    // A positional token with no flag name is named by POSITION only.
+    let positional = ''
+    try {
+      assertConfigshellArgs(['/iscsi/x', '192.0.2.1 3260'])
+    }
+    catch (err) {
+      positional = (err as Error).message
+    }
+    assert.match(positional, /argument 2/)
+    assert.ok(!positional.includes('192.0.2.1'), positional)
+  })
+
+  it('TargetcliError masks a secret-bearing token but keeps the diagnostic', () => {
+    // Even if argv reached the executor, the failure message (job result and
+    // journald) never carries the secret.
+    const err = new TargetcliError(
+      ['/iscsi/x', `--password=${SECRET}`, 'set', 'auth'],
+      { stdout: '', stderr: 'Could not set auth', exitCode: 1 },
+    )
+    assert.ok(!err.message.includes(SECRET), err.message)
+    assert.match(err.message, /--password=<secret>/)
+    assert.match(err.message, /Could not set auth/)
+    assert.match(err.message, /\/iscsi\/x/)
+    // The two-token form: the value after the flag is masked too.
+    const spaced = new TargetcliError(['/iscsi/x', '--password', SECRET], { stdout: '', stderr: 'x', exitCode: 1 })
+    assert.ok(!spaced.message.includes(SECRET), spaced.message)
+    assert.match(spaced.message, /--password <secret>/)
   })
 })
 
