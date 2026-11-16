@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { sameConfigPath } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { parseFindmnt } from '../../parsers/findmnt.js'
 import { disableMount } from '../../parsers/fstab.js'
@@ -16,6 +17,7 @@ import {
   ahrPinnedSpecs,
   applyMountDefaults,
   buildBaseInventory,
+  buildInventory,
   buildMountWarnings,
   buildSpec,
   classifyStatHealth,
@@ -1057,6 +1059,34 @@ describe('mountTargetRefusal — system paths, the protected credential/login tr
 function baseCommon() {
   return { readOnly: false, nofail: true, noauto: false, automount: false, noatime: false, nosuid: false, nodev: false, noexec: false, netdev: false }
 }
+
+// The inventory joins the kernel's mount table to the fstab by the
+// PATH, not by its exact spelling — the kernel never prints a trailing slash,
+// so an fstab line spelled `/mnt/x/` names the mount at `/mnt/x`.
+describe('buildBaseInventory — the join is by path, not spelling', () => {
+  const live = JSON.stringify({ filesystems: [{ target: '/mnt/x', source: '//nas/x', fstype: 'cifs', options: 'rw' }] })
+  const fstab = '//nas/x /mnt/x/ cifs credentials=/etc/anas/creds/x.cred,nofail 0 0\n'
+
+  it('a mounted filesystem whose fstab line is spelled with a trailing slash is one row, persistent', () => {
+    const rows = buildBaseInventory(live, fstab, new Map())
+    assert.equal(rows.length, 1, JSON.stringify(rows))
+    const row = rows[0]
+    assert.equal(row.persistent, true)
+    assert.equal(row.mounted, true)
+    // The row keeps the kernel's spelling in its mountpoint field.
+    assert.equal(row.mountpoint, '/mnt/x')
+  })
+
+  it('the one row is found by both spellings, as the detail looks it up', () => {
+    const rows = buildInventory(live, fstab, new Map())
+    const plain = rows.filter(r => sameConfigPath(r.mountpoint, '/mnt/x'))
+    const slashed = rows.filter(r => sameConfigPath(r.mountpoint, '/mnt/x/'))
+    assert.equal(plain.length, 1, JSON.stringify(rows))
+    assert.equal(slashed.length, 1, JSON.stringify(rows))
+    assert.equal(plain[0].persistent, true)
+    assert.equal(slashed[0].persistent, true)
+  })
+})
 
 describe('fstabLineFor (node pass R2-D1)', () => {
   it('finds the line of a mountpoint whose fstab field is octal-escaped', () => {

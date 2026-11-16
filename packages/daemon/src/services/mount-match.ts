@@ -1,4 +1,5 @@
 import type { FindmntNode } from '../parsers/findmnt.js'
+import { sameConfigPath } from '@anas/shared'
 
 /**
  * "Is what is mounted at this target the thing that is CONFIGURED there?"
@@ -37,7 +38,7 @@ export function liveAtTarget(nodes: FindmntNode[], target: string): LiveAtTarget
   let real: FindmntNode | undefined
   let armed = false
   for (const n of nodes) {
-    if (n.target !== target)
+    if (!sameConfigPath(n.target, target))
       continue
     if (n.fstype === 'autofs')
       armed = true

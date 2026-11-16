@@ -1463,6 +1463,16 @@ describe('mount routes — AHR pool persistence is hands-off', () => {
     assert.ok((await readFile(fstabPath, 'utf8')).includes('/dev/tank/tank-vol /srv/tank-data'))
   })
 
+  it('refuses DELETE naming the Hybrid RAID view when the pool\'s line is spelled with a trailing slash', async () => {
+    // The gate joins the inventory row to the request by path, not spelling:
+    // a line `/srv/tank-data/` is still this pool's persistence when the
+    // request names `/srv/tank-data`.
+    await writeFile(fstabPath, '/dev/tank/tank-vol /srv/tank-data/ btrfs nofail,subvol=@data 0 0\n')
+    const res = await server!.inject({ method: 'DELETE', url: `/v1/mounts/${enc('/srv/tank-data')}`, headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 400, res.body)
+    assert.match((res.json() as { error: { message: string } }).error.message, /Hybrid RAID/)
+  })
+
   it('does NOT refuse the unpinned look-alike on the AHR guard (its own remote-only guard applies)', async () => {
     const res = await server!.inject({ method: 'DELETE', url: `/v1/mounts/${enc('/mnt/foo')}`, headers: IDENTITY_HEADERS })
     assert.equal(res.statusCode, 400)

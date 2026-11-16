@@ -261,6 +261,33 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
     })
   })
 
+  // One mountpoint, two spellings: the fstab line `/mnt/x/` and the kernel's
+  // `/mnt/x` name one path. A path under a MOUNTED filesystem is not a
+  // configured-but-unmounted source, whatever spelling the line carries.
+  describe('an fstab line spelled with a trailing slash', () => {
+    const LINE = '//nas/x /mnt/x/ cifs credentials=/etc/anas/creds/mnt_x,nofail 0 0\n'
+    const MOUNTED_AT_X = findmnt(['/', '/mnt/x'], { '/mnt/x': { source: '//nas/x', fstype: 'cifs' } })
+
+    it('does not refuse a path under the mounted filesystem', () => {
+      assert.equal(guardSourcePath('/mnt/x/data', buildSourceGuardFacts(LINE, MOUNTED_AT_X)), null)
+    })
+
+    it('a dataset mounted there and a slashed fstab line for the same path: the mounted one counts, as with the plain-spelled line', () => {
+      const live = findmnt(['/', '/mnt/x'], { '/mnt/x': { source: 'tank/x', fstype: 'zfs' } })
+      const zfs = 'tank/x\t/mnt/x\ton\tyes\n'
+      assert.equal(guardSourcePath('/mnt/x', buildSourceGuardFacts(LINE.replace('/mnt/x/ ', '/mnt/x '), live, zfs)), null)
+      assert.equal(guardSourcePath('/mnt/x', buildSourceGuardFacts(LINE, live, zfs)), null)
+    })
+
+    it('refuses a source that IS the mountpoint when nothing is mounted there, as it does for the plain-spelled line', () => {
+      const NOTHING_MOUNTED = findmnt(['/'])
+      const slashed = guardSourcePath('/mnt/x', buildSourceGuardFacts(LINE, NOTHING_MOUNTED))
+      const plain = guardSourcePath('/mnt/x', buildSourceGuardFacts(LINE.replace('/mnt/x/ ', '/mnt/x '), NOTHING_MOUNTED))
+      assert.match(plain ?? '', /defined in \/etc\/fstab but not mounted right now/)
+      assert.match(slashed ?? '', /defined in \/etc\/fstab but not mounted right now/)
+    })
+  })
+
   describe('the refusal sentence', () => {
     it('names the mount and the fix, in ASCII', () => {
       const msg = unmountedSourceRefusal('/mnt/pictures/2026', PICTURES_MOUNT)

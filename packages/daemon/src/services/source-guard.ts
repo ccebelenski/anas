@@ -2,7 +2,7 @@ import type { UnmountedMount } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import type { LiveAtTarget } from './mount-match.js'
-import { isPathWithin } from '@anas/shared'
+import { configPathKey, isPathWithin } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { parseFstab } from '../parsers/fstab.js'
 import { readFstab } from './fstab-file.js'
@@ -306,7 +306,9 @@ function deepestConfigured(path: string, facts: SourceGuardFacts): UnmountedMoun
   for (const entry of facts.configured) {
     if (!isPathWithin(entry.mountpoint, path))
       continue
-    const len = entry.mountpoint === '/' ? 0 : entry.mountpoint.length
+    // Depth is the path's, not the spelling's: `/mnt/x` and `/mnt/x/` tie.
+    const key = configPathKey(entry.mountpoint)
+    const len = key === '/' ? 0 : key.length
     if (len > bestLen) {
       best = [entry]
       bestLen = len

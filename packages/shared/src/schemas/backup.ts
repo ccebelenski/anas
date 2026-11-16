@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { sameConfigPath } from '../mount-target.js'
 import { AbsolutePath, DatasetPath, hasControlChars, ISODateTime, NotifyMode, PoolName, SingleLine } from './common.js'
 import { IscsiIqn, IscsiLunName } from './iscsi.js'
 import { cadenceToOnCalendar, TASK_WEEKDAYS, TaskCadence, TaskCadenceKind, TaskTimeOfDay, TaskWeekday, TaskWeekParity } from './task-cadence.js'
@@ -478,9 +479,12 @@ export function nestedIncluded(choice: BackupIncludeNested, path: string): boole
   return choice.some(p => p === path || path.startsWith(`${p.replace(TRAILING_SLASHES_RE, '')}/`))
 }
 
-/** Is `child` the same path as, or below, `parent`? (both absolute, normalized) */
+/**
+ * Is `child` the same path as, or below, `parent`? Both absolute. Trailing
+ * slashes are spelling, not path (`sameConfigPath`): `/mnt/x` is within `/mnt/x/`.
+ */
 export function isPathWithin(parent: string, child: string): boolean {
-  if (child === parent)
+  if (sameConfigPath(parent, child))
     return true
   const base = parent === '/' ? '' : parent.replace(TRAILING_SLASHES_RE, '')
   return child.startsWith(`${base}/`)

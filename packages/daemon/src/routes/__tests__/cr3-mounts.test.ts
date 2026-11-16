@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { sameConfigPath } from '@anas/shared'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
@@ -727,6 +728,19 @@ describe('cr3.mounts — remote-mount findings at the route', () => {
       assert.equal(disableMount(fstab, mp), fstab, 'the parser never drops it either')
     })
 
+    it('review 3 (4): the same refusal when the legacy line is spelled with a trailing slash', async () => {
+      const mp = join(base, 'legslash')
+      await mkdir(mp)
+      // The line says `${mp}/`; the request names `${mp}` — one mountpoint.
+      const fstab = `#ANAS //nas/s ${mp}/ cifs username=u,password2=ALTpw,nofail 0 0\n`
+      await serve(fstab)
+      const res = await send('POST', `/v1/mounts/${enc(mp)}/state`, { action: 'disable' })
+      assert.equal(res.statusCode, 400, res.body)
+      assert.match(res.json().error.message, /Enable it, then open Edit and Save/)
+      assert.ok(!res.body.includes('ALTpw'))
+      assert.equal(await readFile(join(dir, 'fstab'), 'utf8'), fstab)
+    })
+
     it('review 3 (5): the detail of credentials=OP(alice, CORP)+password2= shows alice and CORP', async () => {
       const mp = join(base, 'det')
       await mkdir(mp)
@@ -1007,6 +1021,57 @@ describe('cr3.mounts — remote-mount findings at the route', () => {
       })
     }
 
+    for (const verb of ['save', 'remove'] as const) {
+      it(`a line spelled with a trailing slash: after a ${verb} the backup does not hold the secret`, async () => {
+        const mp = join(base, 'n1slash')
+        await mkdir(mp)
+        // The line says `${mp}/`; every request names `${mp}` — one mountpoint.
+        await serve(`//nas/s ${mp}/ cifs username=u,password=PlantedS3cret,vers=3.0,nofail 0 0\n`)
+        // An earlier edit made a backup holding the line, as the writer does.
+        await writeFile(join(dir, 'fstab.bak'), await readFile(join(dir, 'fstab'), 'utf8'))
+        await writeFile(join(dir, 'fstab'), `${await readFile(join(dir, 'fstab'), 'utf8')}# an earlier change\n`)
+        const done = verb === 'save' ? await job('PUT', `/v1/mounts/${enc(mp)}`, {}) : await job('DELETE', `/v1/mounts/${enc(mp)}`)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+        const holding = await allFilesHolding('PlantedS3cret', dir)
+        const allowed = verb === 'save' ? holding.filter(p => p.startsWith('/creds/')) : []
+        assert.deepEqual(holding, allowed, `files holding the secret: ${JSON.stringify(holding)}`)
+      })
+    }
+
+    it('a line spelled with a trailing slash: after a migrating Save the backup holds the migrated line', async () => {
+      const mp = join(base, 'n1slashbak')
+      await mkdir(mp)
+      // The line says `${mp}/`; the request names `${mp}` — one mountpoint.
+      await serve(`//nas/s ${mp}/ cifs username=u,password=PlantedS3cret,vers=3.0,nofail 0 0\n`)
+      // An earlier edit made a backup holding the line, as the writer does.
+      await writeFile(join(dir, 'fstab.bak'), await readFile(join(dir, 'fstab'), 'utf8'))
+      await writeFile(join(dir, 'fstab'), `${await readFile(join(dir, 'fstab'), 'utf8')}# an earlier change\n`)
+      const done = await job('PUT', `/v1/mounts/${enc(mp)}`, {})
+      assert.equal(done.status, 'completed', JSON.stringify(done.error))
+      // The scrub replaces the backup's old line with the line the fstab now
+      // holds for this mountpoint — the migrated one, not a line simply gone.
+      const current = (await readFile(join(dir, 'fstab'), 'utf8')).split('\n').find(l => l.includes(mp))
+      assert.ok(current, 'the fstab holds a line for the mountpoint')
+      assert.ok(!current.includes('PlantedS3cret'), `the line was migrated: ${current}`)
+      const backup = (await readFile(join(dir, 'fstab.bak'), 'utf8')).split('\n')
+      assert.ok(backup.includes(current), `fstab.bak holds the migrated line ${JSON.stringify(current)}; backup lines: ${JSON.stringify(backup)}`)
+    })
+
+    // The detail's row lookup joins the inventory to the request by path, not
+    // by spelling: a line spelled `${mp}/` answers a request for `${mp}`.
+    it('the detail of an unmounted line spelled with a trailing slash answers both spellings', async () => {
+      const mp = join(base, 'detail-slash')
+      await mkdir(mp)
+      await serve(`//nas/s ${mp}/ cifs vers=3.0,nofail 0 0\n`)
+      for (const req of [mp, `${mp}/`]) {
+        const res = await send('GET', `/v1/mounts/${enc(req)}`)
+        assert.equal(res.statusCode, 200, `${req}: ${res.body}`)
+        const d = res.json().data as MountDetail
+        assert.equal(d.source, '//nas/s')
+        assert.equal(d.mounted, false)
+      }
+    })
+
     it('N2: a domain token after cred= is what the detail shows (one account path)', async () => {
       const mp = join(base, 'n2')
       await mkdir(mp)
@@ -1146,6 +1211,66 @@ describe('cr3.mounts — remote-mount findings at the route', () => {
       assert.equal(done.status, 'failed')
       assert.match(done.error?.message ?? '', /could not create its credentials directory .* something that is not a directory is in its place/)
       assert.ok(!(done.error?.message ?? '').includes('InlPw'))
+    })
+  })
+
+  // "Is something mounted at this path" is answered by path, not by
+  // spelling: a request spelled with a trailing slash sees the filesystem the
+  // kernel lists without one and treats it exactly as the plain request does.
+
+  describe('a request spelled with a trailing slash sees the mount the kernel lists', () => {
+    /** One CIFS line spelled `${mp}/`; the kernel has it mounted at `${mp}`. */
+    async function mountedSlashedLine(mp: string): Promise<void> {
+      await serve(`//nas/s ${mp}/ cifs guest,vers=3.0,nofail 0 0\n`)
+      extraRows = [{ target: mp, source: '//nas/s', fstype: 'cifs', options: 'rw,vers=3.0' }]
+    }
+
+    /** Did a `umount` run for this mountpoint, in either spelling? */
+    const umountRan = (mp: string): boolean =>
+      calls.some(c => c.command === UMOUNT && c.args.some(a => sameConfigPath(a, mp)))
+
+    it('state unmount asked with the trailing slash is accepted and runs umount', async () => {
+      const mp = join(base, 'slash-umount')
+      await mkdir(mp)
+      await mountedSlashedLine(mp)
+      const done = await job('POST', `/v1/mounts/${enc(`${mp}/`)}/state`, { action: 'unmount' })
+      assert.equal(done.status, 'completed', JSON.stringify(done.error))
+      assert.ok(umountRan(mp), `umount ran: ${JSON.stringify(calls.filter(isMutation))}`)
+    })
+
+    it('state disable asked with the trailing slash runs umount before the line changes', async () => {
+      const mp = join(base, 'slash-disable')
+      await mkdir(mp)
+      await mountedSlashedLine(mp)
+      const done = await job('POST', `/v1/mounts/${enc(`${mp}/`)}/state`, { action: 'disable' })
+      assert.equal(done.status, 'completed', JSON.stringify(done.error))
+      assert.ok(umountRan(mp), `umount ran: ${JSON.stringify(calls.filter(isMutation))}`)
+      assert.match(await readFile(join(dir, 'fstab'), 'utf8'), /noauto/)
+    })
+
+    it('DELETE asked with the trailing slash runs umount before the line goes', async () => {
+      const mp = join(base, 'slash-remove')
+      await mkdir(mp)
+      await mountedSlashedLine(mp)
+      const done = await job('DELETE', `/v1/mounts/${enc(`${mp}/`)}`)
+      assert.equal(done.status, 'completed', JSON.stringify(done.error))
+      assert.ok(umountRan(mp), `umount ran: ${JSON.stringify(calls.filter(isMutation))}`)
+      assert.ok(!(await readFile(join(dir, 'fstab'), 'utf8')).includes('//nas/s'))
+    })
+
+    // The remote gate asks the same question of a kernel-only row: a local
+    // filesystem the kernel lists with no fstab line is refused the unmount
+    // for either spelling, with the same 400.
+    it('a kernel-listed local filesystem with no fstab line answers the same 400 for both spellings', async () => {
+      const mp = join(base, 'slash-local')
+      await mkdir(mp)
+      await serve('')
+      extraRows = [{ target: mp, source: '/dev/sdb1', fstype: 'ext4', options: 'rw' }]
+      for (const req of [mp, `${mp}/`]) {
+        const res = await send('POST', `/v1/mounts/${enc(req)}/state`, { action: 'unmount' })
+        assert.equal(res.statusCode, 400, `${req}: ${res.body}`)
+        assert.match((res.json() as { error: { message: string } }).error.message, /not an ANAS-managed filesystem/)
+      }
     })
   })
 

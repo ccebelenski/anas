@@ -24,9 +24,9 @@ import { constants as FS_CONSTANTS } from 'node:fs'
 import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { basename, dirname, join, normalize, resolve } from 'node:path'
-import { CIFS_CREDENTIAL_OPTION_KEYS, fstabOptionTokens, MountCifsSec, MountExtraOptions, MountNfsSec, nofailDefeatingOption, normalizeMountTarget, sameConfigPath } from '@anas/shared'
+import { CIFS_CREDENTIAL_OPTION_KEYS, configPathKey, fstabOptionTokens, MountCifsSec, MountExtraOptions, MountNfsSec, nofailDefeatingOption, normalizeMountTarget, sameConfigPath } from '@anas/shared'
 import { classifyKind, effectiveMountAt, effectiveMounts, isIgnoredMount, optionsReadOnly, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
-import { cifsAuthToken, cifsCredentialTokenScan, getMount, linesFor, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
+import { cifsAuthToken, cifsCredentialTokenScan, getMount, linesFor, mountLine, parseFstab, parseFstabDoc } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { PVE_STORAGE_CFG, readPveMountPathsStrict } from '../parsers/pve-storage.js'
@@ -94,7 +94,9 @@ export function buildBaseInventory(
 ): MountSummary[] {
   const nodes = parseFindmnt(findmntText).filter(n => !isIgnoredMount(n.fstype, n.target))
   const entries = parseFstab(fstabText)
-  const entryByMount = new Map(entries.map(e => [e.mountpoint, e]))
+  // Every key is `configPathKey(...)`: the join is by path, not by spelling, so
+  // a line spelled `/mnt/x/` names the mount the kernel spells `/mnt/x`.
+  const entryByMount = new Map(entries.map(e => [configPathKey(e.mountpoint), e]))
 
   const byTarget = new Map<string, MountSummary>()
   // cr.60 (review L26): the ONE stacked-mount rule (parsers/findmnt) — the
@@ -105,7 +107,7 @@ export function buildBaseInventory(
   for (const node of effectiveMounts(nodes).values()) {
     const isAutofs = node.fstype === 'autofs'
     const kind = classifyKind(node.fstype, node.source)
-    byTarget.set(node.target, {
+    byTarget.set(configPathKey(node.target), {
       mountpoint: node.target,
       source: node.source,
       type: kind,
@@ -129,7 +131,7 @@ export function buildBaseInventory(
     // without this it reappears here as a ghost unmounted row + dashboard warning.
     if (isIgnoredMount(entry.fstype, entry.mountpoint))
       continue
-    const row = byTarget.get(entry.mountpoint)
+    const row = byTarget.get(configPathKey(entry.mountpoint))
     if (row) {
       row.persistent = true
       row.automount = row.automount || entry.options.common.automount
@@ -154,7 +156,7 @@ export function buildBaseInventory(
     }
     else {
       const kind = classifyKind(entry.fstype, entry.spec)
-      byTarget.set(entry.mountpoint, {
+      byTarget.set(configPathKey(entry.mountpoint), {
         mountpoint: entry.mountpoint,
         source: entry.spec,
         type: kind,
@@ -179,7 +181,7 @@ export function buildBaseInventory(
       row.pveManaged = true
       row.pveStorage = pve
     }
-    const entry = entryByMount.get(row.mountpoint)
+    const entry = entryByMount.get(configPathKey(row.mountpoint))
     // Tag AHR pool persistence hands-off — match on the LV SPEC (never the
     // mountpoint, which is operator-configurable). The fstab entry spec is the
     // reliable identity; a mounted pool's findmnt `source` carries the btrfs
@@ -1907,7 +1909,7 @@ export async function buildMountDetail(
   ])
   const findmntText = table ?? ''
   const rows = buildInventory(table, fstabText, pveMountPaths, ahrPinnedSpecs(mdadmConfText))
-  const row = rows.find(r => r.mountpoint === mountpoint)
+  const row = rows.find(r => sameConfigPath(r.mountpoint, mountpoint))
   if (!row)
     return null
 
@@ -2827,6 +2829,6 @@ export async function removeMountpointLeafThroughOpenedParent(mountpoint: string
  * of its old self. Null when the file has no line for the mountpoint.
  */
 export function fstabLineRevision(fstabText: string, mountpoint: string): string | null {
-  const line = parseFstabDoc(fstabText).find(l => l.kind === 'entry' && sameConfigPath(l.entry.mountpoint, mountpoint))
+  const line = mountLine(fstabText, mountpoint)
   return line ? createHash('sha256').update(line.raw).digest('hex') : null
 }

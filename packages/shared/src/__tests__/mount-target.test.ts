@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { normalizeMountTarget } from '../mount-target.js'
+import { isPathWithin } from '../schemas/backup.js'
 
 /**
  * The normaliser's table (Epic 18 bug fix). Every shape an operator has
@@ -98,5 +99,21 @@ describe('normalizeMountTarget (Epic 18 server/share normaliser)', () => {
       const twice = normalizeMountTarget(type, once)
       assert.deepEqual(twice, once, `${type} second pass`)
     }
+  })
+})
+
+describe('isPathWithin — a trailing slash is spelling, not path', () => {
+  it('a path is within itself under either spelling', () => {
+    assert.equal(isPathWithin('/mnt/x/', '/mnt/x'), true)
+    assert.equal(isPathWithin('/mnt/x', '/mnt/x/'), true)
+    assert.equal(isPathWithin('/', '/'), true)
+  })
+
+  it('below is below under either spelling of the parent, and a sibling prefix is not', () => {
+    assert.equal(isPathWithin('/mnt/x/', '/mnt/x/data'), true)
+    assert.equal(isPathWithin('/mnt/x', '/mnt/x/data'), true)
+    assert.equal(isPathWithin('/mnt/x/', '/mnt/xy'), false)
+    assert.equal(isPathWithin('/mnt/x', '/mnt'), false)
+    assert.equal(isPathWithin('/', '/mnt/x'), true)
   })
 })

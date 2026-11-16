@@ -9,10 +9,10 @@ import type { LiveAtTarget } from '../services/mount-match.js'
 import type { CredentialsFileContent, MountTestStages, StoredProbeCredentials } from '../services/mounts.js'
 import { readdir, readFile, rm } from 'node:fs/promises'
 import { join, resolve as resolvePath } from 'node:path'
-import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
+import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, sameConfigPath, UpdateMountRequest } from '@anas/shared'
 import { CommandTimeoutError } from '../executor/deadline.js'
 import { classifyKind, parseFindmnt, readFindmntTable } from '../parsers/findmnt.js'
-import { addMount, ANAS_MARKER, carriesAutomount, carriesInlineSecret, cifsCredentialTokenScan, directMountOptionArgs, disableMount, enableMount, getMount, hasMount, isCifs, isNfs, linesFor, parseFstabDoc, removeMount, replaceMount, serializeMountLine } from '../parsers/fstab.js'
+import { addMount, ANAS_MARKER, carriesAutomount, carriesInlineSecret, cifsCredentialTokenScan, directMountOptionArgs, disableMount, enableMount, getMount, hasMount, isCifs, isNfs, linesFor, mountLine, removeMount, replaceMount, serializeMountLine } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG, readPveMountPathsStrict, readPveTerritoryClaims, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendRefusal } from '../safety/guard.js'
 import { ahrMountBase } from '../services/ahr-paths.js'
@@ -279,7 +279,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const ahrSpecs = await mountReads.ahrSpecs(reads)
     if (ahrSpecs.size === 0)
       return null
-    const row = buildBaseInventory((await mountReads.findmnt(reads)) ?? '', o.fstabText, new Map(), ahrSpecs).find(r => r.mountpoint === o.mountpoint)
+    const row = buildBaseInventory((await mountReads.findmnt(reads)) ?? '', o.fstabText, new Map(), ahrSpecs).find(r => sameConfigPath(r.mountpoint, o.mountpoint))
     if (!row?.ahrManaged)
       return null
     return { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${o.mountpoint}' is an ANAS Hybrid RAID (AHR) pool — manage it from the Hybrid RAID view, not the Mounts feature` }
@@ -294,7 +294,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
   const remoteGate: Gate<MountObject> = async (o, reads) => {
     let kind: string | undefined = o.entry ? classifyKind(o.entry.fstype, o.entry.spec) : undefined
     if (kind === undefined)
-      kind = buildBaseInventory((await mountReads.findmnt(reads)) ?? '', '', new Map()).find(r => r.mountpoint === o.mountpoint)?.type
+      kind = buildBaseInventory((await mountReads.findmnt(reads)) ?? '', '', new Map()).find(r => sameConfigPath(r.mountpoint, o.mountpoint))?.type
     if (kind === undefined || isRemoteKind(kind))
       return null
     return { status: 400, code: 'VALIDATION_ERROR', message: `Mount '${o.mountpoint}' is not an ANAS-managed filesystem — ANAS manages remote (NFS/CIFS) shares only` }
@@ -393,7 +393,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           message: `${VERBING[verb]} '${o.mountpoint}' is refused: its /etc/fstab line names a credentials file ${scan.files} times (credentials=/cred=). mount.cifs reads each of them in order, and ANAS will not choose one for it — nothing was done. Keep one credentials file on the line on the node, then try again.`,
         }
       }
-      if (verb === 'disable' && !parseFstabDoc(o.fstabText).some(l => l.kind === 'entry' && l.entry.mountpoint === o.mountpoint && l.raw.startsWith(ANAS_MARKER)))
+      if (verb === 'disable' && !mountLine(o.fstabText, o.mountpoint)?.raw.startsWith(ANAS_MARKER))
         return null
       if (e.secretOptions?.length) {
         const keys = [...new Set(e.secretOptions.map(t => `${t.split('=')[0]}=`))].join(', ')
@@ -1300,7 +1300,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           }
         }
         // What the line said before (for the backup scrub, review 4 N1).
-        const oldRaw = parseFstabDoc(o.fstabText).find(l => l.kind === 'entry' && l.entry.mountpoint === mp)?.raw
+        const oldRaw = mountLine(o.fstabText, mp)?.raw
         let wroteOwnFile = false
         if (body.credentials) {
           // cr3.mounts review 3 (3): a rotation with the full new credentials
@@ -1391,7 +1391,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // file as it was before this edit) still holds the secret this Save
         // moved out of the line — scrubbed (the migrated line takes its place).
         if (migrating && oldRaw !== undefined) {
-          const newRaw = parseFstabDoc(await readFstabAbsentAsEmpty(fstabPath)).find(l => l.kind === 'entry' && l.entry.mountpoint === mp)?.raw ?? null
+          const newRaw = mountLine(await readFstabAbsentAsEmpty(fstabPath), mp)?.raw ?? null
           const left = await scrubFstabBackup(oldRaw, newRaw, existing)
           if (left)
             editWarnings.push(left)
@@ -1661,7 +1661,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // cr3.mounts review 4 (N1): a removed line that carried an inline
         // secret leaves it in the writer's backup — scrubbed the same way.
         if (o.entry && carriesInlineSecret(o.entry)) {
-          const oldRaw = parseFstabDoc(o.fstabText).find(l => l.kind === 'entry' && l.entry.mountpoint === mp)?.raw
+          const oldRaw = mountLine(o.fstabText, mp)?.raw
           const left = oldRaw === undefined ? undefined : await scrubFstabBackup(oldRaw, null, o.entry)
           if (left)
             resultWarnings.push(left)
@@ -1905,7 +1905,7 @@ function isTopLevelDir(mountpoint: string): boolean {
 
 /** Does the findmnt table list `mountpoint` as mounted? */
 function mountedIn(findmntText: string, mountpoint: string): boolean {
-  return buildBaseInventory(findmntText, '', new Map()).find(r => r.mountpoint === mountpoint)?.mounted ?? false
+  return buildBaseInventory(findmntText, '', new Map()).find(r => sameConfigPath(r.mountpoint, mountpoint))?.mounted ?? false
 }
 
 /**

@@ -1,5 +1,6 @@
 import type { MountKind } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import { configPathKey, sameConfigPath } from '@anas/shared'
 
 /**
  * Parser for `findmnt --json` (util-linux). findmnt reads the kernel mount table
@@ -282,7 +283,7 @@ export function zfsLiveDatasetMounts(nodes: FindmntNode[]): Map<string, string[]
 
 /** The effective REAL (non-`autofs`) row at `target` by {@link effectiveMounts}' rule; undefined when none. */
 export function effectiveMountAt(nodes: FindmntNode[], target: string): FindmntNode | undefined {
-  const node = effectiveMounts(nodes.filter(n => n.target === target)).get(target)
+  const node = effectiveMounts(nodes.filter(n => sameConfigPath(n.target, target))).get(configPathKey(target))
   return node && node.fstype !== 'autofs' ? node : undefined
 }
 

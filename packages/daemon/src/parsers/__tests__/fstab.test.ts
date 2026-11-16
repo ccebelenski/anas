@@ -18,6 +18,7 @@ import {
   hasMount,
   inlineCommentIndex,
   linesFor,
+  mountLine,
   mountOptionTokens,
   parseFstab,
   parseFstabDoc,
@@ -1111,5 +1112,49 @@ describe('linesFor: every line a mountpoint is on (cr4.conf D-21)', () => {
     const text = '/dev/srv1 /mnt/dup ext4 defaults 0 0\n/dev/srv2 /mnt/dup/ ext4 ro 0 0\n'
     assert.deepEqual(linesFor(text, '/mnt/dup'), [1, 2])
     assert.deepEqual(linesFor(text, '/mnt/dup/'), [1, 2])
+  })
+})
+
+describe('mountLine: the one line a mountpoint is on', () => {
+  const line1 = '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail  0  0'
+  const other = 'tmpfs  /scratch  tmpfs  size=2G,mode=1777  0  0'
+
+  it('returns the entry line for a present mountpoint, `raw` byte-exact', () => {
+    const text = `# a comment\n${other}\n${line1}\n`
+    const found = mountLine(text, '/mnt/anas-nfs')!
+    assert.equal(found.kind, 'entry')
+    assert.equal(found.raw, line1)
+    assert.equal(found.entry.mountpoint, '/mnt/anas-nfs')
+  })
+
+  it('undefined for a mountpoint the file has no line for', () => {
+    assert.equal(mountLine(`${other}\n`, '/mnt/nowhere-at-all'), undefined)
+  })
+
+  it('a line spelled `/mnt/x/` is found for `/mnt/x`, and the reverse', () => {
+    const slashed = '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs/  nfs4  defaults,nofail  0  0'
+    assert.equal(mountLine(`${slashed}\n`, '/mnt/anas-nfs')!.raw, slashed)
+    assert.equal(mountLine(`${line1}\n`, '/mnt/anas-nfs/')!.raw, line1)
+  })
+
+  it('with two lines for one mountpoint the FIRST is returned', () => {
+    const first = '/dev/srv1 /mnt/dup ext4 defaults 0 0'
+    const second = '/dev/srv2 /mnt/dup/ ext4 ro 0 0'
+    assert.equal(mountLine(`${first}\n${second}\n`, '/mnt/dup')!.raw, first)
+    assert.equal(mountLine(`${first}\n${second}\n`, '/mnt/dup/')!.raw, first)
+  })
+
+  it('a disabled line (`noauto,x-anas.disabled`) is returned with disabled === true', () => {
+    const disabled = '127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail,noauto,x-anas.disabled  0  0'
+    const found = mountLine(`${disabled}\n`, '/mnt/anas-nfs')!
+    assert.equal(found.raw, disabled)
+    assert.equal(found.disabled, true)
+  })
+
+  it('a legacy `#ANAS ` line is returned', () => {
+    const marked = `${ANAS_MARKER}${line1}`
+    const found = mountLine(`${marked}\n`, '/mnt/anas-nfs')!
+    assert.equal(found.raw, marked)
+    assert.equal(found.disabled, true)
   })
 })

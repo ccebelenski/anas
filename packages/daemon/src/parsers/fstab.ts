@@ -165,14 +165,26 @@ export function parseFstab(text: string): MountEntry[] {
   return entries
 }
 
+/** One entry line of the document. */
+export type FstabEntryLine = Extract<FstabDocLine, { kind: 'entry' }>
+
+/**
+ * The line for `mountpoint`: the FIRST entry line whose mountpoint names the
+ * same path (`sameConfigPath`), a disabled or legacy `#ANAS ` line included,
+ * or undefined when the file has none. Its `raw` is the line's exact text.
+ */
+export function mountLine(text: string, mountpoint: string): FstabEntryLine | undefined {
+  return parseFstabDoc(text).find((l): l is FstabEntryLine => l.kind === 'entry' && sameConfigPath(l.entry.mountpoint, mountpoint))
+}
+
 /** The entry for `mountpoint`, or undefined if the file has none. */
 export function getMount(text: string, mountpoint: string): MountEntry | undefined {
-  return parseFstab(text).find(e => sameConfigPath(e.mountpoint, mountpoint))
+  return mountLine(text, mountpoint)?.entry
 }
 
 /** Is `mountpoint` present in the file as an entry line? */
 export function hasMount(text: string, mountpoint: string): boolean {
-  return parseFstabDoc(text).some(l => l.kind === 'entry' && sameConfigPath(l.entry.mountpoint, mountpoint))
+  return mountLine(text, mountpoint) !== undefined
 }
 
 /**

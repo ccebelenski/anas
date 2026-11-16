@@ -233,3 +233,22 @@ describe('readFindmntTable — honours the exit status (cr.60, L26)', () => {
     assert.equal(await readFindmntTable(exec({ stdout: '{"filesystems":[{"target":"/","children":42}]}', stderr: '', exitCode: 0 })), null)
   })
 })
+
+describe('effectiveMountAt — a target is a path, whatever its spelling', () => {
+  const table = (rows: object[]): string => JSON.stringify({ filesystems: rows })
+  const ROOT = { target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }
+  const CIFS = { target: '/mnt/x', source: '//nas/s', fstype: 'cifs', options: 'rw' }
+
+  it('a row at /mnt/x answers a target spelled /mnt/x/', () => {
+    assert.equal(effectiveMountAt(parseFindmnt(table([ROOT, CIFS])), '/mnt/x/')?.source, '//nas/s')
+  })
+
+  it('several trailing slashes are the same path', () => {
+    assert.equal(effectiveMountAt(parseFindmnt(table([ROOT, CIFS])), '/mnt/x///')?.source, '//nas/s')
+  })
+
+  it('a real mount stacked over an autofs placeholder: the top real row answers a slashed target', () => {
+    const placeholder = { target: '/mnt/x', source: 'systemd-1', fstype: 'autofs', options: 'rw', children: [CIFS] }
+    assert.equal(effectiveMountAt(parseFindmnt(table([ROOT, placeholder])), '/mnt/x/')?.fstype, 'cifs')
+  })
+})
