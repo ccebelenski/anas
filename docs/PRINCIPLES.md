@@ -64,6 +64,16 @@ The API is the authority on what is safe, what is risky, and what is forbidden. 
 
 Where Proxmox (or the underlying OS) provides infrastructure, use it. TLS certificates, journald logging, the notification system — these already exist, are already configured, and are already trusted by the user. Building parallel systems wastes resources and creates configuration burden. ANAS integrates with the host rather than replacing its capabilities.
 
+## 16. One owner per fact and per act
+
+Each fact about the system (what a config file says, whether a unit can be read, what state a cache is in) is derived by one module, its owner. Each act (editing a file, refusing, confirming, printing a command for the operator) is performed by one module. Every other part of ANAS asks the owner through its contract and does not derive the answer again. This is the single responsibility principle, held by discipline and review and not by visibility rules.
+
+Queries and mutations are separate (command-query separation). A query changes nothing, and its answer states one of three things: the value, that the thing is proven absent, or that it could not be read and why. A mutation acts and reports what it did or what it left.
+
+A function does what its name says and nothing more. When more is wanted, it is composed one level up under a name that says all of it, and the simple function stays callable on its own. An owner is cut narrow: a consumer depends only on what it uses.
+
+A second derivation of an owned fact is a defect, including while it agrees with the first. Owners and their contracts are listed in DESIGN.md.
+
 ---
 
 ## How to use this document
