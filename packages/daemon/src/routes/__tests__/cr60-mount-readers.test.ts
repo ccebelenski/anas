@@ -243,6 +243,46 @@ describe('cr.60 — the mount-family findmnt readers (review L26) and the strict
     assert.ok(!calls.some(c => c.command === UMOUNT || c.command === MOUNT), 'nothing was mounted or unmounted')
   })
 
+  // --- the fstab read: the file owner (services/fstab-file.ts) says what a
+  // failed read means; the doors answer its 503 sentence.
+
+  it('an UNREADABLE fstab answers GET /mounts 503 with the owner\'s sentence — never an empty list', async () => {
+    // A directory where the file should be: readFile fails EISDIR. The owner
+    // reports it as unreadable (not absent), so the door answers 503.
+    process.env.ANAS_FSTAB_PATH = dir
+    const s = serve()
+    const res = await s.inject({ method: 'GET', url: '/v1/mounts', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 503, res.body)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'UNAVAILABLE')
+    assert.equal(error.message, `${dir} could not be read (EISDIR). Check the file, then try again.`)
+  })
+
+  it('an UNREADABLE fstab refuses every mounts door that reads it 503 with the owner\'s sentence and runs no mutating command', async () => {
+    process.env.ANAS_FSTAB_PATH = dir
+    const s = serve()
+    const reqs = [
+      { method: 'GET' as const, url: `/v1/mounts/${enc(NFS_MP)}`, payload: undefined },
+      { method: 'POST' as const, url: `/v1/mounts/${enc(NFS_MP)}/state`, payload: { action: 'mount' } },
+      { method: 'POST' as const, url: `/v1/mounts/${enc(NFS_MP)}/state`, payload: { action: 'unmount' } },
+      { method: 'POST' as const, url: `/v1/mounts/${enc(NFS_MP)}/state`, payload: { action: 'disable' } },
+      { method: 'POST' as const, url: `/v1/mounts/${enc(NFS_MP)}/state`, payload: { action: 'enable' } },
+      { method: 'PUT' as const, url: `/v1/mounts/${enc(NFS_MP)}`, payload: { options: { ro: true } } },
+      { method: 'DELETE' as const, url: `/v1/mounts/${enc(NFS_MP)}`, payload: undefined },
+      { method: 'POST' as const, url: '/v1/mounts', payload: { type: 'nfs', server: '127.0.0.1', remotePath: '/export', mountpoint: join(dir, 'new'), persistent: false } },
+      // No credentials typed: the door reads the stored line for them.
+      { method: 'POST' as const, url: '/v1/mounts/test', payload: { type: 'cifs', server: '127.0.0.1', remotePath: 'share', mountpoint: '/mnt/cifs-stored' } },
+    ]
+    for (const r of reqs) {
+      const res = await s.inject({ method: r.method, url: r.url, headers: r.payload ? JSON_HEADERS : IDENTITY_HEADERS, ...(r.payload ? { payload: JSON.stringify(r.payload) } : {}) })
+      assert.equal(res.statusCode, 503, `${r.method} ${r.url}: ${res.body}`)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'UNAVAILABLE', `${r.method} ${r.url}`)
+      assert.equal(error.message, `${dir} could not be read (EISDIR). Check the file, then try again.`, `${r.method} ${r.url}`)
+    }
+    assert.ok(!calls.some(c => c.command === UMOUNT || c.command === MOUNT), 'nothing was mounted or unmounted')
+  })
+
   it('local-zfs with no `mountpoint` (the installer default): a mount at /rpool/data is PVE\'s — create refuses, a hand-written line is hands-off', async () => {
     process.env.ANAS_STORAGE_CFG = join(FIXTURES, 'pve/storage-zfsroot.cfg')
     await writeFile(join(dir, 'fstab'), `${fixture('mounts/fstab-anas-managed')}127.0.0.1:/srv/nfs/export1  /rpool/data  nfs4  defaults,nofail  0  0\n`)

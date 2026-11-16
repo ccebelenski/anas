@@ -18,7 +18,8 @@ import { guardCheck, guardConfirm, guarded, GuardRefusalError, mountClaim, sendR
 import { ahrMountBase } from '../services/ahr-paths.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders, runFuser, toolNotFound } from '../services/busy-diagnosis.js'
 import { duplicateKeyRefusal } from '../services/config-duplicates.js'
-import { editConfig, readConfig, writeFileAtomic } from '../services/config-writer.js'
+import { editConfig, writeFileAtomic } from '../services/config-writer.js'
+import { readFstabAbsentAsEmpty } from '../services/fstab-file.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { describeLive, liveAtTarget, specMatchesLive } from '../services/mount-match.js'
 import {
@@ -187,7 +188,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     // unreadable (a findmnt that failed, exited non-zero or answered in an
     // unknown shape), never "nothing mounted".
     findmnt: (reads: GuardReads) => reads.once('findmnt', () => readFindmntTable(executor)),
-    fstab: (reads: GuardReads) => reads.once('fstab', () => readConfig(fstabPath)),
+    fstab: (reads: GuardReads) => reads.once('fstab', () => readFstabAbsentAsEmpty(fstabPath)),
     // cr.60 (from cr.54's report): the STRICT reader — an unreadable
     // storage.cfg refuses, never an empty map. cr.60r (review possible 3):
     // the claims also cover every path a zfspool dataset is LIVE at, derived
@@ -866,7 +867,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     // additive), because a mount that is not in fstab cannot be listed.
     const [findmntText, fstabText, pveMountPaths, ahrSpecs] = await Promise.all([
       readFindmntTable(executor),
-      readConfig(fstabPath),
+      readFstabAbsentAsEmpty(fstabPath),
       // cr3.mounts follow-up (4): strict — an unreadable storage.cfg is null,
       // and every row says PVE ownership is unknown.
       readPveMountPathsStrict(storagePath ?? PVE_STORAGE_CFG),
@@ -1390,7 +1391,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // file as it was before this edit) still holds the secret this Save
         // moved out of the line — scrubbed (the migrated line takes its place).
         if (migrating && oldRaw !== undefined) {
-          const newRaw = parseFstabDoc(await readConfig(fstabPath)).find(l => l.kind === 'entry' && l.entry.mountpoint === mp)?.raw ?? null
+          const newRaw = parseFstabDoc(await readFstabAbsentAsEmpty(fstabPath)).find(l => l.kind === 'entry' && l.entry.mountpoint === mp)?.raw ?? null
           const left = await scrubFstabBackup(oldRaw, newRaw, existing)
           if (left)
             editWarnings.push(left)
@@ -1399,7 +1400,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // named before (a pre-ident.4 flattened name) goes once nothing
         // references it — and only from the ANAS creds directory.
         if (existing.credentialsFile && merged.credentialsFile && existing.credentialsFile !== merged.credentialsFile) {
-          const left = await removeCredentialsFileIfUnreferenced(credsDir, existing.credentialsFile, await readConfig(fstabPath))
+          const left = await removeCredentialsFileIfUnreferenced(credsDir, existing.credentialsFile, await readFstabAbsentAsEmpty(fstabPath))
           if (left)
             editWarnings.push(left)
         }
@@ -1669,7 +1670,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         // the one); removed only from the creds dir and only when no other line
         // references it — decided on the fstab as it is after the line is gone.
         const file = credentialsFileOf(o)
-        const fstabAfter = await readConfig(fstabPath)
+        const fstabAfter = await readFstabAbsentAsEmpty(fstabPath)
         if (file) {
           updateProgress('Removing credentials file')
           const kept = await removeCredentialsFileIfUnreferenced(credsDir, file, fstabAfter)
@@ -1744,7 +1745,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     let stored: StoredProbeCredentials = {}
     if (parsed.data.mountpoint !== undefined && parsed.data.type === 'cifs' && !parsed.data.credentials) {
       const mp = parsed.data.mountpoint
-      const fstabText = await readConfig(fstabPath)
+      const fstabText = await readFstabAbsentAsEmpty(fstabPath)
       const entry = getMount(fstabText, mp)
       if (!entry || !isCifs(entry.fstype)) {
         reply.code(404)

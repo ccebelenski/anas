@@ -151,6 +151,7 @@ import {
   validateSchedule,
   writeTaskUnits,
 } from '../services/backup-units.js'
+import { configuredFstabPath } from '../services/fstab-file.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
 import { conflict, foreignGate, lunClaims, lunNameFreeGate, saveableGate, targetView } from '../services/iscsi-guard.js'
 import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
@@ -304,7 +305,7 @@ function CONFLICT(version: number) {
 }
 
 export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOptions) {
-  const { executor, jobQueue, paths, systemdDir, confirmStore, fstabPath = '/etc/fstab' } = opts
+  const { executor, jobQueue, paths, systemdDir, confirmStore, fstabPath = configuredFstabPath() } = opts
   const iscsiPaths: IscsiPaths = opts.iscsiPaths ?? {}
 
   /**

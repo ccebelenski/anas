@@ -23,8 +23,8 @@ import { diskClaim, guardCheck, guardConfirm, guarded, GuardRefusalError, LockCl
 import { readPoolGuid } from '../safety/stable-id.js'
 import { ahrSliceLabelOwner, classifyPartitionWithReason } from '../services/ahr-identity.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
-import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
+import { configuredFstabPath, readFstabAbsentAsEmpty } from '../services/fstab-file.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, LIO_UNREADABLE_KEY, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { mountTargetGate, mountTargetRefusal, normalizeMountpointPath, swapStageGate, swapStageRefusal } from '../services/mounts.js'
 import { BLKID_AMBIVALENT, BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures, blkidPartEntryName, LSBLK_NONE_FOUND, parsePartitionProbe, PART_BY_ID_RE, PARTITION_PROBE_ARGS } from '../services/partition-device.js'
@@ -848,7 +848,7 @@ export async function poolRoutes(
   },
 ) {
   const { executor, jobQueue, confirmStore } = opts
-  const fstabPath = opts.fstabPath ?? '/etc/fstab'
+  const fstabPath = opts.fstabPath ?? configuredFstabPath()
   const vdevRemoveSettleMs = opts.vdevRemoveSettleMs ?? VDEV_REMOVE_SETTLE_MS
   const pveCfgPath = opts.pveStoragePath ?? PVE_STORAGE_CFG
   const iscsiPaths = opts.iscsiPaths ?? {}
@@ -1165,7 +1165,7 @@ export async function poolRoutes(
       const text = await readFindmntTable(executor)
       return text === null ? null : parseFindmnt(text)
     }),
-    fstab: (reads: GuardReads) => reads.once('fstab', () => readConfig(fstabPath)),
+    fstab: (reads: GuardReads) => reads.once('fstab', () => readFstabAbsentAsEmpty(fstabPath)),
   }
 
   /** The object a pool verb acts on: a pool `zpool list` names now. */

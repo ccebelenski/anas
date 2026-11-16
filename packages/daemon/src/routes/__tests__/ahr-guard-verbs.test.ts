@@ -468,6 +468,19 @@ describe('cr.38 — the short AHR verbs re-gate in the job (ruling (j))', () => 
     await refusedInJob(id, release, 'CONFLICT', new RegExp(`'${NEW_MP}' is already claimed in fstab`))
   })
 
+  it('mountpoint: a directory at the fstab path → 503 UNAVAILABLE with its sentence, nothing run', async () => {
+    await serve()
+    // A fstab read that fails for a reason other than absence is neither absent
+    // nor empty: the door answers 503 with the reader's sentence before the job.
+    await rm(fstab, { force: true })
+    await mkdir(fstab)
+    const res = await server!.inject({ method: MOVE.method, url: MOVE.url, headers: MOVE.headers, payload: MOVE.payload })
+    assert.equal(res.statusCode, 503, res.body)
+    assert.equal(res.json().error.code, 'UNAVAILABLE')
+    assert.equal(res.json().error.message, `${fstab} could not be read (EISDIR). Check the file, then try again.`)
+    assert.deepEqual(calls.filter(isAhrMutation), [], 'no mutating argv')
+  })
+
   it('mountpoint: a system pool at the confirm is now the route\'s hard 409 (cr.38 adds the gate)', async () => {
     await serve(FINDMNT_AHR0_AT_VAR)
     const res = await server!.inject({ method: MOVE.method, url: MOVE.url, headers: MOVE.headers, payload: MOVE.payload })

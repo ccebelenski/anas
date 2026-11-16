@@ -2,10 +2,10 @@ import type { UnmountedMount } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import type { LiveAtTarget } from './mount-match.js'
-import { readFile } from 'node:fs/promises'
 import { isPathWithin } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { parseFstab } from '../parsers/fstab.js'
+import { readFstab } from './fstab-file.js'
 import { liveAtTarget, specMatchesLive } from './mount-match.js'
 import { readFindmnt } from './mounts.js'
 
@@ -270,15 +270,13 @@ export async function readSourceGuardFacts(
 ): Promise<SourceGuardFacts> {
   let fstabText = ''
   let fstabUnavailable: string | undefined
-  try {
-    fstabText = await readFile(fstabPath, 'utf-8')
-  }
-  catch (err) {
-    // An ABSENT fstab configures nothing. Any other failure is an unreadable
-    // one (cr3.backup): it never becomes "nothing configured".
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
-      fstabUnavailable = (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err))
-  }
+  const fstab = await readFstab(fstabPath)
+  // An absent fstab configures nothing; an unreadable one (cr3.backup)
+  // never becomes "nothing configured".
+  if (fstab.state === 'read')
+    fstabText = fstab.text
+  else if (fstab.state === 'unreadable')
+    fstabUnavailable = fstab.reason
   const [findmntText, zfsText] = await Promise.all([readFindmnt(executor), readZfsMountText(executor)])
   const realpaths = new Map<string, string>()
   for (const p of new Set(paths)) {

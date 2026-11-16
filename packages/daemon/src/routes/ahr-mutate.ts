@@ -31,7 +31,7 @@ import { repairAhrFiles } from '../services/ahr-repair.js'
 import { attributeScrub, pathExists, runningAhrCheck, scrubAhrPool } from '../services/ahr-scrub.js'
 import { topLevelMountPath } from '../services/ahr-snapshots.js'
 import { AHR_FINDMNT_ARGS } from '../services/ahr-topology.js'
-import { readConfig } from '../services/config-writer.js'
+import { readFstabAbsentAsEmpty } from '../services/fstab-file.js'
 import { heldByLun, heldHolderPhrase, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
 import { mountTargetGate, mountTargetRefusal, normalizeMountpointPath } from '../services/mounts.js'
@@ -422,14 +422,16 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
    * (`services/ahr-fstab.ts`'s `ahrFstabEntry`, the same spec destroyAhrPool
    * matches). A reference is the CONFIGURATION, not the mount: an unmounted
    * pool still owns its configured path — destroying it invalidates a share
-   * served from there even though nothing is mounted now. `undefined` when
-   * fstab cannot be read or names no such line: the configured path is then
-   * simply not knowable, and only the name-matched kinds stay in scope.
+   * served from there even though nothing is mounted now. `undefined` when the
+   * file is absent or names no such line: the configured path is then simply
+   * not knowable, and only the name-matched kinds stay in scope. An fstab that
+   * is there and cannot be read throws FstabUnreadableError, which the door
+   * answers 503.
    */
   async function ahrConfiguredMountpoint(poolName: string): Promise<string | undefined> {
     if (!fstabPath)
       return undefined
-    const fstabText = await readConfig(fstabPath)
+    const fstabText = await readFstabAbsentAsEmpty(fstabPath)
     for (const entry of parseFstab(fstabText)) {
       // cr3 AHR-CORE-M3: the pool's OWN line — never the @snapshots line,
       // which carries the same LV spec.
@@ -523,7 +525,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
   const guard = ahrGuard({ executor, intentDir, iscsiPaths: () => iscsiPaths, jobQueue })
 
   /** `/etc/fstab`, once per guard run (the mountpoint gates of create and move share it). */
-  const fstabOnce = (reads: GuardReads) => reads.once('fstab', () => readConfig(fstabPath))
+  const fstabOnce = (reads: GuardReads) => reads.once('fstab', () => readFstabAbsentAsEmpty(fstabPath))
 
   /**
    * The MOUNTPOINT-COLLISION gates (§2.6, at both doors since cr.38): `mp` is

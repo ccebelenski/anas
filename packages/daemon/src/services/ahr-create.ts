@@ -11,7 +11,7 @@ import { ROLLED_BACK_MARKER } from './ahr-create-status.js'
 import { destroyAhrPool } from './ahr-destroy.js'
 import { requireComposableNow } from './ahr-disk-recheck.js'
 import { LVM_MIXED_BLOCK_ARGS, run, UPDATE_INITRAMFS_BUDGET_MS } from './ahr-exec.js'
-import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, ahrFstabEntry, ahrPoolLineForRemount, defaultAhrFstabPath, isAhrPoolOwnLine, isAhrSnapshotsLine, mountAhrPool } from './ahr-fstab.js'
+import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, ahrFstabEntry, ahrPoolLineForRemount, isAhrPoolOwnLine, isAhrSnapshotsLine, mountAhrPool } from './ahr-fstab.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { ahrNameOccupancy } from './ahr-identity.js'
 import { clearIntent } from './ahr-intent.js'
@@ -20,7 +20,8 @@ import { foreignProgramHook, foreignProgramRefusal, installProgramHook, pinArray
 import { ahrLvPath, ahrMountBase } from './ahr-paths.js'
 import { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
 import { isAhrMountReadOnly } from './ahr-topology.js'
-import { editConfig, readConfig } from './config-writer.js'
+import { editConfig } from './config-writer.js'
+import { configuredFstabPath, readFstab } from './fstab-file.js'
 import { createMountpointThroughOpenedParent, mountThroughOpenedDir } from './mounts.js'
 import { pveNotify } from './pve-notify.js'
 import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
@@ -629,7 +630,7 @@ export async function remountAhrPool(
   // the pool is not mounted — the one cause this sentence may name.
   if (pool.subvolLayout === null)
     throw new Error(`pool '${pool.name}' is not mounted, so its layout cannot be read and its mount cannot be verified — nothing was unmounted. Mount it from the Hybrid RAID view, then try again`)
-  const line = await ahrPoolLineForRemount(opts.fstabPath ?? defaultAhrFstabPath(), pool.name, updateProgress)
+  const line = await ahrPoolLineForRemount(opts.fstabPath ?? configuredFstabPath(), pool.name, updateProgress)
 
   updateProgress(`Unmounting ${pool.mountpoint}`)
   await run(executor, UMOUNT, ['--', pool.mountpoint], { busyPath: pool.mountpoint })
@@ -678,13 +679,11 @@ export async function changeAhrMountpoint(
   // OWN line — so the refusal is narrowed to the shape that actually needs
   // the layout: no movable line of the pool's own.
   if (subvolLayout === null) {
-    let current: string
-    try {
-      current = await readConfig(opts.fstabPath)
-    }
-    catch (err) {
-      throw new Error(`could not read ${opts.fstabPath} for a line of pool '${name}' to carry (${err instanceof Error ? err.message : String(err)}), and the pool is not mounted so its layout cannot be read — nothing was unmounted`)
-    }
+    const read = await readFstab(opts.fstabPath)
+    if (read.state === 'unreadable')
+      throw new Error(`could not read ${opts.fstabPath} for a line of pool '${name}' to carry (${read.reason}), and the pool is not mounted so its layout cannot be read — nothing was unmounted`)
+    // An absent fstab reads as an empty one: the pool then has no line to carry.
+    const current = read.state === 'read' ? read.text : ''
     const movable = findAhrPoolLine(current, name, pool.mountpoint)
     if (!movable || movable.spec !== lvPath || movable.disabled)
       throw new Error(`pool '${name}' is not mounted, so its layout cannot be read, and it has no line of its own in ${opts.fstabPath} to carry — nothing was unmounted. Mount it from the Hybrid RAID view, then try again`)

@@ -4,7 +4,7 @@ import type { JobQueue } from '../../jobs/queue.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -394,6 +394,20 @@ describe('cr.36 — the pool verbs re-gate in the job (ruling (j))', () => {
     await race(mountpointTo('/mnt/anas-nfs'), true, async () => {
       await writeFile(fstab(), FSTAB_WITH_NFS)
     }, 'CONFLICT', /already claimed in fstab/)
+  })
+
+  it('mountpoint: a directory at the fstab path → 503 UNAVAILABLE with its sentence, nothing run', async () => {
+    await serve()
+    // A fstab read that fails for a reason other than absence is neither absent
+    // nor empty: the door answers 503 with the reader's sentence before the job.
+    findmnt = FINDMNT_REAL_AHR0
+    await rm(fstab(), { force: true })
+    await mkdir(fstab())
+    const res = await send(mountpointTo('/mnt/anas-nfs'))
+    assert.equal(res.statusCode, 503, res.body)
+    assert.equal(res.json().error.code, 'UNAVAILABLE')
+    assert.equal(res.json().error.message, `${fstab()} could not be read (EISDIR). Check the file, then try again.`)
+    assert.deepEqual(calls.filter(isMutation), [], 'no mutating argv')
   })
 
   it('mountpoint: another dataset takes the path → CONFLICT naming it, no zfs set', async () => {

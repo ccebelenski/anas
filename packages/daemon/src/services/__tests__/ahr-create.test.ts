@@ -916,6 +916,26 @@ describe('changeAhrMountpoint — the move never chains a missing parent (cr.52s
     assert.equal(await stat(join(dir, 'no-parent')).then(() => true, () => false), false, 'no chain was created')
     assert.equal(executor.calls.some(c => c.command === '/usr/bin/mount'), false, 'the refused move never mounted at a path it could not make')
   })
+
+  it('a move of a pool whose layout could not be read refuses on an unreadable fstab, naming EISDIR, before anything is unmounted', async () => {
+    const fstabDir = join(dir, 'fstab-dir')
+    await mkdir(fstabDir) // a directory where the fstab should be: the read fails EISDIR
+    const executor = new MockExecutor()
+    for (const command of ['/usr/bin/umount', '/usr/bin/mount', '/usr/bin/systemctl'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+    await assert.rejects(
+      changeAhrMountpoint(
+        executor,
+        // mounted, so a refusal that came after the unmount would show as a umount call
+        { name: 'tank', mountpoint: '/mnt/old-here', mounted: true, subvolLayout: null },
+        join(dir, 'moved'),
+        () => {},
+        { fstabPath: fstabDir },
+      ),
+      /\(EISDIR\).*nothing was unmounted/,
+    )
+    assert.equal(executor.calls.some(c => c.command === '/usr/bin/umount'), false, 'no umount was run')
+  })
 })
 
 describe('remountAhrPool — the result is VERIFIED, never assumed (cr.52s-f F7)', () => {

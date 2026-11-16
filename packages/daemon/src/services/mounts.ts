@@ -34,6 +34,7 @@ import { zodIssue } from '../validation.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { duplicateKeySentence } from './config-duplicates.js'
 import { readConfig, writeFileAtomic } from './config-writer.js'
+import { readFstabAbsentAsEmpty } from './fstab-file.js'
 import { liveAtTarget } from './mount-match.js'
 import { execSystemctlShow } from './unit-run-status.js'
 
@@ -434,7 +435,7 @@ export async function collectMountWarnings(
 ): Promise<DashboardWarning[]> {
   const [findmntText, fstabText, pveMountPaths, mdadmConfText] = await Promise.all([
     readFindmntTable(executor),
-    readConfig(opts.fstabPath),
+    readFstabAbsentAsEmpty(opts.fstabPath),
     readPveMountPathsStrict(opts.storagePath ?? PVE_STORAGE_CFG),
     opts.mdadmConfPath ? readMdadmConfText(opts.mdadmConfPath) : Promise.resolve(''),
   ])
@@ -1898,7 +1899,7 @@ export async function buildMountDetail(
   // null and the detail says unknown, never "not currently mounted".
   const [table, fstabText, pveMountPaths, mdadmConfText] = await Promise.all([
     readFindmntTable(executor),
-    readConfig(opts.fstabPath),
+    readFstabAbsentAsEmpty(opts.fstabPath),
     // cr3.mounts follow-up (4): strict — unreadable is null, carried as
     // `pveOwnershipUnknown`, never "not PVE's".
     readPveMountPathsStrict(opts.storagePath ?? PVE_STORAGE_CFG),

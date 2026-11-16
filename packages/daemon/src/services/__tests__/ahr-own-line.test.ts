@@ -139,6 +139,17 @@ describe('AHR re-mounts use the pool\'s own fstab line as stored (cr.52s-a, revi
     assert.equal((await readAhrPoolLine(fstabPath, 'other')).kind, 'none')
     assert.equal((await readAhrPoolLine(join(dir, 'missing-fstab'), 'tank')).kind, 'unreadable')
   })
+
+  it('a missing fstab answers readAhrPoolLine unreadable with the detail the file does not exist', async () => {
+    const line = await readAhrPoolLine(join(dir, 'missing-fstab'), 'tank')
+    assert.deepEqual(line, { kind: 'unreadable', detail: 'the file does not exist' })
+  })
+
+  it('a directory at the fstab path answers readAhrPoolLine unreadable with the detail EISDIR', async () => {
+    await mkdir(join(dir, 'fstab-dir'))
+    const line = await readAhrPoolLine(join(dir, 'fstab-dir'), 'tank')
+    assert.deepEqual(line, { kind: 'unreadable', detail: 'EISDIR' })
+  })
 })
 
 /**

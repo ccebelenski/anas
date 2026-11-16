@@ -14,13 +14,14 @@ import { guardCheck, guarded, GuardRefusalError } from '../safety/guard.js'
 import { IdentityMismatchError } from '../safety/stable-id.js'
 import { cachedVgNames, notifyCacheRecoveryFailed, recoverFailedAhrCache } from './ahr-cache.js'
 import { resumeExpansion } from './ahr-expand-resume.js'
-import { defaultAhrFstabPath, mountAhrPool, readAhrPoolLine } from './ahr-fstab.js'
+import { mountAhrPool, readAhrPoolLine } from './ahr-fstab.js'
 import { ahrGuard } from './ahr-guard.js'
 import { isIntentStale, isOwnedArray, normalizeMdUuid, pinnedUuids, poolPvNames, readAhrPoolIdentity, readMdadmConfDoc, readNamedMdArrays, resolveMdadmConfPath } from './ahr-identity.js'
 import { defaultAhrIntentDir, listIntents, writeIntent } from './ahr-intent.js'
 import { ANAS_MD_EVENT_HOOK, installProgramHook } from './ahr-mdadm-conf.js'
 import { isSubvolLayoutMount } from './ahr-snapshots.js'
 import { AhrTopologyUnreadableError, readAhrPools } from './ahr-topology.js'
+import { configuredFstabPath } from './fstab-file.js'
 import { mountTargetRefusal } from './mounts.js'
 import { pveNotify } from './pve-notify.js'
 import { UDEVADM, UDEVADM_SETTLE_BUDGET_MS, udevSettleArgs } from './udev-settle.js'
@@ -563,7 +564,7 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
           // pool left unmounted gets its own notice naming the mount step,
           // never "could not drop the cache". And an fstab that could not be
           // READ is said so (P1), never reported as "no line".
-          const fstabPath = opts.fstabPath ?? defaultAhrFstabPath()
+          const fstabPath = opts.fstabPath ?? configuredFstabPath()
           const line = await readAhrPoolLine(fstabPath, target.name)
           const leftUnmounted = async (why: string): Promise<void> => {
             await pveNotify(

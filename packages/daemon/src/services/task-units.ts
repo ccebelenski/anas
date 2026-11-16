@@ -13,6 +13,7 @@ import { z } from 'zod'
 import { JobCancelledError } from '../jobs/queue.js'
 import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
 import { writeFileAtomic } from './config-writer.js'
+import { errorWord } from './error-word.js'
 import { deriveRunResult as deriveSystemdRunResult, parseSystemdTimestamp } from './systemd-status.js'
 import { listServiceUnits, parseMarkedJson, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
 import {
@@ -229,10 +230,6 @@ export async function readAllTaskUnitsChecked<T>(
       unreadable.push({ name, reason: `its unit file ${file} carries no valid ${kind.marker.replace(MARKER_EQUALS_RE, '')} JSON` })
   }
   return { tasks, unreadable }
-}
-
-function errorWord(err: unknown): string {
-  return (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err))
 }
 
 /**

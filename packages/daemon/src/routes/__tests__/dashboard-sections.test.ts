@@ -81,6 +81,11 @@ describe('cr.35 readDashboardSection: done, timed out, failed, late', () => {
     assert.equal(r.unavailable?.reason, 'its read did not finish within 30 ms')
   })
 
+  it('a reason that is a whole sentence ends in one period on the card, not two', () => {
+    const [card] = buildUnavailableWarnings([{ section: 'mounts', reason: '/etc/fstab could not be read (EACCES). Check the file, then try again.' }])
+    assert.match(card!.message, /: \/etc\/fstab could not be read \(EACCES\)\. Check the file, then try again\. The rest of the dashboard is current\.$/)
+  })
+
   it('the card: what is missing, why, and that the rest is current', () => {
     assert.deepEqual(buildUnavailableWarnings([{ section: 'disks', reason: '\'zpool status\' did not finish within 10 s and was stopped' }]), [{
       level: 'warning',

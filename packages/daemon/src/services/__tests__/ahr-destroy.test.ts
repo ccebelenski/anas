@@ -974,8 +974,12 @@ describe('destroyAhrPool — the LVM teardown gate (H6)', () => {
     it('an unreadable fstab stops the destroy before the unmount, too', async () => {
       const executor = foreignWorld([{ pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' }])
       await rm(fstabPath)
-      await mkdir(fstabPath) // reading a directory throws EISDIR — not ENOENT
-      await assert.rejects(destroyAhrPool(executor, pool(FOREIGN_MP), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }))
+      await mkdir(fstabPath) // reading a directory fails EISDIR — not absent
+      await assert.rejects(
+        destroyAhrPool(executor, pool(FOREIGN_MP), m => progress.push(m), { fstabPath, mdadmConfPath: confPath }),
+        { message: `${fstabPath} could not be read (EISDIR). Check the file, then try again.` },
+      )
+      // Nothing but reads ran: no umount, no write.
       assert.deepEqual(acts(executor), [])
     })
   })

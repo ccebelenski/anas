@@ -74,6 +74,7 @@ import {
   writeTaskUnits,
 } from '../services/cloud-units.js'
 import { ConfigConflictError } from '../services/config-writer.js'
+import { configuredFstabPath } from '../services/fstab-file.js'
 import { carriesViewMarker, normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, remoteSectionIdentity, remotesReferencing, remotesWithHiddenReferences, removeRemote, trimProviders, viewMarkerRefusal, whitespaceSecretRefusal, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
 import { pathSourceClaims, unlockedSourcesLine } from '../services/source-claims.js'
@@ -285,7 +286,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
   const { executor, jobQueue, paths } = opts
   const available = opts.rcloneAvailable ?? rcloneIsInstalled
   const systemdDir = opts.systemdDir ?? DEFAULT_SYSTEMD_DIR
-  const fstabPath = opts.fstabPath ?? '/etc/fstab'
+  const fstabPath = opts.fstabPath ?? configuredFstabPath()
   // The real store answers the remotes DELETE refusal now that it exists
   // (rclone.1 shipped the hook against an empty store).
   const referencingTasks = opts.referencingTasks ?? (name => tasksReferencingRemote(systemdDir, name))

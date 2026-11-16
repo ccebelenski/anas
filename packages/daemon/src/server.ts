@@ -53,6 +53,7 @@ import { ahrMountBase as resolveAhrMountBase } from './services/ahr-paths.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, AhrTopologyUnreadableError } from './services/ahr-topology.js'
 import { defaultBackupReposPaths } from './services/backup-repos.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
+import { configuredFstabPath, FstabUnreadableError } from './services/fstab-file.js'
 import { deviceStatSeamFromEnv } from './services/iscsi-served.js'
 import { defaultRcloneConfigPaths, RCLONE, rcloneBaseArgs } from './services/rclone-config.js'
 import { defaultRemotesPaths } from './services/replication-remotes.js'
@@ -263,6 +264,14 @@ export function createServer(opts?: ServerOptions) {
         error: { code: 'UNAVAILABLE', message: error.message },
       })
     }
+    // A read of the fstab that found a file it could not read throws
+    // FstabUnreadableError (services/fstab-file.ts); the door answers 503 with its sentence.
+    if (error instanceof FstabUnreadableError) {
+      request.log.warn(`fstab unreadable on ${request.method} ${request.url}: ${error.message}`)
+      return reply.code(503).send({
+        error: { code: 'UNAVAILABLE', message: error.message },
+      })
+    }
     if (!(error instanceof CommandTimeoutError))
       throw error
     request.log.warn(`command timeout on ${request.method} ${request.url}: ${error.message}`)
@@ -315,7 +324,7 @@ export function createServer(opts?: ServerOptions) {
   // (per-mount 0600 root-only files); dev mock uses a throwaway temp dir. PVE
   // storage.cfg is parsed READ-ONLY for hands-off tagging.
   const envFstabPath = process.env.ANAS_FSTAB_PATH
-  let fstabPath = envFstabPath ?? '/etc/fstab'
+  let fstabPath = configuredFstabPath()
 
   // AHR mutation-layer paths (Epic 11 + AHR): mdadm.conf (surgical ARRAY-pin
   // edits) and the pool mount base. Env-overridable for tests/stunt; dev mock

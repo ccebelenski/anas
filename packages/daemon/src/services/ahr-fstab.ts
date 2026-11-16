@@ -1,7 +1,7 @@
 import type { MountEntry } from '@anas/shared'
-import { readFile } from 'node:fs/promises'
 import { directMountOptionArgs, parseFstab } from '../parsers/fstab.js'
 import { ahrLvPath } from './ahr-paths.js'
+import { readFstab } from './fstab-file.js'
 import { mountThroughOpenedDir } from './mounts.js'
 
 /** The `@data` subvolume — the mounted tree of a subvol-layout pool (§12). */
@@ -116,17 +116,14 @@ export function isAhrPoolOwnLine(entry: MountEntry, name: string): boolean {
   return entry.spec === ahrLvPath(name) && !isAhrSnapshotsLine(entry)
 }
 
-/** The fstab the daemon was configured with when a caller has no path to hand (the server's own default). */
-export function defaultAhrFstabPath(): string {
-  return process.env.ANAS_FSTAB_PATH ?? '/etc/fstab'
-}
-
 /**
  * The pool's OWN fstab line as stored, three-valued (cr.52s-a): `line` — the
  * active line whose spec is the pool's LV path; `none` — the file was read and
  * carries no such active line; `unreadable` — the file could not be read, which
  * is never reported as "no line" (a read that could not see never answers
- * "nothing there").
+ * "nothing there"). A missing file is answered `unreadable` here too (detail
+ * `the file does not exist`): a pool whose fstab is gone is never remounted on
+ * ANAS's defaults as if it simply had no line.
  */
 export type AhrPoolLine
   = | { kind: 'line', entry: MountEntry }
@@ -134,14 +131,12 @@ export type AhrPoolLine
     | { kind: 'unreadable', detail: string }
 
 export async function readAhrPoolLine(fstabPath: string, name: string): Promise<AhrPoolLine> {
-  let text: string
-  try {
-    text = await readFile(fstabPath, 'utf8')
-  }
-  catch (err) {
-    return { kind: 'unreadable', detail: err instanceof Error ? err.message : String(err) }
-  }
-  const entry = parseFstab(text).find(e => isAhrPoolOwnLine(e, name) && !e.disabled)
+  const read = await readFstab(fstabPath)
+  if (read.state === 'unreadable')
+    return { kind: 'unreadable', detail: read.reason }
+  if (read.state === 'absent')
+    return { kind: 'unreadable', detail: 'the file does not exist' }
+  const entry = parseFstab(read.text).find(e => isAhrPoolOwnLine(e, name) && !e.disabled)
   return entry ? { kind: 'line', entry } : { kind: 'none' }
 }
 

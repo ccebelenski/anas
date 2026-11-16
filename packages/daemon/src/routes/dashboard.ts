@@ -825,6 +825,8 @@ const SECTION_TITLE: Readonly<Record<DashboardSection, string>> = {
   iscsi: 'iSCSI status',
 }
 
+const TRAILING_PERIOD_RE = /\.$/
+
 /**
  * cr.35: one `unavailable` card per section that could not be read — what is
  * missing, the command that did not answer, and that the rest is current.
@@ -835,7 +837,9 @@ export function buildUnavailableWarnings(sections: UnavailableSection[]): Dashbo
   return sections.map(u => ({
     level: 'warning',
     category: 'unavailable',
-    message: `${SECTION_TITLE[u.section]} is unavailable: ${u.reason}. The rest of the dashboard is current.`,
+    // A reason may be a whole sentence of its own (a failed read's sentence
+    // ends in a period): the card never doubles it.
+    message: `${SECTION_TITLE[u.section]} is unavailable: ${u.reason.replace(TRAILING_PERIOD_RE, '')}. The rest of the dashboard is current.`,
   }))
 }
 

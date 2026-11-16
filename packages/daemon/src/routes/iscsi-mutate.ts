@@ -27,6 +27,7 @@ import {
 import { readNodeInitiatorName } from '../parsers/iscsi-initiator.js'
 import { guardCheck, guardConfirm, GuardRefusalError, iscsiTargetClaim, sendRefusal as sendGuardRefusal } from '../safety/guard.js'
 import { ensureAhrTargetOrdering } from '../services/ahr-create.js'
+import { configuredFstabPath } from '../services/fstab-file.js'
 import { CONFIGFS_TARGET_ROOT, lunsMappingBackstore } from '../services/iscsi-configfs.js'
 import {
   conflict,
@@ -286,7 +287,7 @@ function sendRefusal(reply: FastifyReply, refusal: IscsiRefusal): FastifyReply {
 }
 
 export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMutateRouteOptions) {
-  const { executor, jobQueue, confirmStore, fstabPath = '/etc/fstab', ...paths } = opts
+  const { executor, jobQueue, confirmStore, fstabPath = configuredFstabPath(), ...paths } = opts
   const configfsRoot = paths.configfsRoot ?? CONFIGFS_TARGET_ROOT
   /** cr3.lunrestore (review2 D): what the job records say about a backing. */
   const restoreJobs = restoreJobsOf(jobQueue)

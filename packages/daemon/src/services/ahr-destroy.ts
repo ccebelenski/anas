@@ -16,6 +16,7 @@ import { unpinArrays } from './ahr-mdadm-conf.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, dmName, indexLsblk, isLsblkTree, stripSubvolSuffix } from './ahr-topology.js'
 import { editConfig, readConfig } from './config-writer.js'
+import { readFstabAbsentAsEmpty } from './fstab-file.js'
 import { ahrSnapshotsMountpoint } from './share-selfservice.js'
 
 /**
@@ -489,7 +490,7 @@ export async function destroyAhrPool(
   // before anything changed.
   // The failed create's rollback (cr3 AHR-CORE-H1) removes ONLY the lines it
   // wrote — never "every line at the path", which took another pool's line.
-  const fstabText = await readConfig(opts.fstabPath)
+  const fstabText = await readFstabAbsentAsEmpty(opts.fstabPath)
   // cr3 review2 7: the pool's lines are found by IDENTITY — the spec ANAS
   // writes for this pool's LV (its own line and the @snapshots line) — never
   // by path: removing "the first line at the mountpoint" took an operator's

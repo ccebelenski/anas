@@ -6,6 +6,7 @@ import { parseSmbConf } from '../parsers/smb-conf.js'
 import { BACKUP_UNIT_KIND, readAllTasks as readAllBackupTasks } from './backup-units.js'
 import { CLOUD_UNIT_KIND, readAllTasks as readAllCloudTasks } from './cloud-units.js'
 import { readConfig } from './config-writer.js'
+import { readFstab } from './fstab-file.js'
 import { readAllTasksChecked as readAllReplicationTasks } from './replication-units.js'
 import { readScrubSchedule, SCRUB_SERVICE_NAME } from './scrub-schedule-units.js'
 import { readScheduleList } from './snapshot-schedule-units.js'
@@ -315,16 +316,17 @@ export async function readPoolReferences(ctx: PoolReferenceContext): Promise<Poo
   // --- ANAS mounts (fstab) whose mountpoint is under the pool — never the
   // pool's own filesystem (cr.31 D3) ------------------------------------------
   if (ctx.fstabPath && wanted('mount')) {
-    const fstabText = await readConfigOr(ctx.fstabPath)
-    if (fstabText.readable) {
-      for (const entry of parseFstab(fstabText.text)) {
+    const fstab = await readFstab(ctx.fstabPath)
+    if (fstab.state === 'read') {
+      for (const entry of parseFstab(fstab.text)) {
         if (onPoolPath(entry.mountpoint) && !isOwnMount(entry, ctx))
           refs.push({ kind: 'mount', name: entry.mountpoint, path: entry.mountpoint })
       }
     }
-    else {
+    else if (fstab.state === 'unreadable') {
       unreadableSources.push({ kind: 'mount', unreadable: true })
     }
+    // An absent fstab configures no mounts.
   }
 
   return { refs, unreadableSources }

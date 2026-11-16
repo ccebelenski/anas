@@ -11,8 +11,9 @@ import {
   parseBtrfsSubvolList,
 } from '../parsers/btrfs-subvol-list.js'
 import { run } from './ahr-exec.js'
-import { ahrPoolLineForRemount, defaultAhrFstabPath, mountAhrPool, SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-fstab.js'
+import { ahrPoolLineForRemount, mountAhrPool, SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-fstab.js'
 import { diagnoseBusyPath, formatHolders } from './busy-diagnosis.js'
+import { configuredFstabPath } from './fstab-file.js'
 import { mountThroughOpenedDir } from './mounts.js'
 
 /**
@@ -434,7 +435,7 @@ export async function rollbackAhrSnapshot(
   // read now, before anything is unmounted, so an unreadable fstab refuses
   // with nothing done (a pool with no line re-mounts with ANAS's defaults, and
   // the progress says so).
-  const line = await ahrPoolLineForRemount(opts?.fstabPath ?? defaultAhrFstabPath(), pool.name, updateProgress)
+  const line = await ahrPoolLineForRemount(opts?.fstabPath ?? configuredFstabPath(), pool.name, updateProgress)
 
   if (pool.mounted) {
     updateProgress(`Unmounting ${pool.mountpoint}`)
