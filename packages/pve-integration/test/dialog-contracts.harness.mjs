@@ -3045,6 +3045,8 @@ async function pveReloadRestoreChecks() {
 const ISCSI_IQN = 'iqn.2026-08.nas.anas:vmstore'
 const ISCSI_FOREIGN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
 const ISCSI_INITIATOR = 'iqn.1993-08.org.debian:01:ae3d2ec18ad'
+// A second initiator, for a LUN with more than one known session.
+const ISCSI_INITIATOR_2 = 'iqn.2004-04.com.redhat:7e2b1c9d40f5'
 // The node's OWN initiator IQN, as `/etc/iscsi/initiatorname.iscsi` carries it —
 // the value "Add this node" inserts.
 const ISCSI_NODE_IQN = 'iqn.1993-08.org.debian:01:1dd0a338f783'
@@ -3124,7 +3126,10 @@ function iscsiDetail(opts = {}) {
         size: 2 * GiB_,
         serial: '9bc6e907-6015-4267-be4f-5a0617cb3d71',
         attributes: { emulateTpu: true, emulateTpws: true, blockSize: 512, writeBack: false, maxUnmapLbaCount: 524288 },
-        connectedInitiators: opts.session && (opts.sessionLun ?? 0) === 0 ? [ISCSI_INITIATOR] : [],
+        connectedInitiators: opts.connected
+          ? [ISCSI_INITIATOR, ISCSI_INITIATOR_2].slice(0, opts.connected)
+          : (opts.session && (opts.sessionLun ?? 0) === 0 ? [ISCSI_INITIATOR] : []),
+        connectedInitiatorsUnknown: opts.sessionsUnknown === true,
         present: true,
         backingExists: true,
         pool: 'tank',
@@ -4118,6 +4123,66 @@ async function iscsiSessionGatingChecks() {
     !/NOT AUTHENTICATED/.test(String(panel.html)), panel.html)
 
   ok('session: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ---------------------------------------------------------------------------
+//  own.4 (d): the resize dialog's session note asks the daemon's one question
+//  (heldWithSessions: a known session, OR one that could not be read). With
+//  sessions that could not be read it must NOT fall silent as if nobody were
+//  logged in: the grow is still allowed on a zvol, but the operator is told
+//  the state is unknown and what an unknown logged-in initiator keeps.
+// ---------------------------------------------------------------------------
+
+/** Open the ZVOL LUN's resize dialog on a detail fixture and return its note. */
+async function resizeNoteFor(detailOpts) {
+  const routes = {
+    ...ISCSI_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: iscsiDetail(detailOpts) },
+  }
+  const { grid } = await openIscsiView(routes)
+  const lunsWin = await openLuns(grid, routes)
+  const lunsGrid = lunsWin.down('#lunsGrid')
+  lunsGrid.selectRow(0) // the ZVOL LUN
+  const btn = lunsGrid.down('#lunResize')
+  btn.handler(btn)
+  await settle()
+  const dlg = openWindow()
+  ok(`resize(note,${JSON.stringify(detailOpts)}): the window opened`, !!dlg && !!dlg.down('#resizeNote'))
+  const note = dlg ? String(dlg.down('#resizeNote').html) : ''
+  if (dlg) {
+    dlg.close()
+    await settle()
+  }
+  return note
+}
+
+async function iscsiResizeSessionNoteChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  // (a) two KNOWN sessions: the counted sentence, not the unknown one.
+  const counted = await resizeNoteFor({ connected: 2 })
+  ok('resize(note): two known sessions are COUNTED, each to rescan',
+    /2 initiators are logged in now/.test(counted)
+    && /iscsiadm -m node -R/.test(counted) && /grown separately/.test(counted), counted)
+  ok('resize(note): a known session state never claims it could not be read',
+    !/could not be read/.test(counted), counted)
+
+  // (b) zero known sessions AND the session list could not be read: the note
+  // says so, and counts nothing it did not read.
+  const unknown = await resizeNoteFor({ sessionsUnknown: true })
+  ok('resize(note): an unreadable session state is SAID, with the rescan and the filesystem grow',
+    /Whether an initiator is logged in could not be read/.test(unknown)
+    && /iscsiadm -m node -R/.test(unknown) && /grown separately/.test(unknown), unknown)
+  ok('resize(note): and no session is counted that could not be read',
+    !/logged in now/.test(unknown), unknown)
+
+  // (c) zero sessions, all readable: neither sentence, just the plain zvol text.
+  const quiet = await resizeNoteFor({})
+  ok('resize(note): with nobody logged in the note adds no session sentence',
+    !/logged in now/.test(quiet) && !/could not be read/.test(quiet), quiet)
+  ok('resize(note): and the plain zvol sentence is still there',
+    /grows live/.test(quiet), quiet)
+
+  ok('resize(note): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 // ---------------------------------------------------------------------------
@@ -11112,6 +11177,7 @@ for (const check of [
   iscsiPveSkewChecks,
   iscsiResizeAndDeleteChecks,
   iscsiSessionGatingChecks,
+  iscsiResizeSessionNoteChecks,
   iscsiTargetDeleteChecks,
   iscsiForeignLunChecks,
   iscsiAddressFallbackChecks,

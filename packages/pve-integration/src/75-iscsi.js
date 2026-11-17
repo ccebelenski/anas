@@ -2585,6 +2585,18 @@
     }
 
     /**
+     * Might an initiator be using this LUN right now? The panel's ONE ask of
+     * the daemon's rule (heldWithSessions, iscsi-held.ts): a known session,
+     * OR one that could not be read (cr3: an unreadable session counts as
+     * one, fail closed). `get` is the record's own key accessor, so every
+     * gate asks in this one place.
+     */
+    function lunMaybeInUse(get) {
+        return (get('connectedInitiators') || []).length > 0
+            || get('connectedInitiatorsUnknown') === true;
+    }
+
+    /**
      * THE in-place restore verdict — one computation for EVERY door
      * (backup2.10 fix-up 2026-08-29). The toolbar applies it to its grid
      * record; the unified restore dialog (68-backup.js) applies it to the LUN
@@ -2611,8 +2623,7 @@
             : function (k) { return lun[k]; };
         var kind = '' + (get('kind') || '');
         var kindOk = kind !== 'foreign' && kind !== 'unresolved';
-        // cr3: a session that could not be read counts as one (fail closed).
-        var live = (get('connectedInitiators') || []).length > 0 || get('connectedInitiatorsUnknown') === true;
+        var live = lunMaybeInUse(get);
         if (live) {
             return {
                 allowed: false,
@@ -2649,7 +2660,7 @@
         var foreign = win.anasForeign === true;
         var rec = selectedLun(win);
         var has = !!rec;
-        var live = has && ((rec.get('connectedInitiators') || []).length > 0 || rec.get('connectedInitiatorsUnknown') === true);
+        var live = has && lunMaybeInUse(function (k) { return rec.get(k); });
         // A resize needs a backing object ANAS manages AND one that is actually
         // there: an `unresolved` LUN's zvol or image is not on this node right
         // now, so there is nothing to grow (story iscsi.5).
@@ -3698,7 +3709,11 @@
             return;
         }
         var isFile = rec.get('kind') === 'file';
+        // The note tells the three states of the session read apart (known
+        // sessions, none, not readable), so it reads both facts; the boolean
+        // gate rule itself lives in lunMaybeInUse, not here.
         var liveNow = (rec.get('connectedInitiators') || []).length;
+        var sessionsUnknown = rec.get('connectedInitiatorsUnknown') === true;
         var split = splitSize(current);
         var win;
         try {
@@ -3762,12 +3777,17 @@
                                 : t('A ZFS volume grows live: nothing on the iSCSI side changes and the initiator '
                                     + 'sees the new size after a rescan. Shrinking is refused — ZFS truncates '
                                     + 'silently, even under a live session.')
-                                + (liveNow
-                                    ? ' ' + t('' + liveNow + (liveNow === 1 ? ' initiator is' : ' initiators are')
-                                        + ' logged in now: the grow is allowed and safe, but each one keeps showing '
-                                        + 'the OLD size until it rescans (open-iscsi: iscsiadm -m node -R), and the '
+                                + (sessionsUnknown
+                                    ? ' ' + t('Whether an initiator is logged in could not be read: the grow is '
+                                        + 'allowed and safe, but an initiator that is logged in keeps showing the '
+                                        + 'OLD size until it rescans (open-iscsi: iscsiadm -m node -R), and the '
                                         + 'filesystem on top has to be grown separately.')
-                                    : ''))
+                                    : (liveNow
+                                        ? ' ' + t('' + liveNow + (liveNow === 1 ? ' initiator is' : ' initiators are')
+                                            + ' logged in now: the grow is allowed and safe, but each one keeps '
+                                            + 'showing the OLD size until it rescans (open-iscsi: iscsiadm -m node -R), '
+                                            + 'and the filesystem on top has to be grown separately.')
+                                        : '')))
                         }
                     ]
                 }],
