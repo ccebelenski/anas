@@ -1,9 +1,11 @@
+import type { IscsiHeldByLun } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
-import type { ConfigfsOptions, LunHolder } from './iscsi-configfs.js'
+import type { HeldByLunSubject } from './iscsi-held.js'
+import type { IscsiPaths } from './iscsi.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { zvolDevicePath } from '@anas/shared'
-import { describeLunHolder, describeUnmappedHolder, lunHoldingDevice, unmappedBackstoreHoldingDevice } from './iscsi-configfs.js'
+import { pickHolder } from './iscsi-held.js'
+import { iscsiClaims } from './iscsi-mutate.js'
 
 /**
  * Busy-unmount root-cause diagnosis (story 3.29, docs/EPICS-HISTORY.md Epic 3;
@@ -34,7 +36,8 @@ import { describeLunHolder, describeUnmappedHolder, lunHoldingDevice, unmappedBa
  * `udev_path`. So a `zpool export` or a `zfs destroy` that hits `dataset is
  * busy` because of a LUN produces, today, a busy error with an EMPTY holder
  * list: the worst possible answer, because it reads as "nothing is holding it,
- * try again". {@link diagnoseLunHolder} asks configfs, and when it answers,
+ * try again". {@link diagnoseIscsiHolder} asks the iSCSI claims — the same list
+ * every refusal door asks — and when it answers,
  * `fuser` is NOT consulted at all — it has nothing to add and its silence is
  * exactly what made the original message useless. Same fail-open posture as
  * every other branch: no LIO, no match, any throw ⇒ fall straight through to
@@ -74,11 +77,12 @@ export interface BusyHolder {
 }
 
 /**
- * Injection points for the two diagnoses. `root`/`blockRoot` come from
- * {@link ConfigfsOptions} and are the LIO configfs tree — overridable so a test
- * (and a dev box with no LIO) never reads the kernel.
+ * Injection points for the two diagnoses. The iSCSI paths come from
+ * {@link IscsiPaths} — configfs root, saveconfig, and the read's seams —
+ * overridable so a test (and a dev box with no LIO) never reads the kernel's
+ * target tree, LIO's saved configuration or PVE's storage.cfg.
  */
-export interface BusyDiagnosisOptions extends ConfigfsOptions {
+export interface BusyDiagnosisOptions extends IscsiPaths {
   /** /proc root — overridable so `/proc/<pid>/comm` reads are testable. */
   procRoot?: string
   /**
@@ -235,72 +239,55 @@ export async function diagnoseBusyPath(
 }
 
 /**
- * The LIO branch (story `iscsi.6`): which iSCSI LUN, if any, is holding this?
- *
- * Tries each identity the caller and the message between them can supply, in
- * order of certainty:
+ * The iSCSI branch (story `iscsi.6`): which LUN, if any, is holding
+ * this — as a VIEW over the claim list, which is itself the complete answer to
+ * "what holds this backing for iSCSI" (`iscsiClaims`). This function walks
+ * nothing: it reads the claims ONCE, keeps the ones that can explain a kernel
+ * busy — only a claim whose backstore is live can be a hold the kernel feels,
+ * so `backstoreMissing === true` is filtered out — and asks `pickHolder` for
+ * each identity the caller and the message between them can supply, in order
+ * of certainty:
  *
  *   1. the caller's known path (a mountpoint, an image file, a device node);
  *   2. the path the busy message quotes;
- *   3. `/dev/zvol/<dataset>` for the dataset the caller knows or the message
- *      quotes — the stable by-name path LIO actually stores (never `/dev/zdN`,
- *      GT-48).
+ *   3. the dataset the caller knows or the message quotes.
  *
- * A directory argument also matches any LUN backed by a file underneath it,
- * which is what a busy `zpool export` or a busy dataset destroy needs.
+ * A directory subject also matches any LUN whose backing lives underneath it,
+ * and a dataset subject matches a LUN whose image file lives in that dataset
+ * or below — `pickHolder`'s rules, shared with every refusal door, so the
+ * busy clause and the refusal sentence can never disagree.
  *
- * FAIL-OPEN: no LIO, no configfs, no match, any throw ⇒ null, and the caller
- * falls through to the process-based diagnosis exactly as before.
+ * FAIL-OPEN: no LIO, no match, any throw — including the claims read THROWING
+ * on a configfs tree it could not list in full — ⇒ null, and the caller falls
+ * through to the process-based diagnosis exactly as before.
  */
-export async function diagnoseLunHolder(
+export async function diagnoseIscsiHolder(
+  executor: CommandExecutor,
   errorText: string,
   path?: string,
   opts?: BusyDiagnosisOptions,
-): Promise<LunHolder | null> {
-  const dataset = opts?.dataset ?? extractBusyDataset(errorText)
-  const candidates = [
-    path,
-    extractBusyPath(errorText),
-    dataset ? zvolDevicePath(dataset) : null,
-  ]
-  for (const candidate of candidates) {
-    if (!candidate)
-      continue
-    try {
-      const holder = await lunHoldingDevice(candidate, opts)
-      if (holder)
-        return holder
+): Promise<IscsiHeldByLun | null> {
+  try {
+    const { claims } = await iscsiClaims(executor, opts ?? {})
+    const kernelHolds = claims.filter(c => c.backstoreMissing !== true)
+    const dataset = opts?.dataset ?? extractBusyDataset(errorText)
+    const quoted = extractBusyPath(errorText)
+    const subjects: HeldByLunSubject[] = [
+      ...(path !== undefined ? [{ path }] : []),
+      ...(quoted !== null ? [{ path: quoted }] : []),
+      ...(dataset !== null ? [{ dataset }] : []),
+    ]
+    for (const subject of subjects) {
+      const held = pickHolder(kernelHolds, subject)
+      if (held)
+        return held
     }
-    catch {
-      // Unreadable configfs — fall through to the next candidate, then to fuser.
-    }
+    return null
   }
-  return null
-}
-
-/**
- * cr3.lunrestore (review N7): the same candidates as {@link diagnoseLunHolder},
- * asked of the backstores no LUN maps. Fail-open: null.
- */
-export async function diagnoseUnmappedHolder(
-  errorText: string,
-  path?: string,
-  opts?: BusyDiagnosisOptions,
-): Promise<{ backstoreName: string, plugin: string, backingPath: string } | null> {
-  const dataset = opts?.dataset ?? extractBusyDataset(errorText)
-  for (const candidate of [path, extractBusyPath(errorText), dataset ? zvolDevicePath(dataset) : null]) {
-    if (!candidate)
-      continue
-    try {
-      const holder = await unmappedBackstoreHoldingDevice(candidate, opts)
-      if (holder)
-        return holder
-    }
-    catch {
-      // Unreadable configfs — fall through, as the LUN branch does.
-    }
+  catch {
+    // The claims could not be read — name no iSCSI holder and let fuser answer.
+    return null
   }
-  return null
 }
 
 /**
@@ -314,9 +301,10 @@ export async function diagnoseUnmappedHolder(
  *
  * TWO diagnoses, tried in that order and never both (story `iscsi.6`):
  *
- *   1. **the LIO branch** — configfs knows whether the kernel target is serving
- *      this object. When it is, `fuser` is NOT run: it would return nothing
- *      (GT-41) and "held open by: " with an empty list is worse than silence.
+ *   1. **the iSCSI branch** — the claims say whether the kernel target is
+ *      serving this object. When it is, `fuser` is NOT run: it would return
+ *      nothing (GT-41) and "held open by: " with an empty list is worse than
+ *      silence. The appended sentence is the claim's own `detail`.
  *   2. **the process branch** — the original 3.29 `fuser`/`comm` diagnosis,
  *      byte-for-byte unchanged for every path LIO is not holding.
  */
@@ -328,14 +316,11 @@ export async function enrichBusyError(
 ): Promise<string> {
   if (!isBusyError(errorText))
     return errorText
-  // The one holder `fuser` cannot see. Asked first, and answered exclusively.
-  const lun = await diagnoseLunHolder(errorText, path, opts)
-  if (lun)
-    return `${errorText} — ${describeLunHolder(lun)}`
-  // cr3.lunrestore (review N7): a backstore no LUN maps holds the object too.
-  const unmapped = await diagnoseUnmappedHolder(errorText, path, opts)
-  if (unmapped)
-    return `${errorText} — ${describeUnmappedHolder(unmapped)}`
+  // The one holder `fuser` cannot see: a mapped LUN, a saved LUN missing live,
+  // or a backstore no LUN maps — the claims carry all three, with the sentence.
+  const held = await diagnoseIscsiHolder(executor, errorText, path, opts)
+  if (held)
+    return `${errorText} — ${held.detail}`
   const target = path ?? extractBusyPath(errorText)
   if (!target)
     return errorText

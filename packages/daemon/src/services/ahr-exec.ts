@@ -46,8 +46,9 @@ export const UPDATE_INITRAMFS_BUDGET_MS = 600_000
 
 /**
  * Shared AHR exec helper: run a command, throw its stderr on non-zero exit.
- * A leaf module (executor types + busy-diagnosis, itself executor-types-only)
- * so every AHR service can import it without risking a cycle.
+ * Its only service import is busy-diagnosis, which reads the iSCSI claims;
+ * no module on that path imports this helper back, so every AHR service can
+ * import it without risking a cycle.
  *
  * When `opts.busyPath` is given and the failure is a busy-class one, the thrown
  * message names the processes holding the path open (story 3.29).

@@ -25,11 +25,11 @@ import { isLvmReport, lvIsActive, lvIsCacheTarget, LVS_ARGS, parseLvsReport, par
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { buildAhrCacheState, cacheFailedAdvisory, foreignVgPvAdvisory } from './ahr-cache-state.js'
+import { isSubvolLayoutMount } from './ahr-fstab.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { canonicalMdUuid, isOwnedArray, pinnedUuids, poolBandCount, poolPvNames, readMdadmConfDoc, readMdadmConfDocStrict } from './ahr-identity.js'
 import { readPoolIntent } from './ahr-intent.js'
 import { AHR_MIN_DISKS, floorToGranularity, isPvUnderSized } from './ahr-layout.js'
-import { isSubvolLayoutMount } from './ahr-snapshots.js'
 import { UDEVADM } from './udev-settle.js'
 
 /**

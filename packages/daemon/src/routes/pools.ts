@@ -25,7 +25,7 @@ import { ahrSliceLabelOwner, classifyPartitionWithReason } from '../services/ahr
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configuredFstabPath, readFstabAbsentAsEmpty } from '../services/fstab-file.js'
-import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, LIO_UNREADABLE_KEY, lioUnreadableAdvisory } from '../services/iscsi-held.js'
+import { createIscsiClaimCache, heldByLun, heldByLunRefusal, LIO_UNREADABLE_KEY, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { mountTargetGate, mountTargetRefusal, normalizeMountpointPath, swapStageGate, swapStageRefusal } from '../services/mounts.js'
 import { BLKID_AMBIVALENT, BLKID_FOUND, BLKID_NOTHING, blkidContentSignatures, blkidPartEntryName, LSBLK_NONE_FOUND, parsePartitionProbe, PART_BY_ID_RE, PARTITION_PROBE_ARGS } from '../services/partition-device.js'
 import { poolReferenceKey, poolReferenceWarning, poolUnreadableWarning, readPoolReferences } from '../services/pool-references.js'
@@ -2337,7 +2337,7 @@ export async function poolRoutes(
           // `zfs set mountpoint` unmounts to move — a busy pool blocks it; name
           // the holders (3.29). Path comes from the ZFS error (`cannot unmount`).
           const base = result.stderr.trim() || `zfs set mountpoint exited with code ${result.exitCode}`
-          throw new Error(await enrichBusyError(executor, base, undefined, configfsOptionsFrom(iscsiPaths)))
+          throw new Error(await enrichBusyError(executor, base, undefined, iscsiPaths))
         }
         return { pool: poolName, mountpoint: mp }
       }),
@@ -3214,7 +3214,7 @@ export async function poolRoutes(
           // ZFS's `pool or dataset is busy` names nothing `fuser` can find
           // (GT-41) — the LIO branch of the diagnosis does.
           const base = result.stderr.trim() || `zpool export exited with code ${result.exitCode}`
-          throw new Error(await enrichBusyError(executor, base, undefined, configfsOptionsFrom(iscsiPaths)))
+          throw new Error(await enrichBusyError(executor, base, undefined, iscsiPaths))
         }
 
         // pools.r1 (audit #22, review M6): create/import enable the pool's
@@ -3324,7 +3324,7 @@ export async function poolRoutes(
           // A busy destroy fails to unmount a dataset — name the holders (3.29).
           // The path comes from the ZFS error itself (`cannot unmount '<path>'`).
           const base = result.stderr.trim() || `zpool destroy exited with code ${result.exitCode}`
-          throw new Error(await enrichBusyError(executor, base, undefined, configfsOptionsFrom(iscsiPaths)))
+          throw new Error(await enrichBusyError(executor, base, undefined, iscsiPaths))
         }
 
         // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and

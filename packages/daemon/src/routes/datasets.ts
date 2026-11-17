@@ -21,7 +21,7 @@ import { readDatasetGuid, readPoolGuid, readRollbackIds } from '../safety/stable
 import { createAccessService, SET_ACCESS_PRESENTATION_ONLY, signedAccessRequest } from '../services/access.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
-import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal, lioUnreadableAdvisory } from '../services/iscsi-held.js'
+import { createIscsiClaimCache, heldByLun, heldByLunRefusal, lioUnreadableAdvisory } from '../services/iscsi-held.js'
 import { readIscsiState, withIscsiLock } from '../services/iscsi-mutate.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { targetTpgs } from '../services/iscsi.js'
@@ -2389,7 +2389,7 @@ export async function datasetRoutes(
             ))
           }
           throw new Error(await enrichBusyError(executor, base, undefined, {
-            ...configfsOptionsFrom(iscsiPaths),
+            ...iscsiPaths,
             dataset: fullName,
           }))
         }

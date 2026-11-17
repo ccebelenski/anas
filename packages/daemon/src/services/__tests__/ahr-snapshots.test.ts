@@ -7,15 +7,14 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { AhrSnapshotName } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
+import { isSubvolLayoutMount, subvolFromMountOptions } from '../ahr-fstab.js'
 import {
   createAhrSnapshot,
   defaultSnapshotName,
   deleteAhrSnapshot,
-  isSubvolLayoutMount,
   listAhrSnapshots,
   preRollbackName,
   rollbackAhrSnapshot,
-  subvolFromMountOptions,
   withTopLevelMount,
 } from '../ahr-snapshots.js'
 

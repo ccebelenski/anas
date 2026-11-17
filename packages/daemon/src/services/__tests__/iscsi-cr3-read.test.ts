@@ -237,7 +237,7 @@ describe('ISCSI-H2 — every TPG of a target is read, and a multi-TPG target is 
     assert.equal(foreign.missingLunCount, 1)
   })
 
-  it('(b) a LUN in a second TPG is a held-by-LUN claim, at its own TPG — as findLunHolder says', async () => {
+  it('(b) a LUN in a second TPG is a held-by-LUN claim, at its own TPG', async () => {
     const targets = await buildIscsiTargets(multiTpgCtx())
     const claims = claimsFromTargets(targets).filter(c => c.backingPath === '/tank/img/b_x.raw')
     assert.deepEqual(claims.map(c => [c.targetIqn, c.tpgTag, c.lunIndex, c.connectedInitiators]), [[ANAS_T1, 2, 0, [CLIENT]]])

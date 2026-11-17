@@ -7,9 +7,6 @@ import { after, before, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import {
-  describeLunHolder,
-  findLunHolder,
-  lunHoldingDevice,
   parseAclInfo,
   parseBackstoreInfo,
   parseLunSymlinkTarget,
@@ -294,65 +291,6 @@ describe('readConfigfs — fail-open', () => {
   it('reports an absent configfs tree as present:false, not an error', async () => {
     const state = await readConfigfs({ root: join(tmpdir(), 'anas-no-such-configfs-root') })
     assert.deepEqual(state, { present: false, backstores: [], targets: [] })
-  })
-})
-
-describe('lunHoldingDevice — the busy-diagnosis seam (GT-41)', () => {
-  let root: string
-  let blockRoot: string
-  let dir: string
-
-  before(async () => {
-    ({ root, blockRoot, dir } = await materialize('configfs-live.manifest'))
-  })
-
-  after(async () => {
-    await rm(dir, { recursive: true, force: true })
-  })
-
-  it('names the LUN holding a zvol — the claim nothing else in userspace sees', async () => {
-    const holder = await lunHoldingDevice('/dev/zvol/gtiscsi/vol1', { root, blockRoot })
-    assert.ok(holder)
-    assert.equal(holder.targetIqn, 'iqn.2026-08.dev.anas.gtiscsi:target1')
-    assert.equal(holder.tpgTag, 1)
-    assert.equal(holder.lunIndex, 0)
-    assert.equal(holder.backstoreName, 'gtiscsi_vol1')
-    // The holder speaks the SAME plugin vocabulary as the LUN model — one
-    // definition of `iblock` → `block`, shared with the assembly layer.
-    assert.equal(holder.plugin, 'block')
-    assert.equal(holder.claimed, 'IBLOCK')
-    assert.match(
-      describeLunHolder(holder),
-      /held by iSCSI LUN 0 'gtiscsi_vol1' of target iqn\.2026-08\.dev\.anas\.gtiscsi:target1/,
-    )
-  })
-
-  it('names the LUN holding a fileio image file', async () => {
-    const holder = await lunHoldingDevice('/gtiscsi/images/lun2.raw', { root, blockRoot })
-    assert.equal(holder?.lunIndex, 1)
-    assert.equal(holder?.backstoreName, 'gtiscsi_lun2')
-  })
-
-  it('matches a DIRECTORY the backing file lives under — the busy-export case', async () => {
-    // `zpool export` fails with "cannot unmount '/gtiscsi/images': … busy"
-    // (GT-40); the explanation is the LUN under that directory.
-    const holder = await lunHoldingDevice('/gtiscsi/images', { root, blockRoot })
-    assert.equal(holder?.backstoreName, 'gtiscsi_lun2')
-  })
-
-  it('never matches a volatile /dev/zdN name (GT-48)', async () => {
-    assert.equal(await lunHoldingDevice('/dev/zd16', { root, blockRoot }), null)
-  })
-
-  it('returns null for an unheld path and for an absent LIO stack', async () => {
-    assert.equal(await lunHoldingDevice('/dev/zvol/other/vol', { root, blockRoot }), null)
-    assert.equal(await lunHoldingDevice('/dev/zvol/gtiscsi/vol1', { root: join(tmpdir(), 'anas-nope') }), null)
-    assert.equal(findLunHolder({ present: false, backstores: [], targets: [] }, '/dev/zvol/gtiscsi/vol1'), null)
-  })
-
-  it('does not let a prefix match masquerade as a containment match', async () => {
-    // /gtiscsi/imagesX must not match a backing file under /gtiscsi/images.
-    assert.equal(await lunHoldingDevice('/gtiscsi/image', { root, blockRoot }), null)
   })
 })
 

@@ -2259,8 +2259,8 @@ export function claimsFromTargets(targets: IscsiTargetDetail[]): IscsiClaim[] {
   const claims: IscsiClaim[] = []
   for (const target of targets) {
     // EVERY TPG (cr3, ISCSI-H2): a LUN in a second TPG holds its zvol or image
-    // exactly as one in the first does — `findLunHolder` (the busy diagnosis)
-    // always walked them all, and the two answers must not disagree.
+    // exactly as one in the first does, so the list must carry every TPG of
+    // every target — a view that asks "what holds this" reads this one list.
     for (const { tpgTag, luns } of targetTpgs(target)) {
       for (const lun of luns) {
         if (!lun.backingPath)

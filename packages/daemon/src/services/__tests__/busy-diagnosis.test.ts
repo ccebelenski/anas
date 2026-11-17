@@ -176,13 +176,23 @@ describe('busy-diagnosis — runFuser (the D3 tool-present answer, distinct from
 
 describe('busy-diagnosis — enrichBusyError (the wire-up contract)', () => {
   let procRoot: string
+  let dir: string
+  let configfsRoot: string
+  let saveconfigPath: string
   beforeEach(async () => {
     procRoot = await mkdtemp(join(tmpdir(), 'anas-proc-'))
     await mkdir(join(procRoot, '1234'))
     await writeFile(join(procRoot, '1234', 'comm'), 'chia_harvester\n')
+    // enrichBusyError now reads the iSCSI claims first — pin that read to an
+    // empty configfs root and an absent saveconfig so no test touches this host.
+    dir = await mkdtemp(join(tmpdir(), 'anas-busy-iscsi-'))
+    configfsRoot = join(dir, 'configfs')
+    await mkdir(configfsRoot)
+    saveconfigPath = join(dir, 'absent-saveconfig.json')
   })
   afterEach(async () => {
     await rm(procRoot, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true })
   })
 
   function execWithHolder(path: string): MockExecutor {
@@ -193,37 +203,37 @@ describe('busy-diagnosis — enrichBusyError (the wire-up contract)', () => {
 
   it('appends the holders on a busy error with a KNOWN path', async () => {
     const exec = execWithHolder('/mnt/tank')
-    const out = await enrichBusyError(exec, 'umount: /mnt/tank: target is busy.', '/mnt/tank', { procRoot })
+    const out = await enrichBusyError(exec, 'umount: /mnt/tank: target is busy.', '/mnt/tank', { procRoot, configfsRoot, saveconfigPath })
     assert.equal(out, 'umount: /mnt/tank: target is busy. — held open by: chia_harvester(1234)')
   })
 
   it('appends on a busy error whose path is EXTRACTED from the text (ZFS destroy)', async () => {
     const exec = execWithHolder('/chiapools/pool15')
     const base = `cannot unmount '/chiapools/pool15': pool or dataset is busy`
-    const out = await enrichBusyError(exec, base, undefined, { procRoot })
+    const out = await enrichBusyError(exec, base, undefined, { procRoot, configfsRoot, saveconfigPath })
     assert.equal(out, `${base} — held open by: chia_harvester(1234)`)
   })
 
   it('leaves a NON-busy error verbatim (never diagnoses)', async () => {
     const exec = execWithHolder('/mnt/tank')
     const base = 'cannot open pool: no such pool'
-    assert.equal(await enrichBusyError(exec, base, '/mnt/tank', { procRoot }), base)
+    assert.equal(await enrichBusyError(exec, base, '/mnt/tank', { procRoot, configfsRoot, saveconfigPath }), base)
   })
 
   it('leaves the error verbatim when NO holders are found', async () => {
     const exec = new MockExecutor()
     exec.addFixture({ command: FUSER, args: ['-m', '/mnt/tank'], result: { stdout: '', stderr: '', exitCode: 1 } })
     const base = 'umount: /mnt/tank: target is busy.'
-    assert.equal(await enrichBusyError(exec, base, '/mnt/tank', { procRoot }), base)
+    assert.equal(await enrichBusyError(exec, base, '/mnt/tank', { procRoot, configfsRoot, saveconfigPath }), base)
   })
 
   it('leaves the error verbatim when the tool is MISSING', async () => {
     const base = 'umount: /mnt/tank: target is busy.'
-    assert.equal(await enrichBusyError(new MockExecutor(), base, '/mnt/tank', { procRoot }), base)
+    assert.equal(await enrichBusyError(new MockExecutor(), base, '/mnt/tank', { procRoot, configfsRoot, saveconfigPath }), base)
   })
 
   it('leaves the error verbatim when no path is known or derivable', async () => {
     const base = 'device is busy' // busy, but names no path
-    assert.equal(await enrichBusyError(execWithHolder('/x'), base, undefined, { procRoot }), base)
+    assert.equal(await enrichBusyError(execWithHolder('/x'), base, undefined, { procRoot, configfsRoot, saveconfigPath }), base)
   })
 })

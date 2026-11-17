@@ -20,7 +20,7 @@ import { diagnoseBusyPath, enrichBusyError, formatHolders, runFuser, toolNotFoun
 import { duplicateKeyRefusal } from '../services/config-duplicates.js'
 import { editConfig, writeFileAtomic } from '../services/config-writer.js'
 import { readFstabAbsentAsEmpty } from '../services/fstab-file.js'
-import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { describeLive, liveAtTarget, specMatchesLive } from '../services/mount-match.js'
 import {
   ahrPinnedSpecs,
@@ -1845,7 +1845,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const why = r.stderr.trim() || `umount exited ${r.exitCode}`
     if (lazy)
       return `The forced (lazy) unmount of '${mp}' failed (${why}) — it is still mounted, and nothing else was changed`
-    return enrichBusyError(executor, why, mp, configfsOptionsFrom(iscsiPaths))
+    return enrichBusyError(executor, why, mp, iscsiPaths)
   }
 
   /**

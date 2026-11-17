@@ -38,7 +38,6 @@
 import type { IscsiClaim, IscsiHeldByLun, IscsiTargetDetail } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { Advisory } from '../safety/guard.js'
-import type { ConfigfsOptions } from './iscsi-configfs.js'
 import type { IscsiPaths } from './iscsi.js'
 import { iscsiClaims, readIscsiState } from './iscsi-mutate.js'
 import { liveUnreadablePaths, targetTpgs } from './iscsi.js'
@@ -79,21 +78,6 @@ export interface IscsiClaimCache {
    * first-class healthy answer, not a failure.
    */
   readFailed: () => Promise<boolean>
-}
-
-/**
- * The configfs half of an {@link IscsiPaths} override, in the shape
- * `busy-diagnosis` and `iscsi-configfs` take. One conversion, so a route that
- * already carries `iscsiPaths` can hand the LIO branch its test root without
- * every caller re-deriving the field names.
- */
-export function configfsOptionsFrom(paths: IscsiPaths): ConfigfsOptions {
-  const opts: ConfigfsOptions = {}
-  if (paths.configfsRoot !== undefined)
-    opts.root = paths.configfsRoot
-  if (paths.blockRoot !== undefined)
-    opts.blockRoot = paths.blockRoot
-  return opts
 }
 
 /** Strip trailing slashes for path comparison (`/tank/` → `/tank`). */

@@ -11,7 +11,6 @@ import { MockExecutor } from '../../executor/mock.js'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import {
   claimHoldsSubject,
-  configfsOptionsFrom,
   createIscsiClaimCache,
   heldByLun,
   heldByLunOnce,
@@ -120,6 +119,12 @@ describe('heldByLun — the matrix (story iscsi.6)', () => {
 
     it('is held when named by its device path', () => {
       assert.equal(claimHoldsSubject(ZVOL_CLAIM, { path: '/dev/zvol/tank/vol1' }), true)
+    })
+
+    it('is NOT held when named by a volatile /dev/zdN kernel name (GT-48)', () => {
+      // The kernel number changes with every reconnection; only the stable
+      // backing path a claim carries can hold the object.
+      assert.equal(claimHoldsSubject(ZVOL_CLAIM, { path: '/dev/zd16' }), false)
     })
 
     it('is held when its POOL is named — the Pools screen\'s question', () => {
@@ -487,15 +492,5 @@ describe('iscsiServedSerials — the disk-inventory seam', () => {
       blockRoot: join(dir, 'absent-block'),
     })
     assert.equal(serials.size, 0)
-  })
-})
-
-describe('configfsOptionsFrom — one conversion, no field-name duplication', () => {
-  it('passes the configfs and block roots through', () => {
-    assert.deepEqual(configfsOptionsFrom({ configfsRoot: '/x', blockRoot: '/y' }), { root: '/x', blockRoot: '/y' })
-  })
-
-  it('omits what was not overridden, so the service defaults still apply', () => {
-    assert.deepEqual(configfsOptionsFrom({}), {})
   })
 })

@@ -36,11 +36,11 @@ import { reconcileLunWarnings, rewriteLunWarnings } from '../../routes/ahr-mutat
 import { assertVolumeMutable } from '../../routes/datasets.js'
 import { failedBeforeWriting, imageBytesWritten, ownBackstoreRefusal, parseRestoreProgress, runImageRestore, runNewLunImageRestore, volsizeArgs } from '../backup-restore.js'
 import { buildBackupEnv, PBC } from '../backup-runner.js'
-import { describeUnmappedHolder, findUnmappedBackstoreHolder } from '../iscsi-configfs.js'
+import { describeUnmappedHolder } from '../iscsi-configfs.js'
 import { lunNameFreeGate } from '../iscsi-guard.js'
 import { computeIscsiHealth, unmappedLiveBackstores } from '../iscsi-health.js'
 import { heldByLunRefusal, heldHolderPhrase, pickHolder } from '../iscsi-held.js'
-import { assertSaveable, claimsFromState, createAndMapLun, createLunBackstore, createSparseImage, mapLunIntoTarget, saveIscsiConfig, TARGETCLI, withIscsiLock, ZFS } from '../iscsi-mutate.js'
+import { assertSaveable, claimsFromState, createAndMapLun, createLunBackstore, createSparseImage, mapLunIntoTarget, saveIscsiConfig, TARGETCLI, unmappedBackstoreClaims, withIscsiLock, ZFS } from '../iscsi-mutate.js'
 import { readRestoreMarks } from '../iscsi-quarantine.js'
 import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../iscsi-repair.js'
 import { buildIscsiWarnings } from '../iscsi-warnings.js'
@@ -741,12 +741,25 @@ describe('cr3.lunrestore Part B — the restore mark reader (tri-state, plus "th
 })
 
 describe('cr3.lunrestore N7 — the busy diagnosis names a backstore no LUN maps', () => {
-  it('findUnmappedBackstoreHolder finds it by device or by a directory above a file; a mapped one is the LUN branch\'s', () => {
-    const ctx = contextOf({ backstores: [{ name: 'newvol', plugin: 'block', dev: NEWVOL, wwn: 's' }, { name: 'img', plugin: 'fileio', dev: '/tank/images/img.raw', wwn: 't' }], luns: [] }, null, SOURCE_BASE)
-    assert.deepEqual(findUnmappedBackstoreHolder(ctx.live, NEWVOL), { backstoreName: 'newvol', plugin: 'block', backingPath: NEWVOL })
-    assert.equal(findUnmappedBackstoreHolder(ctx.live, '/tank/images')?.backstoreName, 'img')
-    assert.equal(findUnmappedBackstoreHolder(ctx.live, '/dev/zvol/tank/vol1'), null, 'vol1 is mapped: not this branch')
-    assert.equal(describeUnmappedHolder({ backstoreName: 'newvol', plugin: 'block', backingPath: NEWVOL }), `held by iSCSI backstore 'newvol' (block, ${NEWVOL}), which is not mapped as a LUN`)
+  it('the unmapped claims answer by device or by a directory above a file; a mapped backstore is the LUN branch\'s', () => {
+    const ctx = contextOf({
+      backstores: [
+        { name: 'newvol', plugin: 'block', dev: NEWVOL, wwn: 's' },
+        { name: 'img', plugin: 'fileio', dev: '/tank/images/img.raw', wwn: 't' },
+        { name: 'vol1', plugin: 'block', dev: '/dev/zvol/tank/vol1', wwn: 'u' },
+      ],
+      luns: [{ iqn: IQN, tag: 1, index: 0, backstore: 'vol1', plugin: 'block' }],
+    }, null, SOURCE_BASE)
+    const claims = unmappedBackstoreClaims(ctx)
+    const byDevice = pickHolder(claims, { path: NEWVOL })
+    assert.equal(byDevice?.unmapped, true)
+    assert.equal(byDevice?.name, 'newvol')
+    assert.equal(byDevice?.backingPath, NEWVOL)
+    assert.equal(pickHolder(claims, { path: '/tank/images' })?.name, 'img')
+    assert.equal(pickHolder(claims, { path: '/dev/zvol/tank/vol1' }), null, 'vol1 is mapped: the LUN claim, not this list')
+    // The claim carries the ONE sentence, and it is describeUnmappedHolder's.
+    assert.equal(byDevice?.detail, describeUnmappedHolder({ backstoreName: 'newvol', plugin: 'block', backingPath: NEWVOL }))
+    assert.equal(byDevice?.detail, `held by iSCSI backstore 'newvol' (block, ${NEWVOL}), which is not mapped as a LUN`)
   })
 })
 

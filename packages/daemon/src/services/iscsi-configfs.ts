@@ -33,9 +33,9 @@
  *  - **Nothing in userspace names LIO as the holder of a backing device.**
  *    `fuser`, `lsof` and a device's sysfs `holders/` all find nothing (GT-41); the
  *    claim is visible only here, as `CLAIMED: IBLOCK` in a backstore's `info`
- *    plus its `udev_path`. {@link lunHoldingDevice} is that lookup, exported once
- *    so `busy-diagnosis.ts` (story `iscsi.6`) reuses it rather than growing a
- *    second copy.
+ *    plus its `udev_path`. `readBackstores` lifts it into the live state; the
+ *    claim list in `services/iscsi-mutate.ts` is the one place that answers
+ *    "what holds this object for iSCSI", busy refusals included.
  *
  * The configfs ROOT is injectable so the whole reader is testable against a
  * materialised fixture tree.
@@ -46,7 +46,7 @@
  */
 
 import { readdir, readFile, readlink, stat } from 'node:fs/promises'
-import { basename, join } from 'node:path'
+import { join } from 'node:path'
 import { lioAuthUnset } from '@anas/shared'
 
 /** The configfs mount point of the LIO target core. */
@@ -60,18 +60,6 @@ const SYSFS_SECTOR_BYTES = 512
 
 /** The prefix `wwn/vpd_unit_serial` reads back with (GT-13). */
 export const UNIT_SERIAL_PREFIX = 'T10 VPD Unit Serial Number: '
-
-/**
- * LIO's sentinel for a CHAP credential that is NOT set.
- *
- * The kernel's node-ACL auth store reads the literal string `NULL` as a clear —
- * it drops the corresponding `NAF_*_IN_SET` flag — while a zero-length write
- * would store an EMPTY credential and mark it as set. That is why removing a
- * credential means writing `NULL` (`services/iscsi-mutate.ts`), and why a
- * credential file reading back `NULL` here must be reported as unset rather than
- * as a four-character secret.
- */
-export const LIO_AUTH_NULL = 'NULL'
 
 /**
  * Is this configfs auth value "not set" — empty, or LIO's `NULL` sentinel?
@@ -139,9 +127,6 @@ const TRAILING_NEWLINE_RE = /\n$/
 
 /** A plausible kernel device name — it is spliced into a sysfs path. */
 const KERNEL_DEVICE_RE = /^[\w.:-]+$/
-
-/** One or more trailing slashes on a path, stripped before comparison. */
-const TRAILING_SLASH_RE = /\/+$/
 
 /** The attribute subset ANAS surfaces (see `IscsiLunAttributes` in @anas/shared). */
 const READ_ATTRIBUTES = [
@@ -823,86 +808,9 @@ export async function readConfigfs(opts?: ConfigfsOptions): Promise<LioLiveState
 }
 
 // ---------------------------------------------------------------------------
-// The busy-diagnosis seam (story iscsi.6 reuses this — one implementation)
+// Backstore sharing and the holder sentences — one phrasing each, rendered
+// once into the claim detail and reused verbatim everywhere it surfaces
 // ---------------------------------------------------------------------------
-
-/** Which LUN holds a backing device/file open. */
-export interface LunHolder {
-  targetIqn: string
-  tpgTag: number
-  lunIndex: number
-  backstoreName: string
-  plugin: string
-  /** The backing path as configfs records it. */
-  backingPath: string
-  /** `CLAIMED: IBLOCK` when the kernel names the claim; null for fileio. */
-  claimed: string | null
-}
-
-/**
- * Which LUN, if any, is holding `devPath` open.
- *
- * This is the ONLY way to answer that question. `fuser -m`, `lsof` and
- * `/sys/block/<dev>/holders/` all report nothing for a device LIO is serving
- * (GT-41), which is why a ZFS `dataset is busy` on a LUN-backed zvol currently
- * has no explanation attached. Exported here — once — so `busy-diagnosis.ts`
- * grows an LIO branch that CALLS this rather than a second copy of it.
- *
- * Matching is on the stable path (`/dev/zvol/<pool>/<vol>` or the image file),
- * never a `zdN` kernel name (GT-48). A directory argument also matches any LUN
- * backed by a file underneath it, which is what a busy `zpool export` or a busy
- * dataset destroy actually needs to explain (GT-40).
- *
- * FAIL-OPEN: no LIO, no match, or any read failure → `null`.
- */
-export async function lunHoldingDevice(
-  devPath: string,
-  opts?: ConfigfsOptions,
-): Promise<LunHolder | null> {
-  const state = await readConfigfs(opts)
-  return findLunHolder(state, devPath)
-}
-
-/**
- * The pure half of {@link lunHoldingDevice}, for callers that already hold a
- * live state (and for tests). Returns the first match; a backing object can be
- * mapped into several targets, and naming one is enough to explain a refusal.
- */
-export function findLunHolder(state: LioLiveState, devPath: string): LunHolder | null {
-  if (!state.present || devPath.length === 0)
-    return null
-  const wanted = devPath.replace(TRAILING_SLASH_RE, '') || '/'
-  const byName = new Map(state.backstores.map(b => [b.name, b]))
-
-  const matches = (backingPath: string): boolean => {
-    if (backingPath.length === 0)
-      return false
-    // Exact device/file, or a file under the directory the caller named.
-    return backingPath === wanted || (wanted !== '/' && backingPath.startsWith(`${wanted}/`))
-  }
-
-  for (const target of state.targets) {
-    for (const tpg of target.tpgs) {
-      for (const lun of tpg.luns) {
-        if (!lun.backstoreName)
-          continue
-        const backstore = byName.get(lun.backstoreName)
-        if (!backstore || !matches(backstore.udevPath))
-          continue
-        return {
-          targetIqn: target.iqn,
-          tpgTag: tpg.tag,
-          lunIndex: lun.index,
-          backstoreName: backstore.name,
-          plugin: normalizePlugin(backstore.plugin),
-          backingPath: backstore.udevPath,
-          claimed: backstore.claimed,
-        }
-      }
-    }
-  }
-  return null
-}
 
 /**
  * Every live LUN, in any target and any TPG, that maps the backstore `name`
@@ -937,43 +845,14 @@ export function lunsMappingBackstore(
 /**
  * Human sentence for a LUN holder — ONE phrasing, used wherever it surfaces.
  *
- * Three places render it and they must not drift: the `busy-diagnosis` clause
- * appended to a ZFS `dataset is busy` (story `iscsi.6`), an `IscsiClaim.detail`
- * on `GET /v1/iscsi/claims`, and every held-by-LUN refusal body. The LUN's
- * NAME is in it because that is the SCSI model string the operator sees on the
- * initiator (GT-15) — "LUN 0" alone names nothing recognisable.
+ * Rendered once, into an `IscsiClaim.detail` on `GET /v1/iscsi/claims`; the
+ * `busy-diagnosis` clause and every held-by-LUN refusal body reuse that detail
+ * verbatim, so they cannot drift. The LUN's NAME is in it because that is the
+ * SCSI model string the operator sees on the initiator (GT-15) — "LUN 0" alone
+ * names nothing recognisable.
  */
-export function describeLunHolder(holder: Pick<LunHolder, 'lunIndex' | 'backstoreName' | 'targetIqn' | 'backingPath'>): string {
+export function describeLunHolder(holder: { lunIndex: number, backstoreName: string, targetIqn: string, backingPath: string }): string {
   return `held by iSCSI LUN ${holder.lunIndex} '${holder.backstoreName}' of target ${holder.targetIqn} (${holder.backingPath})`
-}
-
-/**
- * cr3.lunrestore (review N7): a LIVE backstore that NO LUN maps and that holds
- * `devPath` (the exact device or file, or a file under the directory named) —
- * a restore as a new LUN writing into it, or one left behind. It holds the
- * object exactly as a mapped LUN does (GT-40), so it explains a bare `busy`
- * too. Pure; null when none.
- */
-export function findUnmappedBackstoreHolder(state: LioLiveState, devPath: string): { backstoreName: string, plugin: string, backingPath: string } | null {
-  if (!state.present || devPath.length === 0)
-    return null
-  const wanted = devPath.replace(TRAILING_SLASH_RE, '') || '/'
-  for (const b of state.backstores) {
-    const plugin = normalizePlugin(b.plugin)
-    const path = b.udevPath
-    if (path.length === 0 || !(path === wanted || (wanted !== '/' && path.startsWith(`${wanted}/`))))
-      continue
-    const mapped = state.targets.some(t => t.tpgs.some(g => g.luns.some(l =>
-      l.backstoreName === b.name && (l.plugin === null || normalizePlugin(l.plugin) === plugin))))
-    if (!mapped)
-      return { backstoreName: b.name, plugin, backingPath: path }
-  }
-  return null
-}
-
-/** {@link findUnmappedBackstoreHolder} with the configfs read done for you (fail-open: null). */
-export async function unmappedBackstoreHoldingDevice(devPath: string, opts?: ConfigfsOptions): Promise<{ backstoreName: string, plugin: string, backingPath: string } | null> {
-  return findUnmappedBackstoreHolder(await readConfigfs(opts), devPath)
 }
 
 /**
@@ -983,9 +862,4 @@ export async function unmappedBackstoreHoldingDevice(devPath: string, opts?: Con
  */
 export function describeUnmappedHolder(holder: { backstoreName: string, plugin: string, backingPath: string }): string {
   return `held by iSCSI backstore '${holder.backstoreName}' (${holder.plugin}, ${holder.backingPath}), which is not mapped as a LUN`
-}
-
-/** The backstore name a configfs path belongs to (the last path component). */
-export function backstoreNameFromPath(path: string): string {
-  return basename(path)
 }

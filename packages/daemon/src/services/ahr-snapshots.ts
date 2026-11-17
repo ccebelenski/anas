@@ -69,35 +69,6 @@ function lvDevice(pool: AhrPool): string {
   return `/dev/${pool.name}/${pool.lv.name}`
 }
 
-// ---- subvolLayout detection (topology + guards) -----------------------------
-
-/**
- * The `subvol=` value from a mount's option string, e.g. "/@data" or "/".
- * Null when the option is absent (non-btrfs, or an old kernel that omits it).
- */
-export function subvolFromMountOptions(options: string): string | null {
-  for (const token of options.split(',')) {
-    const eq = token.indexOf('=')
-    if (eq > 0 && token.slice(0, eq) === 'subvol')
-      return token.slice(eq + 1)
-  }
-  return null
-}
-
-/**
- * Whether a mount's options say it is the §12 subvolume layout — i.e. the
- * filesystem is mounted with `subvol=@data` (btrfs normalizes to `/@data`).
- * A flat pool mounts the top-level (`subvol=/`, `subvolid=5`) and returns
- * false. The mount is the source of truth (§5.3) — nothing is precomputed.
- */
-export function isSubvolLayoutMount(options: string): boolean {
-  const subvol = subvolFromMountOptions(options)
-  if (subvol === null)
-    return false
-  const normalized = subvol.replace(LEADING_SLASH_RE, '') // "/@data" → "@data"
-  return normalized === SUBVOL_DATA
-}
-
 // ---- On-demand top-level mount ----------------------------------------------
 
 /**
