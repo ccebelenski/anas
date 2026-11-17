@@ -134,6 +134,7 @@ describe('own.4 (c) — ready: Repair puts the LUN back', () => {
     assert.deepEqual(holeRepairVerdict(ctx, target, hole, io()), {
       state: 'ready',
       detail: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.',
+      advice: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.',
     })
   })
 
@@ -149,6 +150,7 @@ describe('own.4 (c) — backing-absent: the path is still missing', () => {
     assert.deepEqual(holeRepairVerdict(ctx, target, hole, io()), {
       state: 'backing-absent',
       detail: 'That path is still missing — bring the storage back (import the pool, restore the image) first.',
+      advice: 'That path is still missing — bring the storage back (import the pool, restore the image) first.',
     })
   })
 })
@@ -159,6 +161,7 @@ describe('own.4 (c) — backing-unreadable: a failed read is unknown, never abse
     assert.deepEqual(holeRepairVerdict(ctx, target, hole, io()), {
       state: 'backing-unreadable',
       detail: `ANAS could not tell whether ${BLOCK_PATH} is on this node (its stat failed with an error other than "not found"), and Repair never recreates a backstore over a device it cannot see`,
+      advice: `Repair cannot put it back: ANAS could not tell whether ${BLOCK_PATH} is on this node (its stat failed with an error other than "not found"), and Repair never recreates a backstore over a device it cannot see.`,
     })
   })
 
@@ -167,6 +170,7 @@ describe('own.4 (c) — backing-unreadable: a failed read is unknown, never abse
     assert.deepEqual(holeRepairVerdict(ctx, target, hole, io({ device: null })), {
       state: 'backing-unreadable',
       detail: `ANAS could not stat ${BLOCK_PATH}, so it cannot tell which device the path names, and Repair never recreates a backstore over a device it cannot identify`,
+      advice: `Repair cannot put it back: ANAS could not stat ${BLOCK_PATH}, so it cannot tell which device the path names, and Repair never recreates a backstore over a device it cannot identify.`,
     })
   })
 
@@ -188,6 +192,9 @@ describe('own.4 (c) — placeholder: a zero-byte file, never a full-size one on 
     assert.deepEqual(holeRepairVerdict(ctx, target, hole, fileIo()), {
       state: 'placeholder',
       detail: 'That path holds a PLACEHOLDER the restore service created — a file of the right name that is not the image, '
+        + 'which is why ANAS took the LUN offline. Mount the filesystem that should hold the image, then use Repair on the '
+        + 'iSCSI screen to put the LUN back with its own serial.',
+      advice: 'That path holds a PLACEHOLDER the restore service created — a file of the right name that is not the image, '
         + 'which is why ANAS took the LUN offline. Mount the filesystem that should hold the image, then use Repair on the '
         + 'iSCSI screen to put the LUN back with its own serial.',
     })
@@ -215,6 +222,13 @@ describe('own.4 (c) — foreign-target: ANAS never writes to it', () => {
         + `and ANAS makes no iSCSI change: any save would erase that LUN from /etc/rtslib-fb-target/saveconfig.json. If its `
         + `device is gone for good, the way out is your own 'targetcli saveconfig', which writes the live configuration over `
         + `the saved one and so ERASES that LUN's record — a deliberate act, and not one ANAS takes.`,
+      advice: `LUN 0 of ${IQN} (backstore 'v1', ${BLOCK_PATH}) is missing from a target ANAS does not manage. ANAS never `
+        + `writes to a target it does not own, so Repair leaves it alone. Restore it by hand: bring the backing device back, `
+        + `then run 'systemctl restart rtslib-fb-targetctl' in a maintenance window — it restores the whole saved configuration `
+        + `with the same serials, and drops every iSCSI session on this node while it does. Until then this node stays degraded `
+        + `and ANAS makes no iSCSI change: any save would erase that LUN from /etc/rtslib-fb-target/saveconfig.json. If its `
+        + `device is gone for good, the way out is your own 'targetcli saveconfig', which writes the live configuration over `
+        + `the saved one and so ERASES that LUN's record — a deliberate act, and not one ANAS takes.`,
     })
   })
 })
@@ -228,6 +242,9 @@ describe('own.4 (c) — target-hands-off: an ANAS target ANAS will not write to'
       detail: `Target '${IQN}' has 2 target portal groups (TPG 1, 2). ANAS creates one TPG per target and changes only that `
         + 'one, so it does not change a target that was given more by hand — use targetcli for this target. This refusal has '
         + 'no confirm bypass.',
+      advice: `Repair does not write to this target: Target '${IQN}' has 2 target portal groups (TPG 1, 2). ANAS creates one `
+        + 'TPG per target and changes only that one, so it does not change a target that was given more by hand — use targetcli '
+        + 'for this target. This refusal has no confirm bypass.',
     })
   })
 
@@ -238,6 +255,9 @@ describe('own.4 (c) — target-hands-off: an ANAS target ANAS will not write to'
       state: 'target-hands-off',
       detail: `ANAS could not read the ZFS mountpoint table ('zfs list' failed), so it cannot tell whether '${FILE_PATH}' is `
         + 'inside PVE\'s footprint — refusing the change while its owner is unknown. Nothing was changed; retry once \'zfs list\' answers.',
+      advice: `Repair does not write to this target: ANAS could not read the ZFS mountpoint table ('zfs list' failed), so it `
+        + `cannot tell whether '${FILE_PATH}' is inside PVE's footprint — refusing the change while its owner is unknown. `
+        + `Nothing was changed; retry once 'zfs list' answers.`,
     })
   })
 })
@@ -249,6 +269,9 @@ describe('own.4 (c) — record-incomplete: the saved record cannot be replayed',
       state: 'record-incomplete',
       detail: 'the saved record\'s "name=v 1" cannot be handed to targetcli (a space, a quote or an \'=\' it would read as '
         + 'something else) — restore it by hand (bring the device back, then restart rtslib-fb-targetctl in a maintenance window)',
+      advice: 'Repair cannot put it back: the saved record\'s "name=v 1" cannot be handed to targetcli (a space, a quote '
+        + 'or an \'=\' it would read as something else) — restore it by hand (bring the device back, then restart '
+        + 'rtslib-fb-targetctl in a maintenance window).',
     })
   })
 
@@ -260,6 +283,9 @@ describe('own.4 (c) — record-incomplete: the saved record cannot be replayed',
       detail: `The initiator ACL "bad name" of target '${IQN}' is not an iSCSI name ANAS can address (configfs path, `
         + 'targetcli line), so this change cannot re-grant the LUN to it. Nothing was changed. Remove or recreate that ACL '
         + 'with targetcli, then retry.',
+      advice: `Repair cannot put it back: The initiator ACL "bad name" of target '${IQN}' is not an iSCSI name ANAS can `
+        + 'address (configfs path, targetcli line), so this change cannot re-grant the LUN to it. Nothing was changed. Remove '
+        + 'or recreate that ACL with targetcli, then retry.',
     })
   })
 
@@ -269,6 +295,9 @@ describe('own.4 (c) — record-incomplete: the saved record cannot be replayed',
       state: 'record-incomplete',
       detail: 'the saved backing path "/tank/images/im age.raw" contains a space, a quote or an \'=\', which targetcli '
         + 'cannot be handed — restore it by hand (bring the device back, then restart rtslib-fb-targetctl in a maintenance window)',
+      advice: 'Repair cannot put it back: the saved backing path "/tank/images/im age.raw" contains a space, a quote or an '
+        + '\'=\', which targetcli cannot be handed — restore it by hand (bring the device back, then restart '
+        + 'rtslib-fb-targetctl in a maintenance window).',
     })
   })
 
@@ -278,6 +307,8 @@ describe('own.4 (c) — record-incomplete: the saved record cannot be replayed',
       state: 'record-incomplete',
       detail: `the saved configuration records no size for fileio backstore 'v1' (${FILE_PATH}) — recreating it without `
         + 'one would serve a 0-byte disk with the right serial',
+      advice: `Repair cannot put it back: the saved configuration records no size for fileio backstore 'v1' (${FILE_PATH}) `
+        + '— recreating it without one would serve a 0-byte disk with the right serial.',
     })
   })
 })
@@ -289,7 +320,11 @@ describe('own.4 (c) — backstore-live: a live backstore of this name and plugin
 
   it('block, nothing mapping it', async () => {
     const { ctx, target, hole } = await world()
-    assert.deepEqual(holeRepairVerdict(ctx, target, hole, io()), { state: 'backstore-live', detail: DETAIL })
+    assert.deepEqual(holeRepairVerdict(ctx, target, hole, io()), {
+      state: 'backstore-live',
+      detail: DETAIL,
+      advice: `Repair cannot put it back: ${DETAIL}.`,
+    })
   })
 
   it('fileio', async () => {
@@ -299,6 +334,9 @@ describe('own.4 (c) — backstore-live: a live backstore of this name and plugin
       detail: `backstore 'v1' (fileio, ${FILE_PATH}) is still live and no LUN maps it, so Repair does not create it a `
         + `second time — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by hand: `
         + `'targetcli /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/fileio/v1 lun=0'`,
+      advice: `Repair cannot put it back: backstore 'v1' (fileio, ${FILE_PATH}) is still live and no LUN maps it, so Repair `
+        + `does not create it a second time — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map `
+        + `it back by hand: 'targetcli /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/fileio/v1 lun=0'.`,
     })
   })
 
@@ -325,6 +363,8 @@ describe('own.4 (c) — device-served-elsewhere: the device is another backstore
       state: 'device-served-elsewhere',
       detail: `${BLOCK_PATH} names device 230:16, which LIO already serves as backstore 'other' — the path no longer names `
         + 'the volume this LUN was created on, and recreating it would serve one device under two serials',
+      advice: `Repair cannot put it back: ${BLOCK_PATH} names device 230:16, which LIO already serves as backstore 'other' `
+        + '— the path no longer names the volume this LUN was created on, and recreating it would serve one device under two serials.',
     })
   })
 })
@@ -335,6 +375,7 @@ describe('own.4 (c) — restore-mark: a mark, a running restore, or a standing j
     assert.deepEqual(holeRepairVerdict(ctx, target, hole, io({ mark: present(MARK) })), {
       state: 'restore-mark',
       detail: `${MARK_DETAIL} onto tank/v1 did not finish, so it holds a partial image`,
+      advice: `Repair cannot put it back: ${MARK_DETAIL} onto tank/v1 did not finish, so it holds a partial image.`,
       restoreMark: 'interrupted',
       markOn: 'tank/v1',
     })
@@ -345,6 +386,8 @@ describe('own.4 (c) — restore-mark: a mark, a running restore, or a standing j
     assert.deepEqual(holeRepairVerdict(ctx, target, hole, io({ mark: present(UNVERIFIED) })), {
       state: 'restore-mark',
       detail: `${MARK_DETAIL} wrote tank/v1, and the client reported the image complete, but its size was not verified (size could not be re-read)`,
+      advice: `Repair cannot put it back: ${MARK_DETAIL} wrote tank/v1, and the client reported the image complete, but its `
+        + 'size was not verified (size could not be re-read).',
       restoreMark: 'unverified',
       markOn: 'tank/v1',
     })
@@ -357,6 +400,8 @@ describe('own.4 (c) — restore-mark: a mark, a running restore, or a standing j
       state: 'restore-mark',
       detail: 'ANAS could not read the restore mark on tank/v1 (zfs get exited with code 1), so it cannot tell whether it '
         + 'holds a partially restored image',
+      advice: 'Repair cannot put it back: ANAS could not read the restore mark on tank/v1 (zfs get exited with code 1), so '
+        + 'it cannot tell whether it holds a partially restored image.',
       restoreMark: 'unreadable',
       markOn: 'tank/v1',
     })
@@ -367,6 +412,7 @@ describe('own.4 (c) — restore-mark: a mark, a running restore, or a standing j
     assert.deepEqual(holeRepairVerdict(ctx, target, hole, io({ mark: present(MARK), running: 'job-7' })), {
       state: 'restore-mark',
       detail: 'a whole-image restore is writing it right now (job job-7)',
+      advice: 'Repair cannot put it back: a whole-image restore is writing it right now (job job-7).',
       restoreMark: 'in-progress',
       markOn: 'tank/v1',
     })
@@ -498,4 +544,118 @@ describe('own.4 (c) — holeIoFor is the shape read() gathers', () => {
     assert.ok(facts)
     assert.equal(holeRepairVerdict(ctx, target, hole, facts)?.state, 'restore-mark')
   })
+})
+
+describe('own.4 (c) — advice: one whole sentence for a person, framed by the verdict owner', () => {
+  // The card and the panel print this sentence; neither frames a state itself.
+  // Each case is the same world as the state's own test above, and the whole
+  // sentence is pinned so a change to any state's framing is seen here first.
+  const READY = 'That path is available again — use Repair on the iSCSI screen to put the LUN back.'
+  const ABSENT = 'That path is still missing — bring the storage back (import the pool, restore the image) first.'
+  const PLACEHOLDER = 'That path holds a PLACEHOLDER the restore service created — a file of the right name that is not the image, '
+    + 'which is why ANAS took the LUN offline. Mount the filesystem that should hold the image, then use Repair on the '
+    + 'iSCSI screen to put the LUN back with its own serial.'
+  const BACKSTORE_LIVE = `backstore 'v1' (block, ${BLOCK_PATH}) is still live and no LUN maps it, so Repair does not create it a `
+    + `second time — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by hand: `
+    + `'targetcli /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/v1 lun=0'`
+
+  interface AdviceCase {
+    name: string
+    build: () => Promise<{ ctx: IscsiReadContext, target: IscsiTargetDetail, hole: IscsiMissingLun }>
+    facts: () => HoleIoFacts
+    expected: string
+  }
+  const cases: AdviceCase[] = [
+    {
+      name: 'ready: the verdict\'s own sentence',
+      build: () => world({ liveBackstore: false }),
+      facts: () => io(),
+      expected: READY,
+    },
+    {
+      name: 'backing-absent: the verdict\'s own sentence',
+      build: () => world({ liveBackstore: false, exists: false }),
+      facts: () => io(),
+      expected: ABSENT,
+    },
+    {
+      name: 'placeholder: the verdict\'s own sentence',
+      build: () => world({ plugin: 'fileio', liveBackstore: false, savedSize: 1048576, actualSize: 0 }),
+      facts: () => fileIo(),
+      expected: PLACEHOLDER,
+    },
+    {
+      name: 'foreign-target: the verdict already holds the hand-restore sentence',
+      build: async () => {
+        const w = await world({ exists: false })
+        w.hole.targetOwnership = 'foreign'
+        return w
+      },
+      facts: () => io(),
+      expected: `LUN 0 of ${IQN} (backstore 'v1', ${BLOCK_PATH}) is missing from a target ANAS does not manage. ANAS never `
+        + 'writes to a target it does not own, so Repair leaves it alone. Restore it by hand: bring the backing device back, '
+        + 'then run \'systemctl restart rtslib-fb-targetctl\' in a maintenance window — it restores the whole saved configuration '
+        + 'with the same serials, and drops every iSCSI session on this node while it does. Until then this node stays degraded '
+        + 'and ANAS makes no iSCSI change: any save would erase that LUN from /etc/rtslib-fb-target/saveconfig.json. If its '
+        + 'device is gone for good, the way out is your own \'targetcli saveconfig\', which writes the live configuration over '
+        + 'the saved one and so ERASES that LUN\'s record — a deliberate act, and not one ANAS takes.',
+    },
+    {
+      name: 'target-hands-off: the framing says Repair will not write there',
+      build: async () => {
+        const w = await world()
+        w.target.otherTpgs = [{ tpgTag: 2, enabled: true, present: true, persisted: true, portals: [], luns: [], acls: [] }]
+        return w
+      },
+      facts: () => io(),
+      expected: `Repair does not write to this target: Target '${IQN}' has 2 target portal groups (TPG 1, 2). ANAS creates `
+        + 'one TPG per target and changes only that one, so it does not change a target that was given more by hand — use '
+        + 'targetcli for this target. This refusal has no confirm bypass.',
+    },
+    {
+      name: 'record-incomplete: a clause, and the frame supplies the stop',
+      build: () => world({ name: 'v 1', liveBackstore: false }),
+      facts: () => io(),
+      expected: 'Repair cannot put it back: the saved record\'s "name=v 1" cannot be handed to targetcli (a space, a quote '
+        + 'or an \'=\' it would read as something else) — restore it by hand (bring the device back, then restart '
+        + 'rtslib-fb-targetctl in a maintenance window).',
+    },
+    {
+      name: 'backing-unreadable: a clause, framed as a refusal',
+      build: () => world({ liveBackstore: false, exists: null }),
+      facts: () => io(),
+      expected: `Repair cannot put it back: ANAS could not tell whether ${BLOCK_PATH} is on this node (its stat failed with an `
+        + 'error other than "not found"), and Repair never recreates a backstore over a device it cannot see.',
+    },
+    {
+      name: 'backstore-live: a clause, framed as a refusal',
+      build: () => world(),
+      facts: () => io(),
+      expected: `Repair cannot put it back: ${BACKSTORE_LIVE}.`,
+    },
+    {
+      name: 'device-served-elsewhere: a clause, framed as a refusal',
+      build: async () => {
+        const w = await world({ liveBackstore: false, serial: 'w-1' })
+        w.ctx.live.backstores.push(liveBs('other', 'iblock', '/dev/zvol/tank/other', { devMajor: 230, devMinor: 16 }))
+        return w
+      },
+      facts: () => io(),
+      expected: `Repair cannot put it back: ${BLOCK_PATH} names device 230:16, which LIO already serves as backstore `
+        + '\'other\' — the path no longer names the volume this LUN was created on, and recreating it would serve one '
+        + 'device under two serials.',
+    },
+    {
+      name: 'restore-mark: a clause, framed as a refusal',
+      build: () => world({ liveBackstore: false }),
+      facts: () => io({ mark: { state: 'present', mark: MARK, raw: JSON.stringify(MARK), dataset: 'tank/v1' } }),
+      expected: `Repair cannot put it back: ${MARK_DETAIL} onto tank/v1 did not finish, so it holds a partial image.`,
+    },
+  ]
+  for (const c of cases) {
+    it(c.name, async () => {
+      const { ctx, target, hole } = await c.build()
+      assert.equal(holeRepairVerdict(ctx, target, hole, c.facts())?.advice, c.expected)
+    })
+  }
 })

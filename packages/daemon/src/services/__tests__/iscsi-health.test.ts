@@ -285,6 +285,14 @@ describe('computeIscsiHealth — the restore hole (GT-20/GT-21)', () => {
     const health = computeIscsiHealth(ctx, targets)
 
     assert.equal(health.missingLuns.length, 1)
+    const foreignDetail = 'LUN 0 of iqn.2026-08.dev.anas.gtiscsi:target1 (backstore \'gtiscsi_vol1\', /dev/zvol/gtiscsi/vol1) is '
+      + 'missing from a target ANAS does not manage. ANAS never writes to a target it does not own, so Repair leaves '
+      + 'it alone. Restore it by hand: bring the backing device back, then run \'systemctl restart '
+      + 'rtslib-fb-targetctl\' in a maintenance window — it restores the whole saved configuration with the same '
+      + 'serials, and drops every iSCSI session on this node while it does. Until then this node stays degraded and '
+      + 'ANAS makes no iSCSI change: any save would erase that LUN from /etc/rtslib-fb-target/saveconfig.json. If its '
+      + 'device is gone for good, the way out is your own \'targetcli saveconfig\', which writes the live '
+      + 'configuration over the saved one and so ERASES that LUN\'s record — a deliberate act, and not one ANAS takes.'
     assert.deepEqual(health.missingLuns[0], {
       targetIqn: 'iqn.2026-08.dev.anas.gtiscsi:target1',
       tpgTag: 1,
@@ -298,17 +306,7 @@ describe('computeIscsiHealth — the restore hole (GT-20/GT-21)', () => {
       targetOwnership: 'foreign',
       // own.4 (c): the repair verdict rides the record. This hole is in a
       // foreign target, which is decided from the pure facts alone.
-      repair: {
-        state: 'foreign-target',
-        detail: 'LUN 0 of iqn.2026-08.dev.anas.gtiscsi:target1 (backstore \'gtiscsi_vol1\', /dev/zvol/gtiscsi/vol1) is '
-          + 'missing from a target ANAS does not manage. ANAS never writes to a target it does not own, so Repair leaves '
-          + 'it alone. Restore it by hand: bring the backing device back, then run \'systemctl restart '
-          + 'rtslib-fb-targetctl\' in a maintenance window — it restores the whole saved configuration with the same '
-          + 'serials, and drops every iSCSI session on this node while it does. Until then this node stays degraded and '
-          + 'ANAS makes no iSCSI change: any save would erase that LUN from /etc/rtslib-fb-target/saveconfig.json. If its '
-          + 'device is gone for good, the way out is your own \'targetcli saveconfig\', which writes the live '
-          + 'configuration over the saved one and so ERASES that LUN\'s record — a deliberate act, and not one ANAS takes.',
-      },
+      repair: { state: 'foreign-target', detail: foreignDetail, advice: foreignDetail },
     })
     // The guard: while this is true nothing may run `saveconfig` (GT-22).
     assert.equal(health.degraded, true)
@@ -648,7 +646,7 @@ describe('own.4 (c) — the repair verdict through read()', () => {
     try {
       const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
       assert.equal(health.missingLuns.length, 1)
-      assert.deepEqual(health.missingLuns[0].repair, { state: 'ready', detail: READY })
+      assert.deepEqual(health.missingLuns[0].repair, { state: 'ready', detail: READY, advice: READY })
       assert.deepEqual(node.zfs, [['get', '-Hp', '-o', 'name,value,source', 'anas:restore', '--', 'tank/v2', 'tank/v1']], 'the marks of the live volume and the hole are ONE command')
       assert.equal(node.zfs.length, 1)
     }
@@ -668,6 +666,7 @@ describe('own.4 (c) — the repair verdict through read()', () => {
       assert.deepEqual(health.missingLuns[0].repair, {
         state: 'restore-mark',
         detail: `${MARK_DETAIL} onto tank/v1 did not finish, so it holds a partial image`,
+        advice: `Repair cannot put it back: ${MARK_DETAIL} onto tank/v1 did not finish, so it holds a partial image.`,
         restoreMark: 'interrupted',
         markOn: 'tank/v1',
       })

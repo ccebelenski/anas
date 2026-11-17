@@ -752,6 +752,8 @@ export const IscsiHoleRepair = z.object({
    *  backing-unreadable, backstore-live, device-served-elsewhere and restore-mark; full sentences otherwise).
    */
   detail: z.string(),
+  /** The verdict as one whole sentence for a person: what Repair will do with this hole, or why it will not and what to do. Set by every daemon that sets `state`. */
+  advice: z.string().optional(),
   /** `restore-mark` only: what the mark, or the job record, says now. */
   restoreMark: IscsiRestoreMarkState.optional(),
   /** `restore-mark` only: where the mark is (the volume, or the image file); null when it could not be read off the path. */

@@ -30,7 +30,6 @@ import type { DashboardWarning, IscsiHealth } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { IscsiHealthReadOptions } from './iscsi-health.js'
 import type { IscsiPaths } from './iscsi.js'
-import { foreignHolesSentence } from './iscsi-hole.js'
 import { readIscsiHealth } from './iscsi-quarantine.js'
 import { clearMarkCommand, markDataset, restoreEndSentence } from './restore-mark.js'
 
@@ -146,31 +145,19 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     const removedClause = ' That path is empty because ANAS REMOVED the placeholder it found there — it was 0 bytes and '
       + 'on the wrong filesystem, so nothing of yours was deleted. Mount the filesystem that should hold the image, then '
       + 'use Repair on the iSCSI screen to put the LUN back with its own serial.'
-    // The tail is the hole's own verdict (services/iscsi-hole.ts) — the one
-    // place that decides what Repair can do with it — framed by the shape that
-    // state's sentence takes. A hole with no verdict says nothing about
-    // Repair: this read gathered no fact to decide it from.
-    const state = lun.repair?.state
-    const detail = lun.repair?.detail ?? ''
-    const backNow = state === undefined
+    // The tail is the hole's own sentence (services/iscsi-hole.ts) — the one
+    // place that decides what Repair can do with it, and the one place that
+    // frames the verdict for a person. A hole with no verdict says nothing
+    // about Repair: this read gathered no fact to decide it from.
+    const backNow = lun.repair === undefined
       ? ''
-      // cr3 (ISCSI-L7): a hole in a target ANAS does not manage is never
-      // Repair's — the card says whose it is and how to restore it by hand.
-      : state === 'foreign-target'
-        ? ` ${foreignHolesSentence([lun])}`
-        : state === 'target-hands-off'
-          ? ` Repair does not write to this target: ${detail}`
-          : state === 'record-incomplete' || state === 'backing-unreadable' || state === 'backstore-live'
-            || state === 'device-served-elsewhere' || state === 'restore-mark'
-            // A clause: it names why Repair refuses, so the full stop is the
-            // frame's, not the verdict's.
-            ? ` Repair cannot put it back: ${detail}${detail.endsWith('.') ? '' : '.'}`
-            : state === 'backing-absent'
-              // ANAS made this hole by removing the placeholder at that path
-              // in this very read (story `iscsi.8`), and says so rather than
-              // telling the operator to undo a deletion that lost nothing.
-              ? placeholderRemoved.has(`${lun.targetIqn}#${lun.lunIndex}`) ? removedClause : ` ${detail}`
-              : ` ${detail}`
+      // ANAS made this hole by removing the placeholder at that path in this
+      // very read (story `iscsi.8`), and says so rather than telling the
+      // operator to undo a deletion that lost nothing. The verdict still reads
+      // "absent"; what it removed is this card's own knowledge.
+      : lun.repair.state === 'backing-absent' && placeholderRemoved.has(`${lun.targetIqn}#${lun.lunIndex}`)
+        ? removedClause
+        : ` ${lun.repair.advice}`
     warnings.push({
       level: 'warning',
       category: 'iscsi',

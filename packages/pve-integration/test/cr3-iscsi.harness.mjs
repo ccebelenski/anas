@@ -37,6 +37,13 @@ const ANAS = {
   enc: htmlEncode,
   warn: m => warnings.push(m),
   errText: e => (e && e.message) ? e.message : String(e),
+  // The real helper (00-core.js): a value outside the known set is null.
+  knownEnum(value, known) {
+    if (value === undefined || value === null || value === '')
+      return null
+    const v = '' + value
+    return (known && Object.prototype.hasOwnProperty.call(known, v)) ? v : null
+  },
   formatBytes: v => `${v} B`,
   api: {
     get(_node, path) {
@@ -54,9 +61,19 @@ const ANAS = {
   },
 }
 
+// The panel keeps repairableHoles and servedStubs private; publish both on the
+// test copy only, so the cases below call the real functions. (SRC itself stays
+// verbatim for the source sweeps.)
+const TEST_SRC = SRC.replace(
+  'ANAS.iscsi.applyHealth = applyHealth;',
+  'ANAS.iscsi.applyHealth = applyHealth; ANAS.iscsi.repairableHoles = repairableHoles; ANAS.iscsi.servedStubs = servedStubs;',
+)
+if (TEST_SRC === SRC)
+  throw new Error('cr3-iscsi harness: the export seam did not match 75-iscsi.js')
+
 const sandbox = { window: { ANAS }, console, Ext: { create: () => ({}) } }
 vm.createContext(sandbox)
-vm.runInContext(SRC, sandbox, { filename: '75-iscsi.js' })
+vm.runInContext(TEST_SRC, sandbox, { filename: '75-iscsi.js' })
 const iscsi = ANAS.iscsi
 
 let failed = 0
@@ -163,15 +180,131 @@ async function settle() {
   ok('repair tip: an unreadable saveconfig.json is named (ISCSI-L15)', /cannot be read: \/etc\/x is not valid JSON/.test(btn.tooltip), btn.tooltip)
   iscsi.applyHealth(view, { missingLuns: [], stubLuns: [] })
   ok('repair tip: a clean read still says nothing to repair', /Nothing to repair/.test(btn.tooltip), btn.tooltip)
-  iscsi.applyHealth(view, { missingLuns: [{ targetIqn: 'iqn.2003-01.x:t', lunIndex: 0, backingExists: true, targetOwnership: 'foreign' }], stubLuns: [] })
+  // A foreign hole: the daemon's verdict, printed as its advice — the page
+  // frames nothing itself.
+  const FOREIGN = 'LUN 0 of iqn.2003-01.x:t is missing from a target ANAS does not manage. ANAS never writes to a target '
+    + 'it does not own, so Repair leaves it alone. Restore it by hand: bring the backing device back, then run '
+    + '\'systemctl restart rtslib-fb-targetctl\' in a maintenance window.'
+  iscsi.applyHealth(view, { missingLuns: [{ targetIqn: 'iqn.2003-01.x:t', lunIndex: 0, backingExists: true, targetOwnership: 'foreign', repair: { state: 'foreign-target', detail: FOREIGN, advice: FOREIGN } }], stubLuns: [] })
   ok('repair (ISCSI-L7): a foreign hole never makes Repair live', btn.disabled === true, btn)
   ok('repair (ISCSI-L7): the tip names it and the hand restore', /LUN 0 of iqn\.2003-01\.x:t/.test(btn.tooltip) && /maintenance window/.test(btn.tooltip), btn.tooltip)
-  ok('repair (ISCSI-L7): one LUN reads in the singular', /is missing from a target ANAS does not manage/.test(btn.tooltip), btn.tooltip)
+  ok('repair (ISCSI-L7): one missing LUN reads in the singular', /Repair cannot put back the missing LUN\./.test(btn.tooltip), btn.tooltip)
+  const FOREIGN_U = 'LUN 2 of iqn.2003-01.x:u is missing from a target ANAS does not manage.'
   iscsi.applyHealth(view, { missingLuns: [
-    { targetIqn: 'iqn.2003-01.x:t', lunIndex: 0, backingExists: true, targetOwnership: 'foreign' },
-    { targetIqn: 'iqn.2003-01.x:u', lunIndex: 2, backingExists: false, targetOwnership: 'foreign' },
+    { targetIqn: 'iqn.2003-01.x:t', lunIndex: 0, backingExists: true, targetOwnership: 'foreign', repair: { state: 'foreign-target', detail: FOREIGN, advice: FOREIGN } },
+    { targetIqn: 'iqn.2003-01.x:u', lunIndex: 2, backingExists: false, targetOwnership: 'foreign', repair: { state: 'foreign-target', detail: FOREIGN_U, advice: FOREIGN_U } },
   ], stubLuns: [] })
-  ok('repair (review 2, L7): several LUNs read in the plural', /are missing from targets ANAS does not manage — Repair never writes to them\. Bring their backing devices back/.test(btn.tooltip), btn.tooltip)
+  ok('repair (review 2, L7): several LUNs read in the plural', /Repair cannot put back any of the 2 missing LUNs\./.test(btn.tooltip), btn.tooltip)
+}
+
+// --- the Repair button reads the hole's verdict ------------------------------
+//
+// own.4 (c): the daemon decides whether Repair can put a hole back and says
+// why in `repair.advice`; the panel is a reader. Nothing below may derive
+// readiness from backingExists or ownership.
+
+{
+  const STATES = ['ready', 'foreign-target', 'target-hands-off', 'record-incomplete', 'placeholder', 'backing-absent',
+    'backing-unreadable', 'backstore-live', 'device-served-elsewhere', 'restore-mark']
+  const IQN = 'iqn.2026-08.nas.anas:t'
+  const hole = over => Object.assign({
+    targetIqn: IQN,
+    tpgTag: 1,
+    lunIndex: 0,
+    backstoreName: 'v1',
+    plugin: 'block',
+    backingPath: '/dev/zvol/tank/v1',
+    backingExists: true,
+    targetOwnership: 'anas',
+  }, over)
+  function button() {
+    const btn = { disabled: false, tooltip: '', setDisabled(v) { this.disabled = v }, setTooltip(v) { this.tooltip = v } }
+    const grid = { anasInstalled: true, down: sel => (sel === '#iscsiRepair' ? btn : null) }
+    const view = { down: sel => (sel === '#iscsiGrid' ? grid : null) }
+    return { btn, apply: (health, err) => iscsi.applyHealth(view, health, err) }
+  }
+  const READY_ADVICE = 'That path is available again — use Repair on the iSCSI screen to put the LUN back.'
+  const READY_TIP = '1 LUN can be put back now — the same serial and attributes are replayed, so the initiator sees the same disk.'
+
+  // (i) one ready hole: live, with today's sentence.
+  {
+    const health = { missingLuns: [hole({ repair: { state: 'ready', detail: READY_ADVICE, advice: READY_ADVICE } })], stubLuns: [] }
+    ok('verdict (i): a ready hole is repair-able', iscsi.repairableHoles(health).length === 1, iscsi.repairableHoles(health))
+    const b = button()
+    b.apply(health)
+    ok('verdict (i): the button is live', b.btn.disabled === false, b.btn)
+    ok('verdict (i): the tooltip is the can-be-put-back sentence', b.btn.tooltip === READY_TIP, b.btn.tooltip)
+  }
+
+  // (ii) every other state, in the shape today's rule wrongly calls ready.
+  for (const state of STATES.filter(s => s !== 'ready')) {
+    const advice = `advice for ${state}`
+    const health = { missingLuns: [hole({ repair: { state, detail: `detail for ${state}`, advice } })], stubLuns: [] }
+    ok(`verdict (ii): ${state} is never repair-able`, iscsi.repairableHoles(health).length === 0, iscsi.repairableHoles(health))
+    const b = button()
+    b.apply(health)
+    ok(`verdict (ii): ${state} leaves the button disabled`, b.btn.disabled === true, b.btn)
+    ok(`verdict (ii): ${state} is named with its advice in the tooltip`,
+      b.btn.tooltip.indexOf(`LUN 0 of ${IQN} (/dev/zvol/tank/v1): ${advice}`) !== -1, b.btn.tooltip)
+  }
+
+  // (iii) a ready hole and a refused one: the button is live and both are said.
+  {
+    const health = { missingLuns: [
+      hole({ lunIndex: 0, repair: { state: 'ready', detail: READY_ADVICE, advice: READY_ADVICE } }),
+      hole({ lunIndex: 1, repair: { state: 'backstore-live', detail: 'detail', advice: 'advice for backstore-live' } }),
+    ], stubLuns: [] }
+    const b = button()
+    b.apply(health)
+    ok('verdict (iii): one ready hole keeps the button live', b.btn.disabled === false, b.btn)
+    ok('verdict (iii): the ready sentence is there', b.btn.tooltip.indexOf(READY_TIP) === 0, b.btn.tooltip)
+    ok('verdict (iii): the other LUN is named with its advice',
+      b.btn.tooltip.indexOf(`1 other cannot be put back: LUN 1 of ${IQN} (/dev/zvol/tank/v1): advice for backstore-live`) !== -1, b.btn.tooltip)
+  }
+
+  // (iv) an older daemon: no verdict at all, or one whose sentence is missing.
+  {
+    for (const repair of [undefined, { state: 'backing-absent', detail: 'That path is still missing.' }]) {
+      const health = { missingLuns: [hole(repair ? { repair } : {})], stubLuns: [] }
+      const b = button()
+      b.apply(health)
+      ok('verdict (iv): a hole with no sentence leaves the button disabled', b.btn.disabled === true, b.btn)
+      ok('verdict (iv): the tooltip says the node did not say',
+        b.btn.tooltip.indexOf(`LUN 0 of ${IQN} (/dev/zvol/tank/v1): this node did not say whether Repair can put it back.`) !== -1, b.btn.tooltip)
+    }
+  }
+
+  // (v) a state this page does not know is never ready, and its sentence is shown.
+  {
+    const health = { missingLuns: [hole({ repair: { state: 'some-future-state', detail: 'd', advice: 'advice from a newer daemon' } })], stubLuns: [] }
+    ok('verdict (v): an unknown state is never repair-able', iscsi.repairableHoles(health).length === 0, iscsi.repairableHoles(health))
+    const b = button()
+    b.apply(health)
+    ok('verdict (v): unknown state leaves the button disabled', b.btn.disabled === true, b.btn)
+    ok('verdict (v): its advice is still shown', b.btn.tooltip.indexOf('advice from a newer daemon') !== -1, b.btn.tooltip)
+  }
+
+  // (vi) a served placeholder counts only when the daemon says it is zero-size.
+  {
+    const stub = over => Object.assign({ targetIqn: IQN, tpgTag: 1, lunIndex: 3, backstoreName: 'p', plugin: 'fileio', backingPath: '/p', ownership: 'anas', quarantined: false }, over)
+    const absentFlag = iscsi.servedStubs({ stubLuns: [stub({}), stub({ zeroSized: false })] })
+    ok('verdict (vi): zeroSized absent or false is not counted', absentFlag.length === 0, absentFlag)
+    const zero = iscsi.servedStubs({ stubLuns: [stub({ zeroSized: true }), stub({ zeroSized: true, ownership: 'foreign' })] })
+    ok('verdict (vi): a zero-size ANAS stub is counted, a foreign one is not', zero.length === 1, zero)
+  }
+
+  // (vii) the branches before the hole list are what they were.
+  {
+    const b = button()
+    b.apply(null, 'HTTP 500')
+    ok('verdict (vii): an unreadable health read still says so', /could not be read \(HTTP 500\)/.test(b.btn.tooltip), b.btn.tooltip)
+    b.apply({ missingLuns: [hole({ repair: { state: 'ready', detail: READY_ADVICE, advice: READY_ADVICE } })], stubLuns: [], saveconfigUnreadable: '/etc/x' })
+    ok('verdict (vii): an unreadable saveconfig still wins', /cannot be read: \/etc\/x/.test(b.btn.tooltip), b.btn.tooltip)
+    b.apply({ missingLuns: [hole({ repair: { state: 'ready', detail: READY_ADVICE, advice: READY_ADVICE } })], stubLuns: [{ targetIqn: IQN, lunIndex: 3, ownership: 'anas', quarantined: false, zeroSized: true }] })
+    ok('verdict (vii): a served placeholder still wins', /serving a placeholder/.test(b.btn.tooltip), b.btn.tooltip)
+    b.apply({ missingLuns: [], stubLuns: [] })
+    ok('verdict (vii): nothing missing still says nothing to repair', /Nothing to repair/.test(b.btn.tooltip), b.btn.tooltip)
+  }
 }
 
 // --- source sweeps ----------------------------------------------------------

@@ -19,6 +19,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { computeIscsiHealth } from '../iscsi-health.js'
+import { repairAdvice } from '../iscsi-hole.js'
 import { buildIscsiWarnings, collectIscsiWarnings } from '../iscsi-warnings.js'
 import { buildIscsiTargets } from '../iscsi.js'
 import { restoreMarkDetail } from '../restore-mark.js'
@@ -112,6 +113,7 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
         repair: {
           state: 'backing-absent',
           detail: 'That path is still missing — bring the storage back (import the pool, restore the image) first.',
+          advice: 'That path is still missing — bring the storage back (import the pool, restore the image) first.',
         },
       }],
     }))
@@ -142,6 +144,7 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
         repair: {
           state: 'ready',
           detail: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.',
+          advice: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.',
         },
       }],
     }))
@@ -194,6 +197,7 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
         repair: {
           state: 'backing-absent',
           detail: 'That path is still missing — bring the storage back (import the pool, restore the image) first.',
+          advice: 'That path is still missing — bring the storage back (import the pool, restore the image) first.',
         },
       }],
     }))
@@ -315,6 +319,9 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
           detail: 'That path holds a PLACEHOLDER the restore service created — a file of the right name that is not the image, '
             + 'which is why ANAS took the LUN offline. Mount the filesystem that should hold the image, then use Repair on the '
             + 'iSCSI screen to put the LUN back with its own serial.',
+          advice: 'That path holds a PLACEHOLDER the restore service created — a file of the right name that is not the image, '
+            + 'which is why ANAS took the LUN offline. Mount the filesystem that should hold the image, then use Repair on the '
+            + 'iSCSI screen to put the LUN back with its own serial.',
         },
       }],
       degraded: true,
@@ -346,6 +353,7 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
         repair: {
           state: 'backing-absent',
           detail: 'That path is still missing — bring the storage back (import the pool, restore the image) first.',
+          advice: 'That path is still missing — bring the storage back (import the pool, restore the image) first.',
         },
       }],
       stubLuns: [{
@@ -391,6 +399,9 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
         repair: {
           state: 'placeholder',
           detail: 'That path holds a PLACEHOLDER the restore service created — a file of the right name that is not the image, '
+            + 'which is why ANAS took the LUN offline. Mount the filesystem that should hold the image, then use Repair on the '
+            + 'iSCSI screen to put the LUN back with its own serial.',
+          advice: 'That path holds a PLACEHOLDER the restore service created — a file of the right name that is not the image, '
             + 'which is why ANAS took the LUN offline. Mount the filesystem that should hold the image, then use Repair on the '
             + 'iSCSI screen to put the LUN back with its own serial.',
         },
@@ -514,7 +525,7 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
   it('every card carries the iscsi category and a non-empty message', () => {
     const w = buildIscsiWarnings(health({
       degraded: true,
-      missingLuns: [{ targetIqn: IQN, tpgTag: 1, lunIndex: 0, backstoreName: 'a', plugin: 'block', backingPath: '/dev/zvol/p/a', backingExists: true, repair: { state: 'ready', detail: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.' } }],
+      missingLuns: [{ targetIqn: IQN, tpgTag: 1, lunIndex: 0, backstoreName: 'a', plugin: 'block', backingPath: '/dev/zvol/p/a', backingExists: true, repair: { state: 'ready', detail: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.', advice: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.' } }],
       targetsServingNothing: [{ targetIqn: IQN, tpgTag: 1, persistedLunCount: 1, enabled: true }],
       portalsWithoutInterface: [{ targetIqn: IQN, tpgTag: 1, address: '10.9.9.9', port: 3260 }],
     }))
@@ -542,7 +553,9 @@ describe('own.4 (c) — the hole card\'s tail is the hole\'s verdict, framed per
   }
   const HEAD = `LUN 0 'gtiscsi_vol1' of target ${IQN} did not restore — its backing ${BACKING} was not available; the target is serving without it.`
   const cardOf = (repair?: IscsiHoleRepair) => buildIscsiWarnings(health({
-    missingLuns: [repair ? { ...HOLE, repair } : HOLE],
+    // The card prints the verdict's own advice; a hand-built verdict gets the
+    // sentence the owner frames, so these cases pin the card's tail end to end.
+    missingLuns: [repair ? { ...HOLE, repair: { ...repair, advice: repairAdvice(repair.state, repair.detail) } } : HOLE],
     degraded: true,
   })).find(c => /did not restore/.test(c.message))!
 
@@ -601,13 +614,15 @@ describe('own.4 (c) — the hole card\'s tail is the hole\'s verdict, framed per
     assert.match(removedCard.message, /ANAS REMOVED the placeholder/)
     assert.ok(!/still missing/.test(removedCard.message), removedCard.message)
     // Any other verdict says its own thing: the removed clause is about an absence.
-    const readyCard = buildIscsiWarnings(health({ missingLuns: [{ ...HOLE, repair: { state: 'ready', detail: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.' } }], stubLuns: [removed], degraded: true }))
+    const readyCard = buildIscsiWarnings(health({ missingLuns: [{ ...HOLE, repair: { state: 'ready', detail: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.', advice: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.' } }], stubLuns: [removed], degraded: true }))
       .find(c => /did not restore/.test(c.message))!
     assert.ok(!/ANAS REMOVED the placeholder/.test(readyCard.message), readyCard.message)
   })
 
-  it('foreign keeps the hand-restore sentence, whatever the detail says', () => {
-    assert.match(cardOf({ state: 'foreign-target', detail: 'x' }).message, /missing from a target ANAS does not manage\. ANAS never writes to a target it does not own/)
+  it('foreign: the card prints the verdict\'s hand-restore sentence, not one of its own', () => {
+    const sentence = `LUN 0 of ${IQN} (backstore 'gtiscsi_vol1', ${BACKING}) is missing from a target ANAS does not `
+      + 'manage. ANAS never writes to a target it does not own, so Repair leaves it alone.'
+    assert.equal(cardOf({ state: 'foreign-target', detail: sentence }).message, `${HEAD} ${sentence}`)
   })
 
   it('a hole with no verdict gets no tail at all: nothing is claimed about Repair', () => {

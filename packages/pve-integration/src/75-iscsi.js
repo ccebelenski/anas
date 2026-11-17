@@ -55,9 +55,10 @@
  *    logs `Result=success` while the LUN silently vanishes; with a whole pool
  *    late the target comes up enabled with zero LUNs and an initiator logs in
  *    happily and sees nothing. `Repair` is fed by the saveconfig ⟷ configfs diff
- *    and is live only when a hole's backing object is BACK — the tooltip names
- *    what is still missing otherwise. The replay carries the stored serial and
- *    attributes, so a repaired LUN is the same disk.
+ *    and is live only for a hole the daemon's verdict calls ready — the
+ *    tooltip names every other hole with the daemon's own sentence. The replay
+ *    carries the stored serial and attributes, so a repaired LUN is the same
+ *    disk.
  *  - **"Not on this node right now" is not "somebody else's".** A LUN whose pool
  *    is exported reads `Unresolved`, not `Foreign`, and its target stays ANAS's —
  *    otherwise the hands-off badge would take away the very tools that fix it.
@@ -579,28 +580,36 @@
     //
     // A boot restore whose backing device was missing exits 0 and systemd calls
     // it a success, so the ONLY way anyone learns a LUN vanished is this diff of
-    // the saved configuration against what the kernel actually has. The button
-    // is live only when at least one hole's backing object is BACK — repairing
-    // over an absent device is how the hole was made.
+    // the saved configuration against what the kernel actually has. Whether
+    // Repair can put a hole back — and if not, why — is the daemon's one
+    // decision (`repair` on the hole); this page only reads it.
 
+    // The states holeRepairVerdict decides (services/iscsi-hole.ts). Its keys
+    // are also the "known to this page" set (ANAS.knownEnum): the daemon and
+    // the panel upgrade independently, so a state outside them is a newer
+    // daemon's value and is never read as ready.
+    var REPAIR_STATES = {
+        ready: 1,
+        'foreign-target': 1,
+        'target-hands-off': 1,
+        'record-incomplete': 1,
+        placeholder: 1,
+        'backing-absent': 1,
+        'backing-unreadable': 1,
+        'backstore-live': 1,
+        'device-served-elsewhere': 1,
+        'restore-mark': 1
+    };
+
+    // Repair is offered only for the holes the daemon's verdict calls ready.
+    // A hole it refuses is named with the daemon's own sentence in the
+    // tooltip, never offered: an enabled button is a claim about the system.
     function repairableHoles(health) {
         var missing = (health && isArray(health.missingLuns)) ? health.missingLuns : [];
         var out = [];
         for (var i = 0; i < missing.length; i++) {
-            // cr3 (ISCSI-L7): a hole in a target ANAS does not manage is never
-            // Repair's, so it never makes the button live.
-            if (missing[i] && missing[i].backingExists === true && missing[i].targetOwnership !== 'foreign') {
-                out.push(missing[i]);
-            }
-        }
-        return out;
-    }
-
-    function foreignHoles(health) {
-        var missing = (health && isArray(health.missingLuns)) ? health.missingLuns : [];
-        var out = [];
-        for (var i = 0; i < missing.length; i++) {
-            if (missing[i] && missing[i].targetOwnership === 'foreign') {
+            var repair = missing[i] && missing[i].repair;
+            if (repair && ANAS.knownEnum(repair.state, REPAIR_STATES) === 'ready') {
                 out.push(missing[i]);
             }
         }
@@ -616,9 +625,11 @@
         var stubs = (health && isArray(health.stubLuns)) ? health.stubLuns : [];
         var out = [];
         for (var i = 0; i < stubs.length; i++) {
-            // cr3 (review): only a zero-size placeholder is Repair's to take
-            // offline; a full-size image on an unexpected mount is reported only.
-            if (stubs[i] && stubs[i].ownership === 'anas' && stubs[i].quarantined !== true && stubs[i].zeroSized !== false) {
+            // Only a placeholder the daemon says is zero-size is Repair's to
+            // take offline. A full-size image on an unexpected mount is
+            // reported only, and a size the read could not take is not known
+            // to be zero — neither is an offer.
+            if (stubs[i] && stubs[i].ownership === 'anas' && stubs[i].quarantined !== true && stubs[i].zeroSized === true) {
                 out.push(stubs[i]);
             }
         }
@@ -655,33 +666,40 @@
                     + 'then puts back whatever LUN has its storage again.');
         } else if (!missing.length) {
             tip = t('Nothing to repair — the live configuration matches the saved one.');
-        } else if (!ready.length && foreignHoles(health).length === missing.length) {
-            // cr3 (ISCSI-L7): only foreign holes — Repair never touches them.
-            var fh = foreignHoles(health);
-            var names = [];
-            for (var j = 0; j < fh.length; j++) {
-                names.push('LUN ' + fh[j].lunIndex + ' ' + t('of') + ' ' + fh[j].targetIqn);
-            }
-            // cr3 review 2 (L7): the sentence agrees with how many are listed.
-            tip = names.join(', ') + ' '
-                + (fh.length === 1
-                    ? t('is missing from a target ANAS does not manage — Repair never writes to it. '
-                        + 'Bring its backing device back')
-                    : t('are missing from targets ANAS does not manage — Repair never writes to them. '
-                        + 'Bring their backing devices back'))
-                + t(', then run systemctl restart rtslib-fb-targetctl in a maintenance window '
-                    + '(it drops every iSCSI session on this node). Until then iSCSI changes stay refused.');
-        } else if (!ready.length) {
-            var paths = [];
-            for (var i = 0; i < missing.length; i++) {
-                paths.push('' + (missing[i].backingPath || ''));
-            }
-            tip = t('Waiting on the backing storage: ') + paths.join(', ')
-                + t('. Import the pool or restore the image, then Repair.');
         } else {
-            tip = ready.length + ' ' + (ready.length === 1 ? t('LUN') : t('LUNs'))
+            // Every hole Repair will not touch, in the daemon's own words: the
+            // state it decided and the sentence that says what to do about it.
+            var refused = [];
+            for (var j = 0; j < missing.length; j++) {
+                if (ready.indexOf(missing[j]) !== -1) {
+                    continue;
+                }
+                var hole = missing[j] || {};
+                var repair = hole.repair;
+                var advice = (repair && repair.advice)
+                    ? '' + repair.advice
+                    : t('this node did not say whether Repair can put it back.');
+                // The backing path is named beside the LUN: several of the
+                // daemon's sentences speak of "that path".
+                refused.push('LUN ' + hole.lunIndex + ' ' + t('of') + ' ' + hole.targetIqn
+                    + (hole.backingPath ? ' (' + hole.backingPath + ')' : '') + ': ' + advice);
+            }
+            var refusedList = refused.join(' ');
+            var readySentence = ready.length + ' ' + (ready.length === 1 ? t('LUN') : t('LUNs'))
                 + ' ' + t('can be put back now — the same serial and attributes are replayed, '
                     + 'so the initiator sees the same disk.');
+            if (!ready.length) {
+                tip = (missing.length === 1
+                    ? t('Repair cannot put back the missing LUN. ')
+                    : t('Repair cannot put back any of the ') + missing.length + t(' missing LUNs. '))
+                    + refusedList;
+            } else if (!refused.length) {
+                tip = readySentence;
+            } else {
+                tip = readySentence + ' ' + refused.length + ' '
+                    + (refused.length === 1 ? t('other cannot be put back: ') : t('others cannot be put back: '))
+                    + refusedList;
+            }
         }
         btnSetTip(grid, 'iscsiRepair', tip);
     }
@@ -719,9 +737,9 @@
             body: {},
             view: view,
             failTitle: 'Repair failed',
-            successMsg: ready.length
-                ? t('Restore holes repaired') + ': ' + ready.length + ' ' + (ready.length === 1 ? t('LUN') : t('LUNs'))
-                : t('Placeholder LUNs taken offline'),
+            // What was put back is the task's own report; counting here would
+            // claim an outcome before the job has run.
+            successMsg: t('Repair finished'),
             onComplete: function () {
                 loadTargets(view, node);
             },

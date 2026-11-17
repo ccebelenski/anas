@@ -5,7 +5,7 @@
  * hole's backing, whether a device is already served elsewhere, and how a hole
  * is named in a sentence. Nothing here reads or writes the live tree.
  */
-import type { IscsiHoleRepair, IscsiLunAttributes, IscsiMissingLun, IscsiRestoreMarkState, IscsiTargetDetail } from '@anas/shared'
+import type { IscsiHoleRepair, IscsiHoleRepairState, IscsiLunAttributes, IscsiMissingLun, IscsiRestoreMarkState, IscsiTargetDetail } from '@anas/shared'
 import type { SaveconfigStorageObject } from '../parsers/lio-saveconfig.js'
 import type { LioLiveState } from './iscsi-configfs.js'
 import type { HoleReplayRecord } from './iscsi-repair.js'
@@ -206,6 +206,22 @@ export interface HoleIoFacts {
 }
 
 /**
+ * The verdict as one whole sentence for whoever prints it — the warnings card
+ * and the iSCSI screen both do, and neither frames a state itself. The detail's
+ * form is fixed per state (a clause for the five refusals that state a reason, a
+ * full sentence otherwise), so only the opening frame differs.
+ */
+export function repairAdvice(state: IscsiHoleRepairState, detail: string): string {
+  if (state === 'target-hands-off')
+    return `Repair does not write to this target: ${detail}`
+  if (state === 'record-incomplete' || state === 'backing-unreadable' || state === 'backstore-live'
+    || state === 'device-served-elsewhere' || state === 'restore-mark') {
+    return `Repair cannot put it back: ${detail}${detail.endsWith('.') ? '' : '.'}`
+  }
+  return detail
+}
+
+/**
  * What Repair can do with one hole — THE one decision, from facts
  * already gathered: the persisted record, the live tree, and (when the caller
  * has a job view) the backing's I/O facts. The first rung that holds wins.
@@ -224,45 +240,41 @@ export function holeRepairVerdict(
   const rec = holeReplayRecord(ctx, hole, [target])
   const path = rec.backingPath
 
-  if (hole.targetOwnership === 'foreign')
-    return { state: 'foreign-target', detail: foreignHolesSentence([hole]) }
+  if (hole.targetOwnership === 'foreign') {
+    const detail = foreignHolesSentence([hole])
+    return { state: 'foreign-target', detail, advice: repairAdvice('foreign-target', detail) }
+  }
 
   const handsOff = handsOffRefusal(target)
   if (handsOff)
-    return { state: 'target-hands-off', detail: handsOff.message }
+    return { state: 'target-hands-off', detail: handsOff.message, advice: repairAdvice('target-hands-off', handsOff.message) }
 
   const unsafeToken = repairTokensRefusal(rec)
   if (unsafeToken)
-    return { state: 'record-incomplete', detail: unsafeToken }
+    return { state: 'record-incomplete', detail: unsafeToken, advice: repairAdvice('record-incomplete', unsafeToken) }
   if (backingPathRefusal(path)) {
-    return {
-      state: 'record-incomplete',
-      detail: `the saved backing path ${JSON.stringify(path)} contains a space, a quote or an '=', which targetcli `
-        + `cannot be handed — restore it by hand (bring the device back, then restart rtslib-fb-targetctl in a maintenance window)`,
-    }
+    const detail = `the saved backing path ${JSON.stringify(path)} contains a space, a quote or an '=', which targetcli `
+      + `cannot be handed — restore it by hand (bring the device back, then restart rtslib-fb-targetctl in a maintenance window)`
+    return { state: 'record-incomplete', detail, advice: repairAdvice('record-incomplete', detail) }
   }
   if (rec.plugin === 'fileio' && rec.size === null) {
-    return {
-      state: 'record-incomplete',
-      detail: `the saved configuration records no size for fileio backstore '${rec.backstoreName}' (${path}) — `
-        + `recreating it without one would serve a 0-byte disk with the right serial`,
-    }
+    const detail = `the saved configuration records no size for fileio backstore '${rec.backstoreName}' (${path}) — `
+      + `recreating it without one would serve a 0-byte disk with the right serial`
+    return { state: 'record-incomplete', detail, advice: repairAdvice('record-incomplete', detail) }
   }
 
   // A placeholder is a ZERO-BYTE file: a full-size image on an unexpected mount
   // holds data and is not one (the quarantine acts on the same signal).
   if (ctx.stubs.get(hole.backingPath)?.zeroSized === true)
-    return { state: 'placeholder', detail: PLACEHOLDER_DETAIL }
+    return { state: 'placeholder', detail: PLACEHOLDER_DETAIL, advice: repairAdvice('placeholder', PLACEHOLDER_DETAIL) }
 
   if (hole.backingExists === false)
-    return { state: 'backing-absent', detail: ABSENT_DETAIL }
+    return { state: 'backing-absent', detail: ABSENT_DETAIL, advice: repairAdvice('backing-absent', ABSENT_DETAIL) }
 
   if (hole.backingExists === null) {
-    return {
-      state: 'backing-unreadable',
-      detail: `ANAS could not tell whether ${path} is on this node (its stat failed with an error other than `
-        + `"not found"), and Repair never recreates a backstore over a device it cannot see`,
-    }
+    const detail = `ANAS could not tell whether ${path} is on this node (its stat failed with an error other than `
+      + `"not found"), and Repair never recreates a backstore over a device it cannot see`
+    return { state: 'backing-unreadable', detail, advice: repairAdvice('backing-unreadable', detail) }
   }
 
   // A live backstore of this name and plugin: Repair's create would collide with
@@ -280,43 +292,39 @@ export function holeRepairVerdict(
     // A backing held by a restore mark keeps that fact where it was said before,
     // rather than losing it to the backstore sentence.
     const verdict = io ? restoreVerdict(io.mark, io.running, io.record) : null
-    return {
-      state: 'backstore-live',
-      detail: verdict && io
-        ? `${detail}; its backing is held by a restore mark: ${repairMarkClause(io.mark, verdict.state, io.running, io.record)}`
-        : detail,
-    }
+    const full = verdict && io
+      ? `${detail}; its backing is held by a restore mark: ${repairMarkClause(io.mark, verdict.state, io.running, io.record)}`
+      : detail
+    return { state: 'backstore-live', detail: full, advice: repairAdvice('backstore-live', full) }
   }
 
   if (io === null)
     return null
 
   if (rec.plugin === 'block' && io.device == null) {
-    return {
-      state: 'backing-unreadable',
-      detail: `ANAS could not stat ${path}, so it cannot tell which device the path names, and Repair never `
-        + `recreates a backstore over a device it cannot identify`,
-    }
+    const detail = `ANAS could not stat ${path}, so it cannot tell which device the path names, and Repair never `
+      + `recreates a backstore over a device it cannot identify`
+    return { state: 'backing-unreadable', detail, advice: repairAdvice('backing-unreadable', detail) }
   }
 
   const holder = servedElsewhere(ctx.live, io.device ?? null)
   if (holder) {
-    return {
-      state: 'device-served-elsewhere',
-      detail: `${path} names device ${holder.device}, which LIO already serves as backstore '${holder.name}' — the `
-        + `path no longer names the volume this LUN was created on, and recreating it would serve one device under two serials`,
-    }
+    const detail = `${path} names device ${holder.device}, which LIO already serves as backstore '${holder.name}' — the `
+      + `path no longer names the volume this LUN was created on, and recreating it would serve one device under two serials`
+    return { state: 'device-served-elsewhere', detail, advice: repairAdvice('device-served-elsewhere', detail) }
   }
 
   const verdict = restoreVerdict(io.mark, io.running, io.record)
   if (verdict) {
+    const detail = repairMarkClause(io.mark, verdict.state, io.running, io.record)
     return {
       state: 'restore-mark',
-      detail: repairMarkClause(io.mark, verdict.state, io.running, io.record),
+      detail,
+      advice: repairAdvice('restore-mark', detail),
       restoreMark: verdict.state,
       markOn: io.mark.state === 'present' || io.mark.state === 'unknown' ? io.mark.dataset : null,
     }
   }
 
-  return { state: 'ready', detail: READY_DETAIL }
+  return { state: 'ready', detail: READY_DETAIL, advice: repairAdvice('ready', READY_DETAIL) }
 }

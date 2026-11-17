@@ -69,10 +69,11 @@
  *      session, or a non-empty target greys the right controls with the reason
  *      attached — a target is deletable ONLY empty and quiet, and that delete
  *      is a plain confirm, never a confirm-code flow.
- *   6. iSCSI boot lifecycle (story iscsi.5): the Repair button is live ONLY when
- *      a restore hole's backing object is BACK, and says what is still missing
- *      otherwise — a boot restore with a missing device exits 0 and systemd
- *      calls it a success, so this button is the operator's only handle on it.
+ *   6. iSCSI boot lifecycle (story iscsi.5): the Repair button is live ONLY for
+ *      a hole the daemon's verdict calls ready, and names every other hole with
+ *      the daemon's sentence — a boot restore with a missing device exits 0 and
+ *      systemd calls it a success, so this button is the operator's only handle
+ *      on it.
  *      And an `unresolved` LUN does NOT make its target hands-off: "not on this
  *      node right now" is not "somebody else's", and reading it that way would
  *      take away the very tools that fix it.
@@ -3210,8 +3211,10 @@ function iscsiHealth(opts = {}) {
   }
 }
 
-/** One restore hole; `backingExists` is the whole gate on Repair. */
+/** One restore hole; its `repair` verdict is the whole gate on Repair (own.4 (c)). */
 function iscsiHole(backingExists) {
+  const ready = 'That path is available again — use Repair on the iSCSI screen to put the LUN back.'
+  const absent = 'That path is still missing — bring the storage back (import the pool, restore the image) first.'
   return {
     targetIqn: ISCSI_IQN,
     tpgTag: 1,
@@ -3220,6 +3223,9 @@ function iscsiHole(backingExists) {
     plugin: 'block',
     backingPath: '/dev/zvol/tank/vol1',
     backingExists,
+    repair: backingExists
+      ? { state: 'ready', detail: ready, advice: ready }
+      : { state: 'backing-absent', detail: absent, advice: absent },
   }
 }
 
@@ -4204,9 +4210,9 @@ async function iscsiForeignLunChecks() {
 //
 // A boot restore whose backing device was missing exits 0 and systemd logs
 // `Result=success`, so the Repair button is the operator's only handle on it.
-// It has to be live ONLY when a hole's backing object is actually back —
-// recreating a backstore over an absent device is how the hole was made — and
-// when it is not live it has to say what is still missing.
+// It has to be live ONLY for the holes the daemon's verdict calls ready, and
+// when it is not live it has to say, in the daemon's own sentence, what each
+// hole is waiting on.
 
 async function iscsiRepairChecks() {
   ajax.responses = { '/network': PVE_NETWORK }
@@ -4229,8 +4235,8 @@ async function iscsiRepairChecks() {
   state = toolbar(grid, ['iscsiRepair'])
   ok('repair(absent): still DISABLED — a recreate over an absent device made the hole',
     state.iscsiRepair.disabled === true)
-  ok('repair(absent): names the backing path that has to come back',
-    /\/dev\/zvol\/tank\/vol1/.test(state.iscsiRepair.tip), state.iscsiRepair.tip)
+  ok('repair(absent): says the daemon\'s sentence — the path is still missing',
+    /still missing — bring the storage back/.test(state.iscsiRepair.tip), state.iscsiRepair.tip)
 
   // 3. The backing is BACK: live, and it POSTs the node-level repair.
   created.windows.length = 0
