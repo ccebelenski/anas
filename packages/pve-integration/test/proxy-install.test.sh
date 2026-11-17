@@ -514,8 +514,12 @@ check "the line is exactly the [ -x ] gate, the wrapper and || true" \
 check "the wrapper it names ships executable beside install.sh" "[ -x '${PKG}/apt-reapply.sh' ]"
 check "the hook comment points at the journald tag" "grep -qF 'journalctl -t anas-pve-integration' '${HOOK}'"
 if command -v apt-config >/dev/null 2>&1; then
+  # The dump is captured first: under `set -o pipefail` a `grep -q` that
+  # matches early closes the pipe, apt-config dies of SIGPIPE (141) and the
+  # pipeline reads as a failure although apt parsed the file.
+  APT_DUMP="$(apt-config -c "${HOOK}" dump 2>/dev/null)"
   check "apt-config parses the hook file" \
-    "apt-config -c '${HOOK}' dump 2>/dev/null | grep -qF 'DPkg::Post-Invoke'"
+    "printf '%s\n' \"\${APT_DUMP}\" | grep -F 'DPkg::Post-Invoke' >/dev/null"
 fi
 # Run the line as apt would, retargeted at a staged directory.
 STAGE="${WORK}/stage"
