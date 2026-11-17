@@ -1059,7 +1059,8 @@
     // The ACL editor is a small list of rows; each row carries an initiator IQN
     // and its four credential fields, plus the "credentials set" state the read
     // layer reports (a secret is never returned, so the box is always empty and
-    // the LABEL is what tells the operator one is stored).
+    // the LABEL is what tells the operator one is stored — or, when the read
+    // itself failed (own.4(e)), that nothing about them is known).
     function aclRow(acl, index) {
         acl = acl || {};
         aclRowSeq += 1;
@@ -1113,9 +1114,18 @@
                     cls: 'anas-fld-acl-secret',
                     inputType: 'password',
                     inputAttrTpl: ANAS.noAutofill.secret.inputAttrTpl,
-                    fieldLabel: acl.chapCredentialsSet
-                        ? t('CHAP secret (stored — leave blank to keep)')
-                        : t('CHAP secret'),
+                    // own.4(e): `chapCredentialsSet: false` has two meanings
+                    // now — nothing is set, or nothing could be READ. The
+                    // second must never read as the first: the label says the
+                    // value is unknown, not absent, and "leave blank to keep"
+                    // stays the truth the submit honours (a blank box sends no
+                    // key; the daemon keeps the stored value it could not read
+                    // either, and refuses any edit that leans on it).
+                    fieldLabel: acl.authUnreadable
+                        ? t('CHAP secret (could not be read; leave blank to keep)')
+                        : acl.chapCredentialsSet
+                            ? t('CHAP secret (stored — leave blank to keep)')
+                            : t('CHAP secret'),
                     emptyText: acl.chapCredentialsSet ? t('unchanged') : ''
                 },
                 {
@@ -1132,9 +1142,11 @@
                     cls: 'anas-fld-acl-mutual-secret',
                     inputType: 'password',
                     inputAttrTpl: ANAS.noAutofill.secret.inputAttrTpl,
-                    fieldLabel: acl.mutualCredentialsSet
-                        ? t('Mutual CHAP secret (stored — leave blank to keep)')
-                        : t('Mutual CHAP secret'),
+                    fieldLabel: acl.authUnreadable
+                        ? t('Mutual CHAP secret (could not be read; leave blank to keep)')
+                        : acl.mutualCredentialsSet
+                            ? t('Mutual CHAP secret (stored — leave blank to keep)')
+                            : t('Mutual CHAP secret'),
                     emptyText: acl.mutualCredentialsSet ? t('unchanged') : ''
                 },
                 {

@@ -239,6 +239,18 @@ export interface ConfigfsAcl {
    * a hand-built state (a test's) that never says reads as readable.
    */
   sessionUnreadable?: boolean
+  /**
+   * own.4(e): one of the four auth value files (`userid`, `userid_mutual`,
+   * `password`, `password_mutual`) could not be READ. `chapCredentialsSet`
+   * and `mutualCredentialsSet` are then false and the userids null because
+   * nothing was SEEN, not because nothing is set — a door that decides from
+   * them must refuse rather than edit against a guess — a stored secret
+   * dropped, or a `never be able to log in` refusal about a secret nobody
+   * read.
+   * Optional so a hand-built state (a test's) that never says reads as
+   * readable; the secret value is unknown too and was never held anywhere.
+   */
+  authUnreadable?: boolean
 }
 
 /** A live network portal (an `np/<addr>:<port>` directory). */
@@ -309,13 +321,23 @@ async function readValue(path: string): Promise<string | null> {
 }
 
 /**
+ * Read a configfs value as a trimmed string, keeping a failed read as null —
+ * "unknown", not empty. Where "could not read" must not collapse into "not
+ * set" (own.4(e): the ACL's auth values), read through this.
+ */
+async function readTrimmedOrNull(path: string): Promise<string | null> {
+  const v = await readValue(path)
+  return v === null ? null : v.trim()
+}
+
+/**
  * Read a configfs value as a trimmed string, treating "absent" and "empty" the
  * same. Needed because configfs `stat` reports every attribute file as 4096
  * bytes regardless of content — an `-s`-style size test is meaningless here, so
  * emptiness has to be decided from the CONTENT.
  */
 async function readTrimmed(path: string): Promise<string> {
-  return (await readValue(path))?.trim() ?? ''
+  return (await readTrimmedOrNull(path)) ?? ''
 }
 
 /** Read a `1`/`0` configfs flag; null when absent or unparseable. */
@@ -658,30 +680,38 @@ async function readAcl(aclsDir: string, initiatorIqn: string, sink: string[]): P
   const dir = join(aclsDir, initiatorIqn)
   const authDir = join(dir, 'auth')
 
-  const [chapUserid, mutualUserid, password, passwordMutual, authenticateTarget, infoRaw, mappedLuns]
+  const [userid, useridMutual, password, passwordMutual, authenticateTarget, infoRaw, mappedLuns]
     = await Promise.all([
-      readTrimmed(join(authDir, 'userid')),
-      readTrimmed(join(authDir, 'userid_mutual')),
+      readTrimmedOrNull(join(authDir, 'userid')),
+      readTrimmedOrNull(join(authDir, 'userid_mutual')),
       // Read ONLY to learn whether a secret is set — the value stops here and
       // never enters the returned object (GT-35). configfs stat sizes are always
       // 4096, so emptiness cannot be decided any other way.
-      readTrimmed(join(authDir, 'password')),
-      readTrimmed(join(authDir, 'password_mutual')),
+      readTrimmedOrNull(join(authDir, 'password')),
+      readTrimmedOrNull(join(authDir, 'password_mutual')),
       readFlag(join(authDir, 'authenticate_target')),
       readValue(join(dir, 'info')),
       readMappedLuns(dir, sink),
     ])
 
+  // own.4(e): one failed auth read makes this ACL's credentials UNKNOWN, never
+  // "not set" — the booleans below keep their types (false when unknown) so no
+  // consumer breaks, and the mark is what tells a deciding door it has a
+  // placeholder rather than an answer (the sessionUnreadable shape).
+  const authReadable = userid !== null && useridMutual !== null
+    && password !== null && passwordMutual !== null
+
   return {
     initiatorIqn,
-    chapUserid: authUnset(chapUserid) ? null : chapUserid,
-    chapCredentialsSet: !authUnset(password),
-    mutualUserid: authUnset(mutualUserid) ? null : mutualUserid,
-    mutualCredentialsSet: !authUnset(passwordMutual),
+    chapUserid: userid !== null && !authUnset(userid) ? userid : null,
+    chapCredentialsSet: password !== null && !authUnset(password),
+    mutualUserid: useridMutual !== null && !authUnset(useridMutual) ? useridMutual : null,
+    mutualCredentialsSet: passwordMutual !== null && !authUnset(passwordMutual),
     authenticateTarget,
     mappedLuns,
     session: infoRaw !== null ? parseAclInfo(infoRaw, initiatorIqn) : null,
     ...(aclInfoReadable(infoRaw) ? {} : { sessionUnreadable: true }),
+    ...(authReadable ? {} : { authUnreadable: true }),
   }
 }
 

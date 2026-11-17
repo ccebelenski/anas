@@ -566,6 +566,13 @@ function buildAclFromLive(a: ConfigfsAcl): IscsiAcl {
   }
   if (a.authenticateTarget !== null)
     acl.authenticateTarget = a.authenticateTarget
+  // own.4(e): the mark travels with the row the update route decides from —
+  // without it the placeholders below would read as answers. The persisted
+  // (saveconfig) half of the union needs no copy: that file either parses as
+  // a whole or the whole persisted side is null, so a per-ACL "could not
+  // read" has no meaning there.
+  if (a.authUnreadable === true)
+    acl.authUnreadable = true
   return acl
 }
 

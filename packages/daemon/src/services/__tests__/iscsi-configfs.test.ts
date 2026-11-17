@@ -287,6 +287,93 @@ describe('readConfigfs — the live capture, materialised', () => {
   })
 })
 
+describe('own.4(e) — an auth value that could not be read is unknown, never "not set"', () => {
+  // The read-failure planted here is a DIRECTORY in place of the auth FILE:
+  // `readFile` fails with EISDIR and `readValue` gives null — and, unlike a
+  // `chmod 000`, it fails the same way whether the suite runs as root or not.
+  const DEBIAN = 'iqn.1993-08.org.debian:01:ae3d2ec18ad'
+  const ALLOWED2 = 'iqn.2026-08.dev.anas.gtiscsi:allowed2'
+
+  function authFile(root: string, initiator: string, file: string): string {
+    return join(root, 'iscsi', 'iqn.2026-08.dev.anas.gtiscsi:target1', 'tpgt_1', 'acls', initiator, 'auth', file)
+  }
+
+  /** Make one auth value unreadable the way the kernel sometimes does it. */
+  async function makeUnreadable(path: string): Promise<void> {
+    await rm(path)
+    await mkdir(path)
+  }
+
+  it('marks the ACL authUnreadable when its password cannot be read, keeping the values that did read', async () => {
+    const { root, blockRoot, dir } = await materialize('configfs-live.manifest')
+    try {
+      await makeUnreadable(authFile(root, DEBIAN, 'password'))
+      const state = await readConfigfs({ root, blockRoot })
+      const acls = state.targets[0].tpgs[0].acls
+      const debian = acls.find(a => a.initiatorIqn === DEBIAN)!
+      assert.equal(debian.authUnreadable, true)
+      // The three files that still read keep their values; the one that failed
+      // keeps its type and reads as the unknown placeholder — false here, a
+      // guess ANAS must never decide from, and not a value ANAS invents either.
+      assert.equal(debian.chapUserid, 'gtacluser')
+      assert.equal(debian.chapCredentialsSet, false)
+      assert.equal(debian.mutualUserid, 'gttargetuser')
+      assert.equal(debian.mutualCredentialsSet, true)
+      // The mark is per ACL: the other ACL's four files all read.
+      const allowed2 = acls.find(a => a.initiatorIqn === ALLOWED2)!
+      assert.equal('authUnreadable' in allowed2, false)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('has no authUnreadable key when all four auth files read', async () => {
+    const { root, blockRoot, dir } = await materialize('configfs-live.manifest')
+    try {
+      const state = await readConfigfs({ root, blockRoot })
+      for (const acl of state.targets[0].tpgs[0].acls)
+        assert.equal('authUnreadable' in acl, false)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('marks the ACL authUnreadable when a userid cannot be read either', async () => {
+    const { root, blockRoot, dir } = await materialize('configfs-live.manifest')
+    try {
+      await makeUnreadable(authFile(root, ALLOWED2, 'userid'))
+      const state = await readConfigfs({ root, blockRoot })
+      const allowed2 = state.targets[0].tpgs[0].acls.find(a => a.initiatorIqn === ALLOWED2)!
+      assert.equal(allowed2.authUnreadable, true)
+      // Same rule for the usernames: unknown reads as null, and the mark is
+      // what says null is "could not read" rather than "no username".
+      assert.equal(allowed2.chapUserid, null)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('still never serialises a secret when a password could not be read', async () => {
+    const { root, blockRoot, dir } = await materialize('configfs-live.manifest')
+    try {
+      // Plant the failure on the MUTUAL password so the incoming one keeps its
+      // captured secret: the readable secret must still never appear in the
+      // result, and the unreadable one never either.
+      await makeUnreadable(authFile(root, DEBIAN, 'password_mutual'))
+      const state = await readConfigfs({ root, blockRoot })
+      const serialised = JSON.stringify(state)
+      assert.equal(serialised.includes('REDACTED-16char'), false)
+      assert.equal(serialised.includes('password'), false)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('readConfigfs — fail-open', () => {
   it('reports an absent configfs tree as present:false, not an error', async () => {
     const state = await readConfigfs({ root: join(tmpdir(), 'anas-no-such-configfs-root') })

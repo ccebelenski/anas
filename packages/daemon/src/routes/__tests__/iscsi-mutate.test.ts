@@ -819,6 +819,83 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.match(res.body.error!.message, /at least one portal/)
     })
 
+    // --- own.4(e): stored credentials that could not be READ -----------------
+    //
+    // The planted read-failure is the one the configfs tests use: a DIRECTORY
+    // in place of the ACL's `password` FILE, so the read fails the way a
+    // configfs attribute can fail on a live node. What must NEVER come out of
+    // such a target is a decision taken from the placeholder the failed read
+    // left behind — including the false "could never log in" 400.
+    async function serveUnreadableStoredAuth() {
+      await serveAnas()
+      const password = join(dir, 'target', 'iscsi', ANAS_IQN, 'tpgt_1', 'acls', INITIATOR, 'auth', 'password')
+      await rm(password)
+      await mkdir(password)
+    }
+
+    it('409s turning CHAP on over unreadable stored credentials, not a false never-log-in 400', async () => {
+      await serveUnreadableStoredAuth()
+      const mock = mockOf()
+      const res = await call('PUT', targetUrl(), { auth: 'chap', acls: [{ initiatorIqn: INITIATOR }] })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'acl-auth-unreadable')
+      assert.ok(!/never be able to log in/.test(res.body.error!.message), 'no sentence about a secret nobody read')
+      assert.equal(
+        res.body.error!.message,
+        `The stored CHAP credentials of ${INITIATOR} could not be read just now, so nothing was changed. `
+        + `Try again; if it keeps happening, check the node's kernel log.`,
+      )
+      assert.ok(!res.headers['x-anas-confirm-code'], 'a refusal with no confirm path: try again, not are-you-sure')
+      // Nothing ran: the refusal is before any job, and the read layer itself
+      // never calls targetcli.
+      assert.equal(mock.calls.filter(c => c.command === TARGETCLI).length, 0, JSON.stringify(mock.calls.map(c => [c.command, c.args])))
+    })
+
+    it('409s a credential edit that leaves the secret box blank over the unreadable stored one', async () => {
+      await serveUnreadableStoredAuth()
+      // A panel-style edit: a new username, the secret box left blank to KEEP
+      // the stored one — and the stored one was never read, so keeping it is
+      // exactly the thing ANAS cannot promise.
+      const res = await call('PUT', targetUrl(), { acls: [{ initiatorIqn: INITIATOR, chapUserid: 'alice' }] })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'acl-auth-unreadable')
+    })
+
+    it('does not refuse over the mark when the request carries all four values itself', async () => {
+      await serveUnreadableStoredAuth()
+      // Nothing on this request needs the unreadable stored side, so the mark
+      // is not its business: the edit answers for itself.
+      const res = await call('PUT', targetUrl(), {
+        acls: [{
+          initiatorIqn: INITIATOR,
+          chapUserid: 'alice',
+          chapSecret: '0123456789ab',
+          mutualUserid: 'bob',
+          mutualSecret: '0123456789abc',
+        }],
+      })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      assert.notEqual(res.body.error?.reason, 'acl-auth-unreadable')
+    })
+
+    it('does not refuse a portal-only edit over the mark — it touches no credentials', async () => {
+      await serveUnreadableStoredAuth()
+      const res = await call('PUT', targetUrl(), { portals: [{ address: '192.168.200.50', port: 3260 }] })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+    })
+
+    it('leaves today\'s accepted edit accepted when the four files all read', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      // The same edit as the blank-secret case above, on a READABLE tree:
+      // unchanged behaviour — accepted, and the job writes only the username.
+      const res = await call('PUT', targetUrl(), { acls: [{ initiatorIqn: INITIATOR, chapUserid: 'alice' }] })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    })
+
     // --- M3 / LP6: portal removal under a live session -----------------------
     //
     // A two-portal target, A=192.168.200.50 and B=192.168.200.51, with a live

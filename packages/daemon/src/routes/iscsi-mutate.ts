@@ -489,6 +489,24 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       const desired: IscsiAclRequest[] = req.acls ?? target.acls.map(a => ({ initiatorIqn: a.initiatorIqn }))
       for (const acl of desired) {
         const stored = target.acls.find(a => a.initiatorIqn === acl.initiatorIqn)
+        // own.4(e): the stored credentials could not be READ, and this request
+        // leaves at least one of them to the stored side. `chapCredentialsSet:
+        // false` there means "nothing was seen", not "nothing is set" — so the
+        // merged check below would decide from a placeholder: refuse a CHAP-on
+        // edit that could never log in over a secret that might well be set,
+        // and an edit that would keep (or drop) a secret nobody read. Refuse
+        // over the mark instead, BEFORE that check, with nothing changed. A
+        // request carrying all four values itself needs no stored side and is
+        // not this mark's business.
+        if (stored?.authUnreadable === true
+          && (acl.chapUserid === undefined || acl.chapSecret === undefined
+            || acl.mutualUserid === undefined || acl.mutualSecret === undefined)) {
+          return sendRefusal(reply, {
+            reason: 'acl-auth-unreadable',
+            message: `The stored CHAP credentials of ${acl.initiatorIqn} could not be read just now, so nothing was changed. `
+              + `Try again; if it keeps happening, check the node's kernel log.`,
+          })
+        }
         const merged = {
           chapUserid: acl.chapUserid !== undefined ? acl.chapUserid : stored?.chapUserid ?? null,
           chapSecret: acl.chapSecret !== undefined ? acl.chapSecret : (stored?.chapCredentialsSet ? 'stored' : null),

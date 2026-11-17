@@ -118,8 +118,9 @@ export function portalKey(p: { address: string, port: number }): string {
 
 /**
  * The target's revision: a sha256 over the configuration every target verb is
- * computed from. Credentials enter only as "set or not" (never a secret), and
- * sessions not at all (see the module comment).
+ * computed from. Credentials enter only as "set or not", as the own.4(e)
+ * "could not be read" mark, and never as a secret; sessions not at all (see
+ * the module comment).
  */
 export function targetRevision(target: IscsiTargetDetail): string {
   const facts = {
@@ -132,6 +133,10 @@ export function targetRevision(target: IscsiTargetDetail): string {
       chapCredentialsSet: a.chapCredentialsSet,
       mutualUserid: a.mutualUserid,
       mutualCredentialsSet: a.mutualCredentialsSet,
+      // own.4(e): an ACL whose auth could not be READ is a different fact than
+      // one that read as unset — a job must not bind against a revision that
+      // was computed while the credentials were unknown.
+      ...(a.authUnreadable === true ? { authUnreadable: true } : {}),
       mappedLuns: sorted(a.mappedLuns, n => String(n).padStart(6, '0')),
     })),
     portals: target.portals.map(portalKey).sort(),

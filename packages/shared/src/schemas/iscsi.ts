@@ -494,6 +494,17 @@ export const IscsiAcl = z.object({
    * written. Absent when the flag could not be read.
    */
   authenticateTarget: z.boolean().optional(),
+  /**
+   * own.4(e): true when one of the ACL's four CHAP value files could not be
+   * read — `chapUserid`, `chapCredentialsSet`, `mutualUserid` and
+   * `mutualCredentialsSet` are then placeholders for unknown (null / false),
+   * NOT answers, and a stored secret may or may not exist. The update route
+   * refuses an edit that would leave any of the four to the placeholder side,
+   * and the panel says the secret could not be read instead of labelling the
+   * field as if none were stored. Absent = all four reads succeeded. An older
+   * panel ignores it.
+   */
+  authUnreadable: z.boolean().optional(),
   /** TPG LUN indexes mapped into this ACL. */
   mappedLuns: z.array(z.number().int().nonnegative()),
 })

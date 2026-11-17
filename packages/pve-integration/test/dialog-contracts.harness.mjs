@@ -3107,7 +3107,19 @@ function iscsiDetail(opts = {}) {
     sessions: opts.session
       ? [{ initiatorIqn: ISCSI_INITIATOR, initiatorAlias: 'anas-pve', targetIqn: ISCSI_IQN, tpgTag: 1, sessionId: 1, state: 'TARG_SESS_STATE_LOGGED_IN', connections: [{ cid: 0, address: '192.168.200.60', state: 'TARG_CONN_STATE_LOGGED_IN' }], mappedLuns: [opts.sessionLun ?? 0] }]
       : [],
-    acls: [{
+    acls: opts.authUnreadable ? [{
+      // own.4(e): the daemon could not READ this ACL's four auth files. The
+      // booleans are false and the userids null because NOTHING WAS SEEN, not
+      // because nothing is set — and `authUnreadable: true` is what says so.
+      initiatorIqn: ISCSI_INITIATOR,
+      chapUserid: null,
+      chapCredentialsSet: false,
+      mutualUserid: null,
+      mutualCredentialsSet: false,
+      authUnreadable: true,
+      authenticateTarget: false,
+      mappedLuns: [0, 1],
+    }] : [{
       initiatorIqn: ISCSI_INITIATOR,
       chapUserid: 'alice',
       chapCredentialsSet: true,
@@ -3607,6 +3619,73 @@ async function iscsiEditChecks() {
   eq('edit(remove): the ACL list travels complete and shorter', job.body.acls, [])
 
   ok('edit: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// own.4(e): the read layer could not READ one ACL's four auth files. Every
+// value the dialog would otherwise render is UNKNOWN, and unknown must never
+// dress up as absent: the secret fields say so on their LABELS (a secret is
+// never returned, so the label is the only channel), the empty box sends no
+// key (keep — the daemon refuses anything leaning on the unread side), and a
+// typed secret travels exactly as it does on a readable ACL — it is the
+// daemon's `acl-auth-unreadable` refusal, not the dialog, that decides.
+async function iscsiUnreadableAuthChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { grid } = await openIscsiView({
+    ...ISCSI_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: iscsiDetail({ authUnreadable: true }) },
+  })
+  grid.selectRow(iscsiRowOf(grid, ISCSI_IQN))
+  const openEdit = async () => {
+    const btn = grid.down('#iscsiEdit')
+    btn.handler(btn)
+    await settle()
+    return openWindow()
+  }
+  const save = async (dlg) => {
+    jobs.length = 0
+    const b = dlg.buttonCmps.find(x => x.cls === 'anas-btn-iscsi-target-submit')
+    b.handler(b)
+    await settle()
+    return jobs.length ? jobs[0] : null
+  }
+
+  let dlg = await openEdit()
+  ok('unreadable-auth: the edit dialog opened', !!dlg && !!dlg.down('#iqn'))
+  if (!dlg) { return }
+  const aclRow = dlg.down('#aclsContainer').items.getAt(0)
+  ok('unreadable-auth: the CHAP secret label says it could not be read',
+    /could not be read; leave blank to keep/.test(aclRow.down('#aclSecret').fieldLabel),
+    aclRow.down('#aclSecret').fieldLabel)
+  ok('unreadable-auth: and does not claim one is stored, or that none is',
+    !/stored/.test(aclRow.down('#aclSecret').fieldLabel), aclRow.down('#aclSecret').fieldLabel)
+  ok('unreadable-auth: the mutual secret label says the same',
+    /Mutual CHAP secret \(could not be read; leave blank to keep\)/.test(aclRow.down('#aclMutualSecret').fieldLabel),
+    aclRow.down('#aclMutualSecret').fieldLabel)
+  eq('unreadable-auth: the secret box carries no unchanged claim', aclRow.down('#aclSecret').emptyText, '')
+
+  // An untouched dialog sends NOTHING — unknown produces no keys at all.
+  let job = await save(dlg)
+  eq('unreadable-auth: an untouched edit sends NOTHING', job, null)
+
+  // A portal edit stays what it is: portals only, no acls key to refuse.
+  dlg = await openEdit()
+  dlg.down('#portalPort').setValue(3261)
+  await settle()
+  job = await save(dlg)
+  ok('unreadable-auth: a portal-only edit sends no acls key',
+    job && !('acls' in job.body), JSON.stringify(job && job.body))
+
+  // What the operator TYPES still travels — the panel does not pre-refuse;
+  // the daemon answers over the mark (its route refuses this one, leaving
+  // chapUserid to a stored value nobody read).
+  dlg = await openEdit()
+  dlg.down('#aclsContainer').items.getAt(0).down('#aclSecret').setValue('newsecret1234')
+  await settle()
+  job = await save(dlg)
+  eq('unreadable-auth: a typed secret travels as typed', job && job.body.acls,
+    [{ initiatorIqn: ISCSI_INITIATOR, chapSecret: 'newsecret1234' }])
+
+  ok('unreadable-auth: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 // Bug report (live, 2026-08-28): a target dialog with TWO visible initiator
@@ -11170,6 +11249,7 @@ for (const check of [
   iscsiCreateChecks,
   iscsiNodeIqnAbsentChecks,
   iscsiEditChecks,
+  iscsiUnreadableAuthChecks,
   iscsiRowSurvivalChecks,
   iscsiLunChecks,
   // pvepool.2 — the backing pickers' version-skew fallback (old daemon: no
