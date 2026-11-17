@@ -86,7 +86,7 @@ async function deleteSchedule(ctx: APIRequestContext, id: string): Promise<void>
  */
 async function createSchedule(
   ctx: APIRequestContext,
-  body: Record<string, unknown> & { id: string, target: { dataset: string } },
+  body: Record<string, unknown> & { id: string, target: { kind: 'zfs', dataset: string } },
   adopts?: { count: number },
 ): Promise<void> {
   const data = { enabled: false, ...body }
