@@ -74,18 +74,22 @@
  * and a log line, never an exception that breaks a dashboard.
  */
 
-import type { IscsiHealth, IscsiStubLun, IscsiTargetDetail } from '@anas/shared'
+import type { IscsiHealth, IscsiMissingLun, IscsiStubLun, IscsiTargetDetail } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { LioLiveState } from './iscsi-configfs.js'
 import type { IscsiHealthReadOptions } from './iscsi-health.js'
+import type { HoleIoFacts } from './iscsi-hole.js'
 import type { IscsiPaths, IscsiReadContext } from './iscsi.js'
 import type { RestoreMarkRead } from './restore-mark.js'
 import { stat, unlink } from 'node:fs/promises'
 import { lunsMappingBackstore } from './iscsi-configfs.js'
-import { computeIscsiHealth, unmappedLiveBackstores } from './iscsi-health.js'
-import { assertConfigshellArgs, runTargetcli, tpgPath, withIscsiLock } from './iscsi-mutate.js'
+import { computeIscsiHealth, restoreHoles, unmappedLiveBackstores } from './iscsi-health.js'
+import { holeKey } from './iscsi-hole.js'
+import { assertConfigshellArgs, runTargetcli, withIscsiLock } from './iscsi-mutate.js'
+import { tpgPath } from './iscsi-rules.js'
+import { statDeviceFrom } from './iscsi-served.js'
 import { buildIscsiTargets, readIscsiContext, targetTpgs } from './iscsi.js'
-import { readRestoreMarksBatch } from './restore-mark.js'
+import { consultsJobRecord, readRestoreMarksBatch } from './restore-mark.js'
 
 /** What one quarantine pass did, per stub. */
 export interface IscsiQuarantineOutcome {
@@ -341,28 +345,69 @@ async function read(
 ): Promise<{ ctx: IscsiReadContext, targets: IscsiTargetDetail[], health: IscsiHealth }> {
   const ctx = await readIscsiContext(executor, paths)
   const targets = await buildIscsiTargets(ctx)
-  // cr3.lunrestore: a caller with a job view reads the restore marks too.
-  const marks = opts.restoreRunning ? await readRestoreMarks(executor, ctx, targets) : undefined
+  // cr3.lunrestore: a caller with a job view reads the restore marks too —
+  // for the present LUNs, the unmapped backstores, and the holes' own backings,
+  // in the same one batch.
+  const restoreRunning = opts.restoreRunning
+  const holes = restoreRunning ? restoreHoles(ctx, targets) : []
+  const marks = restoreRunning ? await readRestoreMarks(executor, ctx, targets, holes) : undefined
+  const holeIo = restoreRunning && marks ? await gatherHoleIo(paths, holes, marks, restoreRunning, opts.restoreFailed) : undefined
   const health = computeIscsiHealth(ctx, targets, {
     ...(opts.disabledDetail ? { disabledDetail: opts.disabledDetail } : {}),
-    ...(opts.restoreRunning ? { restoreRunning: opts.restoreRunning } : {}),
+    ...(restoreRunning ? { restoreRunning } : {}),
     ...(opts.restoreFailed ? { restoreFailed: opts.restoreFailed } : {}),
     ...(marks ? { marks } : {}),
+    ...(holeIo ? { holeIo } : {}),
     ...(quarantined ? { quarantined } : {}),
   })
   return { ctx, targets, health }
 }
 
 /**
+ * The I/O facts `holeRepairVerdict` needs, per hole whose backing is present
+ * (the same holes whose backing joined the mark read — an absent backing is
+ * never read). The record is asked only where `consultsJobRecord` says, as the
+ * Repair route asks it. A mark the batch did not answer leaves the hole
+ * unjudged rather than guessed.
+ */
+async function gatherHoleIo(
+  paths: IscsiPaths,
+  holes: { hole: IscsiMissingLun, target: IscsiTargetDetail }[],
+  marks: Map<string, RestoreMarkRead>,
+  restoreRunning: (backingPath: string) => string | undefined,
+  restoreFailed?: (backingPath: string, targetIqn?: string) => HoleIoFacts['record'],
+): Promise<Map<string, HoleIoFacts>> {
+  const statOf = statDeviceFrom(paths)
+  const out = new Map<string, HoleIoFacts>()
+  for (const { hole } of holes) {
+    if (hole.backingExists !== true)
+      continue
+    const mark = marks.get(hole.backingPath)
+    if (!mark)
+      continue
+    out.set(holeKey(hole), {
+      ...(hole.plugin === 'block' ? { device: await statOf(hole.backingPath) } : {}),
+      mark,
+      running: restoreRunning(hole.backingPath),
+      record: consultsJobRecord(mark) ? restoreFailed?.(hole.backingPath, hole.targetIqn) : undefined,
+    })
+  }
+  return out
+}
+
+/**
  * The restore mark of every backing the health read reports on — each
- * present LUN's and each live backstore no LUN maps — in one `zfs get`
- * (cr3.lunrestore, review2 (7)). An image file's mark is read off the file
- * itself, one `getfattr` each (cr3.lunrestore.filemark).
+ * present LUN's, each live backstore no LUN maps, and each hole whose backing
+ * is back — in one `zfs get` (cr3.lunrestore, review2 (7)). An image file's
+ * mark is read off the file itself, one `getfattr` each
+ * (cr3.lunrestore.filemark). An absent backing is not read: it cannot carry
+ * anything a verdict would consult.
  */
 export async function readRestoreMarks(
   executor: CommandExecutor,
   ctx: IscsiReadContext,
   targets: IscsiTargetDetail[],
+  holes: { hole: IscsiMissingLun, target: IscsiTargetDetail }[],
 ): Promise<Map<string, RestoreMarkRead>> {
   const paths = new Set<string>()
   for (const t of targets) {
@@ -375,6 +420,10 @@ export async function readRestoreMarks(
   }
   for (const b of unmappedLiveBackstores(ctx))
     paths.add(b.backingPath)
+  for (const { hole } of holes) {
+    if (hole.backingExists === true)
+      paths.add(hole.backingPath)
+  }
   // review2 (7): ONE `zfs get` for every volume, not one per backing.
   return readRestoreMarksBatch(executor, [...paths])
 }

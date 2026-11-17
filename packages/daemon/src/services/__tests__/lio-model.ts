@@ -17,8 +17,14 @@ import type { IscsiTargetDetail } from '@anas/shared'
 import type { CommandExecutor, ExecOptions, ExecResult, ExecStreamOptions, ExecStreamResult, ExecStreamTarget, PipelineResult } from '../../executor/types.js'
 import type { ConfigfsBackstore, ConfigfsTpg, LioLiveState } from '../iscsi-configfs.js'
 import type { TargetObject } from '../iscsi-guard.js'
+import type { HoleIoFacts } from '../iscsi-hole.js'
+import type { DeviceStat } from '../iscsi-served.js'
 import type { IscsiReadContext } from '../iscsi.js'
+import type { RestoreJobRecord, RestoreMarkRead } from '../restore-mark.js'
+import { restoreHoles } from '../iscsi-health.js'
+import { holeKey } from '../iscsi-hole.js'
 import { TARGETCLI, ZFS } from '../iscsi-mutate.js'
+import { markOn } from '../restore-mark.js'
 
 /** One recorded call and how it ended. `exitCode: null` = it never returned (the run halted inside it). */
 export interface RecordedCall {
@@ -189,6 +195,41 @@ export function contextOf(tree: LioTree, saved: LioTree | null, base: { iqn: str
 /** The `refreshAfterCreate` answer a test hands the service: the target as given, the live tree of the model. */
 export function targetObjectOf(target: IscsiTargetDetail, ctx: IscsiReadContext): TargetObject {
   return { target, state: { ctx, targets: [target] } }
+}
+
+/** A block device no model backstore names, so a default stat is never "served elsewhere". */
+const UNCLAIMED: DeviceStat = { type: 'block', rdevMajor: 230, rdevMinor: 0, dev: '0', ino: '0', size: 0 }
+
+/** What a test overrides about a hole's I/O facts. */
+export interface HoleIoOver {
+  /** The mark read; default absent for every hole whose backing is present. */
+  mark?: RestoreMarkRead
+  /** A restore running onto the backing. */
+  running?: string
+  /** The retained failed restore onto the backing. */
+  record?: RestoreJobRecord
+  /** The block backing's stat; default a device nothing serves. */
+  device?: DeviceStat | null
+}
+
+/**
+ * The I/O facts `computeIscsiHealth`'s `holeIo` takes, for every hole whose
+ * backing is present — the shape `read()` gathers, so a test can drive the
+ * verdict through `computeIscsiHealth` without a configfs tree on disk.
+ */
+export function holeIoFor(ctx: IscsiReadContext, targets: IscsiTargetDetail[], over: HoleIoOver = {}): Map<string, HoleIoFacts> {
+  const out = new Map<string, HoleIoFacts>()
+  for (const { hole } of restoreHoles(ctx, targets)) {
+    if (hole.backingExists !== true)
+      continue
+    out.set(holeKey(hole), {
+      ...(hole.plugin === 'block' ? { device: over.device === undefined ? UNCLAIMED : over.device } : {}),
+      mark: over.mark ?? { state: 'absent', dataset: markOn(hole.backingPath) ?? hole.backingPath },
+      running: over.running,
+      record: over.record,
+    })
+  }
+  return out
 }
 
 /**

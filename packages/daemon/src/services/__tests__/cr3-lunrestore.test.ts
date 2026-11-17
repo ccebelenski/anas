@@ -1605,7 +1605,7 @@ describe('cr3.lunrestore review2 (7) — the marks of every volume in ONE zfs ge
     const ctx = contextOf({ backstores: [{ name: 'newvol', plugin: 'block', dev: NEWVOL, wwn: 's' }, { name: 'other2', plugin: 'block', dev: '/dev/zvol/tank/other2', wwn: 't' }], luns: [{ iqn: IQN, tag: 1, index: 2, backstore: 'other2', plugin: 'block' }] }, null, SOURCE_BASE)
     const node = withMarks(new MockExecutor())
     const rec = recording(node.executor)
-    const reads = await readRestoreMarks(rec.executor, ctx, await buildIscsiTargets(ctx))
+    const reads = await readRestoreMarks(rec.executor, ctx, await buildIscsiTargets(ctx), [])
     assert.equal(reads.size, 3)
     assert.deepEqual(argv(rec.calls), [`${ZFS} get -Hp -o name,value,source anas:restore -- tank/vol1 tank/other2 tank/newvol`])
   })
@@ -1682,7 +1682,7 @@ async function verdictsOn(base: typeof SOURCE_BASE, enabled: boolean, marks: Com
   targets[0].ownership = 'anas'
   const facts = await readLunMarks(marks, targets[0].luns)
   const v = enableMarkVerdict(IQN, facts)
-  const reads = await readRestoreMarks(marks, ctx, targets)
+  const reads = await readRestoreMarks(marks, ctx, targets, [])
   const health = computeIscsiHealth(ctx, targets, { marks: reads, restoreRunning: () => undefined, restoreFailed: () => undefined })
   return { enable: v.kind === 'refuse' ? `refuse (${v.reason})` : v.kind, card: cardOf(buildIscsiWarnings(health).map(w => w.message)) }
 }
@@ -2250,7 +2250,7 @@ describe('cr3.lunrestore.filemark — every door that reads the mark, per state,
       ...(state === 'unreadable' ? { unreadable: new Set([F]) } : {}),
       ...(state === 'unsupported' ? { unsupported: new Set([F]) } : {}),
     })
-    const marks = await readRestoreMarks(reader.executor, ctx, targets)
+    const marks = await readRestoreMarks(reader.executor, ctx, targets, [])
     const j = jobsWith(o)
     const health = computeIscsiHealth(ctx, targets, { marks, restoreRunning: j.restoreRunning, restoreFailed: j.restoreFailed })
     return { health, msgs: buildIscsiWarnings(health).map(w => w.message) }

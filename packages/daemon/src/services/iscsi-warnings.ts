@@ -30,7 +30,7 @@ import type { DashboardWarning, IscsiHealth } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { IscsiHealthReadOptions } from './iscsi-health.js'
 import type { IscsiPaths } from './iscsi.js'
-import { foreignHolesSentence } from './iscsi-mutate.js'
+import { foreignHolesSentence } from './iscsi-hole.js'
 import { readIscsiHealth } from './iscsi-quarantine.js'
 import { clearMarkCommand, markDataset, restoreEndSentence } from './restore-mark.js'
 

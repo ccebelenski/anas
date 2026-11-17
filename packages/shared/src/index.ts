@@ -485,6 +485,8 @@ export {
   IscsiForeignChangeKind,
   IscsiHealth,
   IscsiHeldByLun,
+  IscsiHoleRepair,
+  IscsiHoleRepairState,
   IscsiIqn,
   IscsiLun,
   IscsiLunAttributes,

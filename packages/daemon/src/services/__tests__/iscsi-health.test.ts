@@ -1,14 +1,17 @@
 import type { CommandExecutor, ExecResult, ExecStreamResult, PipelineResult } from '../../executor/types.js'
-import type { IscsiReadContext } from '../iscsi.js'
+import type { StatDevice } from '../iscsi-served.js'
+import type { IscsiPaths, IscsiReadContext } from '../iscsi.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { computeIscsiHealth } from '../iscsi-health.js'
+import { ZFS } from '../iscsi-mutate.js'
+import { readIscsiHealth } from '../iscsi-quarantine.js'
 import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, parseIpAddrJson, readIscsiContext, toTargetSummary } from '../iscsi.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -292,6 +295,19 @@ describe('computeIscsiHealth — the restore hole (GT-20/GT-21)', () => {
       // cr3 (ISCSI-L7): whose target the hole is in. The captured gtiscsi
       // target's IQN is not ANAS's, so it is foreign — and still degrades.
       targetOwnership: 'foreign',
+      // own.4 (c): the repair verdict rides the record. This hole is in a
+      // foreign target, which is decided from the pure facts alone.
+      repair: {
+        state: 'foreign-target',
+        detail: 'LUN 0 of iqn.2026-08.dev.anas.gtiscsi:target1 (backstore \'gtiscsi_vol1\', /dev/zvol/gtiscsi/vol1) is '
+          + 'missing from a target ANAS does not manage. ANAS never writes to a target it does not own, so Repair leaves '
+          + 'it alone. Restore it by hand: bring the backing device back, then run \'systemctl restart '
+          + 'rtslib-fb-targetctl\' in a maintenance window — it restores the whole saved configuration with the same '
+          + 'serials, and drops every iSCSI session on this node while it does. Until then this node stays degraded and '
+          + 'ANAS makes no iSCSI change: any save would erase that LUN from /etc/rtslib-fb-target/saveconfig.json. If its '
+          + 'device is gone for good, the way out is your own \'targetcli saveconfig\', which writes the live '
+          + 'configuration over the saved one and so ERASES that LUN\'s record — a deliberate act, and not one ANAS takes.',
+      },
     })
     // The guard: while this is true nothing may run `saveconfig` (GT-22).
     assert.equal(health.degraded, true)
@@ -496,5 +512,290 @@ describe('the not-installed path is a first-class state, never an error', () => 
       saveconfigPath: join(tmpdir(), 'anas-no-lio-saveconfig.json'),
     })
     assert.deepEqual(calls, [])
+  })
+})
+
+/**
+ * own.4 (c): the repair verdict as the HEALTH READ attaches it — through
+ * `read()` with a job view, on a configfs tree and a saved configuration built
+ * for the case. One live zvol LUN (v2) and one hole (v1), so the marks of the
+ * live volume and of the hole's volume are one `zfs get`.
+ */
+describe('own.4 (c) — the repair verdict through read()', () => {
+  const IQN = 'iqn.2026-08.nas.anas:vmstore'
+  const MARK = { v: 1, repo: 'pbs-main', snapshot: 'host/gtimgboth/2026-08-25T19:28:38Z', archive: 'v1.img', started: '2026-11-14T10:00:00.000Z', state: 'writing' }
+  const MARK_DETAIL = 'a whole-image restore of v1.img from host/gtimgboth/2026-08-25T19:28:38Z (repository pbs-main) started 2026-11-14T10:00:00.000Z'
+  const READY = 'That path is available again — use Repair on the iSCSI screen to put the LUN back.'
+  const ST = { type: 'block' as const, rdevMajor: 230, rdevMinor: 16, dev: '0', ino: '0', size: 0 }
+
+  interface LiveBs { name: string, plugin: 'block' | 'fileio', udevPath: string, serial: string, info?: string }
+  interface LiveLun { index: number, backstore: string, plugin: 'block' | 'fileio' }
+  interface SavedBs { name: string, plugin: 'block' | 'fileio', dev: string, wwn: string, size?: number | null }
+  interface SavedLun { index: number, backstore: string, plugin: 'block' | 'fileio' }
+
+  const V2_BS: LiveBs = { name: 'v2', plugin: 'block', udevPath: '/dev/zvol/tank/v2', serial: 'w-2' }
+  const V2_SAVED: SavedBs = { name: 'v2', plugin: 'block', dev: '/dev/zvol/tank/v2', wwn: 'w-2' }
+  const V1_SAVED: SavedBs = { name: 'v1', plugin: 'block', dev: '/dev/zvol/tank/v1', wwn: 'w-1' }
+  const V2_LUN: LiveLun = { index: 1, backstore: 'v2', plugin: 'block' }
+  const V1_LUN: SavedLun = { index: 0, backstore: 'v1', plugin: 'block' }
+
+  async function holeNode(o: {
+    iqn?: string
+    live?: { backstores?: LiveBs[], luns?: LiveLun[] }
+    saved?: { backstores?: SavedBs[], luns?: SavedLun[] }
+    backingExists?: (path: string) => Promise<boolean | null>
+    backingSize?: (path: string) => Promise<number | null>
+    deviceStat?: StatDevice
+    findmnt?: () => Promise<string | null>
+    zfsMountpoints?: { dataset: string, mountpoint: string, pool: string }[]
+    zfsGet?: string
+  } = {}) {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-hole-health-'))
+    const root = join(dir, 'target')
+    const iqn = o.iqn ?? IQN
+    const tpgDir = join(root, 'iscsi', iqn, 'tpgt_1')
+    await mkdir(join(tpgDir, 'lun'), { recursive: true })
+    await mkdir(join(tpgDir, 'acls'), { recursive: true })
+    await writeFile(join(tpgDir, 'enable'), '1\n')
+    for (const b of o.live?.backstores ?? []) {
+      const pluginDir = b.plugin === 'block' ? 'iblock_1' : 'fileio_1'
+      const bsDir = join(root, 'core', pluginDir, b.name)
+      await mkdir(join(bsDir, 'wwn'), { recursive: true })
+      await writeFile(join(bsDir, 'wwn', 'vpd_unit_serial'), `T10 VPD Unit Serial Number: ${b.serial}\n`)
+      await writeFile(join(bsDir, 'udev_path'), `${b.udevPath}\n`)
+      await writeFile(join(bsDir, 'info'), `${b.info ?? 'Status: DEACTIVATED'}\n`)
+    }
+    for (const l of o.live?.luns ?? []) {
+      const pluginDir = l.plugin === 'block' ? 'iblock_1' : 'fileio_1'
+      const linkDir = join(tpgDir, 'lun', `lun_${l.index}`)
+      await mkdir(linkDir, { recursive: true })
+      await symlink(join(root, 'core', pluginDir, l.backstore), join(linkDir, 'l'))
+    }
+    const saveconfigPath = join(dir, 'saveconfig.json')
+    await writeFile(saveconfigPath, JSON.stringify({
+      fabric_modules: [],
+      storage_objects: (o.saved?.backstores ?? []).map(b => ({
+        name: b.name,
+        plugin: b.plugin,
+        dev: b.dev,
+        wwn: b.wwn,
+        attributes: {},
+        ...(b.size === undefined ? {} : { size: b.size }),
+      })),
+      targets: [{
+        wwn: iqn,
+        fabric: 'iscsi',
+        parameters: {},
+        tpgs: [{
+          tag: 1,
+          enable: true,
+          attributes: {},
+          parameters: {},
+          portals: [],
+          node_acls: [],
+          luns: (o.saved?.luns ?? []).map(l => ({ index: l.index, storage_object: `/backstores/${l.plugin}/${l.backstore}` })),
+        }],
+      }],
+    }))
+    const zfs: string[][] = []
+    const executor: CommandExecutor = {
+      async exec(command: string, args: string[]): Promise<ExecResult> {
+        if (command === '/usr/bin/ip') {
+          return {
+            stdout: JSON.stringify([{ ifname: 'vmbr0', addr_info: [{ family: 'inet', local: '192.168.200.50' }] }]),
+            stderr: '',
+            exitCode: 0,
+          }
+        }
+        if (command === ZFS && args[0] === 'get') {
+          zfs.push(args)
+          return { stdout: o.zfsGet ?? '', stderr: '', exitCode: 0 }
+        }
+        return { stdout: '', stderr: '', exitCode: 1 }
+      },
+      async pipeline(): Promise<PipelineResult> {
+        return { leftExitCode: 1, rightExitCode: 1, leftStderr: '', rightStderr: '', stdout: '' }
+      },
+      async execToStream(): Promise<ExecStreamResult> {
+        return { stderr: '', exitCode: 1, bytesWritten: 0 }
+      },
+    }
+    const paths: IscsiPaths = {
+      configfsRoot: root,
+      saveconfigPath,
+      pveStorageCfg: join(dir, 'no-storage.cfg'),
+      initiatorNamePath: join(dir, 'no-initiator'),
+      backingExists: o.backingExists ?? (async () => true),
+      zfsMountpoints: async () => o.zfsMountpoints ?? [],
+      ...(o.backingSize ? { backingSize: o.backingSize } : {}),
+      // A block hole's stat: a device no fixture backstore names, so a default
+      // is never read as "served elsewhere".
+      deviceStat: o.deviceStat ?? (async () => ({ type: 'block', rdevMajor: 230, rdevMinor: 0, dev: '0', ino: '0', size: 0 })),
+      ...(o.findmnt ? { findmnt: o.findmnt } : {}),
+    }
+    return { dir, paths, executor, zfs, close: () => rm(dir, { recursive: true, force: true }) }
+  }
+
+  const jobs = { restoreRunning: () => undefined, restoreFailed: () => undefined }
+
+  it('a live zvol LUN and a hole: ONE zfs get covers both volumes, and the hole reads ready', async () => {
+    const node = await holeNode({
+      live: { backstores: [V2_BS], luns: [V2_LUN] },
+      saved: { backstores: [V2_SAVED, V1_SAVED], luns: [V2_LUN, V1_LUN] },
+      zfsGet: 'tank/v2\t-\t-\ntank/v1\t-\t-\n',
+    })
+    try {
+      const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.equal(health.missingLuns.length, 1)
+      assert.deepEqual(health.missingLuns[0].repair, { state: 'ready', detail: READY })
+      assert.deepEqual(node.zfs, [['get', '-Hp', '-o', 'name,value,source', 'anas:restore', '--', 'tank/v2', 'tank/v1']], 'the marks of the live volume and the hole are ONE command')
+      assert.equal(node.zfs.length, 1)
+    }
+    finally {
+      await node.close()
+    }
+  })
+
+  it('a marked hole volume reads restore-mark, with where the mark is', async () => {
+    const node = await holeNode({
+      live: { backstores: [V2_BS], luns: [V2_LUN] },
+      saved: { backstores: [V2_SAVED, V1_SAVED], luns: [V2_LUN, V1_LUN] },
+      zfsGet: `tank/v2\t-\t-\ntank/v1\t${JSON.stringify(MARK)}\tlocal\n`,
+    })
+    try {
+      const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.deepEqual(health.missingLuns[0].repair, {
+        state: 'restore-mark',
+        detail: `${MARK_DETAIL} onto tank/v1 did not finish, so it holds a partial image`,
+        restoreMark: 'interrupted',
+        markOn: 'tank/v1',
+      })
+      assert.equal(node.zfs.length, 1, 'still one zfs get')
+    }
+    finally {
+      await node.close()
+    }
+  })
+
+  it('an absent backing reads backing-absent, and its volume is NOT read', async () => {
+    const node = await holeNode({
+      live: { backstores: [V2_BS], luns: [V2_LUN] },
+      saved: { backstores: [V2_SAVED, V1_SAVED], luns: [V2_LUN, V1_LUN] },
+      backingExists: async p => (p !== '/dev/zvol/tank/v1'),
+      zfsGet: 'tank/v2\t-\t-\n',
+    })
+    try {
+      const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.equal(health.missingLuns[0].repair?.state, 'backing-absent')
+      assert.deepEqual(node.zfs, [['get', '-Hp', '-o', 'value,source', 'anas:restore', '--', 'tank/v2']], 'an absent backing never joins the batch (one volume left, read on its own)')
+    }
+    finally {
+      await node.close()
+    }
+  })
+
+  it('an existence check that failed reads backing-unreadable, never absent', async () => {
+    const node = await holeNode({
+      live: { backstores: [V2_BS], luns: [V2_LUN] },
+      saved: { backstores: [V2_SAVED, V1_SAVED], luns: [V2_LUN, V1_LUN] },
+      backingExists: async p => (p === '/dev/zvol/tank/v1' ? null : true),
+      zfsGet: 'tank/v2\t-\t-\n',
+    })
+    try {
+      const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.equal(health.missingLuns[0].repair?.state, 'backing-unreadable')
+    }
+    finally {
+      await node.close()
+    }
+  })
+
+  it('a live backstore of the hole\'s name and plugin reads backstore-live', async () => {
+    const node = await holeNode({
+      live: { backstores: [V2_BS, { ...V1_SAVED, udevPath: '/dev/zvol/tank/v1', serial: 'w-1' }], luns: [V2_LUN] },
+      saved: { backstores: [V2_SAVED, V1_SAVED], luns: [V2_LUN, V1_LUN] },
+      zfsGet: 'tank/v2\t-\t-\ntank/v1\t-\t-\n',
+    })
+    try {
+      const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.equal(health.missingLuns[0].repair?.state, 'backstore-live')
+      assert.match(health.missingLuns[0].repair!.detail, /^backstore 'v1' \(block, \/dev\/zvol\/tank\/v1\) is still live and no LUN maps it/)
+    }
+    finally {
+      await node.close()
+    }
+  })
+
+  it('the hole\'s device served by another live backstore reads device-served-elsewhere', async () => {
+    const node = await holeNode({
+      live: { backstores: [V2_BS, { name: 'other', plugin: 'block', udevPath: '/dev/zvol/tank/other', serial: 's', info: 'Status: DEACTIVATED Major: 230 Minor: 16' }], luns: [V2_LUN] },
+      saved: { backstores: [V2_SAVED, V1_SAVED], luns: [V2_LUN, V1_LUN] },
+      zfsGet: 'tank/v2\t-\t-\ntank/v1\t-\t-\n',
+      deviceStat: async () => ST,
+    })
+    try {
+      const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.equal(health.missingLuns[0].repair?.state, 'device-served-elsewhere')
+    }
+    finally {
+      await node.close()
+    }
+  })
+
+  it('a fileio record with no size reads record-incomplete', async () => {
+    const node = await holeNode({
+      live: { backstores: [V2_BS], luns: [V2_LUN] },
+      saved: {
+        backstores: [V2_SAVED, { name: 'v1', plugin: 'fileio', dev: '/tank/images/v1.raw', wwn: 'w-1', size: null }],
+        luns: [V2_LUN, { index: 0, backstore: 'v1', plugin: 'fileio' }],
+      },
+      zfsMountpoints: [{ dataset: 'tank/images', mountpoint: '/tank/images', pool: 'tank' }],
+      zfsGet: 'tank/v2\t-\t-\n',
+    })
+    try {
+      const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.equal(health.missingLuns[0].repair?.state, 'record-incomplete')
+    }
+    finally {
+      await node.close()
+    }
+  })
+
+  it('a 0-byte image against a saved size reads placeholder', async () => {
+    const node = await holeNode({
+      live: { backstores: [V2_BS], luns: [V2_LUN] },
+      saved: {
+        backstores: [V2_SAVED, { name: 'v1', plugin: 'fileio', dev: '/tank/images/v1.raw', wwn: 'w-1', size: 1048576 }],
+        luns: [V2_LUN, { index: 0, backstore: 'v1', plugin: 'fileio' }],
+      },
+      zfsGet: 'tank/v2\t-\t-\n',
+      backingSize: async p => (p === '/tank/images/v1.raw' ? 0 : null),
+      zfsMountpoints: [{ dataset: 'tank/images', mountpoint: '/tank/images', pool: 'tank' }],
+      findmnt: async () => JSON.stringify({ filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }] }),
+    })
+    try {
+      const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.equal(health.missingLuns[0].repair?.state, 'placeholder')
+    }
+    finally {
+      await node.close()
+    }
+  })
+
+  it('a foreign IQN reads foreign-target, decided without its I/O facts', async () => {
+    const foreign = 'iqn.2026-08.other.example:target1'
+    const node = await holeNode({
+      iqn: foreign,
+      live: { backstores: [V2_BS], luns: [V2_LUN] },
+      saved: { backstores: [V2_SAVED, V1_SAVED], luns: [V2_LUN, V1_LUN] },
+      zfsGet: 'tank/v2\t-\t-\ntank/v1\t-\t-\n',
+    })
+    try {
+      const { health } = await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.equal(health.missingLuns[0].repair?.state, 'foreign-target')
+    }
+    finally {
+      await node.close()
+    }
   })
 })

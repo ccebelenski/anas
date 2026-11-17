@@ -42,7 +42,8 @@ import type { EndedRun } from '../jobs/queue.js'
 import { createHash } from 'node:crypto'
 import { ImageRestoreFailureCode, RESTORE_MARK_PROPERTY, RestoreMark, zvolDatasetFromPath } from '@anas/shared'
 import { DEFAULT_MAX_PINNED, DEFAULT_MAX_RETAINED } from '../jobs/queue.js'
-import { ZFS } from './iscsi-mutate.js'
+
+const ZFS = '/usr/sbin/zfs'
 
 /**
  * The restore mark on an image FILE: an extended attribute in the `trusted.`

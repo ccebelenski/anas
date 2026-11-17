@@ -42,9 +42,11 @@
  */
 
 import type { IscsiDisabledTarget, IscsiForeignChange, IscsiHealth, IscsiMissingLun, IscsiPortalWithoutInterface, IscsiRestoreMarkRow, IscsiRestoreMarkState, IscsiStubLun, IscsiTargetDetail, IscsiTargetServingNothing, IscsiUnmappedBackstore } from '@anas/shared'
+import type { HoleIoFacts } from './iscsi-hole.js'
 import type { BackingClassification } from './iscsi-ownership.js'
 import type { IscsiReadContext } from './iscsi.js'
 import type { RestoreJobFacts, RestoreMarkRead } from './restore-mark.js'
+import { holeKey, holeRepairVerdict } from './iscsi-hole.js'
 import { classifyBacking } from './iscsi-ownership.js'
 import { iscsiAvailability, liveUnreadablePaths, normalizePlugin, targetTpgs } from './iscsi.js'
 import { consultsJobRecord, fileRestoreAgain, isFileMark, markDataset, restoreMarkDetail, restoreMarkState, restoreVerdict } from './restore-mark.js'
@@ -158,6 +160,13 @@ export interface IscsiHealthOptions {
    * path) — `readRestoreMarks`. Absent = marks were not read: no mark row.
    */
   marks?: Map<string, RestoreMarkRead>
+  /**
+   * The I/O facts of each hole whose backing is present, keyed by
+   * `holeKey`, as the read gathered them. Absent when the caller has no job
+   * view (the save gate's internal read, the boot scan): every hole then
+   * carries only the verdict its pure facts decide, or none.
+   */
+  holeIo?: Map<string, HoleIoFacts>
 }
 
 /** The callbacks and reads a health READ passes through. */
@@ -165,6 +174,59 @@ export type IscsiHealthReadOptions = Pick<IscsiHealthOptions, 'disabledDetail' |
 
 // The mark-state rules live with the mark (`restore-mark.ts`); re-exported for the readers.
 export { restoreMarkDetail, restoreMarkState }
+
+/**
+ * Every LUN the saved configuration holds and the live tree does not — the
+ * restore holes — each with the target it belongs to.
+ */
+export function restoreHoles(ctx: IscsiReadContext, targets: IscsiTargetDetail[]): { hole: IscsiMissingLun, target: IscsiTargetDetail }[] {
+  const persistedByIqn = new Map((ctx.persisted?.targets ?? []).map(t => [t.iqn, t]))
+  const persistedBackstores = new Map((ctx.persisted?.storageObjects ?? []).map(s => [s.name, s]))
+  const holes: { hole: IscsiMissingLun, target: IscsiTargetDetail }[] = []
+  for (const target of targets) {
+    // EVERY TPG (cr3, ISCSI-H2): a hole in a second TPG is as much a hole as
+    // one in the first — a save over it drops that LUN for good (GT-22) — so
+    // the diff walks them all, each against its own tag on both sides.
+    for (const tpg of targetTpgs(target)) {
+      const persistedTpg = persistedByIqn.get(target.iqn)?.tpgs.find(t => t.tag === tpg.tpgTag)
+
+      // --- LUNs in saveconfig with no configfs counterpart: the restore hole ---
+      for (const lun of tpg.luns) {
+        if (lun.present)
+          continue
+        // cr3: a target whose configfs could not be listed has LUNs nobody
+        // SAW — not holes. Reporting them would point Repair at LUNs that may
+        // be live; the node is degraded by `configfsUnreadable` instead.
+        if ((target.configfsUnreadable ?? []).length > 0)
+          continue
+        // Only a PERSISTED LUN can be a restore hole. A LUN that is in neither
+        // source cannot exist, and one that is live-only is a different finding.
+        const persistedLun = persistedTpg?.luns.find(l => l.index === lun.index)
+        if (!persistedLun)
+          continue
+        const backstore = persistedLun.backstoreName ? persistedBackstores.get(persistedLun.backstoreName) : undefined
+        const backingPath = backstore?.dev ?? lun.backingPath
+        const hole: IscsiMissingLun = {
+          targetIqn: target.iqn,
+          tpgTag: tpg.tpgTag,
+          lunIndex: lun.index,
+          backstoreName: persistedLun.backstoreName ?? lun.name,
+          plugin: normalizePlugin(backstore?.plugin ?? persistedLun.plugin ?? lun.plugin),
+          backingPath,
+          backingExists: lun.backingExists,
+          // A hole whose path holds a placeholder is a DIFFERENT thing to fix, and
+          // the quarantine is what turned it into a hole in the first place. The
+          // fact is re-derived from the filesystem here, so it keeps being told
+          // for as long as it is true and stops the moment it is not.
+          ...(ctx.stubs.has(backingPath) ? { stubBacking: true } : {}),
+          targetOwnership: target.ownership,
+        }
+        holes.push({ hole, target })
+      }
+    }
+  }
+  return holes
+}
 
 /**
  * Compute the health diff from a gathered context and the targets already built
@@ -176,7 +238,12 @@ export function computeIscsiHealth(
   opts: IscsiHealthOptions = {},
 ): IscsiHealth {
   const now = opts.now ?? new Date()
-  const missingLuns: IscsiMissingLun[] = []
+  // The repair verdict rides each hole it was decided for; a hole whose verdict
+  // is not judged (`holeRepairVerdict` → null) carries none.
+  const missingLuns: IscsiMissingLun[] = restoreHoles(ctx, targets).map(({ hole, target }) => {
+    const repair = holeRepairVerdict(ctx, target, hole, opts.holeIo?.get(holeKey(hole)) ?? null)
+    return repair ? { ...hole, repair } : hole
+  })
   const targetsServingNothing: IscsiTargetServingNothing[] = []
   const portalsWithoutInterface: IscsiPortalWithoutInterface[] = []
   const foreignChanges: IscsiForeignChange[] = []
@@ -206,45 +273,9 @@ export function computeIscsiHealth(
       })
     }
 
-    // EVERY TPG (cr3, ISCSI-H2): a hole in a second TPG is as much a hole as
-    // one in the first — a save over it drops that LUN for good (GT-22) — so
-    // the diff walks them all, each against its own tag on both sides.
     for (const tpg of targetTpgs(target)) {
       const persistedTpg = persistedByIqn.get(target.iqn)?.tpgs.find(t => t.tag === tpg.tpgTag)
       const liveTpg = liveByIqn.get(target.iqn)?.tpgs.find(t => t.tag === tpg.tpgTag)
-
-      // --- LUNs in saveconfig with no configfs counterpart: the restore hole ---
-      for (const lun of tpg.luns) {
-        if (lun.present)
-          continue
-        // cr3: a target whose configfs could not be listed has LUNs nobody
-        // SAW — not holes. Reporting them would point Repair at LUNs that may
-        // be live; the node is degraded by `configfsUnreadable` instead.
-        if ((target.configfsUnreadable ?? []).length > 0)
-          continue
-        // Only a PERSISTED LUN can be a restore hole. A LUN that is in neither
-        // source cannot exist, and one that is live-only is a different finding.
-        const persistedLun = persistedTpg?.luns.find(l => l.index === lun.index)
-        if (!persistedLun)
-          continue
-        const backstore = persistedLun.backstoreName ? persistedBackstores.get(persistedLun.backstoreName) : undefined
-        const backingPath = backstore?.dev ?? lun.backingPath
-        missingLuns.push({
-          targetIqn: target.iqn,
-          tpgTag: tpg.tpgTag,
-          lunIndex: lun.index,
-          backstoreName: persistedLun.backstoreName ?? lun.name,
-          plugin: normalizePlugin(backstore?.plugin ?? persistedLun.plugin ?? lun.plugin),
-          backingPath,
-          backingExists: lun.backingExists,
-          // A hole whose path holds a placeholder is a DIFFERENT thing to fix, and
-          // the quarantine is what turned it into a hole in the first place. The
-          // fact is re-derived from the filesystem here, so it keeps being told
-          // for as long as it is true and stops the moment it is not.
-          ...(ctx.stubs.has(backingPath) ? { stubBacking: true } : {}),
-          targetOwnership: target.ownership,
-        })
-      }
 
       // --- LUNs being served over a PLACEHOLDER (story iscsi.8) ---------------
       // Not a hole: the LUN is ACTIVATED, the right size, the right serial — and

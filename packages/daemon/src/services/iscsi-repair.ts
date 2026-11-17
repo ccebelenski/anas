@@ -48,30 +48,21 @@
  *     after a repair that left NO holes, and a partial repair says so instead.
  */
 
-import type { IscsiHealth, IscsiLunAttributes, IscsiMissingLun, IscsiRestoreMarkState, IscsiTargetDetail } from '@anas/shared'
-import type { SaveconfigStorageObject } from '../parsers/lio-saveconfig.js'
+import type { IscsiHealth, IscsiRestoreMarkState, IscsiTargetDetail } from '@anas/shared'
 import type { LioLiveState } from './iscsi-configfs.js'
-import type { IscsiBackstoreAttributes, IscsiMutateOptions, IscsiRefusal } from './iscsi-mutate.js'
+import type { IscsiMutateOptions, IscsiRefusal } from './iscsi-mutate.js'
+import type { IscsiBackstoreAttributes } from './iscsi-rules.js'
 import type { StatDevice } from './iscsi-served.js'
 import type { IscsiReadContext } from './iscsi.js'
-import { storageObjectsByName } from '../parsers/lio-saveconfig.js'
+import { foreignHolesSentence, holeReplayRecord, repairTokensRefusal, servedElsewhere } from './iscsi-hole.js'
+import { grantLunsToAcl, runTargetcli, saveIscsiConfig } from './iscsi-mutate.js'
 import {
-  aclNamesRefusal,
   attributeTokens,
   backingPathRefusal,
   backstorePath,
-  configshellSafe,
-  foreignHolesSentence,
-  grantLunsToAcl,
   handsOffRefusal,
-  ISCSI_DEFAULT_WRITE_BACK,
-  replayAttributes,
-  runTargetcli,
-  saveIscsiConfig,
   tpgPath,
-} from './iscsi-mutate.js'
-import { servedElsewhere } from './iscsi-served.js'
-import { attributesFromPersisted, normalizePlugin, targetTpgs } from './iscsi.js'
+} from './iscsi-rules.js'
 import { clearMarkCommand, isFileMark, unreadableMarkWay } from './restore-mark.js'
 
 /** One hole, with everything the replay needs, read off the PERSISTED config. */
@@ -159,19 +150,14 @@ export interface IscsiRepairPlan {
 /**
  * Turn the health diff into a repair plan, entirely from the PERSISTED config.
  *
- * The persisted record is the only honest source here: the live tree does not
- * have these objects (that is what makes them holes), and the built
- * `IscsiTargetDetail` for a missing LUN is itself derived from the same
- * persisted record. Reading `saveconfig.json` directly keeps the size, the
- * `write_back` flag and the raw attribute map — all three of which a create line
- * needs — in one place.
+ * Each hole's replay record comes from {@link holeReplayRecord}; the ladder
+ * below marks the holes whose record cannot be replayed and says why.
  */
 export function planIscsiRepair(
   ctx: IscsiReadContext,
   health: IscsiHealth,
   targets: IscsiTargetDetail[],
 ): IscsiRepairPlan {
-  const persistedStorage = ctx.persisted ? storageObjectsByName(ctx.persisted) : new Map<string, SaveconfigStorageObject>()
   const targetByIqn = new Map(targets.map(t => [t.iqn, t]))
   const repairable: IscsiRepairItem[] = []
   const blocked: IscsiRepairItem[] = []
@@ -181,30 +167,14 @@ export function planIscsiRepair(
     return t ? handsOffRefusal(t) : null
   }
   for (const missing of health.missingLuns) {
-    const store = persistedStorage.get(missing.backstoreName)
-    const plugin = normalizePlugin(store?.plugin ?? missing.plugin)
-    const backingPath = store?.dev || missing.backingPath
-    const attributes: IscsiLunAttributes = store
-      ? attributesFromPersisted(store)
-      : tpgOf(targetByIqn.get(missing.targetIqn), missing.tpgTag)?.luns.find(l => l.index === missing.lunIndex)?.attributes ?? {}
-
+    const record = holeReplayRecord(ctx, missing, targets)
     const item: IscsiRepairItem = {
-      targetIqn: missing.targetIqn,
-      tpgTag: missing.tpgTag,
-      lunIndex: missing.lunIndex,
-      backstoreName: missing.backstoreName,
-      plugin,
-      backingPath,
+      ...record,
       // Only a checked, positive answer counts. `null` ("we could not tell")
       // is treated as absent: recreating over a device we cannot even stat is
       // how the hole was made.
       backingPresent: missing.backingExists === true,
-      stubBacking: ctx.stubs.has(backingPath),
-      serial: store?.wwn ?? null,
-      size: store?.size ?? null,
-      writeBack: store?.writeBack ?? ISCSI_DEFAULT_WRITE_BACK,
-      attributes: replayAttributes({ attributes }, plugin),
-      aclInitiators: persistedAclsMapping(ctx, missing),
+      stubBacking: ctx.stubs.has(record.backingPath),
     }
     // C3: a fileio create line needs a size, and the persisted record is the
     // only place an honest one can come from. A record without one used to be
@@ -232,8 +202,8 @@ export function planIscsiRepair(
     else if (repairTokensRefusal(item)) {
       item.blockedReason = repairTokensRefusal(item)!
     }
-    else if (backingPathRefusal(backingPath)) {
-      item.blockedReason = `the saved backing path ${JSON.stringify(backingPath)} contains a space, a quote or an '=', which `
+    else if (backingPathRefusal(item.backingPath)) {
+      item.blockedReason = `the saved backing path ${JSON.stringify(item.backingPath)} contains a space, a quote or an '=', which `
         + `targetcli cannot be handed — restore it by hand (bring the device back, then restart rtslib-fb-targetctl in a maintenance window)`
     }
     else if (item.plugin === 'fileio' && item.size === null) {
@@ -281,41 +251,6 @@ export async function guardRepairPlan(
     repairable.push(item)
   }
   return { repairable, blocked }
-}
-
-/** The hole's own TPG of a built target (cr3, ISCSI-H2: never the first by default). */
-function tpgOf(target: IscsiTargetDetail | undefined, tag: number) {
-  return target ? targetTpgs(target).find(t => t.tpgTag === tag) : undefined
-}
-
-/**
- * Why a hole's SAVED record cannot be replayed through targetcli (cr3 review
- * 2): a backstore name, a serial or an attribute token configshell would
- * re-split or read as a keyword, or an ACL name ANAS cannot address. Null when
- * every one of them can be run.
- */
-function repairTokensRefusal(item: IscsiRepairItem): string | null {
-  const tokens = [
-    `name=${item.backstoreName}`,
-    item.backstoreName,
-    ...(item.serial ? [`wwn=${item.serial}`] : []),
-    ...attributeTokens(item.attributes),
-  ]
-  const bad = tokens.find(t => !configshellSafe(t))
-  if (bad !== undefined) {
-    return `the saved record's ${JSON.stringify(bad)} cannot be handed to targetcli (a space, a quote or an '=' it would `
-      + `read as something else) — restore it by hand (bring the device back, then restart rtslib-fb-targetctl in a maintenance window)`
-  }
-  const acl = aclNamesRefusal(item.targetIqn, item.aclInitiators.map(initiatorIqn => ({ initiatorIqn })))
-  return acl ? acl.message : null
-}
-
-/** The initiators whose PERSISTED ACL maps this LUN index. */
-function persistedAclsMapping(ctx: IscsiReadContext, missing: IscsiMissingLun): string[] {
-  const target = (ctx.persisted?.targets ?? []).find(t => t.iqn === missing.targetIqn)
-  const tpg = target?.tpgs.find(p => p.tag === missing.tpgTag)
-  const acls = (tpg?.acls ?? []).filter(a => a.mappedLuns.includes(missing.lunIndex))
-  return acls.map(a => a.initiatorIqn)
 }
 
 /**

@@ -1,14 +1,14 @@
-import type { IscsiAclRequest, IscsiClaimList, IscsiLun, IscsiRestoreMarkState, IscsiTargetDetail } from '@anas/shared'
+import type { IscsiAclRequest, IscsiClaimList, IscsiLun, IscsiTargetDetail } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { Gate, GuardReads } from '../safety/guard.js'
 import type { IscsiState, TargetObject } from '../services/iscsi-guard.js'
-import type { IscsiBackstoreAttributes, IscsiMutateOptions, IscsiRefusal, ResolvedAhrPool } from '../services/iscsi-mutate.js'
+import type { IscsiMutateOptions, IscsiRefusal, ResolvedAhrPool } from '../services/iscsi-mutate.js'
 import type { IscsiRepairItem, IscsiRepairPlan } from '../services/iscsi-repair.js'
+import type { IscsiBackstoreAttributes } from '../services/iscsi-rules.js'
 import type { IscsiPaths } from '../services/iscsi.js'
-import type { RestoreJobRecord, RestoreMarkRead } from '../services/restore-mark.js'
 import {
   aclAuthRequirement,
   aclSatisfiesAuth,
@@ -51,13 +51,12 @@ import {
   updateSessionsReadableGate,
 } from '../services/iscsi-guard.js'
 import { computeIscsiHealth } from '../services/iscsi-health.js'
+import { repairMarkClause } from '../services/iscsi-hole.js'
 import {
-  aclNamesRefusal,
   addIscsiLun,
   assertInstalled,
   assertPersistedReadable,
   assertSaveable,
-  backingPathRefusal,
   claimsFromState,
   createIscsiTarget,
   createSparseImage,
@@ -68,11 +67,9 @@ import {
   lunBackingClaims,
   newSerial,
   newTargetIqn,
-  ownershipUnknownRefusal,
   proveZvolBacking,
   readIscsiState,
   removeCreatedImage,
-  replayAttributes,
   resizeFileLun,
   resolveFileBackingDir,
   resolveZvolBacking,
@@ -86,9 +83,10 @@ import {
 } from '../services/iscsi-mutate.js'
 import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
 import { assertRepairable, guardRepairPlan, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
+import { aclNamesRefusal, backingPathRefusal, ownershipUnknownRefusal, replayAttributes } from '../services/iscsi-rules.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { iscsiAvailability, targetTpgs } from '../services/iscsi.js'
-import { clearMarkCommand, clearRestoreMark, consultsJobRecord, describeMarkSet, describeRestoreMark, enableMarkVerdict, jobRecordOnly, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkRefusal, restoreVerdict } from '../services/restore-mark.js'
+import { clearMarkCommand, clearRestoreMark, consultsJobRecord, describeMarkSet, enableMarkVerdict, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkRefusal, restoreVerdict } from '../services/restore-mark.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -243,31 +241,6 @@ async function removeOrphanedBackstore(executor: CommandExecutor, plugin: string
       return { sentence: '', gone: true }
     return { sentence: `the half-created backstore '${name}' could not be deleted (${msg})`, gone: false }
   }
-}
-
-/**
- * What a restore mark says about a hole's backing, as a clause for the Repair
- * refusal (cr3.lunrestore, review2 E): no leading capital, no stop.
- */
-function repairMarkClause(read: RestoreMarkRead, state: IscsiRestoreMarkState, running: string | undefined, record?: RestoreJobRecord): string {
-  if (read.state === 'unknown')
-    return `ANAS could not read the restore mark on ${read.dataset} (${read.reason}), so it cannot tell whether it holds a partially restored image`
-  if (state === 'in-progress')
-    return `a whole-image restore is writing it right now (job ${running})`
-  if (read.state !== 'present') {
-    // review S3: an image file with no mark whose failed restore record stands.
-    if (record) {
-      const how = record.outcome === 'unverified'
-        ? 'wrote it, and the client reported the image complete, but ANAS could not verify it'
-        : 'did not finish, so it may hold a partial image'
-      return `the whole-image restore job ${record.job} onto it ${how}. ${jobRecordOnly(read)}`
-    }
-    return 'it carries a restore mark'
-  }
-  const what = `${describeRestoreMark(read)}${record ? ` (job ${record.job})` : ''}`
-  return state === 'unverified'
-    ? `${what} wrote ${read.dataset}, and the client reported the image complete, but its size was not verified${read.mark?.reason ? ` (${read.mark.reason})` : ''}`
-    : `${what} onto ${read.dataset} did not finish, so it holds a partial image`
 }
 
 /** An error's message, or the thing thrown. */

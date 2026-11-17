@@ -708,6 +708,58 @@ export type IscsiSessionList = z.infer<typeof IscsiSessionList>
 // ---------------------------------------------------------------------------
 
 /**
+ * What a restore mark on a LUN's (or an unmapped backstore's) volume means NOW
+ * (cr3.lunrestore): `in-progress` — a whole-image restore job is running onto
+ * it; `interrupted` — a mark and no running job: the restore did not finish and
+ * the object holds a partial image; `unverified` — the client reported the
+ * image complete but its size could not be confirmed; `unreadable` — the mark
+ * could not be read (never read as "no mark").
+ */
+export const IscsiRestoreMarkState = z.enum(['in-progress', 'interrupted', 'unverified', 'unreadable'])
+export type IscsiRestoreMarkState = z.infer<typeof IscsiRestoreMarkState>
+
+/**
+ * What Repair can do with one hole (a LUN in the saved
+ * configuration and missing from the live tree), decided in ONE place
+ * (`holeRepairVerdict`, services/iscsi-hole.ts) and read by Repair, the save
+ * gate, the warnings and the panel. The first state that holds, in this order:
+ *  - `foreign-target`: the target is not ANAS's; ANAS never writes to it.
+ *  - `target-hands-off`: an ANAS target ANAS will not write to (a TPG added
+ *    by hand, a LUN whose backing's owner could not be judged).
+ *  - `record-incomplete`: the saved record cannot be replayed (a name, serial,
+ *    ACL name or backing path targetcli cannot be handed; fileio with no size).
+ *  - `placeholder`: the path holds a 0-byte placeholder, not the image.
+ *  - `backing-absent`: the backing is not on this node.
+ *  - `backing-unreadable`: ANAS could not check the backing (whether it is
+ *    there, or which device it names): unknown, never absent or present.
+ *  - `backstore-live`: a live backstore of this name and plugin still
+ *    exists; Repair would create it a second time.
+ *  - `device-served-elsewhere`: the block path names a device LIO already
+ *    serves under another backstore.
+ *  - `restore-mark`: the backing carries a restore mark, the mark could not
+ *    be read, or a restore is writing it.
+ *  - `ready`: Repair puts it back with its saved serial and attributes.
+ * A state outside this list is a newer daemon's; a reader shows it as
+ * unknown (ANAS.knownEnum).
+ */
+export const IscsiHoleRepairState = z.enum(['ready', 'foreign-target', 'target-hands-off', 'record-incomplete', 'placeholder', 'backing-absent', 'backing-unreadable', 'backstore-live', 'device-served-elsewhere', 'restore-mark'])
+export type IscsiHoleRepairState = z.infer<typeof IscsiHoleRepairState>
+
+export const IscsiHoleRepair = z.object({
+  state: IscsiHoleRepairState,
+  /**
+   * The hole's own sentence for this state; its form is fixed per state (a clause for record-incomplete,
+   *  backing-unreadable, backstore-live, device-served-elsewhere and restore-mark; full sentences otherwise).
+   */
+  detail: z.string(),
+  /** `restore-mark` only: what the mark, or the job record, says now. */
+  restoreMark: IscsiRestoreMarkState.optional(),
+  /** `restore-mark` only: where the mark is (the volume, or the image file); null when it could not be read off the path. */
+  markOn: z.string().nullable().optional(),
+})
+export type IscsiHoleRepair = z.infer<typeof IscsiHoleRepair>
+
+/**
  * A LUN that `saveconfig.json` records but configfs does not have: the boot
  * restore skipped it because its backing device was missing, and reported
  * SUCCESS anyway (GT-20/GT-21). Nothing in systemd catches this; the diff is the
@@ -741,6 +793,12 @@ export const IscsiMissingLun = z.object({
    * from an older daemon. An older panel ignores it.
    */
   targetOwnership: IscsiOwnership.optional(),
+  /**
+   * Repair's verdict on this hole. Absent from an older daemon, and
+   * when the read gathered no I/O facts for it (no job view: the save gate's
+   * internal read, the boot scan). An older panel ignores it.
+   */
+  repair: IscsiHoleRepair.optional(),
 })
 export type IscsiMissingLun = z.infer<typeof IscsiMissingLun>
 
@@ -919,17 +977,6 @@ export type RestoreMark = z.infer<typeof RestoreMark>
  */
 export const ImageRestoreFailureCode = z.enum(['IMAGE_PARTIAL', 'IMAGE_UNVERIFIED'])
 export type ImageRestoreFailureCode = z.infer<typeof ImageRestoreFailureCode>
-
-/**
- * What a restore mark on a LUN's (or an unmapped backstore's) volume means NOW
- * (cr3.lunrestore): `in-progress` — a whole-image restore job is running onto
- * it; `interrupted` — a mark and no running job: the restore did not finish and
- * the object holds a partial image; `unverified` — the client reported the
- * image complete but its size could not be confirmed; `unreadable` — the mark
- * could not be read (never read as "no mark").
- */
-export const IscsiRestoreMarkState = z.enum(['in-progress', 'interrupted', 'unverified', 'unreadable'])
-export type IscsiRestoreMarkState = z.infer<typeof IscsiRestoreMarkState>
 
 /**
  * Where a restore-mark row's verdict comes from (cr3.lunrestore, review2 D):

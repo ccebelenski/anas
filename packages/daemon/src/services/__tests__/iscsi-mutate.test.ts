@@ -20,7 +20,6 @@ import {
   assertConfigshellArgs,
   assertNoSecretArgs,
   assertSaveable,
-  attributeTokens,
   claimsFromTargets,
   createIscsiTarget,
   createSparseImage,
@@ -30,13 +29,11 @@ import {
   growImageFile,
   growZvolLun,
   imageFilePath,
-  ISCSI_MAX_UNMAP_LBA_COUNT,
   iscsiNodeName,
   newSerial,
   newTargetIqn,
   nextLunIndex,
   proveZvolBacking,
-  replayAttributes,
   resizeFileLun,
   resolveFileBackingDir,
   resolveZvolBacking,
@@ -51,6 +48,7 @@ import {
   zvolDevicePath,
   zvolExistsArgs,
 } from '../iscsi-mutate.js'
+import { attributeTokens, ISCSI_MAX_UNMAP_LBA_COUNT, replayAttributes } from '../iscsi-rules.js'
 
 /**
  * iSCSI mutation sequences, asserted as EXACT argv lists (story `iscsi.4`).

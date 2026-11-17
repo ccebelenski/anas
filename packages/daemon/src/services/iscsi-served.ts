@@ -192,27 +192,6 @@ export function servedDevice(
   return { device: `file:${st.dev}:${st.ino}`, refusal: null }
 }
 
-/**
- * Which live block backstore, if any, already serves the device `st` names.
- * The repair half of the rule: a hole is recreated only over a device no other
- * backstore serves.
- */
-export function servedElsewhere(
-  live: LioLiveState,
-  st: DeviceStat | null,
-): { name: string, device: string } | null {
-  if (!st || st.type !== 'block')
-    return null
-  const device = `${st.rdevMajor}:${st.rdevMinor}`
-  for (const b of live.backstores) {
-    if (normalizePlugin(b.plugin) === 'block' && b.devMajor !== null && b.devMinor !== null
-      && `${b.devMajor}:${b.devMinor}` === device) {
-      return { name: b.name, device }
-    }
-  }
-  return null
-}
-
 /** One served-device comparison with the stat done for you. */
 export async function checkServedDevice(
   live: LioLiveState,
