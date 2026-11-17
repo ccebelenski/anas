@@ -14,12 +14,12 @@ import { lioInstalled, poolExists, skipIfFixtureMissing, sshExec } from './fixtu
  *
  * Over the real daemon, LIO and ZFS on the stunt node:
  *
- *   A. The LUN is unmapped from configfs, its backstore still live. Reloading
- *      the screen shows Repair DISABLED, with the daemon's "map it back by
- *      hand" sentence (`luns create storage_object=`), never "can be put back
- *      now".
- *   B. The backstore is deleted too. Reloading shows Repair ENABLED and the
- *      tooltip promising the same disk.
+ *   A. The LUN is unmapped from configfs; its backstore is still live but no
+ *      longer carries the saved serial. Reloading the screen shows Repair
+ *      DISABLED, with the daemon's "map it back by hand" sentence
+ *      (`luns create storage_object=`), never "can be put back now".
+ *   B. The saved serial is written back: the live backstore is provably the
+ *      saved one. Reloading shows Repair ENABLED.
  *   C. Repair puts the LUN back: the health read has no missing LUN for the
  *      target, and the button is disabled with "Nothing to repair".
  *
@@ -185,18 +185,25 @@ test.describe('own.4 (c) — the Repair button reads the hole verdict', () => {
     await loginToPve(page)
     await openIscsi(page)
 
-    // (A) The LUN is unmapped from configfs, the backstore still live: the
-    // daemon refuses (mapping an existing backstore is the manual path).
+    // (A) The LUN is unmapped from configfs and its still-live backstore no
+    // longer carries the saved serial: the daemon cannot show it is the saved
+    // disk, refuses, and gives the by-hand mapping line.
+    const serialFile = `/sys/kernel/config/target/core/iblock_*/${lun.name}/wwn/vpd_unit_serial`
+    const savedSerial = (await sshExec(`cat ${serialFile}`)).replace(/^.*Number:\s*/, '').trim()
+    expect(savedSerial).toBeTruthy()
     await sshExec(`targetcli /iscsi/${iqn}/tpg1/luns delete ${lun.index}`)
+    await sshExec(`for f in ${serialFile}; do echo 11111111-2222-3333-4444-555555555555 > "$f"; done`)
     await reloadIscsi(page)
     await expect.poll(async () => (await repairState(page)).tip, { timeout: 45_000 })
       .toContain('luns create storage_object=')
     const refused = await repairState(page)
     expect(refused.disabled, 'a hole the daemon refuses never enables the button').toBe(true)
     expect(refused.tip, 'and it never claims the disk can be put back').not.toContain('can be put back now')
+    expect(refused.tip).toContain('cannot show its serial is the saved one')
 
-    // (B) The backstore is deleted too: the daemon calls the hole ready.
-    await sshExec(`targetcli /backstores/block delete ${lun.name}`)
+    // (B) The saved serial is back on the live backstore: it is provably the
+    // saved one, and the daemon calls the hole ready (Repair maps it back).
+    await sshExec(`for f in ${serialFile}; do echo ${savedSerial} > "$f"; done`)
     await reloadIscsi(page)
     await expect.poll(async () => (await repairState(page)).tip, { timeout: 45_000 })
       .toContain('can be put back now')
