@@ -55,7 +55,7 @@ import { dirname, join } from 'node:path'
 import { anasIqn, IscsiIqn } from '@anas/shared'
 import { zfsDatasetClaims } from '../safety/guard.js'
 import { readPoolGuid } from '../safety/stable-id.js'
-import { readAhrPools } from './ahr-topology.js'
+import { ahrPoolHolding, readAhrPools } from './ahr-topology.js'
 import { CONFIGFS_TARGET_ROOT, describeLunHolder, describeUnmappedHolder, readMappedLuns } from './iscsi-configfs.js'
 import { computeIscsiHealth, unmappedLiveBackstores } from './iscsi-health.js'
 import { classifyBacking, ownershipFromInputs } from './iscsi-ownership.js'
@@ -1420,6 +1420,13 @@ export async function resolveFileBackingDir(
       ok.dataset = c.dataset
     if (c.pool)
       ok.pool = c.pool
+    // A file on no dataset that still classified as ANAS's is on an AHR pool:
+    // the inputs carried the AHR mountpoints (an AHR-backed LUN exists
+    // already) and the classification named the pool. It rides the answer as
+    // it does above, so the job orders this pool's mount before the restore
+    // service too. No second topology read: the classification is the answer.
+    if (!c.dataset && c.pool && c.mountpoint)
+      ok.ahr = { name: c.pool, mountpoint: c.mountpoint }
     return { ok }
   }
 
@@ -1556,21 +1563,19 @@ export interface ResolvedFileDir {
 }
 
 /**
- * The AHR pool whose mountpoint contains `path`, or null when the topology is
- * readable and no pool's mountpoint holds it. A topology that could NOT be
- * read throws {@link AhrTopologyUnreadableError} (cr.64c, cr.63 (h)): "I could
- * not see the arrays" is not "no AHR pool lives here" — the caller's refusal
- * carries the read's sentence (503 at the route, a failed job in the job)
- * instead of the misleading "not on storage ANAS manages".
+ * The AHR pool that holds `path` — when mountpoints nest, the one with the
+ * deepest mountpoint (the rule lives in {@link ahrPoolHolding}) — or null
+ * when the topology is readable and no pool's mountpoint holds it. A topology
+ * that could NOT be read throws {@link AhrTopologyUnreadableError} (cr.64c,
+ * cr.63 (h)): "I could not see the arrays" is not "no AHR pool lives here" —
+ * the caller's refusal carries the read's sentence (503 at the route, a failed
+ * job in the job) instead of the misleading "not on storage ANAS manages".
  */
 async function ahrPoolFor(executor: CommandExecutor, path: string): Promise<ResolvedAhrPool | null> {
-  for (const pool of await readAhrPools(executor)) {
-    if (!pool.mountpoint)
-      continue
-    if (path === pool.mountpoint || path.startsWith(`${pool.mountpoint}/`))
-      return { name: pool.name, mountpoint: pool.mountpoint }
-  }
-  return null
+  const pool = ahrPoolHolding(path, await readAhrPools(executor))
+  if (!pool)
+    return null
+  return { name: pool.name, mountpoint: pool.mountpoint }
 }
 
 /**

@@ -16,7 +16,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { DmStatusLine } from '../parsers/dmsetup.js'
 import type { MdadmDetailExport } from '../parsers/mdadm-detail.js'
 import type { MdstatArray } from '../parsers/mdstat.js'
-import { AhrPool, AhrPoolBrief } from '@anas/shared'
+import { AhrPool, AhrPoolBrief, configPathKey, isPathWithin } from '@anas/shared'
 import { btrfsUsageArgs, parseBtrfsScrubStatusWord, parseBtrfsUsage } from '../parsers/btrfs-usage.js'
 import { parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { dmsetupStatusArgs, parseDmsetupStatus } from '../parsers/dmsetup.js'
@@ -1191,6 +1191,34 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
   }
 
   return pools
+}
+
+/**
+ * The pool whose mountpoint holds `path` — the ONE answer to "which AHR pool
+ * is this path on", so no caller re-derives it. When mountpoints NEST (pools
+ * at `/mnt/a` and `/mnt/a/b`), the DEEPEST mountpoint holds the path, in
+ * either list order; two pools on one mountpoint go to the first. A pool with
+ * no mountpoint holds nothing, and nothing counts as under `/`, so a
+ * root-mounted pool holds nothing either. Trailing slashes are spelling
+ * ({@link configPathKey}): `/mnt/a/` holds what `/mnt/a` holds. The pool
+ * object comes back exactly as given, its own mountpoint spelling included.
+ */
+export function ahrPoolHolding<T extends { name: string, mountpoint: string }>(path: string, pools: Iterable<T>): T | null {
+  let best: T | null = null
+  let bestDepth = 0
+  for (const pool of pools) {
+    const mount = configPathKey(pool.mountpoint)
+    // An empty mountpoint and `/` both normalize to `/`, and neither holds:
+    // the first names no directory, the second would swallow every path.
+    if (mount === '/' || !isPathWithin(mount, path))
+      continue
+    // Strict `>` keeps the FIRST pool among mountpoints of equal depth.
+    if (best === null || mount.length > bestDepth) {
+      best = pool
+      bestDepth = mount.length
+    }
+  }
+  return best
 }
 
 // --- Dashboard warnings (story 11.10, AHR-DESIGN §10) ------------------------

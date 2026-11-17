@@ -1201,6 +1201,25 @@ describe('resolveFileBackingDir — an AHR pool name is a backing, like a datase
     assert.deepEqual(r.ok.ahr, { name: 'ahr0', mountpoint: '/mnt/anas-ahr/ahr0' })
   })
 
+  it('a directory on a mounted AHR pool resolves with the pool, whether or not the ownership inputs already carry the AHR mountpoints', async () => {
+    const dir = '/mnt/anas-ahr/ahr0/images'
+    const pool = { name: 'ahr0', mountpoint: '/mnt/anas-ahr/ahr0' }
+    // No AHR-backed LUN exists yet: the inputs carry no AHR map, the door reads the topology.
+    const first = await resolveFileBackingDir(ahrExecutor(pool.mountpoint), dir, emptyCtx())
+    assert.ok('ok' in first)
+    assert.equal(first.ok.dir, dir)
+    assert.equal(first.ok.pool, 'ahr0')
+    assert.deepEqual(first.ok.ahr, pool)
+    // An AHR-backed LUN exists already: the inputs carry the map. The answer is the same,
+    // so the add-LUN job still orders this pool's mount before the restore service.
+    const ctx = emptyCtx()
+    ctx.inputs.ahrMountpoints = new Map([['ahr0', pool.mountpoint]])
+    const later = await resolveFileBackingDir(ahrExecutor(pool.mountpoint), dir, ctx)
+    assert.ok('ok' in later)
+    assert.equal(later.ok.pool, 'ahr0')
+    assert.deepEqual(later.ok.ahr, pool)
+  })
+
   it('refuses an UNMOUNTED AHR pool by name — naming it, saying to mount it', async () => {
     const r = await resolveFileBackingDir(ahrExecutor(), 'ahr0', emptyCtx())
     assert.ok('refusal' in r)

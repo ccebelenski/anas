@@ -203,6 +203,19 @@ describe('classifyBacking — where a LUN\'s backing object actually lives', () 
     assert.equal(c.pool, 'ahr0')
   })
 
+  it('a file under the deeper of two nested AHR mountpoints resolves to the deeper pool, in either map order', () => {
+    const outerFirst: [string, string][] = [['ahr-outer', '/mnt/a'], ['ahr-inner', '/mnt/a/b']]
+    const innerFirst: [string, string][] = [['ahr-inner', '/mnt/a/b'], ['ahr-outer', '/mnt/a']]
+    for (const pools of [outerFirst, innerFirst]) {
+      const c = classifyBacking('/mnt/a/b/lun.raw', inputs({
+        ahrMountpoints: new Map(pools),
+      }))
+      assert.equal(c.kind, 'file')
+      assert.equal(c.pool, 'ahr-inner')
+      assert.equal(c.mountpoint, '/mnt/a/b')
+    }
+  })
+
   it('calls everything else foreign', () => {
     // A raw block device someone pointed LIO at by hand.
     assert.equal(classifyBacking('/dev/sdb', inputs()).kind, 'foreign')

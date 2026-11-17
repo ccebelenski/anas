@@ -11,7 +11,7 @@ import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { isPvUnderSized, PV_UNDERSIZE_MARGIN_BYTES } from '../ahr-layout.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, AhrTopologyUnreadableError, buildAhrPoolBriefs, buildAhrWarnings, readAhrPools, withExpansionIntent } from '../ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, ahrPoolHolding, AhrTopologyUnreadableError, buildAhrPoolBriefs, buildAhrWarnings, readAhrPools, withExpansionIntent } from '../ahr-topology.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/ahr')
@@ -1190,5 +1190,54 @@ describe('cr3: a failed read is unknown, never invented', () => {
     assert.equal(r1.members.filter(m => m.memberState !== 'spare').length, 4)
     const brief = buildAhrPoolBriefs([pool])[0].bands.find(b => b.band === 1)!
     assert.equal(brief.memberCount, 3, 'the dashboard reads md\'s count, never the row count')
+  })
+})
+
+// The ONE answer to "which AHR pool's mountpoint holds this path" (the rule:
+// the deepest mountpoint wins when pools nest — see ahrPoolHolding).
+describe('ahrPoolHolding — the deepest mountpoint holds', () => {
+  const OUTER = { name: 'pool-a', mountpoint: '/mnt/a' }
+  const INNER = { name: 'pool-b', mountpoint: '/mnt/a/b' }
+
+  it('the deeper mountpoint holds a path under it, in either list order', () => {
+    assert.equal(ahrPoolHolding('/mnt/a/b/img.raw', [OUTER, INNER]), INNER)
+    assert.equal(ahrPoolHolding('/mnt/a/b/img.raw', [INNER, OUTER]), INNER)
+  })
+
+  it('a path only the shallower mountpoint covers belongs to it, in either list order', () => {
+    assert.equal(ahrPoolHolding('/mnt/a/x.raw', [OUTER, INNER]), OUTER)
+    assert.equal(ahrPoolHolding('/mnt/a/x.raw', [INNER, OUTER]), OUTER)
+  })
+
+  it('a sibling directory of a mountpoint is held by nobody', () => {
+    assert.equal(ahrPoolHolding('/mnt/ab/x.raw', [OUTER, INNER]), null)
+  })
+
+  it('a path equal to a mountpoint is held by that pool', () => {
+    assert.equal(ahrPoolHolding('/mnt/a/b', [OUTER, INNER]), INNER)
+  })
+
+  it('a trailing slash on a mountpoint is spelling, not path', () => {
+    const spelled = { name: 'pool-a', mountpoint: '/mnt/a/' }
+    assert.equal(ahrPoolHolding('/mnt/a/x.raw', [spelled]), spelled)
+  })
+
+  it('an empty mountpoint and a / mountpoint hold nothing', () => {
+    const unmounted = { name: 'no-mount', mountpoint: '' }
+    const root = { name: 'root', mountpoint: '/' }
+    assert.equal(ahrPoolHolding('/mnt/a/x.raw', [unmounted, root]), null)
+    // A real holder still answers when a non-holder is listed first.
+    assert.equal(ahrPoolHolding('/mnt/a/x.raw', [root, OUTER]), OUTER)
+  })
+
+  it('two pools on one mountpoint — the first in the list holds', () => {
+    const first = { name: 'first', mountpoint: '/mnt/a' }
+    const second = { name: 'second', mountpoint: '/mnt/a' }
+    assert.equal(ahrPoolHolding('/mnt/a/x.raw', [first, second]), first)
+  })
+
+  it('returns the pool object it was given, unchanged', () => {
+    const pool = { name: 'pool-a', mountpoint: '/mnt/a', extra: true }
+    assert.equal(ahrPoolHolding('/mnt/a/x.raw', [pool]), pool)
   })
 })

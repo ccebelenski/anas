@@ -49,11 +49,12 @@
 import type { IscsiLunKind, IscsiOwnershipTag, PveOwnership, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
-import { isAnasIqn, ZVOL_PATH_PREFIX, zvolDatasetFromPath } from '@anas/shared'
+import { configPathKey, isAnasIqn, ZVOL_PATH_PREFIX, zvolDatasetFromPath } from '@anas/shared'
 import { matchMountpoint } from '../parsers/pve-storage.js'
+import { ahrPoolHolding } from './ahr-topology.js'
 import { ownershipWithFallback } from './pve-footprint.js'
 
-/** Trailing slashes, stripped before any path comparison. */
+/** The trailing slashes that are spelling, not path ({@link stripTrailingSlash}). */
 const TRAILING_SLASH_RE = /\/+$/
 
 /** What ANAS knows about the storage a LUN's backing object sits on. */
@@ -156,13 +157,6 @@ export interface OwnershipInputs {
 
 function stripTrailingSlash(path: string): string {
   return path.replace(TRAILING_SLASH_RE, '') || '/'
-}
-
-/** Is `path` at or under `dir`? (`/tank` must not swallow `/tank-other`.) */
-function isUnder(path: string, dir: string): boolean {
-  if (dir === '/')
-    return path.startsWith('/')
-  return path === dir || path.startsWith(`${dir}/`)
 }
 
 /** An absolute path that is not a device node — an image file. */
@@ -299,18 +293,13 @@ export function classifyBacking(
   }
 
   // AHR's only block object is a file on its btrfs volume, so an AHR pool
-  // mountpoint is as much "ANAS-managed storage" as a ZFS dataset is.
+  // mountpoint is as much "ANAS-managed storage" as a ZFS dataset is. When
+  // pool mountpoints nest, the deepest holder wins (ahrPoolHolding owns that
+  // rule); the answer keeps the slash-stripped spelling it always carried.
   if (inputs.ahrMountpoints) {
-    let best: { pool: string, mountpoint: string } | null = null
-    for (const [pool, mountpoint] of inputs.ahrMountpoints) {
-      const canonical = stripTrailingSlash(mountpoint)
-      if (isUnder(stripTrailingSlash(devPath), canonical)
-        && (best === null || canonical.length > best.mountpoint.length)) {
-        best = { pool, mountpoint: canonical }
-      }
-    }
+    const best = ahrPoolHolding(devPath, Array.from(inputs.ahrMountpoints, ([name, mountpoint]) => ({ name, mountpoint })))
     if (best)
-      return { kind: 'file', pool: best.pool, dataset: null, mountpoint: best.mountpoint, pveOwned: false, pveOwnership: null, pveGuestVolume: false }
+      return { kind: 'file', pool: best.name, dataset: null, mountpoint: configPathKey(best.mountpoint), pveOwned: false, pveOwnership: null, pveGuestVolume: false }
   }
 
   // cr3: with the mountpoint table unreadable, "no dataset matched" proves

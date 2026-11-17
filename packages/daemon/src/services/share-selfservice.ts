@@ -1,12 +1,12 @@
 import type { AhrPool, CreateSmbShareRequest, MountEntry, SnapshotSchedule } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
-import { isPathWithin, RetentionBucket } from '@anas/shared'
+import { RetentionBucket } from '@anas/shared'
 import { addMount, directMountOptionArgs, getMount } from '../parsers/fstab.js'
 import { matchMountpoint, readZfsMountpointsFull } from '../parsers/pve-storage.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
-import { readAhrPools } from './ahr-topology.js'
+import { ahrPoolHolding, readAhrPools } from './ahr-topology.js'
 import { editConfig } from './config-writer.js'
 import { mountThroughOpenedDir } from './mounts.js'
 import { readAllSchedules } from './snapshot-schedule-units.js'
@@ -76,15 +76,8 @@ export async function resolveSelfServiceTarget(executor: CommandExecutor, path: 
   if (dataset)
     return { kind: 'zfs', dataset }
 
-  const pools = await readAhrPools(executor)
-  let best: { pool: AhrPool, mountpoint: string } | undefined
-  for (const pool of pools) {
-    if (!isPathWithin(pool.mountpoint, path))
-      continue
-    if (!best || pool.mountpoint.length > best.mountpoint.length)
-      best = { pool, mountpoint: pool.mountpoint }
-  }
-  return best ? { kind: 'ahr', pool: best.pool.name, poolRecord: best.pool } : null
+  const pool = ahrPoolHolding(path, await readAhrPools(executor))
+  return pool ? { kind: 'ahr', pool: pool.name, poolRecord: pool } : null
 }
 
 /**
