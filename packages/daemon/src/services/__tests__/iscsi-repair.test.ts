@@ -21,8 +21,9 @@
  * `saveconfig.json` permanently.
  */
 
-import type { IscsiHealth, IscsiTargetDetail } from '@anas/shared'
+import type { IscsiHealth, IscsiHoleRepair, IscsiTargetDetail } from '@anas/shared'
 import type { LioSaveconfig } from '../../parsers/lio-saveconfig.js'
+import type { IscsiRepairItem } from '../iscsi-repair.js'
 import type { IscsiReadContext } from '../iscsi.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -38,6 +39,7 @@ import { computeIscsiHealth } from '../iscsi-health.js'
 import { TARGETCLI } from '../iscsi-mutate.js'
 import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../iscsi-repair.js'
 import { buildIscsiTargets, readIscsiContext } from '../iscsi.js'
+import { holeIoFor } from './lio-model.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/iscsi')
@@ -69,8 +71,12 @@ function targetcliCalls(mock: MockExecutor): string[] {
  * The real restore-hole state, built from the real captures: `saveconfig-final`
  * has both LUNs, the materialised configfs has only the fileio one because the
  * block backing device was missing at restore.
+ *
+ * `backing` answers the backing probe for every path (`null` is a failed read),
+ * so the verdict is decided by the SAME health read the door runs — Repair
+ * plans what that read says.
  */
-async function holeState(): Promise<{
+async function holeState(opts: { backing?: boolean | null } = {}): Promise<{
   ctx: IscsiReadContext
   targets: IscsiTargetDetail[]
   health: IscsiHealth
@@ -94,23 +100,19 @@ async function holeState(): Promise<{
     // `zfs list` (the bare mock's) now means "the image's owner is unknown",
     // and Repair rightly refuses such a target — not what these tests are about.
     zfsMountpoints: async () => [],
+    ...(opts.backing !== undefined ? { backingExists: async () => opts.backing ?? null } : {}),
   })
   const targets = await buildIscsiTargets(ctx)
-  return { ctx, targets, health: computeIscsiHealth(ctx, targets), dir }
-}
-
-/** The same state, with the backing device declared BACK. */
-function withBackingPresent(health: IscsiHealth): IscsiHealth {
-  return { ...health, missingLuns: health.missingLuns.map(l => ({ ...l, backingExists: true })) }
+  return { ctx, targets, health: computeIscsiHealth(ctx, targets, { holeIo: holeIoFor(ctx, targets) }), dir }
 }
 
 // ---------------------------------------------------------------------------
 
 describe('planIscsiRepair — the plan comes from the PERSISTED record', () => {
   it('reads serial, size, write_back and attributes off saveconfig.json', async () => {
-    const s = await holeState()
+    const s = await holeState({ backing: true })
     try {
-      const plan = planIscsiRepair(s.ctx, withBackingPresent(s.health), s.targets)
+      const plan = planIscsiRepair(s.ctx, s.health, s.targets)
       assert.equal(plan.repairable.length, 1)
       assert.equal(plan.blocked.length, 0)
       const item = plan.repairable[0]
@@ -152,16 +154,16 @@ describe('planIscsiRepair — the plan comes from the PERSISTED record', () => {
     }
   })
 
-  it('"we could not tell" (null) counts as absent, not as present', async () => {
-    const s = await holeState()
+  it('"we could not tell" (null) is backing-unreadable, never repairable', async () => {
+    const s = await holeState({ backing: null })
     try {
-      const unknown: IscsiHealth = {
-        ...s.health,
-        missingLuns: s.health.missingLuns.map(l => ({ ...l, backingExists: null })),
-      }
-      const plan = planIscsiRepair(s.ctx, unknown, s.targets)
+      // The probe itself failed (EACCES, EIO): the read says so, and the
+      // verdict is "could not check" — never "absent", never "ready".
+      assert.equal(s.health.missingLuns[0].backingExists, null)
+      const plan = planIscsiRepair(s.ctx, s.health, s.targets)
       assert.equal(plan.repairable.length, 0)
       assert.equal(plan.blocked.length, 1)
+      assert.equal(plan.blocked[0].verdict?.state, 'backing-unreadable')
     }
     finally {
       await rm(s.dir, { recursive: true, force: true })
@@ -192,10 +194,80 @@ describe('assertRepairable — the guiding 409', () => {
     }
   })
 
+  it('the reason follows the first group that holds: backstore-live leads served-device-mismatch', () => {
+    const item = (lunIndex: number, verdict: IscsiHoleRepair): IscsiRepairItem => ({
+      targetIqn: IQN,
+      tpgTag: 1,
+      lunIndex,
+      backstoreName: `b${lunIndex}`,
+      plugin: 'block',
+      backingPath: `/dev/zvol/tank/b${lunIndex}`,
+      serial: null,
+      size: null,
+      writeBack: false,
+      attributes: {} as IscsiRepairItem['attributes'],
+      aclInitiators: [],
+      verdict,
+    })
+    const served = item(1, { state: 'device-served-elsewhere', detail: 'the path names another volume' })
+    const live = item(2, { state: 'backstore-live', detail: 'a backstore of its name is still live' })
+    const refusal = assertRepairable({ repairable: [], blocked: [served, live] })
+    assert.equal(refusal?.reason, 'backstore-live')
+    // …and the clauses print in the same order: backstore-live before served.
+    const liveAt = refusal!.message.indexOf('still live:')
+    const servedAt = refusal!.message.indexOf('different device:')
+    assert.ok(liveAt >= 0 && servedAt > liveAt, refusal!.message)
+  })
+
+  it('a hole whose path names another backstore\'s device is refused as served-device-mismatch, with its sentence', () => {
+    const served: IscsiRepairItem = {
+      targetIqn: IQN,
+      tpgTag: 1,
+      lunIndex: 1,
+      backstoreName: 'b1',
+      plugin: 'block',
+      backingPath: '/dev/zvol/tank/b1',
+      serial: null,
+      size: null,
+      writeBack: false,
+      attributes: {} as IscsiRepairItem['attributes'],
+      aclInitiators: [],
+      verdict: { state: 'device-served-elsewhere', detail: 'the path names another volume' },
+    }
+    assert.deepEqual(assertRepairable({ repairable: [], blocked: [served] }), {
+      reason: 'served-device-mismatch',
+      message: `None of the missing LUNs can be repaired. One hole is refused because the path names a different device: LUN 1 of ${IQN} — the path names another volume.`,
+    })
+  })
+
+  it('a plan that holds an item which is not a ready hole runs NOTHING: every item is checked before the first create', async () => {
+    const ready = (lunIndex: number, verdict?: IscsiHoleRepair): IscsiRepairItem => ({
+      targetIqn: IQN,
+      tpgTag: 1,
+      lunIndex,
+      backstoreName: `b${lunIndex}`,
+      plugin: 'block',
+      backingPath: `/dev/zvol/tank/b${lunIndex}`,
+      serial: null,
+      size: null,
+      writeBack: false,
+      attributes: {} as IscsiRepairItem['attributes'],
+      aclInitiators: [],
+      ...(verdict ? { verdict } : {}),
+    })
+    const good = ready(0, { state: 'ready', detail: 'ready' })
+    for (const bad of [ready(1, { state: 'backstore-live', detail: 'still live' }), ready(1)]) {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      await assert.rejects(repairIscsiHoles({ executor: mock }, { repairable: [good, bad], blocked: [] }), /Cannot repair LUN 1 of .*not a ready hole/)
+      assert.equal(mock.calls.filter(c => c.command === TARGETCLI).length, 0)
+    }
+  })
+
   it('allows the repair the moment ONE hole has its backing back', async () => {
-    const s = await holeState()
+    const s = await holeState({ backing: true })
     try {
-      const plan = planIscsiRepair(s.ctx, withBackingPresent(s.health), s.targets)
+      const plan = planIscsiRepair(s.ctx, s.health, s.targets)
       assert.equal(assertRepairable(plan), null)
     }
     finally {
@@ -206,10 +278,10 @@ describe('assertRepairable — the guiding 409', () => {
 
 describe('repairIscsiHoles — the exact replay argv', () => {
   it('creates with wwn=, replays every attribute, maps at the STORED index, re-grants', async () => {
-    const s = await holeState()
+    const s = await holeState({ backing: true })
     try {
       const mock = okExecutor()
-      const plan = planIscsiRepair(s.ctx, withBackingPresent(s.health), s.targets)
+      const plan = planIscsiRepair(s.ctx, s.health, s.targets)
       const result = await repairIscsiHoles({ executor: mock }, plan)
 
       assert.deepEqual(targetcliCalls(mock), [
@@ -248,13 +320,13 @@ describe('repairIscsiHoles — the exact replay argv', () => {
     // configFS` and takes the whole repair down — live-proven on the stunt node,
     // where Repair after a pool re-import failed exactly this way. The shared
     // grant helper reads the ACL's live mapped set first.
-    const s = await holeState()
+    const s = await holeState({ backing: true })
     try {
       const root = join(s.dir, 'target')
       for (const initiator of ['iqn.2026-08.dev.anas.gtiscsi:allowed2', 'iqn.1993-08.org.debian:01:ae3d2ec18ad'])
         await mkdir(join(root, 'iscsi', IQN, 'tpgt_1', 'acls', initiator, 'lun_0'), { recursive: true })
       const mock = okExecutor()
-      const plan = planIscsiRepair(s.ctx, withBackingPresent(s.health), s.targets)
+      const plan = planIscsiRepair(s.ctx, s.health, s.targets)
       const result = await repairIscsiHoles({ executor: mock, configfsRoot: root }, plan)
 
       const calls = targetcliCalls(mock)
@@ -272,9 +344,8 @@ describe('repairIscsiHoles — the exact replay argv', () => {
     // Two holes, one device back. The repaired LUN goes in; the save does not
     // happen, because saving now would write the OTHER hole into
     // saveconfig.json permanently.
-    const ctx = twoHoleCtx()
-    const health = twoHoleHealth([true, false])
-    const plan = planIscsiRepair(ctx, health, [])
+    const { ctx, targets, health } = await twoHoleState([true, false])
+    const plan = planIscsiRepair(ctx, health, targets)
     assert.equal(plan.repairable.length, 1)
     assert.equal(plan.blocked.length, 1)
 
@@ -287,8 +358,8 @@ describe('repairIscsiHoles — the exact replay argv', () => {
   })
 
   it('saveconfig runs exactly once, last, after a FULL repair', async () => {
-    const ctx = twoHoleCtx()
-    const plan = planIscsiRepair(ctx, twoHoleHealth([true, true]), [])
+    const { ctx, targets, health } = await twoHoleState([true, true])
+    const plan = planIscsiRepair(ctx, health, targets)
     const mock = okExecutor()
     const result = await repairIscsiHoles({ executor: mock }, plan)
     const calls = targetcliCalls(mock)
@@ -298,8 +369,8 @@ describe('repairIscsiHoles — the exact replay argv', () => {
   })
 
   it('a fileio hole is recreated with its size and write_back on the create line', async () => {
-    const ctx = twoHoleCtx()
-    const plan = planIscsiRepair(ctx, twoHoleHealth([false, true]), [])
+    const { ctx, targets, health } = await twoHoleState([false, true])
+    const plan = planIscsiRepair(ctx, health, targets)
     const mock = okExecutor()
     await repairIscsiHoles({ executor: mock }, plan)
     assert.equal(
@@ -312,8 +383,8 @@ describe('repairIscsiHoles — the exact replay argv', () => {
     // The one case where identity cannot be replayed. It is reported, not
     // papered over: the disk that comes back is a different disk to its
     // initiator, and the job result has to admit that.
-    const ctx = twoHoleCtx({ dropSerial: true })
-    const plan = planIscsiRepair(ctx, twoHoleHealth([true, false]), [])
+    const { ctx, targets, health } = await twoHoleState([true, false], { dropSerial: true })
+    const plan = planIscsiRepair(ctx, health, targets)
     const mock = okExecutor()
     const result = await repairIscsiHoles({ executor: mock }, plan)
     assert.equal(targetcliCalls(mock)[0], '/backstores/block create name=vol1 dev=/dev/zvol/tank/vol1')
@@ -324,16 +395,16 @@ describe('repairIscsiHoles — the exact replay argv', () => {
   // file at the image's path and serves it with the right serial, which is the
   // placeholder story `iscsi.8` exists to take away, made this time by ANAS.
   it('a fileio record with NO persisted size is BLOCKED, never created at size=0 (C3)', async () => {
-    const ctx = twoHoleCtx({ dropSize: true })
     // The fileio backing is BACK — the only thing standing in the way is the
     // record itself, which is the whole point of the case.
-    const plan = planIscsiRepair(ctx, twoHoleHealth([false, true]), [])
+    const { ctx, targets, health } = await twoHoleState([false, true], { dropSize: true })
+    const plan = planIscsiRepair(ctx, health, targets)
     assert.equal(plan.repairable.length, 0)
     const sizeless = plan.blocked.find(b => b.backstoreName === 'img1')
     assert.ok(sizeless, JSON.stringify(plan.blocked))
-    assert.equal(sizeless.backingPresent, true, 'the backing is present — the RECORD is what blocks it')
+    assert.equal(sizeless.verdict?.state, 'record-incomplete', 'the backing is present — the RECORD is what blocks it')
     assert.equal(sizeless.size, null)
-    assert.match(sizeless.blockedReason ?? '', /no size/)
+    assert.match(sizeless.verdict?.detail ?? '', /no size/)
 
     const mock = okExecutor()
     const result = await repairIscsiHoles({ executor: mock }, plan)
@@ -343,12 +414,11 @@ describe('repairIscsiHoles — the exact replay argv', () => {
     assert.ok(!targetcliCalls(mock).some(c => /size=0/.test(c)), 'no 0-byte placeholder may be created')
   })
 
-  it('the 409 for a size-less record NAMES the missing size, not "import the pool"', () => {
-    const ctx = twoHoleCtx({ dropSize: true })
-    const both = twoHoleHealth([true, true])
+  it('the 409 for a size-less record NAMES the missing size, not "import the pool"', async () => {
+    const { ctx, targets, health } = await twoHoleState([true, true], { dropSize: true })
     // ONLY the fileio hole: the other one is repairable and would carry the
     // ordinary absent-backing sentence.
-    const plan = planIscsiRepair(ctx, { ...both, missingLuns: [both.missingLuns[1]] }, [])
+    const plan = planIscsiRepair(ctx, { ...health, missingLuns: [health.missingLuns[1]] }, targets)
     const refusal = assertRepairable(plan)
     assert.ok(refusal)
     assert.equal(refusal.reason, 'record-incomplete')
@@ -360,8 +430,8 @@ describe('repairIscsiHoles — the exact replay argv', () => {
   it('never issues `targetctl restore` or a service restart', async () => {
     // rtslib's restore takes clear_existing=True and wipes the whole live tree,
     // dropping every healthy LUN's sessions. Repair is surgical, by design.
-    const ctx = twoHoleCtx()
-    const plan = planIscsiRepair(ctx, twoHoleHealth([true, true]), [])
+    const { ctx, targets, health } = await twoHoleState([true, true])
+    const plan = planIscsiRepair(ctx, health, targets)
     const mock = okExecutor()
     await repairIscsiHoles({ executor: mock }, plan)
     for (const call of mock.calls) {
@@ -418,7 +488,7 @@ const TWO_HOLE_SAVECONFIG = {
   }],
 }
 
-function twoHoleCtx(opts: { dropSerial?: boolean, dropSize?: boolean } = {}): IscsiReadContext {
+function twoHoleCtx(opts: { dropSerial?: boolean, dropSize?: boolean } = {}, present: [boolean, boolean] = [true, true]): IscsiReadContext {
   const raw = JSON.parse(JSON.stringify(TWO_HOLE_SAVECONFIG))
   if (opts.dropSerial)
     delete raw.storage_objects[0].wwn
@@ -430,31 +500,25 @@ function twoHoleCtx(opts: { dropSerial?: boolean, dropSize?: boolean } = {}): Is
     // Live: the target is up, but neither backstore nor LUN restored.
     live: { present: true, backstores: [], targets: [] },
     persisted,
-    inputs: { pveStorages: new Map(), zfsMountpoints: [] },
+    // The image's directory is a dataset, so the file ranks as ANAS's own;
+    // `present` is per LUN, in order, and decides what each probe answered.
+    inputs: { pveStorages: new Map(), zfsMountpoints: [{ dataset: 'tank/images', mountpoint: '/tank/images', pool: 'tank' }], systemFacts: [] },
     nodeAddresses: null,
-    backing: new Map(),
+    backing: new Map([
+      ['/dev/zvol/tank/vol1', { exists: present[0], size: null }],
+      ['/tank/images/img1.raw', { exists: present[1], size: null }],
+    ]),
     mounts: new Map(),
     stubs: new Map(),
   } as IscsiReadContext
 }
 
-/** The health diff for the synthetic state; `present` is per LUN, in order. */
-function twoHoleHealth(present: [boolean, boolean]): IscsiHealth {
-  return {
-    installed: true,
-    configfsPresent: true,
-    saveconfigPresent: true,
-    missingLuns: [
-      { targetIqn: IQN, tpgTag: 1, lunIndex: 0, backstoreName: 'vol1', plugin: 'block', backingPath: '/dev/zvol/tank/vol1', backingExists: present[0] },
-      { targetIqn: IQN, tpgTag: 1, lunIndex: 1, backstoreName: 'img1', plugin: 'fileio', backingPath: '/tank/images/img1.raw', backingExists: present[1] },
-    ],
-    targetsServingNothing: [{ targetIqn: IQN, tpgTag: 1, persistedLunCount: 2, enabled: true }],
-    stubLuns: [],
-    disabledTargets: [],
-    portalsWithoutInterface: [],
-    foreignChanges: [],
-    degraded: true,
-    interfacesUnknown: true,
-    checkedAt: '2026-08-25T20:00:00.000Z',
-  }
+/**
+ * The health read for the synthetic state — targets built from the context and
+ * the verdicts `holeIoFor` gives them, which is exactly what the door plans.
+ */
+async function twoHoleState(present: [boolean, boolean], opts: { dropSerial?: boolean, dropSize?: boolean } = {}) {
+  const ctx = twoHoleCtx(opts, present)
+  const targets = await buildIscsiTargets(ctx)
+  return { ctx, targets, health: computeIscsiHealth(ctx, targets, { holeIo: holeIoFor(ctx, targets) }) }
 }

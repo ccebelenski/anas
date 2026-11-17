@@ -1429,13 +1429,12 @@ describe('cr3.lunrestore review2 (5, E) — a hole held back by a restore mark i
     backstoreName: 'ghost',
     plugin: 'block',
     backingPath: '/dev/zvol/tank/gone',
-    backingPresent: true,
-    stubBacking: false,
     serial: 's',
     size: null,
     writeBack: false,
     attributes: {} as IscsiRepairItem['attributes'],
     aclInitiators: [],
+    verdict: { state: 'backing-absent', detail: 'That path is still missing — bring the storage back (import the pool, restore the image) first.' },
     ...over,
   })
 
@@ -1443,15 +1442,15 @@ describe('cr3.lunrestore review2 (5, E) — a hole held back by a restore mark i
     const mock = new MockExecutor()
     mock.addFixture({ command: TARGETCLI, result: OK })
     mock.addFixture({ command: ZFS, result: OK })
-    const marked = hole({ lunIndex: 2, backstoreName: 'held', restoreMark: 'interrupted', restoreMarkDataset: 'tank/gone', blockedReason: 'a whole-image restore (its details could not be read) onto tank/gone did not finish, so it holds a partial image' })
-    const result = await repairIscsiHoles({ executor: mock }, { repairable: [hole({ backingPath: '/dev/zvol/tank/back' })], blocked: [marked] })
+    const marked = hole({ lunIndex: 2, backstoreName: 'held', verdict: { state: 'restore-mark', detail: 'a whole-image restore (its details could not be read) onto tank/gone did not finish, so it holds a partial image', restoreMark: 'interrupted', markOn: 'tank/gone' } })
+    const result = await repairIscsiHoles({ executor: mock }, { repairable: [hole({ backingPath: '/dev/zvol/tank/back', verdict: { state: 'ready', detail: 'That path is available again — use Repair on the iSCSI screen to put the LUN back.' } })], blocked: [marked] })
     assert.equal(result.repaired.length, 1)
     assert.match(result.stillDegraded ?? '', /^This node stays degraded: 1 LUN is still missing, so nothing was saved\. One hole is held back by a restore mark on the backing: LUN 2 of .* \(backstore 'held', \/dev\/zvol\/tank\/gone\): a whole-image restore .* did not finish, so it holds a partial image\. Repair would map that image into the target again, so it does not\./)
     assert.match(result.stillDegraded ?? '', /clear its restore mark \('zfs inherit anas:restore tank\/gone'\) and run Repair again/)
   })
 
   it('only marked holes: reason restore-mark (not record-incomplete), the clause once, one stop', () => {
-    const r = assertRepairable({ repairable: [], blocked: [hole({ restoreMark: 'interrupted', restoreMarkDataset: 'tank/gone', blockedReason: 'a whole-image restore (its details could not be read) onto tank/gone did not finish, so it holds a partial image' })] })
+    const r = assertRepairable({ repairable: [], blocked: [hole({ verdict: { state: 'restore-mark', detail: 'a whole-image restore (its details could not be read) onto tank/gone did not finish, so it holds a partial image', restoreMark: 'interrupted', markOn: 'tank/gone' } })] })
     assert.equal(r?.reason, 'restore-mark')
     assert.match(r?.message ?? '', /^None of the missing LUNs can be repaired\. One hole is held back by a restore mark on the backing: LUN 1 of .* \(backstore 'ghost', \/dev\/zvol\/tank\/gone\): a whole-image restore \(its details could not be read\) onto tank\/gone did not finish, so it holds a partial image\. Repair would map that image into the target again/)
     assert.doesNotMatch(r?.message ?? '', /\.\.|does not describe/)
@@ -1459,8 +1458,8 @@ describe('cr3.lunrestore review2 (5, E) — a hole held back by a restore mark i
 
   it('a marked hole beside an absent one: the absent one leads (bring the storage back), the marked one is named after it', () => {
     const r = assertRepairable({ repairable: [], blocked: [
-      hole({ lunIndex: 2, backstoreName: 'away', backingPath: '/dev/zvol/tank/away', backingPresent: false }),
-      hole({ restoreMark: 'in-progress', restoreMarkDataset: 'tank/gone', blockedReason: 'a whole-image restore is writing it right now (job j)' }),
+      hole({ lunIndex: 2, backstoreName: 'away', backingPath: '/dev/zvol/tank/away' }),
+      hole({ verdict: { state: 'restore-mark', detail: 'a whole-image restore is writing it right now (job j)', restoreMark: 'in-progress', markOn: 'tank/gone' } }),
     ] })
     assert.equal(r?.reason, 'backing-absent')
     assert.match(r?.message ?? '', /LUN 2 of .* \(backstore 'away', \/dev\/zvol\/tank\/away\)\. Bring the storage back first/)
@@ -2297,7 +2296,7 @@ describe('cr3.lunrestore.filemark — every door that reads the mark, per state,
   })
 
   it('review S4: Repair over a hole whose FILE mark cannot be read names the command', () => {
-    const item = { targetIqn: IQN, tpgTag: 1, lunIndex: 1, backstoreName: 'lun2', plugin: 'fileio', backingPath: F, backingPresent: true, stubBacking: false, serial: 's', size: null, writeBack: false, attributes: {} as IscsiRepairItem['attributes'], aclInitiators: [], restoreMark: 'unreadable' as const, restoreMarkDataset: F, blockedReason: `ANAS could not read the restore mark on ${F} (Command timed out after 12000ms), so it cannot tell whether it holds a partially restored image` }
+    const item = { targetIqn: IQN, tpgTag: 1, lunIndex: 1, backstoreName: 'lun2', plugin: 'fileio', backingPath: F, serial: 's', size: null, writeBack: false, attributes: {} as IscsiRepairItem['attributes'], aclInitiators: [], verdict: { state: 'restore-mark' as const, detail: `ANAS could not read the restore mark on ${F} (Command timed out after 12000ms), so it cannot tell whether it holds a partially restored image`, restoreMark: 'unreadable' as const, markOn: F } }
     const r = assertRepairable({ repairable: [], blocked: [item] })
     assert.match(r?.message ?? '', S4_WAY('Repair'))
   })

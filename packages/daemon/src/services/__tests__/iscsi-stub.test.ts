@@ -437,7 +437,7 @@ describe('Repair refuses to build a LUN over a placeholder', () => {
     const plan = planIscsiRepair(ctx, health, targets)
     assert.equal(plan.repairable.length, 0)
     assert.equal(plan.blocked.length, 1)
-    assert.equal(plan.blocked[0].stubBacking, true)
+    assert.equal(plan.blocked[0].verdict?.state, 'placeholder')
   })
 })
 

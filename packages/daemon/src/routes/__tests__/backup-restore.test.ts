@@ -2279,7 +2279,9 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
     // --- review2 E: Repair over a hole whose backing carries a restore mark ---
 
     async function repairOverMarkedHole(state: 'interrupted' | 'unverified' | 'unreadable') {
-      await serveAnas({ hole: true, backingPresent: `${ZVOL_PATH}:/dev/zvol/tank/gone` })
+      // The hole's device must be readable AND served by nothing, or the
+      // "could not stat it" verdict would lead before the mark does.
+      await serveAnas({ hole: true, backingPresent: `${ZVOL_PATH}:/dev/zvol/tank/gone`, deviceStat: `${ZVOL_PATH}=230:16;/dev/zvol/tank/gone=230:32` })
       const m = marksFollow(mockOf())
       if (state === 'interrupted')
         m.marks.set('tank/gone', MARK)

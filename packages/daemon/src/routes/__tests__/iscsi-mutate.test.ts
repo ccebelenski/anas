@@ -63,6 +63,8 @@ const GT_IQN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
 /** The zvol LUN's path and the image path the file-LUN tests use (ident.2 stat seam). */
 const SERVED_ZVOL = '/dev/zvol/tank/vol1'
 const SERVED_IMAGE = '/tank/images/imgdisk.raw'
+/** The GT-21 restore hole's backing (story `iscsi.5`). */
+const HOLE_PATH = '/dev/zvol/tank/gone'
 
 /** SYNTHETIC (not a capture): the smallest tree the mutation gates need. */
 function anasManifest(opts: {
@@ -223,6 +225,50 @@ function anasSaveconfig(extraLun = false, holeDev = '/dev/zvol/tank/gone', fileL
       }],
     }],
   })
+}
+
+/**
+ * SYNTHETIC: one LIVE backstore `name`, as a manifest fragment beside
+ * {@link anasManifest} — the state a saved LUN finds when its backstore outlived
+ * it (`core/<plugin>_9` is an index the shared manifest does not use).
+ */
+function liveBackstore(name: string, plugin: 'block' | 'fileio', dev: string, majorMinor = '230:32'): string {
+  const [major, minor] = majorMinor.split(':')
+  const dir = plugin === 'fileio' ? 'core/fileio_9' : 'core/iblock_9'
+  return [
+    `D ${dir}`,
+    `D ${dir}/${name}`,
+    `F ${dir}/${name}/udev_path = ${dev}`,
+    `F ${dir}/${name}/enable = 1`,
+    `F ${dir}/${name}/info = Status: ACTIVATED  Max Queue Depth: 128  SectorSize: 512  HwMaxSectors: 16384\\n        Major: ${major} Minor: ${minor}`,
+    `D ${dir}/${name}/attrib`,
+    `F ${dir}/${name}/attrib/block_size = 512`,
+    `D ${dir}/${name}/wwn`,
+    `F ${dir}/${name}/wwn/vpd_unit_serial = T10 VPD Unit Serial Number: deadbeef-0000-0000-0000-000000000000`,
+    `F ${dir}/${name}/wwn/product_id = ${name}`,
+    `F ${dir}/${name}/wwn/vendor_id = LIO-ORG`,
+  ].join('\n')
+}
+
+/** SYNTHETIC: the persisted half of {@link anasSaveconfig} plus ONE hole `name` (LUN 1). */
+function saveconfigWithHole(plugin: 'block' | 'fileio', name: string, dev: string, size?: number): string {
+  const cfg = JSON.parse(anasSaveconfig()) as {
+    storage_objects: Record<string, unknown>[]
+    targets: { tpgs: { luns: Record<string, unknown>[] }[] }[]
+  }
+  cfg.storage_objects.push({
+    name,
+    plugin,
+    dev,
+    ...(size === undefined ? {} : { size }),
+    wwn: 'deadbeef-0000-0000-0000-000000000000',
+    readonly: false,
+    write_back: false,
+    attributes: {},
+    alua_tpgs: [],
+  })
+  cfg.targets[0].tpgs[0].luns.push({ index: 1, storage_object: `/backstores/${plugin}/${name}`, alias: '0000000000' })
+  return JSON.stringify(cfg)
 }
 
 /**
@@ -389,6 +435,45 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       await new Promise(resolve => setTimeout(resolve, 10))
     }
     throw new Error(`Job ${id} did not finish`)
+  }
+
+  /**
+   * Answer `zfs get anas:restore` (the single and the batched form) from a map
+   * the test can change mid-flight, so a mark can appear while a job waits.
+   */
+  function marksFollow(mock: MockExecutor): Map<string, string> {
+    const marks = new Map<string, string>()
+    const exec = mock.exec.bind(mock)
+    mock.exec = async (command, args, o) => {
+      if (command === ZFS && args[0] === 'get' && args.includes('anas:restore')) {
+        mock.calls.push({ command, args })
+        const datasets = args.slice(args.indexOf('--') + 1)
+        const named = args.includes('name,value,source')
+        const rows = datasets.map((d) => {
+          const v = marks.get(d)
+          const row = v === undefined ? '-\t-' : `${v}\tlocal`
+          return named ? `${d}\t${row}` : row
+        })
+        return { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 }
+      }
+      return exec(command, args, o)
+    }
+    return marks
+  }
+
+  /** Park the iSCSI mutex so a submitted job waits exactly where it re-reads. */
+  async function parkRepairLock(): Promise<{ release: () => void, held: Promise<void> }> {
+    let release!: () => void
+    let locked!: () => void
+    const isLocked = new Promise<void>((r) => {
+      locked = r
+    })
+    const held = withIscsiLock(() => new Promise<void>((r) => {
+      release = r
+      locked()
+    }))
+    await isLocked
+    return { release, held }
   }
 
   /** The ANAS-owned tree every mutation test runs against. */
@@ -1656,7 +1741,10 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       // ANAS does not manage, which since the L7 ruling makes the target
       // foreign and its hole never Repair's (the next test).
       const savedPresent = process.env.ANAS_ISCSI_BACKING_PRESENT
-      process.env.ANAS_ISCSI_BACKING_PRESENT = '/dev/zvol/tank/gone'
+      process.env.ANAS_ISCSI_BACKING_PRESENT = HOLE_PATH
+      // The device the path names, so the verdict reaches `ready`: a block hole
+      // whose stat fails is `backing-unreadable`, never repairable.
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16;${HOLE_PATH}=230:32`
       try {
         await serveAnas({ hole: true })
         const res = await call('POST', '/v1/iscsi/health/repair')
@@ -1724,6 +1812,98 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       await serveAnas({ hole: true })
       const res = await server!.inject({ method: 'POST', url: '/v1/iscsi/health/repair' })
       assert.equal(res.statusCode, 401)
+    })
+
+    // --- C10: a hole whose backstore is STILL LIVE is backstore-live --------
+    //
+    // A saved LUN can find a live backstore of its own name and plugin: the
+    // restore recreated the backstore and left the LUN unmapped. `create` would
+    // collide with it. The verdict says so, before any targetcli word.
+
+    it('C10: a fileio hole whose backstore is still live is refused as backstore-live — nothing is created', async () => {
+      process.env.ANAS_ISCSI_BACKING_PRESENT = HOLE_PATH
+      await serve({
+        manifest: `${anasManifest()}\n${liveBackstore('ghost', 'fileio', HOLE_PATH)}\n`,
+        saveconfigText: saveconfigWithHole('fileio', 'ghost', HOLE_PATH, 268435456),
+      })
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.reason, 'backstore-live')
+      assert.match(res.body.error!.message, /backstore 'ghost' \(fileio, \/dev\/zvol\/tank\/gone\) is still live/)
+      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0)
+    })
+
+    it('C10: a block hole whose backstore is still live is backstore-live, not served-device-mismatch', async () => {
+      process.env.ANAS_ISCSI_BACKING_PRESENT = HOLE_PATH
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16;${HOLE_PATH}=230:16`
+      await serve({
+        manifest: `${anasManifest()}\n${liveBackstore('ghost', 'block', HOLE_PATH, '230:16')}\n`,
+        saveconfigText: saveconfigWithHole('block', 'ghost', HOLE_PATH),
+      })
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.reason, 'backstore-live')
+      assert.doesNotMatch(res.body.error!.message, /path names a different device/)
+      assert.match(res.body.error!.message, /backstore 'ghost' \(block, \/dev\/zvol\/tank\/gone\) is still live/)
+      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0)
+    })
+
+    it('R3: a block hole whose device stat fails is backing-unreadable, never repairable', async () => {
+      process.env.ANAS_ISCSI_BACKING_PRESENT = HOLE_PATH
+      // The path is not in the seam, so it falls through to a real stat, which
+      // fails: the device is not on this node and ANAS cannot name it.
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16`
+      await serveAnas({ hole: true })
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
+      assert.equal(res.body.error!.reason, 'backing-unreadable')
+      assert.match(res.body.error!.message, /could not stat \/dev\/zvol\/tank\/gone/)
+      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0)
+    })
+
+    it('a restore mark that appears between the request and the job is seen and reported by the job', async () => {
+      process.env.ANAS_ISCSI_BACKING_PRESENT = HOLE_PATH
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16;${HOLE_PATH}=230:32`
+      await serveAnas({ hole: true })
+      mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const marks = marksFollow(mockOf())
+      const lock = await parkRepairLock()
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      // A whole-image restore starts writing the backing while the job waits.
+      marks.set('tank/gone', JSON.stringify({ v: 1, repo: 'pbs-main', snapshot: 'host/x/2026-11-17T10:00:00Z', archive: 'vol.img', started: '2026-11-17T10:00:00.000Z', state: 'writing' }))
+      lock.release()
+      await lock.held
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as { repaired: unknown[], stillMissing: unknown[], saved: boolean, stillDegraded?: string }
+      assert.equal(result.repaired.length, 0)
+      assert.equal(result.saved, false)
+      // The job read the mark under the lock and said what held the hole back.
+      assert.match(result.stillDegraded ?? '', /held back by a restore mark on the backing/)
+      assert.equal(mockOf().calls.some(c => c.command === TARGETCLI), false)
+    })
+
+    it('a hole that becomes backstore-live between the request and the job is blocked by the job', async () => {
+      process.env.ANAS_ISCSI_BACKING_PRESENT = HOLE_PATH
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16;${HOLE_PATH}=230:48`
+      await serveAnas({ hole: true })
+      mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const lock = await parkRepairLock()
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      // The restore put the backstore back while the job waited. Its device is
+      // the one the OTHER LUN serves, so the old device rung saw nothing.
+      await materializeConfigfsManifest(liveBackstore('ghost', 'block', HOLE_PATH, '230:16'), join(dir, 'target'))
+      lock.release()
+      await lock.held
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as { repaired: unknown[], stillMissing: unknown[], saved: boolean }
+      assert.equal(result.repaired.length, 0)
+      assert.equal(result.stillMissing.length, 1)
+      assert.equal(result.saved, false)
+      assert.equal(mockOf().calls.some(c => c.command === TARGETCLI && c.args.includes('name=ghost')), false)
     })
   })
 

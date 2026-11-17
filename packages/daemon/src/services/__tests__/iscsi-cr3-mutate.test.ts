@@ -15,11 +15,13 @@ import { zfsSnapshotListArgs } from '../../parsers/zfs-list.js'
 import { lunsMappingBackstore } from '../iscsi-configfs.js'
 import { lunDeleteSpec, zvolSnapshotNames } from '../iscsi-guard.js'
 import { computeIscsiHealth } from '../iscsi-health.js'
+import { holeRepairVerdict } from '../iscsi-hole.js'
 import { assertSaveable, createSparseImage, deleteIscsiLun, resizeFileLun, runTargetcli, TARGETCLI, TargetcliArgError, updateIscsiTarget, ZFS } from '../iscsi-mutate.js'
 import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../iscsi-repair.js'
 import { aclNamesRefusal, backingPathRefusal, configshellSafe } from '../iscsi-rules.js'
 import { buildIscsiTargets } from '../iscsi.js'
 import { readPveFirewallAdvisory } from '../pve-firewall.js'
+import { holeIoFor } from './lio-model.js'
 
 const IQN = 'iqn.2026-08.nas.anas:vmstore'
 
@@ -357,7 +359,7 @@ describe('cr3 ISCSI-L7 (ruled) — Repair never writes to a foreign target; its 
     // into the foreign target.
     const c = ctx(true)
     const targets = await buildIscsiTargets(c)
-    const health = computeIscsiHealth(c, targets)
+    const health = computeIscsiHealth(c, targets, { holeIo: holeIoFor(c, targets) })
     // Targets come in IQN order.
     assert.deepEqual(health.missingLuns.map(m => [m.targetIqn, m.targetOwnership]), [[FOREIGN, 'foreign'], [OWN, 'anas']])
     // A change refused now names BOTH: Repair for ANAS's, the hand restore for theirs.
@@ -367,7 +369,7 @@ describe('cr3 ISCSI-L7 (ruled) — Repair never writes to a foreign target; its 
 
     const plan = planIscsiRepair(c, health, targets)
     assert.deepEqual(plan.repairable.map(r => r.targetIqn), [OWN])
-    assert.deepEqual(plan.blocked.map(b => [b.targetIqn, b.foreignTarget]), [[FOREIGN, true]])
+    assert.deepEqual(plan.blocked.map(b => [b.targetIqn, b.verdict?.state]), [[FOREIGN, 'foreign-target']])
     assert.equal(assertRepairable(plan), null)
 
     const mock = okExecutor()
@@ -384,7 +386,7 @@ describe('cr3 ISCSI-L7 (ruled) — Repair never writes to a foreign target; its 
   it('foreign only: Repair refuses with the sentence, and every change names the foreign target, never "use Repair"', async () => {
     const c = ctx(false)
     const targets = await buildIscsiTargets(c)
-    const health = computeIscsiHealth(c, targets)
+    const health = computeIscsiHealth(c, targets, { holeIo: holeIoFor(c, targets) })
     assert.equal(health.degraded, true)
     const refusal = assertRepairable(planIscsiRepair(c, health, targets))
     assert.equal(refusal?.reason, 'foreign-holes-only')
@@ -427,12 +429,14 @@ describe('cr3 ISCSI-L10 follow-up — an existing LUN on a path targetcli would 
     const path = '/dev/zvol/tank/my vol'
     const ctx = {
       persisted: { storageObjects: [{ name: 'x', plugin: 'block', dev: path, wwn: 'w', size: null, writeBack: null, readOnly: null, aio: null, attributes: {} }], targets: [{ iqn: IQN, fabric: 'iscsi', tpgs: [{ tag: 1, acls: [], luns: [], portals: [] }] }] },
+      live: { present: true, backstores: [], targets: [] },
       stubs: new Map(),
     } as never
-    const health = { missingLuns: [{ targetIqn: IQN, tpgTag: 1, lunIndex: 0, backstoreName: 'x', plugin: 'block', backingPath: path, backingExists: true, targetOwnership: 'anas' }] } as never
+    const hole = { targetIqn: IQN, tpgTag: 1, lunIndex: 0, backstoreName: 'x', plugin: 'block', backingPath: path, backingExists: true, targetOwnership: 'anas' as const }
+    const health = { missingLuns: [{ ...hole, repair: holeRepairVerdict(ctx, target(), hole, null) }] } as never
     const plan = planIscsiRepair(ctx, health, [])
     assert.equal(plan.repairable.length, 0)
-    assert.match(plan.blocked[0].blockedReason ?? '', /contains a space, a quote or an '='/)
+    assert.match(plan.blocked[0].verdict?.detail ?? '', /contains a space, a quote or an '='/)
   })
 
   it('a file resize is refused BEFORE the first act: the file is not grown, the LUN not unmapped', async () => {
@@ -509,15 +513,19 @@ describe('cr3 review 2 — every line and every ACL is checked before the first 
         storageObjects: [{ name: 'x', plugin: 'block', dev: '/dev/zvol/tank/x', wwn, size: null, writeBack: null, readOnly: null, aio: null, attributes: {} }],
         targets: [{ iqn: IQN, fabric: 'iscsi', tpgs: [{ tag: 1, acls: [{ initiatorIqn: acl, mappedLuns: [0] }], luns: [], portals: [] }] }],
       },
+      live: { present: true, backstores: [], targets: [] },
       stubs: new Map(),
     }) as never
-    const health = { missingLuns: [{ targetIqn: IQN, tpgTag: 1, lunIndex: 0, backstoreName: 'x', plugin: 'block', backingPath: '/dev/zvol/tank/x', backingExists: true, targetOwnership: 'anas' }] } as never
-    const badWwn = planIscsiRepair(ctx('a b', 'iqn.1993-08.org.debian:01:x'), health, [])
+    const hole = { targetIqn: IQN, tpgTag: 1, lunIndex: 0, backstoreName: 'x', plugin: 'block', backingPath: '/dev/zvol/tank/x', backingExists: true, targetOwnership: 'anas' as const }
+    // No mark, and a device nothing serves: the good record is a ready hole.
+    const facts = { device: { type: 'block' as const, rdevMajor: 230, rdevMinor: 0, dev: '0', ino: '0', size: 0 }, mark: { state: 'absent' as const, dataset: 'tank/x' }, running: undefined, record: undefined }
+    const health = (wwn: string, acl: string) => ({ missingLuns: [{ ...hole, repair: holeRepairVerdict(ctx(wwn, acl), target(), hole, facts) }] }) as never
+    const badWwn = planIscsiRepair(ctx('a b', 'iqn.1993-08.org.debian:01:x'), health('a b', 'iqn.1993-08.org.debian:01:x'), [])
     assert.equal(badWwn.repairable.length, 0)
-    assert.match(badWwn.blocked[0].blockedReason ?? '', /"wwn=a b" cannot be handed to targetcli/)
-    const badAcl = planIscsiRepair(ctx('w', 'not an iqn'), health, [])
+    assert.match(badWwn.blocked[0].verdict?.detail ?? '', /"wwn=a b" cannot be handed to targetcli/)
+    const badAcl = planIscsiRepair(ctx('w', 'not an iqn'), health('w', 'not an iqn'), [])
     assert.equal(badAcl.repairable.length, 0)
-    assert.match(badAcl.blocked[0].blockedReason ?? '', /initiator ACL "not an iqn"/)
-    assert.equal(planIscsiRepair(ctx('w', 'iqn.1993-08.org.debian:01:x'), health, []).repairable.length, 1)
+    assert.match(badAcl.blocked[0].verdict?.detail ?? '', /initiator ACL "not an iqn"/)
+    assert.equal(planIscsiRepair(ctx('w', 'iqn.1993-08.org.debian:01:x'), health('w', 'iqn.1993-08.org.debian:01:x'), []).repairable.length, 1)
   })
 })

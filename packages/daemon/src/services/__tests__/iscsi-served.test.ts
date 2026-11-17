@@ -1,11 +1,8 @@
-import type { ConfigfsBackstore, LioLiveState } from '../iscsi-configfs.js'
-import type { IscsiRepairPlan } from '../iscsi-repair.js'
+import type { ConfigfsBackstore } from '../iscsi-configfs.js'
 import type { DeviceStat } from '../iscsi-served.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { parseBackstoreInfo } from '../iscsi-configfs.js'
-import { servedElsewhere } from '../iscsi-hole.js'
-import { assertRepairable, guardRepairPlan } from '../iscsi-repair.js'
 import {
   decodeDevT,
   deviceStatSeamFromEnv,
@@ -123,54 +120,6 @@ describe('servedDevice — THE comparison', () => {
     assert.equal(ok.device, 'file:2049:77')
     assert.equal(ok.refusal, null)
     assert.equal(servedDevice(FILE_LUN, fileStore, null).refusal?.reason, 'served-device-unknown')
-  })
-})
-
-describe('servedElsewhere + guardRepairPlan — a hole is never recreated over a served device', () => {
-  const live: LioLiveState = { present: true, backstores: [backstore()], targets: [] }
-
-  it('finds the live block backstore serving a device', () => {
-    assert.deepEqual(servedElsewhere(live, blockStat(230, 16)), { name: 'vmdisk1', device: '230:16' })
-    assert.equal(servedElsewhere(live, blockStat(230, 48)), null)
-    assert.equal(servedElsewhere(live, null), null)
-  })
-
-  function plan(path: string): IscsiRepairPlan {
-    return {
-      repairable: [{
-        targetIqn: 'iqn.x',
-        tpgTag: 1,
-        lunIndex: 1,
-        backstoreName: 'ghost',
-        plugin: 'block',
-        backingPath: path,
-        backingPresent: true,
-        stubBacking: false,
-        serial: 'deadbeef',
-        size: null,
-        writeBack: false,
-        attributes: { emulateTpu: true, emulateTpws: true, maxUnmapLbaCount: 524288, writeBack: false },
-        aclInitiators: [],
-      }],
-      blocked: [],
-    }
-  }
-
-  it('moves a hole whose path names a served device to blocked, with the reason', async () => {
-    const guarded = await guardRepairPlan(plan('/dev/zvol/tank/gone'), live, async () => blockStat(230, 16))
-    assert.equal(guarded.repairable.length, 0)
-    assert.equal(guarded.blocked.length, 1)
-    assert.equal(guarded.blocked[0].deviceServed, true)
-    assert.match(guarded.blocked[0].blockedReason!, /already serves as backstore 'vmdisk1'/)
-    const refusal = assertRepairable(guarded)
-    assert.equal(refusal?.reason, 'served-device-mismatch')
-    assert.match(refusal!.message, /path names a different device/)
-  })
-
-  it('leaves a hole over an unserved device repairable', async () => {
-    const guarded = await guardRepairPlan(plan('/dev/zvol/tank/gone'), live, async () => blockStat(230, 48))
-    assert.equal(guarded.repairable.length, 1)
-    assert.equal(assertRepairable(guarded), null)
   })
 })
 

@@ -8,7 +8,7 @@
 import type { IscsiHoleRepair, IscsiLunAttributes, IscsiMissingLun, IscsiRestoreMarkState, IscsiTargetDetail } from '@anas/shared'
 import type { SaveconfigStorageObject } from '../parsers/lio-saveconfig.js'
 import type { LioLiveState } from './iscsi-configfs.js'
-import type { IscsiRepairItem } from './iscsi-repair.js'
+import type { HoleReplayRecord } from './iscsi-repair.js'
 import type { DeviceStat } from './iscsi-served.js'
 import type { IscsiReadContext } from './iscsi.js'
 import type { RestoreJobRecord, RestoreMarkRead } from './restore-mark.js'
@@ -63,7 +63,7 @@ export function tpgOf(target: IscsiTargetDetail | undefined, tag: number) {
  * re-split or read as a keyword, or an ACL name ANAS cannot address. Null when
  * every one of them can be run.
  */
-export function repairTokensRefusal(item: Pick<IscsiRepairItem, 'targetIqn' | 'backstoreName' | 'serial' | 'attributes' | 'aclInitiators'>): string | null {
+function repairTokensRefusal(item: Pick<HoleReplayRecord, 'targetIqn' | 'backstoreName' | 'serial' | 'attributes' | 'aclInitiators'>): string | null {
   const tokens = [
     `name=${item.backstoreName}`,
     item.backstoreName,
@@ -92,7 +92,7 @@ export function persistedAclsMapping(ctx: IscsiReadContext, missing: IscsiMissin
  * The repair half of the rule: a hole is recreated only over a device no other
  * backstore serves.
  */
-export function servedElsewhere(
+function servedElsewhere(
   live: LioLiveState,
   st: DeviceStat | null,
 ): { name: string, device: string } | null {
@@ -122,7 +122,7 @@ export function holeReplayRecord(
   ctx: IscsiReadContext,
   missing: IscsiMissingLun,
   targets: IscsiTargetDetail[],
-): Omit<IscsiRepairItem, 'backingPresent' | 'stubBacking'> {
+): HoleReplayRecord {
   const persistedStorage = ctx.persisted ? storageObjectsByName(ctx.persisted) : new Map<string, SaveconfigStorageObject>()
   const targetByIqn = new Map(targets.map(t => [t.iqn, t]))
 
@@ -152,7 +152,7 @@ export function holeReplayRecord(
  * What a restore mark says about a hole's backing, as a clause for the Repair
  * refusal (cr3.lunrestore, review2 E): no leading capital, no stop.
  */
-export function repairMarkClause(read: RestoreMarkRead, state: IscsiRestoreMarkState, running: string | undefined, record?: RestoreJobRecord): string {
+function repairMarkClause(read: RestoreMarkRead, state: IscsiRestoreMarkState, running: string | undefined, record?: RestoreJobRecord): string {
   if (read.state === 'unknown')
     return `ANAS could not read the restore mark on ${read.dataset} (${read.reason}), so it cannot tell whether it holds a partially restored image`
   if (state === 'in-progress')

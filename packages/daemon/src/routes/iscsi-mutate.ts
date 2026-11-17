@@ -6,7 +6,6 @@ import type { ConfirmStore } from '../safety/confirm.js'
 import type { Gate, GuardReads } from '../safety/guard.js'
 import type { IscsiState, TargetObject } from '../services/iscsi-guard.js'
 import type { IscsiMutateOptions, IscsiRefusal, ResolvedAhrPool } from '../services/iscsi-mutate.js'
-import type { IscsiRepairItem, IscsiRepairPlan } from '../services/iscsi-repair.js'
 import type { IscsiBackstoreAttributes } from '../services/iscsi-rules.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import {
@@ -50,8 +49,6 @@ import {
   updateSessionScope,
   updateSessionsReadableGate,
 } from '../services/iscsi-guard.js'
-import { computeIscsiHealth } from '../services/iscsi-health.js'
-import { repairMarkClause } from '../services/iscsi-hole.js'
 import {
   addIscsiLun,
   assertInstalled,
@@ -81,12 +78,12 @@ import {
   withIscsiLock,
   zvolDataset,
 } from '../services/iscsi-mutate.js'
-import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
-import { assertRepairable, guardRepairPlan, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
+import { readIscsiHealth, readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
+import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
 import { aclNamesRefusal, backingPathRefusal, ownershipUnknownRefusal, replayAttributes } from '../services/iscsi-rules.js'
 import { checkServedDevice, reverifyServedLun, servedLunIdentity, statDeviceFrom } from '../services/iscsi-served.js'
 import { iscsiAvailability, targetTpgs } from '../services/iscsi.js'
-import { clearMarkCommand, clearRestoreMark, consultsJobRecord, describeMarkSet, enableMarkVerdict, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkRefusal, restoreVerdict } from '../services/restore-mark.js'
+import { clearMarkCommand, clearRestoreMark, describeMarkSet, enableMarkVerdict, markDataset, markSignature, readLunMarks, readRestoreMark, restoreJobsOf, restoreMarkRefusal } from '../services/restore-mark.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -264,37 +261,6 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
   const configfsRoot = paths.configfsRoot ?? CONFIGFS_TARGET_ROOT
   /** cr3.lunrestore (review2 D): what the job records say about a backing. */
   const restoreJobs = restoreJobsOf(jobQueue)
-
-  /**
-   * cr3.lunrestore (review D5 d): Repair re-creates a saved LUN over its
-   * backing; a backing whose volume carries a restore mark (or whose mark
-   * cannot be read) would be served with a partial image, so that hole moves
-   * to `blocked` with the mark's sentence.
-   */
-  async function markRepairPlan(plan: IscsiRepairPlan): Promise<IscsiRepairPlan> {
-    const repairable: IscsiRepairItem[] = []
-    const blocked = [...plan.blocked]
-    // review2 (7): every hole's mark in one command.
-    const reads = await readRestoreMarksBatch(executor, plan.repairable.map(i => i.backingPath))
-    for (const item of plan.repairable) {
-      // review2 E: the mark's state rides the item (`restoreMark`), and the
-      // refusal's sentence is built from it in `assertRepairable`.
-      const read = reads.get(item.backingPath)!
-      const running = restoreJobs.restoreRunning(item.backingPath)
-      // review S3: the one rule every door uses (`restoreVerdict`): a file
-      // with no mark whose failed restore record stands is held back here as
-      // Enable asks about it there.
-      const record = consultsJobRecord(read) ? restoreJobs.restoreFailed(item.backingPath, item.targetIqn) : undefined
-      const verdict = restoreVerdict(read, running, record)
-      if (verdict === null) {
-        repairable.push(item)
-        continue
-      }
-      const state = verdict.state
-      blocked.push({ ...item, restoreMark: state, restoreMarkDataset: read.state === 'present' || read.state === 'unknown' ? read.dataset : null, blockedReason: repairMarkClause(read, state, running, record) })
-    }
-    return { repairable, blocked }
-  }
 
   /**
    * cr3.lunrestore (review D5 d): an edit that ADDS an initiator ACL grants
@@ -1521,7 +1487,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     // not yet a hole — it is a live LUN with an empty file behind it — so the
     // tear-down has to happen before the plan is built, or Repair would answer
     // "nothing to repair" about the very thing it exists to fix.
-    const state = await readIscsiHealthWithQuarantine(executor, paths)
+    //
+    // The read carries the job view, so every hole it reports carries Repair's
+    // verdict on it: one decision, made where the facts are gathered.
+    const state = await readIscsiHealthWithQuarantine(executor, paths, restoreJobs)
     const notInstalled = assertInstalled(state.ctx)
     if (notInstalled)
       return sendRefusal(reply, notInstalled)
@@ -1531,11 +1500,7 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (unreadable)
       return sendRefusal(reply, unreadable)
 
-    const plan = await markRepairPlan(await guardRepairPlan(
-      planIscsiRepair(state.ctx, state.health, state.targets),
-      state.ctx.live,
-      statDeviceFrom(paths),
-    ))
+    const plan = planIscsiRepair(state.ctx, state.health, state.targets)
     const refusal = assertRepairable(plan)
     if (refusal) {
       // cr.64b2-iii (I): when THIS request's read just quarantined a
@@ -1562,22 +1527,17 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         },
       },
       async updateProgress => withIscsiLock(async () => {
-        // ident.2: the plan above is the request's; the job may run later. It
-        // is rebuilt from a fresh read under the lock, and a hole whose path
-        // now names a device LIO already serves through another backstore is
-        // blocked rather than given a second identity.
-        const fresh = await readIscsiState(executor, paths)
+        // The request's plan describes the tree when the request was made; the
+        // job may run later. It is planned again from a fresh read under the
+        // lock — the same read, with the same job view — so a hole that became
+        // unrepairable while the job waited is blocked, never recreated.
+        const fresh = await readIscsiHealth(executor, paths, restoreJobs)
         // cr3 (ISCSI-L15): the job ends in a save; never over a file it
         // could not read under the lock.
         const freshUnreadable = assertPersistedReadable(fresh.ctx)
         if (freshUnreadable)
           throw new GuardRefusalError(conflict(freshUnreadable))
-        const freshPlan = await markRepairPlan(await guardRepairPlan(
-          planIscsiRepair(fresh.ctx, computeIscsiHealth(fresh.ctx, fresh.targets), fresh.targets),
-          fresh.ctx.live,
-          statDeviceFrom(paths),
-        ))
-        return repairIscsiHoles(mutateOptions(updateProgress), freshPlan)
+        return repairIscsiHoles(mutateOptions(updateProgress), planIscsiRepair(fresh.ctx, fresh.health, fresh.targets))
       }),
       // cr.40 (§4.2): the keys of every target and LUN the request's plan
       // repairs. The job re-plans under the mutex; a hole that appeared on
