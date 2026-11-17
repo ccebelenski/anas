@@ -36,6 +36,11 @@ const HELPER = fileURLToPath(new URL('../anas-acl-walk.pl', import.meta.url))
 const scratch = mkdtempSync(join(tmpdir(), 'anas-cr3-verdict-'))
 after(() => {
   Object.assign(accessDirIo, REAL_IO)
+  // The D4 test leaves a tree 400 levels deep whose full path is far past
+  // PATH_MAX. Node 22's recursive rmSync unlinks by absolute path and fails on
+  // it with ENAMETOOLONG (Node 26 does not); rm(1) walks by directory
+  // descriptor and removes any depth. rmSync then clears whatever is left.
+  spawnSync('/bin/rm', ['-rf', '--', scratch])
   rmSync(scratch, { recursive: true, force: true })
 })
 
