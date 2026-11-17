@@ -761,6 +761,30 @@ describe('own.4 (c) — the repair verdict through read()', () => {
     }
   })
 
+  it('a fileio hole\'s I/O facts carry the stat of its backing, like a block hole\'s', async () => {
+    const statted: string[] = []
+    const node = await holeNode({
+      live: { backstores: [V2_BS], luns: [V2_LUN] },
+      saved: {
+        backstores: [V2_SAVED, { name: 'v1', plugin: 'fileio', dev: '/tank/images/v1.raw', wwn: 'w-1', size: 1048576 }],
+        luns: [V2_LUN, { index: 0, backstore: 'v1', plugin: 'fileio' }],
+      },
+      zfsGet: 'tank/v2\t-\t-\n',
+      deviceStat: async (p) => {
+        statted.push(p)
+        return { type: 'file', rdevMajor: 0, rdevMinor: 0, dev: '2049', ino: '77', size: 1048576 }
+      },
+      zfsMountpoints: [{ dataset: 'tank/images', mountpoint: '/tank/images', pool: 'tank' }],
+    })
+    try {
+      await readIscsiHealth(node.executor, node.paths, jobs)
+      assert.deepEqual(statted, ['/tank/images/v1.raw'], 'the fileio hole\'s backing is stat-ed, so its I/O facts carry the device')
+    }
+    finally {
+      await node.close()
+    }
+  })
+
   it('a 0-byte image against a saved size reads placeholder', async () => {
     const node = await holeNode({
       live: { backstores: [V2_BS], luns: [V2_LUN] },

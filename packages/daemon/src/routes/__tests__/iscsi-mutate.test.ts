@@ -1833,19 +1833,48 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0)
     })
 
-    it('C10: a block hole whose backstore is still live is backstore-live, not served-device-mismatch', async () => {
+    it('C10: a block hole whose live backstore IS the saved one is mapped back — one luns create, nothing created', async () => {
       process.env.ANAS_ISCSI_BACKING_PRESENT = HOLE_PATH
-      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16;${HOLE_PATH}=230:16`
+      // ghost's OWN device, not the other LUN's 230:16: LIO claims a device
+      // exclusively, so two backstores cannot hold one.
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16;${HOLE_PATH}=230:48`
       await serve({
-        manifest: `${anasManifest()}\n${liveBackstore('ghost', 'block', HOLE_PATH, '230:16')}\n`,
+        manifest: `${anasManifest()}\n${liveBackstore('ghost', 'block', HOLE_PATH, '230:48')}\n`,
         saveconfigText: saveconfigWithHole('block', 'ghost', HOLE_PATH),
       })
+      mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
       const res = await call('POST', '/v1/iscsi/health/repair')
-      assert.equal(res.statusCode, 409, JSON.stringify(res.body))
-      assert.equal(res.body.error!.reason, 'backstore-live')
-      assert.doesNotMatch(res.body.error!.message, /path names a different device/)
-      assert.match(res.body.error!.message, /backstore 'ghost' \(block, \/dev\/zvol\/tank\/gone\) is still live/)
-      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0)
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.deepEqual(mockOf().calls.filter(c => c.command === TARGETCLI).map(c => c.args.join(' ')), [
+        `/iscsi/${ANAS_IQN}/tpg1/luns create storage_object=/backstores/block/ghost lun=1`,
+        'saveconfig',
+      ])
+      const result = job.result as { repaired: { serial?: string }[], saved: boolean }
+      assert.equal(result.repaired.length, 1)
+      assert.equal(result.repaired[0].serial, 'kept')
+      assert.equal(result.saved, true)
+    })
+
+    it('C10: a fileio hole whose live backstore IS the saved one is mapped back (the file: stat seam)', async () => {
+      process.env.ANAS_ISCSI_BACKING_PRESENT = HOLE_PATH
+      process.env.ANAS_ISCSI_DEVICE_STAT = `${SERVED_ZVOL}=230:16;${HOLE_PATH}=file:2049:77:268435456`
+      await serve({
+        manifest: `${anasManifest()}\n${liveBackstore('ghost', 'fileio', HOLE_PATH)}\n`,
+        saveconfigText: saveconfigWithHole('fileio', 'ghost', HOLE_PATH, 268435456),
+      })
+      mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.deepEqual(mockOf().calls.filter(c => c.command === TARGETCLI).map(c => c.args.join(' ')), [
+        `/iscsi/${ANAS_IQN}/tpg1/luns create storage_object=/backstores/fileio/ghost lun=1`,
+        'saveconfig',
+      ])
+      const result = job.result as { repaired: { serial?: string }[] }
+      assert.equal(result.repaired[0].serial, 'kept')
     })
 
     it('R3: a block hole whose device stat fails is backing-unreadable, never repairable', async () => {

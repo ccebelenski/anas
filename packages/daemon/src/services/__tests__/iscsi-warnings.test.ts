@@ -122,7 +122,8 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
     assert.equal(w[0].level, 'warning')
     assert.equal(w[0].ref, IQN)
     assert.match(w[0].message, /LUN 0 'gtiscsi_vol1' of target iqn\.2026-08\.dev\.anas\.gtiscsi:target1 did not restore/)
-    assert.match(w[0].message, /its backing \/dev\/zvol\/gtiscsi\/vol1 was not available/)
+    assert.match(w[0].message, /\(its backing is \/dev\/zvol\/gtiscsi\/vol1\)/)
+    assert.doesNotMatch(w[0].message, /was not available/)
     assert.match(w[0].message, /serving without it/)
     // Still missing ⇒ the card says what to do FIRST, not "press Repair".
     assert.match(w[0].message, /still missing/)
@@ -551,7 +552,7 @@ describe('own.4 (c) — the hole card\'s tail is the hole\'s verdict, framed per
     backingPath: BACKING,
     backingExists: true,
   }
-  const HEAD = `LUN 0 'gtiscsi_vol1' of target ${IQN} did not restore — its backing ${BACKING} was not available; the target is serving without it.`
+  const HEAD = `LUN 0 'gtiscsi_vol1' of target ${IQN} did not restore (its backing is ${BACKING}); the target is serving without it.`
   const cardOf = (repair?: IscsiHoleRepair) => buildIscsiWarnings(health({
     // The card prints the verdict's own advice; a hand-built verdict gets the
     // sentence the owner frames, so these cases pin the card's tail end to end.

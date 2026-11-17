@@ -224,7 +224,10 @@ async function settle() {
     return { btn, apply: (health, err) => iscsi.applyHealth(view, health, err) }
   }
   const READY_ADVICE = 'That path is available again — use Repair on the iSCSI screen to put the LUN back.'
-  const READY_TIP = '1 LUN can be put back now — the same serial and attributes are replayed, so the initiator sees the same disk.'
+  // own.4 (c) B2: the promise is the button only. Repair may MAP a still-live
+  // saved backstore back (nothing replayed), so the identity lives in the
+  // per-hole advice, never in a sentence claiming a replay.
+  const READY_TIP = '1 LUN can be put back now.'
 
   // (i) one ready hole: live, with today's sentence.
   {

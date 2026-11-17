@@ -208,7 +208,7 @@ export interface HoleIoOver {
   running?: string
   /** The retained failed restore onto the backing. */
   record?: RestoreJobRecord
-  /** The block backing's stat; default a device nothing serves. */
+  /** The backing's stat (block or fileio); default a device nothing serves. */
   device?: DeviceStat | null
 }
 
@@ -223,7 +223,7 @@ export function holeIoFor(ctx: IscsiReadContext, targets: IscsiTargetDetail[], o
     if (hole.backingExists !== true)
       continue
     out.set(holeKey(hole), {
-      ...(hole.plugin === 'block' ? { device: over.device === undefined ? UNCLAIMED : over.device } : {}),
+      device: over.device === undefined ? UNCLAIMED : over.device,
       mark: over.mark ?? { state: 'absent', dataset: markOn(hole.backingPath) ?? hole.backingPath },
       running: over.running,
       record: over.record,

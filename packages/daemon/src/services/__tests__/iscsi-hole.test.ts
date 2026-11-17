@@ -315,7 +315,8 @@ describe('own.4 (c) — record-incomplete: the saved record cannot be replayed',
 
 describe('own.4 (c) — backstore-live: a live backstore of this name and plugin still exists', () => {
   const DETAIL = `backstore 'v1' (block, ${BLOCK_PATH}) is still live and no LUN maps it, so Repair does not create it a `
-    + `second time — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by hand: `
+    + `second time, and it does not map it back because ANAS could not show that ${BLOCK_PATH} names the device it holds `
+    + `— check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by hand: `
     + `'targetcli /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/v1 lun=0'`
 
   it('block, nothing mapping it', async () => {
@@ -332,11 +333,13 @@ describe('own.4 (c) — backstore-live: a live backstore of this name and plugin
     assert.deepEqual(holeRepairVerdict(ctx, target, hole, fileIo()), {
       state: 'backstore-live',
       detail: `backstore 'v1' (fileio, ${FILE_PATH}) is still live and no LUN maps it, so Repair does not create it a `
-        + `second time — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by hand: `
+        + `second time, and it does not map it back because ANAS could not show that ${FILE_PATH} names the file it holds `
+        + `— check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by hand: `
         + `'targetcli /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/fileio/v1 lun=0'`,
       advice: `Repair cannot put it back: backstore 'v1' (fileio, ${FILE_PATH}) is still live and no LUN maps it, so Repair `
-        + `does not create it a second time — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map `
-        + `it back by hand: 'targetcli /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/fileio/v1 lun=0'.`,
+        + `does not create it a second time, and it does not map it back because ANAS could not show that ${FILE_PATH} names `
+        + `the file it holds — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by `
+        + `hand: 'targetcli /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/fileio/v1 lun=0'.`,
     })
   })
 
@@ -352,6 +355,139 @@ describe('own.4 (c) — backstore-live: a live backstore of this name and plugin
     const { ctx, target, hole } = await world({ liveBackstore: false })
     ctx.live.backstores.push(liveBs('v1', 'fileio', BLOCK_PATH, { serial: 'w-1' }))
     assert.equal(holeRepairVerdict(ctx, target, hole, io())?.state, 'ready')
+  })
+})
+
+describe('own.4 (c) — a live backstore that is provably the saved one: Repair maps it back', () => {
+  const O2 = `Backstore 'v1' (block, ${BLOCK_PATH}) is still live and is the saved one (serial w-1). Use Repair on the iSCSI screen to map it back as the LUN.`
+  const O2_FILE = `Backstore 'v1' (fileio, ${FILE_PATH}) is still live and is the saved one (serial w-1). Use Repair on the iSCSI screen to map it back as the LUN.`
+  const FILE_ST = { type: 'file' as const, rdevMajor: 0, rdevMinor: 0, dev: '2049', ino: '77', size: 1048576 }
+
+  /** `world()` with the live backstore reporting the device LIO holds (the model sets no Major/Minor). */
+  async function matched(o: WorldOptions = {}): Promise<{ ctx: IscsiReadContext, target: IscsiTargetDetail, hole: IscsiMissingLun }> {
+    const w = await world(o)
+    w.ctx.live.backstores[0].devMajor = 230
+    w.ctx.live.backstores[0].devMinor = 16
+    return w
+  }
+
+  it('block: path, serial and device all match → ready, and the verdict says why Repair maps it', async () => {
+    const { ctx, target, hole } = await matched()
+    assert.deepEqual(holeRepairVerdict(ctx, target, hole, io()), {
+      state: 'ready',
+      savedBackstoreLive: true,
+      detail: O2,
+      advice: O2,
+    })
+  })
+
+  it('fileio: a regular file at the path → ready as well', async () => {
+    const { ctx, target, hole } = await matched({ plugin: 'fileio' })
+    assert.deepEqual(holeRepairVerdict(ctx, target, hole, fileIo({ device: FILE_ST })), {
+      state: 'ready',
+      savedBackstoreLive: true,
+      detail: O2_FILE,
+      advice: O2_FILE,
+    })
+  })
+
+  it('W1: a live LUN already maps it', async () => {
+    const { ctx, target, hole } = await matched()
+    ctx.live.targets.push(otherTarget(OTHER_IQN, 3, [{ index: 2, backstoreName: 'v1', plugin: 'iblock' }]))
+    const verdict = holeRepairVerdict(ctx, target, hole, io())
+    assert.equal(verdict?.state, 'backstore-live')
+    assert.equal(verdict?.savedBackstoreLive, undefined)
+    assert.ok(verdict!.detail.startsWith(`backstore 'v1' (block, ${BLOCK_PATH}) is still live and serves LUN 2 of ${OTHER_IQN}, so Repair`), verdict!.detail)
+    assert.match(verdict!.detail, /because a live LUN already maps it/)
+  })
+
+  it('W2: the live backstore holds another path', async () => {
+    const { ctx, target, hole } = await matched()
+    ctx.live.backstores[0].udevPath = '/dev/zvol/tank/other'
+    const verdict = holeRepairVerdict(ctx, target, hole, io())
+    assert.equal(verdict?.state, 'backstore-live')
+    assert.match(verdict!.detail, new RegExp(`because it holds /dev/zvol/tank/other, and the saved record names ${BLOCK_PATH}`))
+  })
+
+  it('W3: the live serial is unknown or another value, never read as the saved one', async () => {
+    for (const serial of ['w-2', null]) {
+      const { ctx, target, hole } = await matched()
+      ctx.live.backstores[0].serial = serial
+      const verdict = holeRepairVerdict(ctx, target, hole, io())
+      assert.equal(verdict?.state, 'backstore-live')
+      assert.match(verdict!.detail, /because ANAS cannot show its serial is the saved one/)
+    }
+  })
+
+  it('W3: a saved record with no serial never matches', async () => {
+    const { ctx, target, hole } = await matched()
+    ;(ctx.persisted as unknown as { storageObjects: { wwn: string | null }[] }).storageObjects[0].wwn = null
+    const verdict = holeRepairVerdict(ctx, target, hole, io())
+    assert.equal(verdict?.state, 'backstore-live')
+    assert.match(verdict!.detail, /because ANAS cannot show its serial is the saved one/)
+  })
+
+  it('W4: the path does not name the device LIO holds (Major/Minor absent or another)', async () => {
+    const absent = await matched()
+    absent.ctx.live.backstores[0].devMajor = null
+    absent.ctx.live.backstores[0].devMinor = null
+    const v1 = holeRepairVerdict(absent.ctx, absent.target, absent.hole, io())
+    assert.equal(v1?.state, 'backstore-live')
+    assert.match(v1!.detail, new RegExp(`because ANAS could not show that ${BLOCK_PATH} names the device it holds`))
+    const other = await matched()
+    other.ctx.live.backstores[0].devMajor = 230
+    other.ctx.live.backstores[0].devMinor = 48
+    const v2 = holeRepairVerdict(other.ctx, other.target, other.hole, io())
+    assert.equal(v2?.state, 'backstore-live')
+    assert.match(v2!.detail, /names the device it holds/)
+  })
+
+  it('W4 for a fileio backstore: the path is not a regular file', async () => {
+    const { ctx, target, hole } = await matched({ plugin: 'fileio' })
+    const verdict = holeRepairVerdict(ctx, target, hole, fileIo({ device: { type: 'other', rdevMajor: 0, rdevMinor: 0, dev: '0', ino: '0', size: 0 } }))
+    assert.equal(verdict?.state, 'backstore-live')
+    assert.match(verdict!.detail, new RegExp(`because ANAS could not show that ${FILE_PATH} names the file it holds`))
+  })
+
+  it('a mark on the backing makes it restore-mark, still naming the live saved backstore', async () => {
+    const { ctx, target, hole } = await matched()
+    assert.deepEqual(holeRepairVerdict(ctx, target, hole, io({ mark: present(MARK) })), {
+      state: 'restore-mark',
+      detail: `${MARK_DETAIL} onto tank/v1 did not finish, so it holds a partial image`,
+      advice: `Repair cannot put it back: ${MARK_DETAIL} onto tank/v1 did not finish, so it holds a partial image.`,
+      restoreMark: 'interrupted',
+      markOn: 'tank/v1',
+      savedBackstoreLive: true,
+    })
+  })
+
+  it('with no I/O facts a match is NOT judged (the save gate and the boot scan)', async () => {
+    const { ctx, target, hole } = await matched()
+    assert.equal(holeRepairVerdict(ctx, target, hole, null), null)
+  })
+
+  it('foreign, hands-off, incomplete, placeholder, absent and unreadable each beat a match', async () => {
+    const foreign = await matched()
+    foreign.hole.targetOwnership = 'foreign'
+    assert.equal(holeRepairVerdict(foreign.ctx, foreign.target, foreign.hole, io())?.state, 'foreign-target')
+
+    const handsOff = await matched()
+    handsOff.target.otherTpgs = [{ tpgTag: 2, enabled: true, present: true, persisted: true, portals: [], luns: [], acls: [] }]
+    assert.equal(holeRepairVerdict(handsOff.ctx, handsOff.target, handsOff.hole, io())?.state, 'target-hands-off')
+
+    const incomplete = await matched({ plugin: 'fileio', savedSize: null })
+    assert.equal(holeRepairVerdict(incomplete.ctx, incomplete.target, incomplete.hole, fileIo({ device: FILE_ST }))?.state, 'record-incomplete')
+
+    const placeholder = await matched({ plugin: 'fileio', actualSize: 0 })
+    assert.equal(holeRepairVerdict(placeholder.ctx, placeholder.target, placeholder.hole, fileIo({ device: FILE_ST }))?.state, 'placeholder')
+
+    const absent = await matched({ exists: false })
+    assert.equal(holeRepairVerdict(absent.ctx, absent.target, absent.hole, io())?.state, 'backing-absent')
+
+    const unreadable = await matched({ exists: null })
+    const verdict = holeRepairVerdict(unreadable.ctx, unreadable.target, unreadable.hole, io())
+    assert.equal(verdict?.state, 'backing-unreadable')
+    assert.equal(verdict?.savedBackstoreLive, undefined)
   })
 })
 
@@ -463,7 +599,8 @@ describe('own.4 (c) — the first rung that holds wins, and no earlier lead is l
     const verdict = holeRepairVerdict(ctx, target, hole, io({ mark: present(MARK) }))
     assert.equal(verdict?.state, 'backstore-live')
     assert.equal(verdict?.detail, `backstore 'v1' (block, ${BLOCK_PATH}) is still live and no LUN maps it, so Repair does not `
-    + `create it a second time — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by `
+    + `create it a second time, and it does not map it back because ANAS could not show that ${BLOCK_PATH} names the device `
+    + `it holds — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by `
     + `hand: 'targetcli /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/v1 lun=0'; its backing is held by a `
     + `restore mark: ${MARK_DETAIL} onto tank/v1 did not finish, so it holds a partial image`)
     assert.equal(verdict?.restoreMark, undefined, 'a backstore-live verdict carries no restoreMark field')
@@ -500,7 +637,15 @@ describe('own.4 (c) — io === null: the pure states stand, everything else is N
     { name: 'placeholder', build: () => world({ plugin: 'fileio', liveBackstore: false, actualSize: 0 }), expect: 'placeholder' },
     { name: 'absent', build: () => world({ liveBackstore: false, exists: false }), expect: 'backing-absent' },
     { name: 'unreadable', build: () => world({ liveBackstore: false, exists: null }), expect: 'backing-unreadable' },
-    { name: 'backstore-live', build: () => world(), expect: 'backstore-live' },
+    {
+      name: 'backstore-live',
+      build: async () => {
+        const w = await world()
+        w.ctx.live.backstores[0].serial = 'w-2'
+        return w
+      },
+      expect: 'backstore-live',
+    },
   ]
   for (const c of pure) {
     it(`${c.name} is decided without I/O facts`, async () => {
@@ -516,6 +661,7 @@ describe('own.4 (c) — io === null: the pure states stand, everything else is N
 
   it('a block hole with a live backstore but no facts: backstore-live, with no mark clause invented', async () => {
     const { ctx, target, hole } = await world()
+    ctx.live.backstores[0].serial = 'w-2'
     const verdict = holeRepairVerdict(ctx, target, hole, null)
     assert.equal(verdict?.state, 'backstore-live')
     assert.doesNotMatch(verdict!.detail, /restore mark/)
@@ -556,7 +702,8 @@ describe('own.4 (c) — advice: one whole sentence for a person, framed by the v
     + 'which is why ANAS took the LUN offline. Mount the filesystem that should hold the image, then use Repair on the '
     + 'iSCSI screen to put the LUN back with its own serial.'
   const BACKSTORE_LIVE = `backstore 'v1' (block, ${BLOCK_PATH}) is still live and no LUN maps it, so Repair does not create it a `
-    + `second time — check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by hand: `
+    + `second time, and it does not map it back because ANAS could not show that ${BLOCK_PATH} names the device it holds `
+    + `— check that it is this LUN's disk (live serial w-1, saved serial w-1), then map it back by hand: `
     + `'targetcli /iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/v1 lun=0'`
 
   interface AdviceCase {

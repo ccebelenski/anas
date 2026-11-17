@@ -686,8 +686,7 @@
             }
             var refusedList = refused.join(' ');
             var readySentence = ready.length + ' ' + (ready.length === 1 ? t('LUN') : t('LUNs'))
-                + ' ' + t('can be put back now — the same serial and attributes are replayed, '
-                    + 'so the initiator sees the same disk.');
+                + ' ' + t('can be put back now.');
             if (!ready.length) {
                 tip = (missing.length === 1
                     ? t('Repair cannot put back the missing LUN. ')

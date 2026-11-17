@@ -5,9 +5,12 @@
  * refusals asked before the first act. Constants and pure functions — nothing
  * here reads or writes the node.
  */
-import type { IscsiTargetDetail } from '@anas/shared'
+import type { IscsiLun, IscsiTargetDetail } from '@anas/shared'
+import type { ConfigfsBackstore, LioLiveState } from './iscsi-configfs.js'
 import type { IscsiRefusal } from './iscsi-mutate.js'
+import type { DeviceStat } from './iscsi-served.js'
 import { IscsiIqn } from '@anas/shared'
+import { normalizePlugin } from './iscsi-configfs.js'
 import { targetTpgs } from './iscsi.js'
 
 /**
@@ -146,6 +149,106 @@ export function backingPathRefusal(path: string): IscsiRefusal | null {
       + `arguments with spaces and parses the line again, so it would read the path as something else. ANAS cannot create `
       + `a backstore on it; nothing was changed. Use a path without those characters (rename the dataset or move the mountpoint).`,
   }
+}
+
+/** The sentence every mismatch starts with — one phrasing, every door. */
+export const SERVED_DEVICE_MISMATCH = 'LUN serves a different device than its path names'
+
+/** The live backstore a LUN maps, by name AND plugin (names are per plugin). */
+export function liveBackstoreOf(
+  live: LioLiveState,
+  lun: Pick<IscsiLun, 'name' | 'plugin'>,
+): ConfigfsBackstore | undefined {
+  return live.backstores.find(b => b.name === lun.name && normalizePlugin(b.plugin) === normalizePlugin(lun.plugin))
+}
+
+/** The verdict of one served-device comparison. */
+export interface ServedDeviceVerdict {
+  /**
+   * `block:<major>:<minor>` or `file:<dev>:<ino>` when the comparison held;
+   * null when it did not (the refusal says why).
+   */
+  device: string | null
+  refusal: IscsiRefusal | null
+}
+
+/**
+ * THE comparison: is the object at the LUN's path the one LIO is serving?
+ *
+ * Pure over its inputs (the live backstore and one `stat` of the path) so it is
+ * the same answer at the request and inside the job. A caller that is about to
+ * act on the backing object refuses on a non-null `refusal`; a caller that only
+ * unmaps (a LUN delete that keeps the backing) may proceed and still binds the
+ * device when there is one.
+ */
+export function servedDevice(
+  lun: Pick<IscsiLun, 'index' | 'name' | 'plugin' | 'backingPath'>,
+  backstore: ConfigfsBackstore | undefined,
+  st: DeviceStat | null,
+): ServedDeviceVerdict {
+  const path = lun.backingPath
+  const plugin = normalizePlugin(lun.plugin)
+  if (!backstore) {
+    return {
+      device: null,
+      refusal: {
+        reason: 'served-device-unknown',
+        message: `LUN ${lun.index} ('${lun.name}') is not live in the kernel, so there is no served device to compare `
+          + `with ${path || '(no path)'} — ANAS will not act on the backing object of a LUN whose device it cannot see.`,
+      },
+    }
+  }
+  if (plugin === 'block') {
+    if (backstore.devMajor === null || backstore.devMinor === null) {
+      return {
+        device: null,
+        refusal: {
+          reason: 'served-device-unknown',
+          message: `The kernel does not report which device LUN ${lun.index} ('${lun.name}') opened (no Major/Minor in `
+            + `its configfs info), so ANAS cannot prove ${path} is the device it serves and will not act on it.`,
+        },
+      }
+    }
+    const served = `${backstore.devMajor}:${backstore.devMinor}`
+    if (!st || st.type !== 'block') {
+      return {
+        device: null,
+        refusal: {
+          reason: 'served-device-mismatch',
+          message: `${SERVED_DEVICE_MISMATCH}: LUN ${lun.index} ('${lun.name}') serves device ${served}, and ${path} `
+            + `${st ? 'is not a block device' : 'no longer resolves'} — the volume was renamed or destroyed under the live LUN. `
+            + `ANAS will not run a ZFS verb on what the path names now. Delete the LUN without "Also destroy" to drop it.`,
+        },
+      }
+    }
+    const named = `${st.rdevMajor}:${st.rdevMinor}`
+    if (named !== served) {
+      return {
+        device: null,
+        refusal: {
+          reason: 'served-device-mismatch',
+          message: `${SERVED_DEVICE_MISMATCH}: LUN ${lun.index} ('${lun.name}') serves device ${served}`
+            + `${backstore.kernelDevice ? ` (${backstore.kernelDevice})` : ''}, but ${path} is device ${named} — the volume `
+            + `was renamed or re-created under the live LUN. ANAS will not run a ZFS verb on the volume the path names now. `
+            + `Delete the LUN without "Also destroy" to drop it, then export the volume you mean.`,
+        },
+      }
+    }
+    return { device: `block:${served}`, refusal: null }
+  }
+  // fileio: the kernel keeps the file open and names no inode, so the path's
+  // own identity is what a request binds and a job compares.
+  if (!st || st.type !== 'file') {
+    return {
+      device: null,
+      refusal: {
+        reason: 'served-device-unknown',
+        message: `${path} ${st ? 'is not a regular file' : 'no longer resolves'}, so it is not the image LUN ${lun.index} `
+          + `('${lun.name}') was created on — ANAS will not act on it.`,
+      },
+    }
+  }
+  return { device: `file:${st.dev}:${st.ino}`, refusal: null }
 }
 
 /** `/iscsi/<iqn>/tpg<tag>` — the configshell path of one TPG. */

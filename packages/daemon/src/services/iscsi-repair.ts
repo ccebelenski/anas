@@ -289,8 +289,14 @@ export interface IscsiRepairOutcome {
   lunIndex: number
   backstoreName: string
   backingPath: string
-  /** True when the stored serial was replayed — i.e. it is the same disk. */
-  serialReplayed: boolean
+  /**
+   * `repaired` entries only: what happened to the unit serial. `replayed` — the
+   * stored one went onto a recreated backstore (the same disk to its initiator);
+   * `kept` — the live saved backstore was mapped back as the LUN, so no serial
+   * was touched; `new` — the record stored none, so LIO made one. Blocked and
+   * foreign entries carry none: they were not repaired.
+   */
+  serial?: 'replayed' | 'kept' | 'new'
 }
 
 /**
@@ -333,7 +339,10 @@ export async function repairIscsiHoles(
   // than re-checking the record: only a hand-built plan can reach it, and it
   // fails loudly.
   for (const item of plan.repairable) {
-    if (item.verdict?.state !== 'ready' || (item.plugin === 'fileio' && item.size === null)) {
+    // A hole whose live backstore IS the saved one is mapped, not created: it
+    // needs no size and replays nothing.
+    const keep = item.verdict?.savedBackstoreLive === true
+    if (item.verdict?.state !== 'ready' || (!keep && item.plugin === 'fileio' && item.size === null)) {
       throw new Error(
         `Cannot repair LUN ${item.lunIndex} of ${item.targetIqn}: its verdict is '${item.verdict?.state ?? 'none'}', `
         + `not a ready hole whose create line has everything it needs`,
@@ -343,39 +352,49 @@ export async function repairIscsiHoles(
 
   for (const item of plan.repairable) {
     const store = backstorePath(item.plugin, item.backstoreName)
+    // The verdict already proved this live backstore is the saved one (same
+    // path, same serial, and the path names the object LIO holds). Repair maps
+    // it back and creates nothing — no attribute is replayed because none of
+    // them left with the LUN.
+    const keep = item.verdict?.savedBackstoreLive === true
 
-    opts.progress?.(`Recreating ${item.plugin} backstore ${item.backstoreName} from the saved configuration`)
-    if (item.plugin === 'fileio') {
-      const args = [
-        '/backstores/fileio',
-        'create',
-        `name=${item.backstoreName}`,
-        `file_or_dev=${item.backingPath}`,
-        `size=${item.size}`,
-        `write_back=${item.writeBack}`,
-      ]
-      // A record with no stored serial is the one case where identity cannot be
-      // replayed. It is recreated without `wwn=` and the result says so rather
-      // than pretending the disk came back the same.
-      if (item.serial)
-        args.push(`wwn=${item.serial}`)
-      await runTargetcli(executor, args)
+    if (keep) {
+      opts.progress?.(`Keeping the live ${item.plugin} backstore ${item.backstoreName}: it is the saved one (serial ${item.serial})`)
     }
     else {
-      const args = [
-        `/backstores/${item.plugin}`,
-        'create',
-        `name=${item.backstoreName}`,
-        `dev=${item.backingPath}`,
-      ]
-      if (item.serial)
-        args.push(`wwn=${item.serial}`)
-      await runTargetcli(executor, args)
-    }
+      opts.progress?.(`Recreating ${item.plugin} backstore ${item.backstoreName} from the saved configuration`)
+      if (item.plugin === 'fileio') {
+        const args = [
+          '/backstores/fileio',
+          'create',
+          `name=${item.backstoreName}`,
+          `file_or_dev=${item.backingPath}`,
+          `size=${item.size}`,
+          `write_back=${item.writeBack}`,
+        ]
+        // A record with no stored serial is the one case where identity cannot be
+        // replayed. It is recreated without `wwn=` and the result says so rather
+        // than pretending the disk came back the same.
+        if (item.serial)
+          args.push(`wwn=${item.serial}`)
+        await runTargetcli(executor, args)
+      }
+      else {
+        const args = [
+          `/backstores/${item.plugin}`,
+          'create',
+          `name=${item.backstoreName}`,
+          `dev=${item.backingPath}`,
+        ]
+        if (item.serial)
+          args.push(`wwn=${item.serial}`)
+        await runTargetcli(executor, args)
+      }
 
-    for (const token of attributeTokens(item.attributes)) {
-      opts.progress?.(`Replaying ${token} on ${item.backstoreName}`)
-      await runTargetcli(executor, [store, 'set', 'attribute', token])
+      for (const token of attributeTokens(item.attributes)) {
+        opts.progress?.(`Replaying ${token} on ${item.backstoreName}`)
+        await runTargetcli(executor, [store, 'set', 'attribute', token])
+      }
     }
 
     opts.progress?.(`Re-mapping ${item.backstoreName} as LUN ${item.lunIndex} of ${item.targetIqn}`)
@@ -394,10 +413,10 @@ export async function repairIscsiHoles(
     for (const initiator of item.aclInitiators)
       await grantLunsToAcl(opts, item.targetIqn, item.tpgTag, initiator, [item.lunIndex])
 
-    repaired.push(outcome(item))
+    repaired.push(outcome(item, true))
   }
 
-  const stillMissing = plan.blocked.map(outcome)
+  const stillMissing = plan.blocked.map(item => outcome(item))
 
   // GT-22: the save is the last step, and only when the tree is whole again.
   // Saving with a hole left in it writes the hole into saveconfig.json forever.
@@ -423,7 +442,7 @@ export async function repairIscsiHoles(
   }
 
   const foreign = plan.blocked.filter(b => b.verdict?.state === 'foreign-target')
-  const foreignUntouched = foreign.map(outcome)
+  const foreignUntouched = foreign.map(item => outcome(item))
   // cr3 review 2: holes of an ANAS target ANAS will not write to, named.
   const handsOffItems = plan.blocked.filter(b => b.verdict?.state === 'target-hands-off')
   const handsOffClause = handsOffItems.length === 0
@@ -442,12 +461,14 @@ export async function repairIscsiHoles(
   return { repaired, stillMissing, saved, foreignUntouched, ...(stillDegraded ? { stillDegraded } : {}) }
 }
 
-function outcome(item: IscsiRepairItem): IscsiRepairOutcome {
+function outcome(item: IscsiRepairItem, repaired = false): IscsiRepairOutcome {
   return {
     targetIqn: item.targetIqn,
     lunIndex: item.lunIndex,
     backstoreName: item.backstoreName,
     backingPath: item.backingPath,
-    serialReplayed: item.serial !== null,
+    ...(repaired
+      ? { serial: item.verdict?.savedBackstoreLive === true ? 'kept' : item.serial ? 'replayed' : 'new' }
+      : {}),
   }
 }

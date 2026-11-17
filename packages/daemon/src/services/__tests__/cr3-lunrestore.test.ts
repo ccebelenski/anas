@@ -47,7 +47,7 @@ import { buildIscsiWarnings } from '../iscsi-warnings.js'
 import { buildIscsiTargets } from '../iscsi.js'
 import { ATTR_NOT_INSTALLED, consultsJobRecord, decodeRestoreMark, describeMarkSet, enableMarkVerdict, encodeRestoreMark, GETFATTR, imageRestorePin, JOB_RECORD_ONLY, jobRecordLifetime, markDataset, markSignature, readLunMarks, readRestoreMark, readRestoreMarksBatch, restoreJobsOf, restoreMarkDetail, restoreMarkGetArgs, restoreMarkRefusal, restoreMarksGetArgs, restoreVerdict, SETFATTR, unverifiedMark, writingMark } from '../restore-mark.js'
 import { hexOf, withFileMarks } from './file-mark-fixtures.js'
-import { contextOf, recording, replayLio, targetObjectOf } from './lio-model.js'
+import { contextOf, holeIoFor, recording, replayLio, targetObjectOf } from './lio-model.js'
 
 const IQN = 'iqn.2026-08.nas.anas:vmstore'
 const SNAP = 'host/gtimgboth/2026-08-25T19:28:38Z'
@@ -2546,14 +2546,24 @@ describe('own.4 (c) — a live backstore a hole already names as live is one fac
       { backstores: [{ ...NEWVOL_BS, dev: savedDev }], luns: [{ iqn: IQN, tag: 1, index: 5, backstore: 'newvol', plugin: 'block' }] },
       SOURCE_BASE,
     )
+    // The model's live backstore reports no Major/Minor; a proved match needs
+    // the device LIO holds, the stat `holeIoFor` answers (230:0).
+    const live = ctx.live.backstores.find(b => b.name === 'newvol')!
+    live.devMajor = 230
+    live.devMinor = 0
     const targets = await buildIscsiTargets(ctx)
-    return computeIscsiHealth(ctx, targets, { marks: new Map([[NEWVOL, present()]]), restoreRunning: () => undefined })
+    return computeIscsiHealth(ctx, targets, {
+      marks: new Map([[NEWVOL, present()]]),
+      restoreRunning: () => undefined,
+      holeIo: holeIoFor(ctx, targets, { mark: present() }),
+    })
   }
 
   it('the hole (same name, plugin and path) owns it: no unmapped-backstore row and no mark row for it', async () => {
     const health = await world(NEWVOL)
     assert.equal(health.missingLuns.length, 1)
-    assert.equal(health.missingLuns[0].repair?.state, 'backstore-live')
+    assert.equal(health.missingLuns[0].repair?.state, 'restore-mark')
+    assert.equal(health.missingLuns[0].repair?.savedBackstoreLive, true)
     assert.deepEqual(health.unmappedBackstores, [])
     assert.deepEqual(health.restoreMarks, [])
   })

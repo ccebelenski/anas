@@ -7,14 +7,14 @@
  */
 import type { IscsiHoleRepair, IscsiHoleRepairState, IscsiLunAttributes, IscsiMissingLun, IscsiRestoreMarkState, IscsiTargetDetail } from '@anas/shared'
 import type { SaveconfigStorageObject } from '../parsers/lio-saveconfig.js'
-import type { LioLiveState } from './iscsi-configfs.js'
+import type { ConfigfsBackstore, LioLiveState } from './iscsi-configfs.js'
 import type { HoleReplayRecord } from './iscsi-repair.js'
 import type { DeviceStat } from './iscsi-served.js'
 import type { IscsiReadContext } from './iscsi.js'
 import type { RestoreJobRecord, RestoreMarkRead } from './restore-mark.js'
 import { storageObjectsByName } from '../parsers/lio-saveconfig.js'
 import { lunsMappingBackstore, normalizePlugin } from './iscsi-configfs.js'
-import { aclNamesRefusal, attributeTokens, backingPathRefusal, backstorePath, configshellSafe, handsOffRefusal, ISCSI_DEFAULT_WRITE_BACK, replayAttributes, tpgPath } from './iscsi-rules.js'
+import { aclNamesRefusal, attributeTokens, backingPathRefusal, backstorePath, configshellSafe, handsOffRefusal, ISCSI_DEFAULT_WRITE_BACK, liveBackstoreOf, replayAttributes, servedDevice, tpgPath } from './iscsi-rules.js'
 import { attributesFromPersisted, targetTpgs } from './iscsi.js'
 import { describeRestoreMark, jobRecordOnly, restoreVerdict } from './restore-mark.js'
 
@@ -195,7 +195,7 @@ export function holeKey(h: Pick<IscsiMissingLun, 'targetIqn' | 'tpgTag' | 'lunIn
  * read) — per HOLE, not per path: the job record depends on the hole's target.
  */
 export interface HoleIoFacts {
-  /** block holes only: one stat of the backing (statDeviceFrom(paths)); null = the stat failed. Absent for fileio. */
+  /** One stat of the backing, for every hole whose backing is present (statDeviceFrom(paths)); null = the stat failed or the caller gathered none. */
   device?: DeviceStat | null
   /** readRestoreMarksBatch's read of the backing; `unknown` is a failed read. */
   mark: RestoreMarkRead
@@ -203,6 +203,60 @@ export interface HoleIoFacts {
   running: string | undefined
   /** restoreJobs.restoreFailed(path, hole.targetIqn), asked only where consultsJobRecord(mark) (as the Repair route does) */
   record: RestoreJobRecord | undefined
+}
+
+/**
+ * The restore-mark verdict rung 11 and a matched live backstore (7f) share: the
+ * mark, the running restore or the standing record, as one verdict, or null
+ * when none holds. `savedBackstoreLive` travels with it from 7f — the mark is
+ * on the matched backstore's own backing.
+ */
+function restoreMarkVerdict(io: HoleIoFacts, savedBackstoreLive?: true): IscsiHoleRepair | null {
+  const verdict = restoreVerdict(io.mark, io.running, io.record)
+  if (!verdict)
+    return null
+  const detail = repairMarkClause(io.mark, verdict.state, io.running, io.record)
+  return {
+    state: 'restore-mark',
+    detail,
+    advice: repairAdvice('restore-mark', detail),
+    restoreMark: verdict.state,
+    markOn: io.mark.state === 'present' || io.mark.state === 'unknown' ? io.mark.dataset : null,
+    ...(savedBackstoreLive ? { savedBackstoreLive } : {}),
+  }
+}
+
+/**
+ * A `backstore-live` verdict: the live backstore, why Repair does not map it
+ * back, and the by-hand map. A restore mark on the backing is still said (the
+ * one case where the operator has a way out that is not by hand).
+ */
+function backstoreLiveVerdict(
+  rec: HoleReplayRecord,
+  live: ConfigfsBackstore,
+  mapped: { targetIqn: string, tpgTag: number, lunIndex: number }[],
+  why: string,
+  io: HoleIoFacts | null,
+): IscsiHoleRepair {
+  const detail = `backstore '${rec.backstoreName}' (${rec.plugin}, ${live.udevPath}) is still live`
+    + `${mapped.length > 0 ? ` and serves ${mapped.map(m => `LUN ${m.lunIndex} of ${m.targetIqn}`).join(', ')}` : ' and no LUN maps it'}, `
+    + `so Repair does not create it a second time, and it does not map it back because ${why} — check that it is this LUN's disk `
+    + `(live serial ${live.serial ?? 'unreadable'}, saved serial ${rec.serial ?? 'not recorded'}), then map it back by hand: 'targetcli `
+    + `${tpgPath(rec.targetIqn, rec.tpgTag)}/luns create storage_object=${backstorePath(rec.plugin, rec.backstoreName)} `
+    + `lun=${rec.lunIndex}'`
+  // A backing held by a restore mark keeps that fact where it was said before,
+  // rather than losing it to the backstore sentence.
+  const verdict = io ? restoreVerdict(io.mark, io.running, io.record) : null
+  const full = verdict && io
+    ? `${detail}; its backing is held by a restore mark: ${repairMarkClause(io.mark, verdict.state, io.running, io.record)}`
+    : detail
+  return { state: 'backstore-live', detail: full, advice: repairAdvice('backstore-live', full) }
+}
+
+/** The `ready` detail for a hole whose still-live backstore ANAS showed is the saved one. */
+function savedBackstoreLiveDetail(rec: HoleReplayRecord): string {
+  return `Backstore '${rec.backstoreName}' (${rec.plugin}, ${rec.backingPath}) is still live and is the saved one `
+    + `(serial ${rec.serial}). Use Repair on the iSCSI screen to map it back as the LUN.`
 }
 
 /**
@@ -278,24 +332,54 @@ export function holeRepairVerdict(
   }
 
   // A live backstore of this name and plugin: Repair's create would collide with
-  // it. Sits after the placeholder and absence rungs so nobody is told to map
-  // a placeholder or a dead path by hand.
-  const live = ctx.live.backstores.find(b => b.name === rec.backstoreName && normalizePlugin(b.plugin) === rec.plugin)
+  // it, and if ANAS can show it is the SAVED one (same path, same serial, and
+  // the path names the object LIO holds) then the LUN is mapped back onto it
+  // instead. Sits after the placeholder and absence rungs so nobody is told to
+  // map a placeholder or a dead path by hand.
+  const live = liveBackstoreOf(ctx.live, { name: rec.backstoreName, plugin: rec.plugin })
   if (live) {
     const mapped = lunsMappingBackstore(ctx.live, rec.plugin, rec.backstoreName)
-    const detail = `backstore '${rec.backstoreName}' (${rec.plugin}, ${live.udevPath}) is still live`
-      + `${mapped.length > 0 ? ` and serves ${mapped.map(m => `LUN ${m.lunIndex} of ${m.targetIqn}`).join(', ')}` : ' and no LUN maps it'}, `
-      + `so Repair does not create it a second time — check that it is this LUN's disk (live serial ${live.serial ?? 'unreadable'}, `
-      + `saved serial ${rec.serial ?? 'not recorded'}), then map it back by hand: 'targetcli `
-      + `${tpgPath(rec.targetIqn, rec.tpgTag)}/luns create storage_object=${backstorePath(rec.plugin, rec.backstoreName)} `
-      + `lun=${rec.lunIndex}'`
-    // A backing held by a restore mark keeps that fact where it was said before,
-    // rather than losing it to the backstore sentence.
-    const verdict = io ? restoreVerdict(io.mark, io.running, io.record) : null
-    const full = verdict && io
-      ? `${detail}; its backing is held by a restore mark: ${repairMarkClause(io.mark, verdict.state, io.running, io.record)}`
-      : detail
-    return { state: 'backstore-live', detail: full, advice: repairAdvice('backstore-live', full) }
+    // 7a-7c: the facts that say this live backstore is NOT provably the saved
+    // one. A fact that could not be read (a null serial, an empty udev_path) is
+    // never "the same".
+    const why = mapped.length > 0
+      ? 'a live LUN already maps it'
+      : live.udevPath !== rec.backingPath
+        ? `it holds ${live.udevPath || 'a path ANAS could not read'}, and the saved record names ${rec.backingPath}`
+        : live.serial === null || rec.serial === null || live.serial !== rec.serial
+          ? 'ANAS cannot show its serial is the saved one'
+          : null
+    // 7d: no I/O facts were gathered (the save gate, the boot scan) — a match is
+    // NOT judged ready for a caller that cannot see the device and the mark.
+    if (why === null && io === null)
+      return null
+    // 7e: the path must name the object the live backstore holds. For a block
+    // backstore that is `info`'s Major/Minor against the stat; a null stat, a
+    // null Major/Minor or another device all refuse (unknown is never "same").
+    // LIO's exclusive claim means no second backstore can hold the device, so
+    // this replaces the served-elsewhere and unreadable-device rungs here.
+    if (why === null && io) {
+      const proof = servedDevice(
+        { index: rec.lunIndex, name: rec.backstoreName, plugin: rec.plugin, backingPath: rec.backingPath },
+        live,
+        io.device ?? null,
+      )
+      if (proof.refusal !== null) {
+        const kind = rec.plugin === 'block' ? 'device' : 'file'
+        return backstoreLiveVerdict(rec, live, mapped, `ANAS could not show that ${rec.backingPath} names the ${kind} it holds`, io)
+      }
+    }
+    if (why !== null)
+      return backstoreLiveVerdict(rec, live, mapped, why, io)
+    // 7f: the matched backstore's backing still carries a restore mark.
+    if (io) {
+      const marked = restoreMarkVerdict(io, true)
+      if (marked)
+        return marked
+    }
+    // 7g: the live backstore IS the saved one — map it, create nothing.
+    const detail = savedBackstoreLiveDetail(rec)
+    return { state: 'ready', savedBackstoreLive: true, detail, advice: repairAdvice('ready', detail) }
   }
 
   if (io === null)
@@ -314,17 +398,9 @@ export function holeRepairVerdict(
     return { state: 'device-served-elsewhere', detail, advice: repairAdvice('device-served-elsewhere', detail) }
   }
 
-  const verdict = restoreVerdict(io.mark, io.running, io.record)
-  if (verdict) {
-    const detail = repairMarkClause(io.mark, verdict.state, io.running, io.record)
-    return {
-      state: 'restore-mark',
-      detail,
-      advice: repairAdvice('restore-mark', detail),
-      restoreMark: verdict.state,
-      markOn: io.mark.state === 'present' || io.mark.state === 'unknown' ? io.mark.dataset : null,
-    }
-  }
+  const marked = restoreMarkVerdict(io)
+  if (marked)
+    return marked
 
   return { state: 'ready', detail: READY_DETAIL, advice: repairAdvice('ready', READY_DETAIL) }
 }

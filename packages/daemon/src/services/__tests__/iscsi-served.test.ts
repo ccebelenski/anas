@@ -3,11 +3,10 @@ import type { DeviceStat } from '../iscsi-served.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { parseBackstoreInfo } from '../iscsi-configfs.js'
+import { SERVED_DEVICE_MISMATCH, servedDevice } from '../iscsi-rules.js'
 import {
   decodeDevT,
   deviceStatSeamFromEnv,
-  SERVED_DEVICE_MISMATCH,
-  servedDevice,
 } from '../iscsi-served.js'
 
 /**

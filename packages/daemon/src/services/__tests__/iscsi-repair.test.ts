@@ -304,7 +304,7 @@ describe('repairIscsiHoles — the exact replay argv', () => {
       ])
 
       assert.equal(result.repaired.length, 1)
-      assert.equal(result.repaired[0].serialReplayed, true)
+      assert.equal(result.repaired[0].serial, 'replayed')
       assert.deepEqual(result.stillMissing, [])
       assert.equal(result.saved, true)
     }
@@ -355,6 +355,7 @@ describe('repairIscsiHoles — the exact replay argv', () => {
     assert.equal(result.stillMissing.length, 1)
     assert.equal(result.saved, false)
     assert.equal(targetcliCalls(mock).includes('saveconfig'), false)
+    assert.equal('serial' in result.stillMissing[0], false, 'a hole nobody touched carries no serial')
   })
 
   it('saveconfig runs exactly once, last, after a FULL repair', async () => {
@@ -388,7 +389,7 @@ describe('repairIscsiHoles — the exact replay argv', () => {
     const mock = okExecutor()
     const result = await repairIscsiHoles({ executor: mock }, plan)
     assert.equal(targetcliCalls(mock)[0], '/backstores/block create name=vol1 dev=/dev/zvol/tank/vol1')
-    assert.equal(result.repaired[0].serialReplayed, false)
+    assert.equal(result.repaired[0].serial, 'new')
   })
 
   // C3: `size=${item.size ?? 0}` did not refuse — `targetcli` CREATES a 0-byte
@@ -425,6 +426,59 @@ describe('repairIscsiHoles — the exact replay argv', () => {
     assert.match(refusal.message, /no size/)
     assert.match(refusal.message, /img1/)
     assert.doesNotMatch(refusal.message, /import the pool/)
+  })
+
+  it('a hole whose live backstore IS the saved one is MAPPED: no create, no attribute replay', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-iscsi-keep-'))
+    try {
+      const ctx = twoHoleCtx()
+      // The restore recreated the block backstore and left the LUN unmapped.
+      // The captured hole state (GT-own4c addendum): `info` still prints the
+      // Major/Minor of the device LIO holds while Status is DEACTIVATED.
+      ctx.live.backstores.push({
+        name: 'vol1',
+        plugin: 'iblock',
+        hbaIndex: 0,
+        udevPath: '/dev/zvol/tank/vol1',
+        serial: '11111111-2222-3333-4444-555555555555',
+        productId: 'vol1',
+        vendorId: 'LIO-ORG',
+        enabled: true,
+        status: 'DEACTIVATED',
+        claimed: 'IBLOCK',
+        kernelDevice: 'zd16',
+        size: null,
+        devMajor: 230,
+        devMinor: 0,
+        attributes: {},
+      })
+      const root = join(dir, 'target')
+      // The ACL already carries the mapped LUN (auto-add put it there), so the
+      // grant issues nothing: the argv is the map and the save.
+      await mkdir(join(root, 'iscsi', IQN, 'tpgt_1', 'acls', 'iqn.1993-08.org.debian:01:aaaaaaaaaaaa', 'lun_0'), { recursive: true })
+      const targets = await buildIscsiTargets(ctx)
+      const health = computeIscsiHealth(ctx, targets, { holeIo: holeIoFor(ctx, targets) })
+      assert.equal(health.missingLuns[0].repair?.state, 'ready')
+      assert.equal(health.missingLuns[0].repair?.savedBackstoreLive, true)
+
+      const plan = planIscsiRepair(ctx, { ...health, missingLuns: [health.missingLuns[0]] }, targets)
+      assert.equal(assertRepairable(plan), null, 'a map-only hole is repairable')
+
+      const progress: string[] = []
+      const mock = okExecutor()
+      const result = await repairIscsiHoles({ executor: mock, configfsRoot: root, progress: line => progress.push(line) }, plan)
+      assert.deepEqual(targetcliCalls(mock), [
+        `/iscsi/${IQN}/tpg1/luns create storage_object=/backstores/block/vol1 lun=0`,
+        'saveconfig',
+      ])
+      assert.ok(progress.includes('Keeping the live block backstore vol1: it is the saved one (serial 11111111-2222-3333-4444-555555555555)'), JSON.stringify(progress))
+      assert.equal(result.repaired[0].serial, 'kept')
+      assert.deepEqual(result.stillMissing, [])
+      assert.equal(result.saved, true)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('never issues `targetctl restore` or a service restart', async () => {

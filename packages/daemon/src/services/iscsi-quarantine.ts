@@ -386,7 +386,10 @@ async function gatherHoleIo(
     if (!mark)
       continue
     out.set(holeKey(hole), {
-      ...(hole.plugin === 'block' ? { device: await statOf(hole.backingPath) } : {}),
+      // Every present backing is stat-ed: a block hole's Major/Minor is proved
+      // against the device the path names, and a fileio hole's regular-file
+      // stat is the same comparison's other half (iscsi-rules servedDevice).
+      device: await statOf(hole.backingPath),
       mark,
       running: restoreRunning(hole.backingPath),
       record: consultsJobRecord(mark) ? restoreFailed?.(hole.backingPath, hole.targetIqn) : undefined,

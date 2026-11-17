@@ -733,12 +733,15 @@ export type IscsiRestoreMarkState = z.infer<typeof IscsiRestoreMarkState>
  *  - `backing-unreadable`: ANAS could not check the backing (whether it is
  *    there, or which device it names): unknown, never absent or present.
  *  - `backstore-live`: a live backstore of this name and plugin still
- *    exists; Repair would create it a second time.
+ *    exists, and ANAS cannot show it is the saved one; Repair would create it
+ *    a second time.
  *  - `device-served-elsewhere`: the block path names a device LIO already
  *    serves under another backstore.
  *  - `restore-mark`: the backing carries a restore mark, the mark could not
  *    be read, or a restore is writing it.
- *  - `ready`: Repair puts it back with its saved serial and attributes.
+ *  - `ready`: Repair puts it back with its saved serial and attributes; or,
+ *    with `savedBackstoreLive`, it maps the hole's still-live saved backstore
+ *    back as the LUN.
  * A state outside this list is a newer daemon's; a reader shows it as
  * unknown (ANAS.knownEnum).
  */
@@ -758,6 +761,8 @@ export const IscsiHoleRepair = z.object({
   restoreMark: IscsiRestoreMarkState.optional(),
   /** `restore-mark` only: where the mark is (the volume, or the image file); null when it could not be read off the path. */
   markOn: z.string().nullable().optional(),
+  /** `ready` and `restore-mark` only: the hole's backstore is still live and ANAS showed it is the saved one (same plugin, name, backing path and serial, and the path names the object it holds). On `ready`, Repair maps it back and creates nothing. */
+  savedBackstoreLive: z.literal(true).optional(),
 })
 export type IscsiHoleRepair = z.infer<typeof IscsiHoleRepair>
 

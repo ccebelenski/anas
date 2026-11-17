@@ -599,14 +599,29 @@ describe('own.4 (c) — a hole Repair cannot put back is named as such, never "u
     assert.match(message, /[^.]\.$/)
   })
 
-  it('backstore-live: the live backstore is the reason, and the way back is the map line', async () => {
+  it('a hole whose live backstore IS the saved one is the save gate\'s own hole: "use Repair"', async () => {
+    // The gate has no job view, so a hole that would need I/O facts to be
+    // judged carries no verdict here (own.4 (c) B2): it is an ordinary hole.
     const bs = { name: 'img', plugin: 'block', dev: '/dev/zvol/tank/img', wwn: 'w-1' }
     const ctx = contextOf({ backstores: [bs], luns: [] }, { backstores: [bs], luns: LUN0('img', 'block') }, BASE)
+    const targets = await buildIscsiTargets(ctx)
+    assert.equal(computeIscsiHealth(ctx, targets).missingLuns[0].repair, undefined)
+
+    const refused = assertSaveable(ctx, targets)!
+    assert.match(refused.message, /the kernel does not: LUN 0 of /)
+    assert.match(refused.message, /then use Repair on the iSCSI screen, and retry\./)
+    assert.doesNotMatch(refused.message, /map it back by hand/)
+  })
+
+  it('backstore-live: a live backstore ANAS cannot prove is the saved one keeps the by-hand clause', async () => {
+    const bs = { name: 'img', plugin: 'block', dev: '/dev/zvol/tank/img', wwn: 'w-1' }
+    const ctx = contextOf({ backstores: [{ ...bs, wwn: 'w-2' }], luns: [] }, { backstores: [bs], luns: LUN0('img', 'block') }, BASE)
     const targets = await buildIscsiTargets(ctx)
     assert.equal(computeIscsiHealth(ctx, targets).missingLuns[0].repair?.state, 'backstore-live')
 
     const refused = assertSaveable(ctx, targets)!
     assert.match(refused.message, /is missing too, and Repair cannot put it back: backstore 'img' \(block, \/dev\/zvol\/tank\/img\) is still live and no LUN maps it/)
+    assert.match(refused.message, /because ANAS cannot show its serial is the saved one/)
     assert.match(refused.message, /map it back by hand: 'targetcli \/iscsi\/iqn\.2026-08\.nas\.anas:vmstore\/tpg1\/luns create storage_object=\/backstores\/block\/img lun=0'\.$/)
     assert.doesNotMatch(refused.message, /use Repair/)
   })

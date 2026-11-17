@@ -4249,8 +4249,9 @@ async function iscsiRepairChecks() {
   state = toolbar(grid, ['iscsiRepair'])
   ok('repair(present): ENABLED once the backing object resolves again',
     state.iscsiRepair.disabled === false)
-  ok('repair(present): the tooltip promises the SAME disk, not a new one',
-    /same serial and attributes/.test(state.iscsiRepair.tip), state.iscsiRepair.tip)
+  ok('repair(present): the tooltip says a LUN can be put back now, and claims no replay it may not do',
+    /1 LUN can be put back now\.$/.test(state.iscsiRepair.tip) && !/same serial and attributes/.test(state.iscsiRepair.tip),
+    state.iscsiRepair.tip)
   const btn = grid.down('#iscsiRepair')
   btn.handler(btn)
   await settle()

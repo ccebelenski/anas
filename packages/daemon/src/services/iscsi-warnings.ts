@@ -74,7 +74,7 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
       level: 'critical',
       category: 'iscsi',
       message: `iSCSI target ${t.targetIqn} restored with none of its ${t.persistedLunCount} `
-        + `LUN${t.persistedLunCount === 1 ? '' : 's'} — the backing storage was not available. `
+        + `LUN${t.persistedLunCount === 1 ? '' : 's'}. `
         + `${t.enabled ? 'It is enabled and accepting logins with no disks behind it' : 'It is disabled'}.`,
       ref: t.targetIqn,
     })
@@ -161,8 +161,11 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     warnings.push({
       level: 'warning',
       category: 'iscsi',
-      message: `LUN ${lun.lunIndex} '${lun.backstoreName}' of target ${lun.targetIqn} did not restore — `
-        + `its backing ${lun.backingPath} was not available; the target is serving without it.${backNow}`,
+      // The head says what was read (saved, not live, and the backing the
+      // record names) and no cause: the verdict's sentence after it carries
+      // the reason, and a hole whose backstore is still live has its backing.
+      message: `LUN ${lun.lunIndex} '${lun.backstoreName}' of target ${lun.targetIqn} did not restore `
+        + `(its backing is ${lun.backingPath}); the target is serving without it.${backNow}`,
       ref: lun.targetIqn,
     })
   }

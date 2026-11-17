@@ -484,7 +484,10 @@ export function computeIscsiHealth(
   // "unmapped backstore" card would repeat it, and a restore-mark row would
   // hand that backstore a second subject. Only the exact pair — name, plugin
   // and backing path — is suppressed, as the claims keep a differing pair.
-  const liveHoleBackings = missingLuns.filter(l => l.repair?.state === 'backstore-live')
+  // A hole whose verdict maps its still-live saved backstore back (or refuses
+  // only for the reason that it is live) accounts for that backstore: the row
+  // and the mark row would give it a second subject.
+  const liveHoleBackings = missingLuns.filter(l => l.repair?.state === 'backstore-live' || l.repair?.savedBackstoreLive === true)
   const unmappedBackstores: IscsiUnmappedBackstore[] = unmappedLiveBackstores(ctx)
     .filter(isAnasUnmappedBackstore)
     .filter(b => !liveHoleBackings.some(l => l.backstoreName === b.name && l.plugin === b.plugin && l.backingPath === b.backingPath))
