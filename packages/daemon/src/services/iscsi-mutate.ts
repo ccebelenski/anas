@@ -2239,7 +2239,10 @@ export function lunDeletedBackingKept(index: number, backingPath: string, err: u
 // ---------------------------------------------------------------------------
 
 /**
- * Every backing object currently mapped into a LUN on this node.
+ * Every backing object a LUN on this node holds: the mapped live ones, and the
+ * ones only the saved configuration still names — a LUN missing from the live
+ * tree holds its backing until it is put back, and its claim says so
+ * (`lunMissing: true`).
  *
  * The ONE call Pools, Datasets, AHR and Mounts make before they destroy, rename,
  * roll back, shrink or unmount anything. It exists because nothing else in
@@ -2291,6 +2294,12 @@ export function claimsFromTargets(targets: IscsiTargetDetail[]): IscsiClaim[] {
           claim.pool = lun.pool
         if (lun.dataset !== undefined)
           claim.dataset = lun.dataset
+        // The saved configuration names this LUN but the live tree does not:
+        // it holds its backing until it is put back, and the claim says so.
+        if (lun.savedOnly === true) {
+          claim.lunMissing = true
+          claim.detail += '; this LUN is in the saved iSCSI configuration and missing from the live one, and it holds this object until the LUN is put back'
+        }
         claims.push(claim)
       }
     }
@@ -2310,6 +2319,9 @@ export { describeUnmappedHolder }
  * destroy or export, an AHR verb or an unmount would pass ANAS's gate on the
  * very object the restore is writing. Every backstore counts, whoever made it:
  * a hold is a fact about the object, not about ownership.
+ *
+ * `claimsFromState` drops one of these when a saved LUN missing live already
+ * carries the same claim (same backstore, backing path, pool and dataset).
  */
 export function unmappedBackstoreClaims(ctx: IscsiReadContext): IscsiClaim[] {
   return unmappedLiveBackstores(ctx).map((b) => {
@@ -2331,9 +2343,25 @@ export function unmappedBackstoreClaims(ctx: IscsiReadContext): IscsiClaim[] {
   })
 }
 
-/** Every claim a gathered state holds: the mapped LUNs', then the unmapped backstores' (cr3.lunrestore). */
+/**
+ * Every claim a gathered state holds: the LUNs' (the live ones and the saved
+ * ones missing live, which say so), then the live backstores no LUN maps —
+ * minus an unmapped claim a missing LUN's claim already says exactly (one
+ * backing, one claim; a hold is never lost, so a differing pair both stay).
+ */
 export function claimsFromState(ctx: IscsiReadContext, targets: IscsiTargetDetail[]): IscsiClaim[] {
-  return [...claimsFromTargets(targets), ...unmappedBackstoreClaims(ctx)]
+  const claims = claimsFromTargets(targets)
+  // The join already looks the live backstore up by name to set `present`;
+  // this repeats that lookup until the LUN row carries the fact itself.
+  const liveBackstoreNames = new Set(ctx.live.backstores.map(b => b.name))
+  for (const claim of claims) {
+    if (claim.lunMissing === true && !liveBackstoreNames.has(claim.backstoreName))
+      claim.backstoreMissing = true
+  }
+  const missingHolds = claims.filter(c => c.lunMissing === true && c.backstoreMissing === undefined)
+  const unmapped = unmappedBackstoreClaims(ctx).filter(u => !missingHolds.some(h =>
+    h.backstoreName === u.backstoreName && h.backingPath === u.backingPath && h.pool === u.pool && h.dataset === u.dataset))
+  return [...claims, ...unmapped]
 }
 
 /** `claimsFromState` with the read done for you — the seam's public form. */

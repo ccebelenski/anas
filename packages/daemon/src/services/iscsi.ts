@@ -750,6 +750,7 @@ function buildTpg(
         .filter(s => s.mappedLuns.includes(index))
         .map(s => s.initiatorIqn),
       present: liveLun !== undefined && liveBackstore !== undefined,
+      ...(liveLun === undefined && persistedLun !== undefined ? { savedOnly: true as const } : {}),
       // A stub reports its BACKING as absent, and it is not a lie: the file is
       // there, but the LUN's data is not, and every consumer of this flag —
       // Repair's "is it back yet", the image-restore door, the grid's tooltips

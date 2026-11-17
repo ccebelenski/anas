@@ -434,6 +434,12 @@ export const IscsiLun = z.object({
    */
   present: z.boolean(),
   /**
+   * The saved configuration has this LUN and the live tree does not. Absent =
+   * the LUN is in the live tree. `present` is false here too, but `present` is
+   * also false for a live LUN whose backstore was not found live.
+   */
+  savedOnly: z.literal(true).optional(),
+  /**
    * Does `backingPath` resolve on this node? A `zfs rename` under a live LUN
    * succeeds silently and leaves a dangling `udev_path` (GT-40), so a LUN whose
    * backing path does not resolve is BROKEN, not foreign. `null` when unchecked.
@@ -1672,6 +1678,18 @@ export const IscsiClaim = z.object({
   unmapped: z.literal(true).optional(),
   /** The backstore plugin (`block` / `fileio`), on an `unmapped` claim. */
   plugin: z.string().optional(),
+  /**
+   * The LUN is in the saved configuration and missing from the live one. It
+   * holds its backing until it is put back. Absent = the LUN is live (or the
+   * claim is `unmapped`).
+   */
+  lunMissing: z.literal(true).optional(),
+  /**
+   * No live backstore holds the backing either, so nothing in the kernel has
+   * it open. Only ever set together with `lunMissing`. Absent = a live
+   * backstore holds it.
+   */
+  backstoreMissing: z.literal(true).optional(),
   backstoreName: z.string(),
   /** Initiator IQNs with a live session mapping this LUN. */
   connectedInitiators: z.array(z.string()),
@@ -1687,9 +1705,10 @@ export const IscsiClaim = z.object({
 export type IscsiClaim = z.infer<typeof IscsiClaim>
 
 /**
- * `iscsiClaims()` — every backing object currently mapped into a LUN, and
- * (cr3.lunrestore) every backing object a live backstore no LUN maps holds
- * (`unmapped: true`).
+ * `iscsiClaims()` — every backing object an iSCSI configuration holds on this
+ * node: one mapped into a live LUN, one a live backstore holds that no LUN
+ * maps (`unmapped: true`), or one named by a saved LUN that is missing from
+ * the live tree (`lunMissing: true`) and holds it until the LUN is put back.
  */
 export const IscsiClaimList = IscsiAvailability.extend({
   claims: z.array(IscsiClaim),
@@ -1724,6 +1743,12 @@ export const IscsiHeldByLun = z.object({
   unmapped: z.literal(true).optional(),
   /** The backstore plugin (`block` / `fileio`), when `unmapped`. */
   plugin: z.string().optional(),
+  /**
+   * The LUN is in the saved configuration and missing from the live one. It
+   * holds its backing until it is put back. Absent = the LUN is live (or the
+   * claim is `unmapped`).
+   */
+  lunMissing: z.literal(true).optional(),
   /**
    * cr3 (ISCSI-H2): the TPG the LUN is in — `index` is an address inside one
    * TPG, so a lookup by index alone can find another TPG's LUN 0. Absent from

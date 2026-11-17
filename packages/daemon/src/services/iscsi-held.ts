@@ -191,6 +191,7 @@ export function toHeldByLun(claim: IscsiClaim): IscsiHeldByLun {
     backingPath: claim.backingPath,
     connectedInitiators: claim.connectedInitiators,
     ...(claim.connectedInitiatorsUnknown === true ? { connectedInitiatorsUnknown: true } : {}),
+    ...(claim.lunMissing === true ? { lunMissing: true } : {}),
     detail: claim.detail,
   }
 }
@@ -419,6 +420,21 @@ export function heldByLunRefusal(
         + `A backstore no LUN maps is what a restore as a new LUN holds while it writes the image (it is mapped once the image is complete), `
         + `or what an interrupted restore or a LUN removed by hand left behind; its content may be incomplete. `
         + `If no restore is running, delete it with ${command}, then retry. `
+        + `This refusal has no confirm bypass.`,
+      heldByLun: held,
+    }
+  }
+  if (held.lunMissing === true) {
+    // The LUN is saved but missing live: every iSCSI mutation is refused
+    // while the live tree lacks a saved LUN, so the mapped LUN's advice —
+    // delete the LUN from the iSCSI screen first — is not a way out, and
+    // for a target ANAS does not change it never is. The way out is to put
+    // the LUN back: Repair where it acts, targetcli where it does not.
+    return {
+      reason: 'held-by-lun',
+      message: `${action} ${what} is refused: it is ${held.detail}. `
+        + `The restore at boot replays the saved configuration, so the LUN returns with this object as its disk. `
+        + `Put the LUN back first: use Repair on the iSCSI screen, and where Repair does not restore it, restore it by hand with targetcli. `
         + `This refusal has no confirm bypass.`,
       heldByLun: held,
     }

@@ -95,6 +95,21 @@ const MOUNT_CLAIM: IscsiClaim = {
   detail: `held by iSCSI LUN 0 'remoteblock' of target iqn.2026-08.nas.anas:remote (/mnt/anas-nfs/blocks/lun.raw)`,
 }
 
+/** A LUN the saved configuration names and the live tree lacks — it holds its backing until it is put back. */
+const MISSING_CLAIM: IscsiClaim = {
+  backingPath: '/dev/zvol/tank/newvol',
+  kind: 'zvol',
+  pool: 'tank',
+  dataset: 'tank/newvol',
+  targetIqn: 'iqn.2026-08.nas.anas:vmstore',
+  tpgTag: 1,
+  lunIndex: 0,
+  backstoreName: 'newvol',
+  connectedInitiators: [],
+  lunMissing: true,
+  detail: `held by iSCSI LUN 0 'newvol' of target iqn.2026-08.nas.anas:vmstore (/dev/zvol/tank/newvol); this LUN is in the saved iSCSI configuration and missing from the live one, and it holds this object until the LUN is put back`,
+}
+
 const ALL = [ZVOL_CLAIM, FILE_CLAIM, AHR_CLAIM, MOUNT_CLAIM]
 
 describe('heldByLun — the matrix (story iscsi.6)', () => {
@@ -252,6 +267,23 @@ describe('heldByLunRefusal — the guiding 409 body', () => {
   it('carries the holder back, so a caller can put it on the wire unchanged', () => {
     const held = toHeldByLun(ZVOL_CLAIM)
     assert.deepEqual(heldByLunRefusal('x', 'Destroying', held).heldByLun, held)
+  })
+
+  it('a saved LUN missing live: the WHOLE message says the LUN returns with the object and must be put back first', () => {
+    const r = heldByLunRefusal(`dataset 'tank/newvol'`, 'Destroying', toHeldByLun(MISSING_CLAIM))
+    assert.equal(r.reason, 'held-by-lun')
+    assert.equal(r.message, 'Destroying dataset \'tank/newvol\' is refused: it is '
+    + 'held by iSCSI LUN 0 \'newvol\' of target iqn.2026-08.nas.anas:vmstore (/dev/zvol/tank/newvol); '
+    + 'this LUN is in the saved iSCSI configuration and missing from the live one, and it holds this object until the LUN is put back. '
+    + 'The restore at boot replays the saved configuration, so the LUN returns with this object as its disk. '
+    + 'Put the LUN back first: use Repair on the iSCSI screen, and where Repair does not restore it, restore it by hand with targetcli. '
+    + 'This refusal has no confirm bypass.')
+  })
+
+  it('a saved LUN missing live: the false way out is gone — no Delete LUN advice, no initiator sentence', () => {
+    const r = heldByLunRefusal(`dataset 'tank/newvol'`, 'Destroying', toHeldByLun(MISSING_CLAIM))
+    assert.ok(!r.message.includes('Delete LUN'), r.message)
+    assert.ok(!r.message.includes('corrupt what the initiator sees'), r.message)
   })
 
   it('names no backend — the same sentence serves ZFS, AHR and mounts (live-proof wave 2)', () => {
