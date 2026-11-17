@@ -2534,3 +2534,34 @@ describe('cr3.lunrestore.filemark — the new-LUN restore onto an image FILE tha
     })
   })
 })
+
+describe('own.4 (c) — a live backstore a hole already names as live is one fact, told once', () => {
+  const NEWVOL_BS = { name: 'newvol', plugin: 'block', dev: NEWVOL, wwn: 's1' }
+  const present = (): RestoreMarkRead => ({ state: 'present', dataset: 'tank/newvol', raw: 'garbage', mark: null })
+
+  /** A live backstore no LUN maps, and a saved LUN of it that the restore dropped. */
+  async function world(savedDev: string) {
+    const ctx = contextOf(
+      { backstores: [NEWVOL_BS], luns: [] },
+      { backstores: [{ ...NEWVOL_BS, dev: savedDev }], luns: [{ iqn: IQN, tag: 1, index: 5, backstore: 'newvol', plugin: 'block' }] },
+      SOURCE_BASE,
+    )
+    const targets = await buildIscsiTargets(ctx)
+    return computeIscsiHealth(ctx, targets, { marks: new Map([[NEWVOL, present()]]), restoreRunning: () => undefined })
+  }
+
+  it('the hole (same name, plugin and path) owns it: no unmapped-backstore row and no mark row for it', async () => {
+    const health = await world(NEWVOL)
+    assert.equal(health.missingLuns.length, 1)
+    assert.equal(health.missingLuns[0].repair?.state, 'backstore-live')
+    assert.deepEqual(health.unmappedBackstores, [])
+    assert.deepEqual(health.restoreMarks, [])
+  })
+
+  it('a differing path keeps the row: only the exact pair is the same fact', async () => {
+    const health = await world('/dev/zvol/tank/elsewhere')
+    assert.equal(health.missingLuns[0].repair?.state, 'backstore-live')
+    assert.deepEqual(health.unmappedBackstores?.map(b => [b.name, b.backingPath]), [['newvol', NEWVOL]])
+    assert.deepEqual(health.restoreMarks?.map(m => [m.backstoreName, m.state]), [['newvol', 'interrupted']])
+  })
+})

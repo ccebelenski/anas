@@ -41,6 +41,7 @@ import type {
   IscsiAclRequest,
   IscsiAuthMode,
   IscsiClaim,
+  IscsiMissingLun,
   IscsiTargetDetail,
   UpdateIscsiTargetRequest,
 } from '@anas/shared'
@@ -65,7 +66,6 @@ import {
   attributeTokens,
   backstorePath,
   configshellSafe,
-  handsOffRefusal,
   ISCSI_DEFAULT_WRITE_BACK,
   ISCSI_MAX_UNMAP_LBA_COUNT,
   ownershipUnknownRefusal,
@@ -276,6 +276,9 @@ const DASHED_FLAG_RE = /^-{1,2}([a-z]\w*)/i
 
 /** A clean parameter name, so a value before an `=` is never mistaken for one. */
 const BARE_FLAG_NAME_RE = /^[a-z]\w*$/i
+
+/** A sentence's own closing full stop, dropped where a list of reasons ends in one. */
+const TRAILING_STOP_RE = /\.$/
 
 /**
  * The PARAMETER NAME of a token, when it has one, for an error message that
@@ -535,27 +538,40 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
 
   // cr3 (ISCSI-L7): holes in foreign targets are named as such — Repair does
   // not touch them, so "use Repair" would send the operator round in a loop.
-  const foreignHoles = health.missingLuns.filter(l => l.targetOwnership === 'foreign')
   // cr3 review 2: holes of an ANAS target ANAS will not write to (a hand-added
   // TPG, an owner that could not be judged) are not Repair's either — named
   // with the target's own refusal, never "use Repair".
-  const targetByIqn = new Map(targets.map(t => [t.iqn, t]))
-  const handsOffOf = (iqn: string) => {
-    const t = targetByIqn.get(iqn)
-    return t ? handsOffRefusal(t) : null
-  }
-  const notRepairable = health.missingLuns.filter(l => l.targetOwnership !== 'foreign' && handsOffOf(l.targetIqn) !== null)
-  const ownHoles = health.missingLuns.filter(l => l.targetOwnership !== 'foreign' && handsOffOf(l.targetIqn) === null)
-  const handsOffClause = notRepairable.length === 0
+  //
+  // Every group below is read off the hole's verdict (services/iscsi-hole.ts),
+  // the one place that decides what Repair can do with it. This guard has no
+  // job view, so its holes carry only the verdicts the pure facts decide: a
+  // hole that would need I/O facts carries none and keeps the sentence below.
+  const stateOf = (l: IscsiMissingLun) => l.repair?.state
+  const foreignHoles = health.missingLuns.filter(l => stateOf(l) === 'foreign-target')
+  const handsOffHoles = health.missingLuns.filter(l => stateOf(l) === 'target-hands-off')
+  const byHandHoles = health.missingLuns.filter(l => stateOf(l) === 'record-incomplete' || stateOf(l) === 'backstore-live')
+  const ownHoles = health.missingLuns.filter(l => stateOf(l) !== 'foreign-target' && stateOf(l) !== 'target-hands-off'
+    && stateOf(l) !== 'record-incomplete' && stateOf(l) !== 'backstore-live')
+  const handsOffClause = handsOffHoles.length === 0
     ? ''
-    : ` ${notRepairable.map(namedLun).join('; ')} `
-      + `${notRepairable.length === 1 ? 'is' : 'are'} missing too, and Repair does not write to ${notRepairable.length === 1 ? 'that target' : 'those targets'}: `
-      + `${[...new Set(notRepairable.map(l => handsOffOf(l.targetIqn)!.message))].join(' ')}`
-  if (ownHoles.length === 0 && (foreignHoles.length > 0 || notRepairable.length > 0)) {
+    : ` ${handsOffHoles.map(namedLun).join('; ')} `
+      + `${handsOffHoles.length === 1 ? 'is' : 'are'} missing too, and Repair does not write to ${handsOffHoles.length === 1 ? 'that target' : 'those targets'}: `
+      + `${[...new Set(handsOffHoles.map(l => l.repair!.detail))].join(' ')}`
+  // A hole Repair cannot put back at all leaves the "use Repair" list and says
+  // why, in the verdict's own sentence — never an instruction to press a
+  // button that refuses this hole.
+  const byHandClause = byHandHoles.length === 0
+    ? ''
+    : ` ${byHandHoles.map(namedLun).join('; ')} `
+      + `${byHandHoles.length === 1 ? 'is' : 'are'} missing too, and Repair cannot put ${byHandHoles.length === 1 ? 'it' : 'them'} back: `
+      // Some reasons are clauses and one is a whole sentence with its own
+      // stop: each is joined without it, and the clause ends in exactly one.
+      + `${byHandHoles.map(l => l.repair!.detail.replace(TRAILING_STOP_RE, '')).join('; ')}.`
+  if (ownHoles.length === 0 && (foreignHoles.length > 0 || handsOffHoles.length > 0 || byHandHoles.length > 0)) {
     return {
       reason: 'degraded-restore',
       message: `The live iSCSI configuration is an INCOMPLETE restore, and every change is refused until it is whole:`
-        + `${foreignHoles.length > 0 ? ` ${foreignHolesSentence(foreignHoles)}` : ''}${handsOffClause}`,
+        + `${foreignHoles.length > 0 ? ` ${foreignHolesSentence(foreignHoles)}` : ''}${handsOffClause}${byHandClause}`,
     }
   }
   const missing = ownHoles.map(namedLun).join('; ')
@@ -570,7 +586,7 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
       // the whole live tree and drops every session on the node first
       // (services/iscsi-repair.ts, and ANAS never issues it).
       + `/etc/rtslib-fb-target/saveconfig.json permanently. Bring the backing storage back (import the pool, `
-      + `restore the image), then use Repair on the iSCSI screen, and retry.${foreignClause}${handsOffClause}`,
+      + `restore the image), then use Repair on the iSCSI screen, and retry.${foreignClause}${handsOffClause}${byHandClause}`,
   }
 }
 

@@ -178,6 +178,11 @@ export { restoreMarkDetail, restoreMarkState }
 /**
  * Every LUN the saved configuration holds and the live tree does not — the
  * restore holes — each with the target it belongs to.
+ *
+ * A hole is a SAVED-ONLY LUN: one the live tree does not have AT ALL. A live
+ * LUN whose backstore was not seen live (a backstore directory that could not
+ * be listed) is a LUN that is there, not an absent saved one, and is reported
+ * as such (`configfsUnreadable`) rather than as a restore hole.
  */
 export function restoreHoles(ctx: IscsiReadContext, targets: IscsiTargetDetail[]): { hole: IscsiMissingLun, target: IscsiTargetDetail }[] {
   const persistedByIqn = new Map((ctx.persisted?.targets ?? []).map(t => [t.iqn, t]))
@@ -192,7 +197,10 @@ export function restoreHoles(ctx: IscsiReadContext, targets: IscsiTargetDetail[]
 
       // --- LUNs in saveconfig with no configfs counterpart: the restore hole ---
       for (const lun of tpg.luns) {
-        if (lun.present)
+        // Only a SAVED-ONLY LUN is a restore hole (`savedOnly` on the built
+        // LUN). A live LUN whose backstore was not seen live is NOT one: the
+        // LUN is there, and the live side is what could not be read.
+        if (!lun.savedOnly)
           continue
         // cr3: a target whose configfs could not be listed has LUNs nobody
         // SAW — not holes. Reporting them would point Repair at LUNs that may
@@ -217,8 +225,11 @@ export function restoreHoles(ctx: IscsiReadContext, targets: IscsiTargetDetail[]
           // A hole whose path holds a placeholder is a DIFFERENT thing to fix, and
           // the quarantine is what turned it into a hole in the first place. The
           // fact is re-derived from the filesystem here, so it keeps being told
-          // for as long as it is true and stops the moment it is not.
-          ...(ctx.stubs.has(backingPath) ? { stubBacking: true } : {}),
+          // for as long as it is true and stops the moment it is not. Only a
+          // ZERO-SIZE file is a placeholder — a full-size image on an unexpected
+          // mount holds data — which is the same signal the verdict's
+          // `placeholder` rung reads.
+          ...(ctx.stubs.get(backingPath)?.zeroSized === true ? { stubBacking: true } : {}),
           targetOwnership: target.ownership,
         }
         holes.push({ hole, target })
@@ -468,8 +479,15 @@ export function computeIscsiHealth(
     }
   }
 
+  // A live backstore a hole already names as live is ONE fact, told once: the
+  // hole's own card says the backstore is there and how to map it, so an
+  // "unmapped backstore" card would repeat it, and a restore-mark row would
+  // hand that backstore a second subject. Only the exact pair — name, plugin
+  // and backing path — is suppressed, as the claims keep a differing pair.
+  const liveHoleBackings = missingLuns.filter(l => l.repair?.state === 'backstore-live')
   const unmappedBackstores: IscsiUnmappedBackstore[] = unmappedLiveBackstores(ctx)
     .filter(isAnasUnmappedBackstore)
+    .filter(b => !liveHoleBackings.some(l => l.backstoreName === b.name && l.plugin === b.plugin && l.backingPath === b.backingPath))
     .map((b) => {
       const inFlight = opts.restoreRunning?.(b.backingPath)
       const marked = markRow(b.backingPath, b.name, `backstore '${b.name}'`)

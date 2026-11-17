@@ -213,7 +213,7 @@ describe('assertRepairable — the guiding 409', () => {
     const live = item(2, { state: 'backstore-live', detail: 'a backstore of its name is still live' })
     const refusal = assertRepairable({ repairable: [], blocked: [served, live] })
     assert.equal(refusal?.reason, 'backstore-live')
-    // …and the clauses print in the same order: backstore-live before served.
+    // The clauses print in the same order: backstore-live before served.
     const liveAt = refusal!.message.indexOf('still live:')
     const servedAt = refusal!.message.indexOf('different device:')
     assert.ok(liveAt >= 0 && servedAt > liveAt, refusal!.message)

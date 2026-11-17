@@ -138,12 +138,6 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
   )
 
   for (const lun of health.missingLuns) {
-    // A hole ANAS made itself, by taking a placeholder off the network, must
-    // keep saying so: "that path is still missing" is confusing when there is
-    // visibly a file at it (story `iscsi.8`).
-    const placeholderClause = ' That path holds a PLACEHOLDER the restore service created — a file of the right name '
-      + 'that is not the image, which is why ANAS took the LUN offline. Mount the filesystem that should hold the '
-      + 'image, then use Repair on the iSCSI screen to put the LUN back with its own serial.'
     // ANAS deleted the file at that path itself, so "bring the storage back
     // (restore the image)" would be an instruction to undo a deletion that
     // destroyed nothing: the file was a 0-byte placeholder on the wrong
@@ -152,19 +146,31 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     const removedClause = ' That path is empty because ANAS REMOVED the placeholder it found there — it was 0 bytes and '
       + 'on the wrong filesystem, so nothing of yours was deleted. Mount the filesystem that should hold the image, then '
       + 'use Repair on the iSCSI screen to put the LUN back with its own serial.'
-    // cr3 (ISCSI-L7): a hole in a target ANAS does not manage is never
-    // Repair's — the card says whose it is and how to restore it by hand.
-    const backNow = lun.targetOwnership === 'foreign'
-      ? ` ${foreignHolesSentence([lun])}`
-      : lun.stubBacking
-        ? placeholderClause
-        : placeholderRemoved.has(`${lun.targetIqn}#${lun.lunIndex}`)
-          ? removedClause
-          : lun.backingExists === true
-            ? ' That path is available again — use Repair on the iSCSI screen to put the LUN back.'
-            : lun.backingExists === false
-              ? ' That path is still missing — bring the storage back (import the pool, restore the image) first.'
-              : ''
+    // The tail is the hole's own verdict (services/iscsi-hole.ts) — the one
+    // place that decides what Repair can do with it — framed by the shape that
+    // state's sentence takes. A hole with no verdict says nothing about
+    // Repair: this read gathered no fact to decide it from.
+    const state = lun.repair?.state
+    const detail = lun.repair?.detail ?? ''
+    const backNow = state === undefined
+      ? ''
+      // cr3 (ISCSI-L7): a hole in a target ANAS does not manage is never
+      // Repair's — the card says whose it is and how to restore it by hand.
+      : state === 'foreign-target'
+        ? ` ${foreignHolesSentence([lun])}`
+        : state === 'target-hands-off'
+          ? ` Repair does not write to this target: ${detail}`
+          : state === 'record-incomplete' || state === 'backing-unreadable' || state === 'backstore-live'
+            || state === 'device-served-elsewhere' || state === 'restore-mark'
+            // A clause: it names why Repair refuses, so the full stop is the
+            // frame's, not the verdict's.
+            ? ` Repair cannot put it back: ${detail}${detail.endsWith('.') ? '' : '.'}`
+            : state === 'backing-absent'
+              // ANAS made this hole by removing the placeholder at that path
+              // in this very read (story `iscsi.8`), and says so rather than
+              // telling the operator to undo a deletion that lost nothing.
+              ? placeholderRemoved.has(`${lun.targetIqn}#${lun.lunIndex}`) ? removedClause : ` ${detail}`
+              : ` ${detail}`
     warnings.push({
       level: 'warning',
       category: 'iscsi',
@@ -211,7 +217,7 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
       : stubs > 0 ? placeholders : incomplete
     // cr3 (ISCSI-L7): when the only holes are in foreign targets, "until this
     // is repaired" would point at a Repair that never touches them.
-    const foreignOnly = stubs === 0 && n > 0 && health.missingLuns.every(l => l.targetOwnership === 'foreign')
+    const foreignOnly = stubs === 0 && n > 0 && health.missingLuns.every(l => l.repair?.state === 'foreign-target')
     warnings.push({
       level: 'critical',
       category: 'iscsi',

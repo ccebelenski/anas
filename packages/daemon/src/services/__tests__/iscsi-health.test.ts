@@ -13,6 +13,7 @@ import { computeIscsiHealth } from '../iscsi-health.js'
 import { ZFS } from '../iscsi-mutate.js'
 import { readIscsiHealth } from '../iscsi-quarantine.js'
 import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, parseIpAddrJson, readIscsiContext, toTargetSummary } from '../iscsi.js'
+import { contextOf } from './lio-model.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/iscsi')
@@ -797,5 +798,45 @@ describe('own.4 (c) — the repair verdict through read()', () => {
     finally {
       await node.close()
     }
+  })
+})
+
+describe('own.4 (c) — a hole is a SAVED LUN the live tree does not have at all', () => {
+  const IQN = 'iqn.2026-08.nas.anas:vmstore'
+  const BASE = { iqn: IQN, tag: 1, backstores: [{ name: 'ok', plugin: 'block', dev: '/dev/zvol/tank/ok', wwn: 's0' }], luns: [{ iqn: IQN, tag: 1, index: 0, backstore: 'ok', plugin: 'block' }] }
+  const GHOST = { name: 'ghost', plugin: 'block', dev: '/dev/zvol/tank/ghost', wwn: 's1' }
+
+  it('a live LUN whose backstore was not seen live is neither a hole nor counted — its LUN is live', async () => {
+    // The live tree holds LUN 1 but not the backstore it names (a backstore
+    // directory that could not be listed): `present` is false, yet the LUN is
+    // NOT saved-only, so it is not a restore hole and the count says so too —
+    // one predicate for the list and the badge.
+    const ctx = contextOf(
+      { backstores: [], luns: [{ iqn: IQN, tag: 1, index: 1, backstore: 'ghost', plugin: 'block' }] },
+      { backstores: [GHOST], luns: [{ iqn: IQN, tag: 1, index: 1, backstore: 'ghost', plugin: 'block' }] },
+      BASE,
+    )
+    const targets = await buildIscsiTargets(ctx)
+    const health = computeIscsiHealth(ctx, targets)
+    assert.equal(targets[0].lunCount, 2)
+    assert.equal(targets[0].luns[1].present, false)
+    assert.equal(targets[0].luns[1].savedOnly, undefined)
+    assert.deepEqual(health.missingLuns, [])
+    assert.equal(targets[0].missingLunCount, 0)
+    assert.equal(health.degraded, false)
+  })
+
+  it('a saved LUN with no live counterpart at all is a hole, and is counted', async () => {
+    const ctx = contextOf(
+      { backstores: [], luns: [] },
+      { backstores: [GHOST], luns: [{ iqn: IQN, tag: 1, index: 1, backstore: 'ghost', plugin: 'block' }] },
+      BASE,
+    )
+    const targets = await buildIscsiTargets(ctx)
+    const health = computeIscsiHealth(ctx, targets)
+    assert.equal(targets[0].luns[1].savedOnly, true)
+    assert.equal(health.missingLuns.length, 1)
+    assert.equal(targets[0].missingLunCount, 1)
+    assert.equal(health.degraded, true)
   })
 })

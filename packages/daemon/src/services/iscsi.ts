@@ -897,7 +897,10 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
       },
       present: liveTarget !== undefined,
       persisted: persistedTarget !== undefined,
-      missingLunCount: allLuns.filter(l => !l.present).length,
+      // The same rows `restoreHoles` reports (services/iscsi-health.ts): a
+      // SAVED-ONLY LUN, none from a target whose configfs could not be listed.
+      // The badge and the hole list must never disagree about what is missing.
+      missingLunCount: unreadable.length > 0 ? 0 : allLuns.filter(l => l.savedOnly === true).length,
       portalsWithoutInterfaceCount: allPortals.filter(p => p.carriedByInterface === false).length,
       luns: primary.luns,
       acls: primary.acls,

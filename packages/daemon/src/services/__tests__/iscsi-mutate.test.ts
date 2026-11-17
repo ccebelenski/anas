@@ -1351,7 +1351,9 @@ describe('assertSaveable — never saveconfig over a degraded restore (GT-22)', 
       },
     } as never)
     const targets = [target({
-      luns: [{ index: 0, name: 'gtiscsi_vol1', kind: 'zvol', plugin: 'block', backingPath: '/dev/zvol/gtiscsi/vol1', size: null, serial: 'abc', attributes: {}, connectedInitiators: [], present: false, backingExists: false }] as never,
+      // `savedOnly` is what the read layer sets on a LUN the live tree does not
+      // have at all — the one thing that makes this a restore hole.
+      luns: [{ index: 0, name: 'gtiscsi_vol1', kind: 'zvol', plugin: 'block', backingPath: '/dev/zvol/gtiscsi/vol1', size: null, serial: 'abc', attributes: {}, connectedInitiators: [], present: false, savedOnly: true, backingExists: false }] as never,
     })]
     const refusal = assertSaveable(ctx, targets)
     assert.ok(refusal)

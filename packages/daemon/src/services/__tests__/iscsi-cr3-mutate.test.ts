@@ -21,7 +21,7 @@ import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../iscsi-re
 import { aclNamesRefusal, backingPathRefusal, configshellSafe } from '../iscsi-rules.js'
 import { buildIscsiTargets } from '../iscsi.js'
 import { readPveFirewallAdvisory } from '../pve-firewall.js'
-import { holeIoFor } from './lio-model.js'
+import { contextOf, holeIoFor } from './lio-model.js'
 
 const IQN = 'iqn.2026-08.nas.anas:vmstore'
 
@@ -527,5 +527,105 @@ describe('cr3 review 2 — every line and every ACL is checked before the first 
     assert.equal(badAcl.repairable.length, 0)
     assert.match(badAcl.blocked[0].verdict?.detail ?? '', /initiator ACL "not an iqn"/)
     assert.equal(planIscsiRepair(ctx('w', 'iqn.1993-08.org.debian:01:x'), health('w', 'iqn.1993-08.org.debian:01:x'), []).repairable.length, 1)
+  })
+})
+
+describe('own.4 (c) — a hole Repair cannot put back is named as such, never "use Repair"', () => {
+  const BASE = { iqn: IQN, tag: 1, backstores: [], luns: [] }
+  const IMG = '/tank/images/img.raw'
+  const LUN0 = (backstore: string, plugin: string) => [{ iqn: IQN, tag: 1, index: 0, backstore, plugin }]
+
+  it('record-incomplete: the saved record cannot be replayed, so the refusal names the reason, not Repair', async () => {
+    const bs = { name: 'img', plugin: 'fileio', dev: IMG, wwn: 'w-1' }
+    const ctx = contextOf({ backstores: [], luns: [] }, { backstores: [bs], luns: LUN0('img', 'fileio') }, BASE)
+    ctx.inputs.zfsMountpoints = [{ dataset: 'tank/images', mountpoint: '/tank/images', pool: 'tank' }]
+    const targets = await buildIscsiTargets(ctx)
+    assert.equal(computeIscsiHealth(ctx, targets).missingLuns[0].repair?.state, 'record-incomplete')
+
+    const refused = assertSaveable(ctx, targets)!
+    assert.equal(refused.reason, 'degraded-restore')
+    // No Repair-able hole is left, so the refusal is the head sentence.
+    assert.match(refused.message, /is an INCOMPLETE restore, and every change is refused until it is whole:/)
+    assert.match(refused.message, /LUN 0 of .* is missing too, and Repair cannot put it back: the saved configuration records no size for fileio backstore 'img' \(\/tank\/images\/img\.raw\) — recreating it without one would serve a 0-byte disk with the right serial\.$/)
+    assert.doesNotMatch(refused.message, /use Repair/)
+  })
+
+  it('a reason that is already a full sentence gets ONE stop in the by-hand clause', () => {
+    // An ACL name targetcli cannot be handed: that refusal is a whole sentence
+    // with its own stop, where the other record-incomplete reasons are clauses.
+    const path = '/dev/zvol/tank/v1'
+    const ctx = {
+      live: { present: true, backstores: [], targets: [] },
+      persisted: {
+        fabricModules: [],
+        storageObjects: [{ name: 'v1', plugin: 'block', dev: path, wwn: 'w-1', size: null, writeBack: null, readOnly: null, aio: null, attributes: {} }],
+        targets: [{
+          iqn: IQN,
+          fabric: 'iscsi',
+          tpgs: [{ tag: 1, enable: true, authentication: true, generateNodeAcls: false, demoModeDiscovery: false, tpgCredentialsSet: false, portals: [], luns: [{ index: 0, backstoreName: 'v1', plugin: 'block', storageObject: '/backstores/block/v1' }], acls: [{ initiatorIqn: 'iqn.2020-01.com.foo:bad name', mappedLuns: [0] }] }],
+        }],
+      },
+      inputs: { pveStorages: new Map(), zfsMountpoints: [] },
+      nodeAddresses: null,
+      backing: new Map(),
+      mounts: new Map(),
+      stubs: new Map(),
+    } as unknown as Parameters<typeof assertSaveable>[0]
+    const targets = [{
+      iqn: IQN,
+      name: 'x',
+      ownership: 'anas',
+      ownershipReason: 'r',
+      ownershipDetail: 'd',
+      tpgTag: 1,
+      enabled: true,
+      portals: [],
+      lunCount: 1,
+      aclCount: 1,
+      sessionCount: 0,
+      security: { authentication: true, generateNodeAcls: false, demoModeDiscovery: false },
+      present: true,
+      persisted: true,
+      missingLunCount: 1,
+      portalsWithoutInterfaceCount: 0,
+      luns: [{ index: 0, name: 'v1', kind: 'zvol', plugin: 'block', backingPath: path, size: null, serial: 'w-1', attributes: {}, connectedInitiators: [], present: false, savedOnly: true, backingExists: true }],
+      acls: [],
+      sessions: [],
+    }] as unknown as Parameters<typeof assertSaveable>[1]
+    assert.equal(computeIscsiHealth(ctx, targets).missingLuns[0].repair?.state, 'record-incomplete')
+    const message = assertSaveable(ctx, targets)!.message
+    assert.match(message, /Repair cannot put it back: /)
+    assert.doesNotMatch(message, /\.\./)
+    assert.match(message, /[^.]\.$/)
+  })
+
+  it('backstore-live: the live backstore is the reason, and the way back is the map line', async () => {
+    const bs = { name: 'img', plugin: 'block', dev: '/dev/zvol/tank/img', wwn: 'w-1' }
+    const ctx = contextOf({ backstores: [bs], luns: [] }, { backstores: [bs], luns: LUN0('img', 'block') }, BASE)
+    const targets = await buildIscsiTargets(ctx)
+    assert.equal(computeIscsiHealth(ctx, targets).missingLuns[0].repair?.state, 'backstore-live')
+
+    const refused = assertSaveable(ctx, targets)!
+    assert.match(refused.message, /is missing too, and Repair cannot put it back: backstore 'img' \(block, \/dev\/zvol\/tank\/img\) is still live and no LUN maps it/)
+    assert.match(refused.message, /map it back by hand: 'targetcli \/iscsi\/iqn\.2026-08\.nas\.anas:vmstore\/tpg1\/luns create storage_object=\/backstores\/block\/img lun=0'\.$/)
+    assert.doesNotMatch(refused.message, /use Repair/)
+  })
+
+  it('a repairable hole beside a by-hand one keeps today\'s sentence for the repairable one', async () => {
+    const img = { name: 'img', plugin: 'fileio', dev: IMG, wwn: 'w-1' }
+    const vol = { name: 'vol', plugin: 'block', dev: '/dev/zvol/tank/vol', wwn: 'w-2' }
+    const ctx = contextOf({ backstores: [], luns: [] }, {
+      backstores: [img, vol],
+      luns: [...LUN0('img', 'fileio'), { iqn: IQN, tag: 1, index: 1, backstore: 'vol', plugin: 'block' }],
+    }, BASE)
+    ctx.inputs.zfsMountpoints = [{ dataset: 'tank/images', mountpoint: '/tank/images', pool: 'tank' }]
+    const targets = await buildIscsiTargets(ctx)
+    const states = computeIscsiHealth(ctx, targets).missingLuns.map(l => l.repair?.state ?? null)
+    assert.deepEqual(states, ['record-incomplete', null])
+
+    const refused = assertSaveable(ctx, targets)!
+    assert.match(refused.message, /has 1 LUN the kernel does not: LUN 1 of /)
+    assert.match(refused.message, /then use Repair on the iSCSI screen, and retry\./)
+    assert.match(refused.message, /LUN 0 of .* is missing too, and Repair cannot put it back: the saved configuration records no size/)
   })
 })
